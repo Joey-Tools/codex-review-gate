@@ -411,14 +411,22 @@ atomic. The helper checks the exact manifest-bound bypass lists; it cannot
 automatically discover or preserve an actor concurrently added outside that
 snapshot.
 
-Every post-activation and cutover stable snapshot also reads the archived-only
-repository from GitHub and requires exact `full_name`, `id`, `node_id`,
-`default_branch`, and `archived: true` equality with the manifest. Immediately
-before the legacy-rule cutover `PUT`, it rereads that identity alongside the old
-ruleset. An unreadable result, same-slug replacement, identity/default-branch
-drift, or an archive flag that is no longer true is inconclusive and produces
-no cutover write; it does not add the archived repository to v2, the receipt,
-or bridge-removal scope.
+Every post-activation and cutover stable snapshot also rereads the
+manifest-bound scheduler and requires its live Actions workflow state to be
+`active`, then reads the archived-only repository from GitHub and requires
+exact `full_name`, `id`, `node_id`, `default_branch`, and `archived: true`
+equality with the manifest. Immediately before the legacy-rule cutover `PUT`,
+it rereads that identity alongside the old ruleset and rereads the exact
+manifest-bound scheduler as `active` and unchanged from the stable snapshot.
+An unreadable result,
+same-slug replacement, identity/default-branch drift, or an archive flag that
+is no longer true is inconclusive and produces no cutover write; it does not
+add the archived repository to v2, the receipt, or bridge-removal scope. If
+restoration was skipped or failed, `derive-cutover`, `apply-repository-cleanup`,
+and `verify` fail closed with
+`recovery_code=activation-scheduler-restore-required`; run a fresh
+`restore-scheduler` preview/apply, confirm its active readback, then restart
+the blocked preview.
 
 The successful activation readback is the double-protection handoff point:
 all ten active members have the complete repository v2 policy, the shared
@@ -437,8 +445,9 @@ exact repository identity, a complete regular-blob workflow inventory with the
 three canonical files, the separately manifest-bound scheduler, and no extra
 producer, exact CODEOWNERS, default-read
 Actions policy with an explicit boolean `can_approve_pull_request_reviews`,
-Active repository and organization v2 rules, the temporary bridge, and current
-cleanup state.
+Active repository and organization v2 rules, the temporary bridge, current
+cleanup state, and the separately manifest-bound scheduler's live `active`
+state.
 
 Next derive the repository-level cleanup read-only:
 
@@ -458,7 +467,8 @@ the raw actions manually. Apply them through the controlled executor while the
 external organization/repository-admin policy-and-target-identity freeze
 remains continuously in force from this cleanup preview through the cleanup
 apply and readback, the later `verify` preview/apply, and its final stable
-readback:
+readback. During this third freeze, the restored scheduler must remain
+`active`; no administrator may separately enable or disable it:
 
 ```bash
 HANDOFF_CLEANUP_PREVIEW="$(mktemp)"
@@ -607,7 +617,7 @@ inconclusive and fails closed. This does not claim that a paginated GitHub API
 endpoint has a fixed number of HTTP requests; the phase deadline is its
 wall-clock boundary. A reviewed deployment manifest may raise soft limits only
 within 1,800 seconds per repository, 300 seconds per scheduler snapshot, 600
-seconds for organization evidence, 15,000 seconds per round, and 30,000
+seconds for organization evidence, 15,000 seconds per round, and 30,005
 seconds per stable pair, while still satisfying the topology formula. These are
 upper capacity limits rather than total `activate` wall-clock or GitHub
 Actions-minutes-free promises: normal execution ends when actual reads finish.

@@ -119,7 +119,7 @@ shared-rule activation preview/apply、stable post-write readback 与 scheduler 
 完整 cleanup batch/readback、最终旧规则 preview/apply，以及另一次最终只读 verify receipt
 capture/validation 全部完成。
 这些 freeze 期间任何管理员都不得修改 organization/repository ruleset、classic branch
-protection、condition、required check 或 bypass actor；第二次 freeze 期间也禁止任何人单独
+protection、condition、required check 或 bypass actor；第二、第三次 freeze 期间也禁止任何人单独
 enable/disable 已绑定 scheduler。第三次 freeze 期间还禁止任何活动 cohort
 repository 被 rename、transfer、delete、改变 default branch，或在原 slug 被 replace/
 re-create。这些是运营冻结，不是持续 API 锁。GitHub ruleset endpoint 没有 documented
@@ -128,11 +128,16 @@ plan digest 与紧邻重读可以拒绝已观察到的 drift，却无法阻止�
 metadata read→write 区间的 racing write，这些区间由 freeze 覆盖。只能验证 manifest 绑定的
 bypass actors，绝不能声称 runtime 会自动发现 snapshot 外新增的 actor。
 
-每个 post-activation/cutover stable snapshot 还必须从 GitHub 读取 archived-only repository，
-并将 `full_name`、`id`、`node_id`、`default_branch` 与 `archived: true` 同 manifest 精确比对。
-旧规则 cutover `PUT` 前，必须与旧 ruleset 一起紧邻复读该 identity。读取失败、same-slug
-replacement、identity/default-branch drift 或 `archived: false` 都是 inconclusive，绝不能发送
-cutover write；这份 proof 不会使归档仓成为 v2、receipt 或 bridge-removal member。
+每个 post-activation/cutover stable snapshot 还必须重新读取 manifest-bound scheduler，并要求其
+live Actions workflow state 为 `active`，然后才从 GitHub 读取 archived-only repository，并将
+`full_name`、`id`、`node_id`、`default_branch` 与 `archived: true` 同 manifest 精确比对。旧规则
+cutover `PUT` 前，必须与旧 ruleset 一起紧邻复读该 identity，并复读 exact manifest-bound scheduler，
+要求它仍为 `active` 且与 stable snapshot 未发生变化。读取失败、same-slug replacement、
+identity/default-branch drift 或 `archived: false` 都是 inconclusive，绝不能发送 cutover write；
+这份 proof 不会使归档仓成为 v2、receipt 或 bridge-removal member。若 scheduler restore 被跳过或
+失败，`derive-cutover`、`apply-repository-cleanup` 与 `verify` 都以
+`recovery_code=activation-scheduler-restore-required` fail closed；先运行新的
+`restore-scheduler` preview/apply，确认 active readback，再重新开始被阻断的 preview。
 
 严格按下列 state machine 执行：
 
@@ -285,8 +290,9 @@ cutover write；这份 proof 不会使归档仓成为 v2、receipt 或 bridge-re
    并验证当前 control-plane/ruleset closure：exact repository identity、包含三份 canonical
    workflows、单独 manifest-bound scheduler 且没有额外 producer 的完整 regular-blob workflow
    inventory、exact CODEOWNERS、
-   包含明确 boolean `can_approve_pull_request_reviews` 的 default-read Actions policy、Active
-   repository/organization v2 rules、temporary bridge 与 cleanup state。
+包含明确 boolean `can_approve_pull_request_reviews` 的 default-read Actions policy、Active
+repository/organization v2 rules、temporary bridge、cleanup state 与单独 manifest-bound scheduler 的
+live `active` state。
 7. `activate --apply` 返回成功的 dual-enforcement readback 后，preview 并 restore scheduler。
    这是一条有独立 plan digest 的单独 mutation；在先判断 interrupted activation 是否到达 dual
    enforcement 后，它也是唯一的正常 recovery operation。
@@ -489,7 +495,7 @@ Workflow YAML inventory、Actions workflow inventory 与 local repository rulese
 cap 推导 paginated GitHub read 具有固定数量的 HTTP pagination requests；其 wall-clock boundary
 是 phase deadline。经过 review 的 deployment manifest 可以提高 soft limits，但只能分别提高到
 每 repository 1,800 秒、每 scheduler snapshot 300 秒、organization evidence 600 秒、每 round
-15,000 秒、每 stable pair 30,000 秒以内，并仍必须满足 topology formula。这些是 upper capacity
+15,000 秒、每 stable pair 30,005 秒以内，并仍必须满足 topology formula。这些是 upper capacity
 limits，不是 `activate` 的总 wall-clock，也不表示 GitHub Actions minutes free；正常执行会在
 实际读取结束时完成。任何 capacity limit 都不允许 incomplete pagination 或改变后的 execution
 epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允许下一次 write；读取

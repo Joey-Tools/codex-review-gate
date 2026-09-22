@@ -516,7 +516,7 @@ the global cutover is closed.
   proof.
 - The deployment manifest may raise reviewed soft limits only within 1,800
   seconds per repository, 300 seconds per scheduler snapshot, 600 seconds for
-  organization evidence, 15,000 seconds per round, and 30,000 seconds per
+  organization evidence, 15,000 seconds per round, and 30,005 seconds per
   stable pair. Any raised configuration must continue to satisfy the topology
   formula; these are reviewed manifest fields rather than ad hoc CLI inputs.
 - The parallel evidence boundary now has an explicit convergence contract.
@@ -576,6 +576,30 @@ the global cutover is closed.
   There is no durable operation ledger: GitHub state plus a fresh complete
   readback remains the recovery authority.
 
+### Review Follow-up — 2026-09-22
+
+- Current-head review found two post-activation correctness gaps. First, the
+  reviewed maximum 15,000-second coverage round could not coexist with the
+  former 30,000-second stable-pair maximum, despite the required formula of
+  two rounds plus the five-second interval. The validated pair maximum is now
+  30,005 seconds, so the documented and enforceable capacity range agrees.
+- Second, post-activation `derive-cutover`, `apply-repository-cleanup`, and
+  `verify` had retained the scheduler source descriptor but had not required a
+  fresh live Actions state of `active`. Each stable post-activation snapshot
+  now contains that exact scheduler identity/source/state and rejects
+  `disabled_manually` with
+  `recovery_code=activation-scheduler-restore-required`. This makes a skipped
+  or failed restore a proved fail-closed boundary before later legacy cleanup
+  or old-rule cutover, rather than an operator convention. Immediate
+  revalidation also compares this state before a mutation, and final
+  `verify --apply` rereads the same scheduler identity/source/state as
+  `active` directly before its legacy-ruleset `PUT`.
+- Regression coverage exercises all three blocked modes, the live workflow
+  reread, no-write behavior, active-state fixture requirements, scheduler
+  drift after the stable pair, and the jointly valid capacity endpoints.
+  `npm run check`, the complete organization-handoff test suite, `git diff
+  --check`, and project-journal validation passed for this correction.
+
 ## Failure And Recovery Boundary
 
 - Any changed selector, active or legacy-only repository identity/default
@@ -627,6 +651,19 @@ the global cutover is closed.
   canonical workflow/CODEOWNERS bytes, default-read Actions policy including
   an explicit boolean `can_approve_pull_request_reviews`, bridge, v2 rulesets,
   and cleanup-state closure.
+- Every post-activation/cutover stable snapshot also rereads the one
+  manifest-bound scheduler and requires its live Actions workflow state to be
+  `active`. This makes scheduler restoration a proved precondition rather than
+  a procedural convention: a skipped or failed restore cannot leave the
+  scheduler `disabled_manually` while later derive/cleanup/verify operations
+  remove legacy protection or issue final closure. A disabled scheduler returns
+  `recovery_code=activation-scheduler-restore-required`; the operator runs a
+  fresh `restore-scheduler` preview/apply, confirms its active readback, and
+  starts a fresh blocked post-activation preview. The stable snapshot includes
+  this exact workflow identity/source/state, so revalidation also rejects an
+  observed transition back to disabled before a later mutation. Final
+  `verify --apply` rereads that same scheduler identity/source/state as
+  `active` immediately before sending its legacy-ruleset `PUT`.
 - Each post-activation/cutover stable snapshot separately binds the
   manifest-declared archived-only repository from live GitHub metadata:
   `full_name`, `id`, `node_id`, `default_branch`, and `archived: true` must all
@@ -641,18 +678,21 @@ the global cutover is closed.
   preview/apply, and a separate final read-only verify receipt capture and
   validation. During that third interval no cohort repository may be renamed,
   transferred, deleted, have its default branch changed, or be replaced or
-  re-created at its original slug, and no ruleset, classic branch-protection,
-  condition, required-check, or bypass-actor mutation is allowed. This is an
-  operational freeze, not a continuous lock. The helper checks exact
+  re-created at its original slug, no ruleset, classic branch-protection,
+  condition, required-check, or bypass-actor mutation is allowed, and the
+  restored manifest-bound scheduler must not be separately disabled. This is
+  an operational freeze, not a continuous lock. The helper checks exact
   manifest-bound repository identity/default branch and bypass lists; it does
   not automatically discover an actor added outside the snapshot.
 - Before the old organization-rule `PUT`, the helper repeats the complete
   cohort revalidation and then rereads both the old rule's writable identity
-  and the archived-only repository directly adjacent to the write. GitHub's
+  and the archived-only repository, plus the restored scheduler's exact
+  identity/source/`active` state, directly adjacent to the write. GitHub's
   ruleset update endpoint has no conditional compare-and-swap contract. Plan
   digests and readback detect observed drift, but cannot prevent or reconstruct
   an external update overwritten in the final GET-to-PUT interval. A missing,
-  mismatched, or no-longer-archived legacy-only repository blocks the `PUT`.
+  mismatched, no-longer-archived, or non-active scheduler observation blocks
+  the `PUT`.
 - Schema-2 final-closure receipt admission validates the manifest-derived
   `manifest_repositories` and stable observed `repositories` as independent
   canonical 10-member identity lists, then requires exact equality before the
@@ -716,7 +756,8 @@ the global cutover is closed.
 - Prior v2 decisions and implementation ledger:
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
 - Current delivery validation: after the current-head review follow-up,
-  `npm run check` passed and `npm run test:organization-handoff` passed
-  233/233. Earlier dedicated v2 workflow-contract and workflow-security
+  `npm run check` passed and the complete
+  `test/organization-review-gate-handoff.test.mjs` suite completed
+  successfully. Earlier dedicated v2 workflow-contract and workflow-security
   validation remain recorded above. `git diff --check` and project-journal
   validation passed after this checkpoint was updated.

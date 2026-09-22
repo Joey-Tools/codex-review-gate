@@ -110,7 +110,9 @@ const MAX_ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS = 600_000;
 const ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 9_000_000;
 const MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 15_000_000;
 const ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 18_005_000;
-const MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 30_000_000;
+const MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS =
+  2 * MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS +
+  ACTIVATION_STABILITY_INTERVAL_MS;
 // These inventories feed bounded fan-out reads. Keep their cardinalities small
 // enough that a single evidence phase remains operationally inspectable.
 const MAX_WORKFLOW_INVENTORY_YAML_FILES = 32;
@@ -1708,6 +1710,34 @@ async function revalidateLegacyOnlyRepositoryImmediatelyBeforeCutover(
     );
   }
   return latestIdentity;
+}
+
+async function revalidateActivationSchedulerImmediatelyBeforeCutover(
+  manifest,
+  plannedSnapshot,
+  runtime,
+) {
+  let latestScheduler;
+  try {
+    latestScheduler = await loadRestoredActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+    );
+  } catch (error) {
+    throw new Error(
+      `The manifest-bound activation scheduler could not be read as active immediately before cutover; no mutation was sent. ${error.message}`,
+      { cause: error },
+    );
+  }
+  if (
+    canonicalJson(latestScheduler) !==
+    canonicalJson(plannedSnapshot.activation_scheduler)
+  ) {
+    throw new Error(
+      `The manifest-bound activation scheduler changed after full-cohort revalidation; no mutation was sent (planned ${sha256Canonical(plannedSnapshot.activation_scheduler)}, latest ${sha256Canonical(latestScheduler)}).`,
+    );
+  }
+  return latestScheduler;
 }
 
 function assertState(actual, allowed, label) {
@@ -4166,15 +4196,37 @@ async function loadActivationCoverageRevalidation(manifest, runtime, label) {
   return loadBoundedActivationCoverageRound(manifest, runtime, { label });
 }
 
-async function loadPostActivationRound(manifest) {
-  const [coverage, legacyOnlyRepository] = await Promise.all([
+async function loadRestoredActivationSchedulerSnapshot(manifest, runtime) {
+  const snapshot = await loadBoundedActivationSchedulerSnapshot(
+    manifest,
+    runtime,
+    {
+      expectedState: ["active", "disabled_manually"],
+      requireCanaryBase: false,
+    },
+  );
+  if (snapshot.workflow.state !== "active") {
+    throw new Error(
+      `${snapshot.repository.full_name} activation scheduler remains disabled_manually after activation; recovery_code=activation-scheduler-restore-required. Run a fresh restore-scheduler preview/apply, confirm its manifest-bound active readback, then restart the blocked post-activation preview.`,
+    );
+  }
+  return snapshot;
+}
+
+async function loadPostActivationRound(manifest, runtime) {
+  const [coverage, activationScheduler, legacyOnlyRepository] = await Promise.all([
     loadCoverageRound(manifest, { requireCanaryEvidence: false }),
+    loadRestoredActivationSchedulerSnapshot(manifest, runtime),
     loadLegacyOnlyRepositoryIdentity(
       manifest,
       "Legacy-only archived repository identity",
     ),
   ]);
-  return { ...coverage, legacy_only_repository: legacyOnlyRepository };
+  return {
+    ...coverage,
+    activation_scheduler: activationScheduler,
+    legacy_only_repository: legacyOnlyRepository,
+  };
 }
 
 function assertCleanupState(snapshot, requiredState) {
@@ -5118,7 +5170,7 @@ async function runDeriveCutoverMode(manifest, runtime) {
     throw new Error("derive-cutover requires manifest.v2_ruleset.id.");
   }
   const snapshot = await loadStable("Dual-enforcement cutover derivation", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(snapshot, {
@@ -5282,7 +5334,7 @@ async function runApplyRepositoryCleanupMode(manifest, options, runtime) {
     throw new Error("apply-repository-cleanup requires manifest.v2_ruleset.id.");
   }
   const snapshot = await loadStable("Repository cleanup precondition", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(snapshot, {
@@ -5318,14 +5370,14 @@ async function runApplyRepositoryCleanupMode(manifest, options, runtime) {
   await revalidateUnchangedBeforeMutation(
     "Repository cleanup precondition",
     snapshot,
-    () => loadPostActivationRound(manifest),
+    () => loadPostActivationRound(manifest, runtime),
   );
   const outcomes = [];
   for (const record of pendingRecords) {
     outcomes.push(await executeRepositoryCleanupRecord(record));
   }
   const readback = await loadStable("Repository cleanup readback", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(readback, {
@@ -5356,7 +5408,7 @@ async function runVerifyMode(manifest, options, runtime) {
     throw new Error("verify requires manifest.v2_ruleset.id.");
   }
   const snapshot = await loadStable("Post-repository-cleanup verification", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertState(
@@ -5398,7 +5450,7 @@ async function runVerifyMode(manifest, options, runtime) {
   await revalidateUnchangedBeforeMutation(
     "Post-repository-cleanup verification",
     snapshot,
-    () => loadPostActivationRound(manifest),
+    () => loadPostActivationRound(manifest, runtime),
   );
   if (runtime.beforeFinalLegacyRevalidation !== undefined) {
     await runtime.beforeFinalLegacyRevalidation();
@@ -5410,6 +5462,11 @@ async function runVerifyMode(manifest, options, runtime) {
   await revalidateLegacyOnlyRepositoryImmediatelyBeforeCutover(
     manifest,
     snapshot,
+  );
+  await revalidateActivationSchedulerImmediatelyBeforeCutover(
+    manifest,
+    snapshot,
+    runtime,
   );
   const response = await ghJson(action.endpoint, {
     method: "PUT",
@@ -5430,7 +5487,7 @@ async function runVerifyMode(manifest, options, runtime) {
     "Legacy organization cutover response",
   );
   const readback = await loadStable("Final organization handoff closure", () =>
-    loadPostActivationRound(manifest),
+    loadPostActivationRound(manifest, runtime),
     runtime.stableSnapshotOptions,
   );
   assertCoveragePhase(readback, {

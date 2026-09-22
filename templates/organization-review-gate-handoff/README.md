@@ -92,7 +92,7 @@ paginated GitHub reads.
 The reviewed deployment manifest may raise its soft limits only within the
 validated maxima: 1,800 seconds per repository, 300 seconds per scheduler
 snapshot, 600 seconds for organization evidence, 15,000 seconds per round, and
-30,000 seconds per stable pair. Any raised values must still satisfy the
+30,005 seconds per stable pair. Any raised values must still satisfy the
 manifest topology formula; they are reviewed input, not ad hoc CLI overrides.
 
 The private scheduler is the only workflow that is temporarily disabled. It
@@ -225,7 +225,9 @@ third freeze before the
 apply/readback, final `verify` preview/apply, and a separate final read-only
 `verify` receipt capture and validation. During these freezes, do not change
 any organization/repository ruleset, classic branch protection, condition,
-required check, or bypass actor. The helper validates the exact manifest-bound
+required check, or bypass actor. During the third freeze, the restored
+manifest-bound scheduler must remain `active`; no administrator may separately
+enable or disable it. The helper validates the exact manifest-bound
 bypass lists; it cannot
 automatically discover or preserve an actor concurrently added outside that
 snapshot. GitHub provides no documented conditional/CAS update for the
@@ -235,13 +237,22 @@ cannot make the final GET-to-PUT interval atomic.
 `verify --apply` removes the whole legacy `required_status_checks` rule from
 the old organization ruleset only after all repository actions read back at
 their exact expected post-state. Each post-activation/cutover stable snapshot
-also reads the legacy-only repository from GitHub and requires its returned
+also rereads the manifest-bound scheduler and requires its live Actions
+workflow state to be `active`, then reads the legacy-only repository from
+GitHub and requires its returned
 `full_name`, `id`, `node_id`, `default_branch`, and `archived` flag to match the
 manifest. The final apply performs the stable full-cohort read, an immediate
-complete cohort revalidation, and then direct rereads of both the old
-organization ruleset and the legacy-only repository immediately before its
-PUT. An unreadable response, identity mismatch, or `archived: false` is
+complete cohort revalidation, and then direct rereads of the old organization
+ruleset, the legacy-only repository, and the manifest-bound scheduler as
+`active` and unchanged from the stable snapshot immediately before its PUT. An
+unreadable response, identity mismatch, or `archived: false` is
 inconclusive and sends no cutover write.
+
+If scheduler restoration was skipped or failed, `derive-cutover`,
+`apply-repository-cleanup`, and `verify` fail closed before their next write
+with `recovery_code=activation-scheduler-restore-required`. Run a fresh
+`restore-scheduler` preview/apply, confirm its manifest-bound active readback,
+then restart the blocked post-activation preview.
 
 Do not use the `verify --apply` response to authorize bridge removal. Even
 after its write/readback, the control plane may drift. While the third freeze

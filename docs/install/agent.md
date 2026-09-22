@@ -148,7 +148,8 @@ cleanup batch/readback, final old-rule preview/apply, and the separate final
 read-only verify receipt capture and validation.
 No administrator may change an organization/repository ruleset, classic branch
 protection, condition, required check or bypass actor during these freezes; in
-the second freeze, no one may separately enable or disable the bound scheduler.
+the second or third freeze, no one may separately enable or disable the bound
+scheduler.
 During the third freeze, no active cohort repository may be renamed, transferred,
 deleted, have its default branch changed, or be replaced or re-created at its
 original slug. These are operational freezes, not continuous API locks.
@@ -160,14 +161,21 @@ the freeze covers those gaps. Validate only the manifest-bound bypass actors;
 never claim that the runtime automatically discovers an actor added outside
 the bound snapshot.
 
-Every post-activation/cutover stable snapshot must also read the archived-only
-repository from GitHub and match its `full_name`, `id`, `node_id`,
-`default_branch`, and `archived: true` against the manifest. Immediately before
-the old-rule cutover `PUT`, reread that identity beside the old ruleset. An
-unreadable response, same-slug replacement, identity/default-branch drift, or
-`archived: false` is inconclusive and must send no cutover write. This proof
-does not make the archived repository an active v2, receipt, or bridge-removal
-member.
+Every post-activation/cutover stable snapshot must also reread the
+manifest-bound scheduler and require its live Actions workflow state to be
+`active`, then read the archived-only repository from GitHub and match its
+`full_name`, `id`, `node_id`, `default_branch`, and `archived: true` against the
+manifest. Immediately before the old-rule cutover `PUT`, reread that identity
+beside the old ruleset and reread the exact manifest-bound scheduler as
+`active` and unchanged from the stable snapshot. An unreadable response,
+same-slug replacement,
+identity/default-branch drift, or `archived: false` is inconclusive and must
+send no cutover write. This proof does not make the archived repository an
+active v2, receipt, or bridge-removal member. If restoration was skipped or
+failed, `derive-cutover`, `apply-repository-cleanup`, and `verify` fail closed
+with `recovery_code=activation-scheduler-restore-required`; run a fresh
+`restore-scheduler` preview/apply, confirm its active readback, then restart
+the blocked preview.
 
 Execute the following state machine in order.
 
@@ -348,7 +356,8 @@ Execute the following state machine in order.
    manifest-bound scheduler, and no extra producer; exact CODEOWNERS;
    default-read Actions policy with an explicit
    boolean `can_approve_pull_request_reviews`; Active repository and
-   organization v2 rules; the temporary bridge; and cleanup state.
+   organization v2 rules; the temporary bridge; cleanup state; and the
+   separately manifest-bound scheduler's live `active` state.
 7. After `activate --apply` returns its successful dual-enforcement readback,
    preview and restore the scheduler. This is a separate mutation with its own
    plan digest; it is also the only normal recovery operation after deciding
@@ -588,7 +597,7 @@ requests from that admission cap: the phase deadline is the wall-clock boundary
 for a paginated GitHub read. A reviewed deployment manifest may raise soft
 limits only within 1,800 seconds per repository, 300 seconds per scheduler
 snapshot, 600 seconds for organization evidence, 15,000 seconds per round, and
-30,000 seconds per stable pair, while still satisfying the topology formula.
+30,005 seconds per stable pair, while still satisfying the topology formula.
 These are upper capacity limits, not the total `activate` wall-clock or a
 GitHub Actions-minutes-free promise: normal execution ends when its actual
 reads finish. No capacity limit permits incomplete pagination or a changed

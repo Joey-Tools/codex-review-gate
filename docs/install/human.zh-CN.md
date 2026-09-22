@@ -347,11 +347,16 @@ digest 与紧邻读回能发现更早或更晚的 drift，却无法让最后一�
 Helper 验证 manifest 绑定的 exact bypass lists，但不能自动发现或保留 snapshot 外并发加入
 的 actor。
 
-每个 post-activation 与 cutover stable snapshot 还会从 GitHub 读取 archived-only repository，
-并要求返回的 `full_name`、`id`、`node_id`、`default_branch` 与 `archived: true` 都精确匹配
-manifest。旧规则 cutover `PUT` 前，会与旧 ruleset 一起紧邻复读该 identity。读取失败、同名
-slug replacement、identity/default-branch drift，或 archive flag 不再为 true 都是 inconclusive，
-不会发送 cutover write；归档仓仍不会加入 v2、receipt 或 bridge-removal scope。
+每个 post-activation 与 cutover stable snapshot 还会重新读取 manifest-bound scheduler，并要求其
+live Actions workflow state 为 `active`，然后才从 GitHub 读取 archived-only repository，并要求返回的
+`full_name`、`id`、`node_id`、`default_branch` 与 `archived: true` 都精确匹配 manifest。旧规则
+cutover `PUT` 前，会与旧 ruleset 一起紧邻复读该 identity，并复读 exact manifest-bound scheduler，
+要求它仍为 `active` 且与 stable snapshot 未发生变化。读取失败、同名 slug replacement、
+identity/default-branch drift，或 archive flag 不再为 true 都是 inconclusive，不会发送 cutover
+write；归档仓仍不会加入 v2、receipt 或 bridge-removal scope。若 scheduler restore 被跳过或失败，
+`derive-cutover`、`apply-repository-cleanup` 与 `verify` 都以
+`recovery_code=activation-scheduler-restore-required` fail closed；先运行新的 `restore-scheduler`
+preview/apply，确认 active readback，再重新开始被阻断的 preview。
 
 Activation readback 成功时才到达双重保护 handoff point：10 个活动成员都具备完整 repository
 v2 policy，共享 v2-only organization rule 已 Active，而旧 organization v1 rule 仍以原始 11 仓
@@ -366,7 +371,7 @@ regular-blob workflow inventory（三份 canonical files、单独 manifest-bound
 额外 producer）、exact
 CODEOWNERS、default-read Actions policy（包含明确 boolean
 `can_approve_pull_request_reviews`）、Active repository 与 organization v2 rules、temporary
-bridge，以及当前 cleanup state。
+bridge、当前 cleanup state，以及单独 manifest-bound scheduler 的 live `active` state。
 
 接着只读推导 repository-level cleanup：
 
@@ -383,7 +388,8 @@ jq . "$HANDOFF_CUTOVER_PLAN"
 actors、`deletion`、`non_fast_forward` 与 unrelated rules 必须全部保留。不得手工执行 raw
 actions。从这次 cleanup preview 开始建立外部 organization/repository admin
 policy-and-target-identity freeze，并连续保持到 cleanup apply/readback、之后的 `verify`
-preview/apply，以及最终 stable readback 全部完成；通过受控 executor 执行：
+preview/apply，以及最终 stable readback 全部完成。第三次 freeze 期间，已 restore 的 scheduler
+必须保持 `active`，任何管理员都不得单独 enable/disable 它；通过受控 executor 执行：
 
 ```bash
 HANDOFF_CLEANUP_PREVIEW="$(mktemp)"
@@ -505,7 +511,7 @@ Workflow YAML inventory、Actions workflow inventory 与 local repository rulese
 GitHub API endpoint 有固定数量的 HTTP requests；其 wall-clock boundary 是 phase deadline。经过
 review 的 deployment manifest 可以提高 soft limits，但只能分别提高到每 repository 1,800 秒、
 每 scheduler snapshot 300 秒、organization evidence 600 秒、每 round 15,000 秒、每 stable
-pair 30,000 秒以内，并仍必须满足 topology formula。这些是 upper capacity limits，不是
+pair 30,005 秒以内，并仍必须满足 topology formula。这些是 upper capacity limits，不是
 `activate` 的总 wall-clock 时间，也不表示 GitHub Actions minutes free；正常路径在实际读取
 完成时结束。任一 budget 都不允许 partial pagination 或改变后的 execution epoch。任一 deadline
 到期或 evidence 变化时，结论均为 inconclusive，不允许下一次 write；读取 `recovery_code` 后

@@ -1891,6 +1891,7 @@ function fakeGhRequests(logPath) {
 
 function immediateStableRuntime({
   afterFirstStablePair = null,
+  afterFirstStablePairNowCall = 2,
   beforeFinalLegacyRevalidation = undefined,
   legacyEvidenceRetryIntervalMs = 5_000,
   schedulerDrainRetryIntervalMs = 5_000,
@@ -1910,7 +1911,7 @@ function immediateStableRuntime({
       timeoutMs: 60_000,
       now: () => {
         nowCalls += 1;
-        if (nowCalls === 2 && afterFirstStablePair !== null) {
+        if (nowCalls === afterFirstStablePairNowCall && afterFirstStablePair !== null) {
           afterFirstStablePair();
         }
         return clock;
@@ -2318,6 +2319,17 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
     [],
     "activate --apply must not rewrite an already-active v2 organization ruleset",
   );
+
+  writeFileSync(harness.logPath, "");
+  const restorePreview = await runFakeCli(harness, "restore-scheduler");
+  assert.equal(restorePreview.status, "preview");
+  const restoreApplied = await runFakeCli(harness, "restore-scheduler", [
+    "--apply",
+    "--expected-plan-sha256",
+    restorePreview.plan_sha256,
+  ]);
+  assert.equal(restoreApplied.status, "applied-restored");
+  assert.equal(readFileSync(harness.schedulerStatePath, "utf8").trim(), "active");
 
   writeFileSync(harness.logPath, "");
   const cutoverPlan = await runFakeCli(harness, "derive-cutover");
@@ -3082,6 +3094,7 @@ function configureDetailedCleanupHandoff(harness) {
   writeFileSync(harness.v2StatePath, "active\n");
   writeFileSync(harness.legacyStatePath, "before\n");
   writeFileSync(harness.cleanupStatePath, "before\n");
+  writeFileSync(harness.schedulerStatePath, "active\n");
   for (const action of harness.cleanupActionStatePaths) {
     writeFileSync(action.path, "before\n");
   }
@@ -3578,6 +3591,7 @@ test("case-variant inherited legacy context blocks activation", async (t) => {
 test("an effective local legacy rule remaining after its cleanup blocks cutover", async (t) => {
   const firstCleanupRuleId = REPOSITORIES[0][2];
   const harness = createFakeGhHarness(t, {
+    schedulerWorkflowState: "active",
     extraEffectiveRules: [
       effectiveStatusRule({
         id: firstCleanupRuleId,
@@ -3601,6 +3615,7 @@ test("an effective local legacy rule remaining after its cleanup blocks cutover"
 
 test("an active v2 rule with a mismatched inherited source blocks cutover", async (t) => {
   const harness = createFakeGhHarness(t, {
+    schedulerWorkflowState: "active",
     mutateEffectiveRules: (rules, { v2State }) =>
       v2State === "active"
         ? rules.map((rule) =>
@@ -3623,7 +3638,7 @@ test("an active v2 rule with a mismatched inherited source blocks cutover", asyn
 });
 
 test("verify apply revalidates the full cohort and legacy rule immediately before PUT", async (t) => {
-  const harness = createFakeGhHarness(t);
+  const harness = createFakeGhHarness(t, { schedulerWorkflowState: "active" });
   writeFileSync(
     harness.manifestPath,
     `${JSON.stringify(harness.manifest, null, 2)}\n`,
@@ -3643,6 +3658,7 @@ test("verify apply revalidates the full cohort and legacy rule immediately befor
     {
       name: "repository cleanup regresses after the stable pair",
       runtime: () => immediateStableRuntime({
+        afterFirstStablePairNowCall: 6,
         afterFirstStablePair: () => {
           writeFileSync(harness.cleanupStatePath, "before\n");
         },
@@ -3652,11 +3668,22 @@ test("verify apply revalidates the full cohort and legacy rule immediately befor
     {
       name: "v2 organization enforcement regresses after the stable pair",
       runtime: () => immediateStableRuntime({
+        afterFirstStablePairNowCall: 6,
         afterFirstStablePair: () => {
           writeFileSync(harness.v2StatePath, "disabled\n");
         },
       }),
       error: /changed after the stable plan snapshot/u,
+    },
+    {
+      name: "scheduler restoration regresses after the stable pair",
+      runtime: () => immediateStableRuntime({
+        afterFirstStablePairNowCall: 6,
+        afterFirstStablePair: () => {
+          writeFileSync(harness.schedulerStatePath, "disabled_manually\n");
+        },
+      }),
+      error: /recovery_code=activation-scheduler-restore-required/u,
     },
     {
       name: "legacy organization rule drifts after full-cohort revalidation",
@@ -3667,12 +3694,22 @@ test("verify apply revalidates the full cohort and legacy rule immediately befor
       }),
       error: /changed after full-cohort revalidation/u,
     },
+    {
+      name: "scheduler restoration regresses after full-cohort revalidation",
+      runtime: () => immediateStableRuntime({
+        beforeFinalLegacyRevalidation: () => {
+          writeFileSync(harness.schedulerStatePath, "disabled_manually\n");
+        },
+      }),
+      error: /recovery_code=activation-scheduler-restore-required/u,
+    },
   ];
   for (const driftCase of cases) {
     await t.test(driftCase.name, async () => {
       writeFileSync(harness.v2StatePath, "active\n");
       writeFileSync(harness.legacyStatePath, "before\n");
       writeFileSync(harness.cleanupStatePath, "after\n");
+      writeFileSync(harness.schedulerStatePath, "active\n");
       writeFileSync(harness.logPath, "");
       await assert.rejects(
         runFakeCli(
@@ -3693,7 +3730,7 @@ test("verify apply revalidates the full cohort and legacy rule immediately befor
 });
 
 test("verify apply fails closed when the retained archived selector cannot be revalidated immediately before PUT", async (t) => {
-  const harness = createFakeGhHarness(t);
+  const harness = createFakeGhHarness(t, { schedulerWorkflowState: "active" });
   writeFileSync(
     harness.manifestPath,
     `${JSON.stringify(harness.manifest, null, 2)}\n`,
@@ -3777,6 +3814,10 @@ test("live workflow inventory rejects an additional v2 caller before activate or
     writeFileSync(harness.v2StatePath, `${phase.v2}\n`);
     writeFileSync(harness.legacyStatePath, "before\n");
     writeFileSync(harness.cleanupStatePath, `${phase.cleanup}\n`);
+    writeFileSync(
+      harness.schedulerStatePath,
+      `${phase.mode === "verify" ? "active" : "disabled_manually"}\n`,
+    );
     writeFileSync(harness.logPath, "");
     await assert.rejects(
       runFakeCli(harness, phase.mode, [
@@ -3965,6 +4006,10 @@ test("live Actions default-write policy blocks activate and verify writes", asyn
     writeFileSync(harness.v2StatePath, `${phase.v2}\n`);
     writeFileSync(harness.legacyStatePath, "before\n");
     writeFileSync(harness.cleanupStatePath, `${phase.cleanup}\n`);
+    writeFileSync(
+      harness.schedulerStatePath,
+      `${phase.mode === "verify" ? "active" : "disabled_manually"}\n`,
+    );
     writeFileSync(harness.logPath, "");
     await assert.rejects(
       runFakeCli(harness, phase.mode, [
@@ -4031,8 +4076,66 @@ test("activation sends GraphQL canary queries with exact owner, repository, and 
   }
 });
 
+test("post-activation operations require an active manifest-bound scheduler", async (t) => {
+  const cases = [
+    {
+      name: "derive-cutover",
+      mode: "derive-cutover",
+      cleanupState: "before",
+      args: [],
+    },
+    {
+      name: "apply-repository-cleanup",
+      mode: "apply-repository-cleanup",
+      cleanupState: "before",
+      args: ["--apply", "--expected-plan-sha256", "a".repeat(64)],
+    },
+    {
+      name: "verify",
+      mode: "verify",
+      cleanupState: "after",
+      args: ["--apply", "--expected-plan-sha256", "a".repeat(64)],
+    },
+  ];
+  for (const testCase of cases) {
+    await t.test(testCase.name, async (t) => {
+      const harness = createFakeGhHarness(t);
+      writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+      writeFileSync(harness.v2StatePath, "active\n");
+      writeFileSync(harness.legacyStatePath, "before\n");
+      writeFileSync(harness.cleanupStatePath, `${testCase.cleanupState}\n`);
+      writeFileSync(harness.logPath, "");
+
+      await assert.rejects(
+        runFakeCli(harness, testCase.mode, testCase.args),
+        /recovery_code=activation-scheduler-restore-required/u,
+      );
+
+      const schedulerRepository = harness.manifest.repositories.find(
+        ({ slug }) => slug === ACTIVATION_SCHEDULER_REPOSITORY,
+      );
+      const schedulerEndpoint =
+        `repos/${encodeEndpointPathForTest(schedulerRepository.slug)}/actions/workflows/` +
+        schedulerRepository.scheduler_quiescence.workflow_id;
+      const requests = fakeGhRequests(harness.logPath);
+      assert.ok(
+        countRequest(requests, "GET", schedulerEndpoint) >= 1,
+        "the post-activation precondition must re-read the live scheduler state",
+      );
+      assert.deepEqual(
+        mutationRequests(requests),
+        [],
+        "an un-restored scheduler must block every post-activation mutation",
+      );
+    });
+  }
+});
+
 test("post-activation cutover accepts canaries that were closed unmerged", async (t) => {
-  const harness = createFakeGhHarness(t, { canaryState: "closed" });
+  const harness = createFakeGhHarness(t, {
+    canaryState: "closed",
+    schedulerWorkflowState: "active",
+  });
   writeFileSync(
     harness.manifestPath,
     `${JSON.stringify(harness.manifest, null, 2)}\n`,
@@ -4078,7 +4181,10 @@ test("post-activation cutover accepts canaries that were closed unmerged", async
 
 test("post-activation closure binds control-plane reads to the current default head", async (t) => {
   const currentHead = "f".repeat(40);
-  const harness = createFakeGhHarness(t, { postActivationHeadSha: currentHead });
+  const harness = createFakeGhHarness(t, {
+    postActivationHeadSha: currentHead,
+    schedulerWorkflowState: "active",
+  });
   writeFileSync(
     harness.manifestPath,
     `${JSON.stringify(harness.manifest, null, 2)}\n`,
@@ -5642,6 +5748,19 @@ test("manifest binds activation stability budgets and the sole private scheduler
   for (const { name, mutate, error } of cases) {
     await t.test(name, () => assertManifestRejected(mutate, error));
   }
+});
+
+test("activation capacity maxima remain jointly valid", () => {
+  const manifest = manifestFixture();
+  manifest.activation.coverage_round_timeout_ms = 15_000_000;
+  manifest.activation.coverage_stability_timeout_ms = 30_005_000;
+  assert.doesNotThrow(() => validateManifest(manifest));
+
+  manifest.activation.coverage_stability_timeout_ms = 30_005_001;
+  assert.throws(
+    () => validateManifest(manifest),
+    /coverage_stability_timeout_ms must be between 18005000ms and 30005000ms/u,
+  );
 });
 
 test("manifest validation binds the old rule and every cleanup before/after snapshot", async (t) => {
