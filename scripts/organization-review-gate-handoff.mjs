@@ -95,15 +95,27 @@ const MAX_LEGACY_EVIDENCE_STABILITY_TIMEOUT_MS = 900_000;
 const ACTIVATION_STABILITY_INTERVAL_MS = 5_000;
 const ACTIVATION_SCHEDULER_DRAIN_TIMEOUT_MS = 2_100_000;
 const MAX_ACTIVATION_SCHEDULER_DRAIN_TIMEOUT_MS = 2_100_000;
-// A coverage round first proves the private scheduler drain, then reads the
-// ten repositories in five bounded waves. Reserve a small, explicit margin
-// for the remaining control-plane reads and the global GitHub API queue. The
-// pair budget covers two whole rounds plus their stable-read interval.
-const ACTIVATION_COVERAGE_CONTROL_PLANE_MARGIN_MS = 600_000;
-const ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 7_200_000;
-const MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 10_000_000;
-const ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 14_405_000;
-const MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 21_600_000;
+// A coverage round first proves the complete post-disable scheduler evidence,
+// then reads the ten repositories in five bounded waves. The organization
+// read and every repository evidence pass have independent budgets, so the
+// round formula remains an enforceable capacity bound even when a live
+// workflow or ruleset inventory grows. The pair budget covers two whole rounds
+// plus their stable-read interval.
+const ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS = 1_200_000;
+const MAX_ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS = 1_800_000;
+const ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS = 120_000;
+const MAX_ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS = 300_000;
+const ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS = 120_000;
+const MAX_ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS = 600_000;
+const ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 9_000_000;
+const MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS = 15_000_000;
+const ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 18_005_000;
+const MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 30_000_000;
+// These inventories feed bounded fan-out reads. Keep their cardinalities small
+// enough that a single evidence phase remains operationally inspectable.
+const MAX_WORKFLOW_INVENTORY_YAML_FILES = 32;
+const MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES = 32;
+const MAX_LOCAL_REPOSITORY_RULESETS = 32;
 const LEGACY_WRITER_RUN_PAGE_SIZE = 100;
 const MAX_LEGACY_WRITER_RUN_ENTRIES = 100_000;
 const MAX_LEGACY_WRITER_RUN_PAGES = 1_000;
@@ -558,6 +570,9 @@ function validateActivationConfiguration(value) {
     value,
     [
       "legacy_evidence_stability_timeout_ms",
+      "repository_evidence_timeout_ms",
+      "scheduler_snapshot_timeout_ms",
+      "organization_evidence_timeout_ms",
       "coverage_round_timeout_ms",
       "coverage_stability_timeout_ms",
     ],
@@ -575,6 +590,24 @@ function validateActivationConfiguration(value) {
     MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS,
     "manifest.activation.coverage_round_timeout_ms",
   );
+  const repositoryEvidenceTimeoutMs = assertBoundedTimeout(
+    value.repository_evidence_timeout_ms,
+    Math.max(legacyEvidenceTimeoutMs, ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS),
+    MAX_ACTIVATION_REPOSITORY_EVIDENCE_TIMEOUT_MS,
+    "manifest.activation.repository_evidence_timeout_ms",
+  );
+  const organizationEvidenceTimeoutMs = assertBoundedTimeout(
+    value.organization_evidence_timeout_ms,
+    ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS,
+    MAX_ACTIVATION_ORGANIZATION_EVIDENCE_TIMEOUT_MS,
+    "manifest.activation.organization_evidence_timeout_ms",
+  );
+  const schedulerSnapshotTimeoutMs = assertBoundedTimeout(
+    value.scheduler_snapshot_timeout_ms,
+    ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS,
+    MAX_ACTIVATION_SCHEDULER_SNAPSHOT_TIMEOUT_MS,
+    "manifest.activation.scheduler_snapshot_timeout_ms",
+  );
   const coverageTimeoutMs = assertBoundedTimeout(
     value.coverage_stability_timeout_ms,
     ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS,
@@ -583,6 +616,9 @@ function validateActivationConfiguration(value) {
   );
   return {
     legacyEvidenceTimeoutMs,
+    repositoryEvidenceTimeoutMs,
+    schedulerSnapshotTimeoutMs,
+    organizationEvidenceTimeoutMs,
     coverageRoundTimeoutMs,
     coverageTimeoutMs,
   };
@@ -600,9 +636,12 @@ function activationCoverageRoundMinimum(manifest) {
   }
   return (
     scheduler.drain_timeout_ms +
-    Math.ceil(manifest.repositories.length / REPOSITORY_EVIDENCE_CONCURRENCY) *
-      manifest.activation.legacy_evidence_stability_timeout_ms +
-    ACTIVATION_COVERAGE_CONTROL_PLANE_MARGIN_MS
+    2 * manifest.activation.scheduler_snapshot_timeout_ms +
+    Math.max(
+      manifest.activation.organization_evidence_timeout_ms,
+      Math.ceil(manifest.repositories.length / REPOSITORY_EVIDENCE_CONCURRENCY) *
+        manifest.activation.repository_evidence_timeout_ms,
+    )
   );
 }
 
@@ -611,7 +650,7 @@ function assertActivationCoverageBudgetTopology(manifest) {
   const minimumRoundTimeoutMs = activationCoverageRoundMinimum(manifest);
   if (roundTimeoutMs < minimumRoundTimeoutMs) {
     throw new Error(
-      "manifest.activation.coverage_round_timeout_ms must cover one scheduler drain, every bounded repository-evidence wave, and the explicit control-plane margin.",
+      "manifest.activation.coverage_round_timeout_ms must cover scheduler drain plus both bounded scheduler snapshots and the longer of bounded organization evidence or every bounded repository-evidence wave.",
     );
   }
   const minimumPairTimeoutMs =
@@ -1791,22 +1830,26 @@ async function loadWorkflowInventoryEvidence(repo, revision) {
       );
     }
   }
+  const workflowEntries = workflowsTree.filter((entry) => /\.ya?ml$/u.test(entry.path));
+  if (workflowEntries.length > MAX_WORKFLOW_INVENTORY_YAML_FILES) {
+    throw new Error(
+      `${repo.slug} .github/workflows inventory exceeds the ${MAX_WORKFLOW_INVENTORY_YAML_FILES}-YAML capacity bound; workflow evidence is inconclusive.`,
+    );
+  }
   const workflowFiles = await Promise.all(
-    workflowsTree
-      .filter((entry) => /\.ya?ml$/u.test(entry.path))
-      .map(async (entry) => {
-        const blob = await ghJson(
-          `repos/${encodeEndpointPath(repo.slug)}/git/blobs/${encodeURIComponent(entry.sha)}`,
-        );
-        const content = decodeGitHubBlobContent(blob);
-        return {
-          path: `.github/workflows/${entry.path}`,
-          mode: entry.mode,
-          git_blob_sha: entry.sha,
-          sha256: createHash("sha256").update(content, "utf8").digest("hex"),
-          content,
-        };
-      }),
+    workflowEntries.map(async (entry) => {
+      const blob = await ghJson(
+        `repos/${encodeEndpointPath(repo.slug)}/git/blobs/${encodeURIComponent(entry.sha)}`,
+      );
+      const content = decodeGitHubBlobContent(blob);
+      return {
+        path: `.github/workflows/${entry.path}`,
+        mode: entry.mode,
+        git_blob_sha: entry.sha,
+        sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+        content,
+      };
+    }),
   );
   const canonicalWorkflows = {};
   const canonicalEvidence = {};
@@ -2600,6 +2643,11 @@ function validateActionsWorkflowInventoryPages(pages, repo) {
       `${repo.slug} Actions workflow inventory is inconsistent.`,
     );
   }
+  if (workflows.length > MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES) {
+    throw new Error(
+      `${repo.slug} Actions workflow inventory exceeds the ${MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES}-entry capacity bound; activation evidence is inconclusive.`,
+    );
+  }
   const workflowIds = new Set();
   for (const [index, workflow] of workflows.entries()) {
     assertPositiveInteger(workflow?.id, `${repo.slug} Actions workflow ${index}.id`);
@@ -3092,7 +3140,13 @@ async function loadActivationSchedulerSnapshot(
 
 function schedulerDrainDeadlineError(repo, timeoutMs) {
   return new Error(
-    `${repo.slug} activation scheduler did not reach a stable terminal execution epoch within ${timeoutMs}ms. It remains disabled_manually. Do not activate v2; wait for the already-started run to finish or inspect it, then use a fresh quiesce preview or explicit restore as appropriate.`,
+    `${repo.slug} activation scheduler did not complete its bound source, control-plane, and stable terminal execution evidence within ${timeoutMs}ms. It remains disabled_manually. Do not activate v2; wait for the already-started run to finish or inspect it, then use a fresh quiesce preview or explicit restore as appropriate.`,
+  );
+}
+
+function activationSchedulerSnapshotDeadlineError(repo, timeoutMs) {
+  return new Error(
+    `${repo.slug} activation scheduler snapshot could not complete within ${timeoutMs}ms; recovery_code=activation-scheduler-snapshot-timeout. Do not make an activation decision from this incomplete observation; inspect the scheduler state, then use a fresh quiesce, activation, or restore preview as appropriate.`,
   );
 }
 
@@ -3209,14 +3263,24 @@ async function loadStableActivationSchedulerDrain(
   }
 }
 
-async function loadQuiescedActivationSchedulerEvidence(manifest, runtime) {
-  const before = await loadActivationSchedulerSnapshot(manifest, {
-    expectedState: "disabled_manually",
-  });
+async function loadQuiescedActivationSchedulerEvidence(
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined, snapshotRuntime = runtime } = {},
+) {
+  const before = await loadBoundedActivationSchedulerSnapshot(
+    manifest,
+    snapshotRuntime,
+    { expectedState: "disabled_manually" },
+    { outerDeadlineAt },
+  );
   const executionEpoch = await loadStableActivationSchedulerDrain(manifest, runtime);
-  const after = await loadActivationSchedulerSnapshot(manifest, {
-    expectedState: "disabled_manually",
-  });
+  const after = await loadBoundedActivationSchedulerSnapshot(
+    manifest,
+    snapshotRuntime,
+    { expectedState: "disabled_manually" },
+    { outerDeadlineAt },
+  );
   if (canonicalJson(before) !== canonicalJson(after)) {
     throw new RetryableHandoffEvidenceUnstableError(
       `${before.repository.full_name} activation scheduler control-plane changed while its execution epoch drained.`,
@@ -3277,6 +3341,11 @@ async function loadLocalRepositoryRulesets(repo) {
     throw new Error(`${repo.slug} local ruleset inventory pagination is malformed.`);
   }
   const summaries = response.flat();
+  if (summaries.length > MAX_LOCAL_REPOSITORY_RULESETS) {
+    throw new Error(
+      `${repo.slug} local ruleset inventory exceeds the ${MAX_LOCAL_REPOSITORY_RULESETS}-ruleset capacity bound; activation evidence is inconclusive.`,
+    );
+  }
   const ids = summaries.map((summary, index) => {
     assertPlainObject(summary, `${repo.slug} local ruleset summary ${index}`);
     assertPositiveInteger(summary.id, `${repo.slug} local ruleset summary ${index}.id`);
@@ -3735,11 +3804,40 @@ export async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
+async function awaitCoverageEvidence(organizationPromise, repositoriesPromise) {
+  // Do not let one evidence branch reject while the other continues in the
+  // background. A subsequent stable-read retry must not overlap stale scans
+  // or inherit their API work after the caller has already handled an error.
+  // Preserve Promise.all's existing first-observed failure semantics after all
+  // already-started work has reached a terminal result.
+  let failureCaptured = false;
+  let firstFailure;
+  const recordFailure = async (promise) => {
+    try {
+      return await promise;
+    } catch (error) {
+      if (!failureCaptured) {
+        failureCaptured = true;
+        firstFailure = error;
+      }
+      return undefined;
+    }
+  };
+  const [organization, repositories] = await Promise.all([
+    recordFailure(organizationPromise),
+    recordFailure(repositoriesPromise),
+  ]);
+  if (failureCaptured) {
+    throw firstFailure;
+  }
+  return { organization, repositories };
+}
+
 async function loadCoverageRound(
   manifest,
   { requireCanaryEvidence = true, legacyEvidenceRuntime = undefined } = {},
 ) {
-  const [organization, repositories] = await Promise.all([
+  const coverage = await awaitCoverageEvidence(
     loadOrganizationRound(manifest),
     mapWithConcurrency(
       manifest.repositories,
@@ -3751,10 +3849,9 @@ async function loadCoverageRound(
           legacyEvidenceRuntime,
         }),
     ),
-  ]);
-  const snapshot = { organization, repositories };
-  assertEffectiveOrganizationGateCoverage(snapshot, manifest);
-  return snapshot;
+  );
+  assertEffectiveOrganizationGateCoverage(coverage, manifest);
+  return coverage;
 }
 
 function activationCoverageDeadlineError(label, timeoutMs) {
@@ -3769,8 +3866,20 @@ function activationCoverageRoundDeadlineError(label, timeoutMs) {
   );
 }
 
+function activationRepositoryEvidenceDeadlineError(repo, timeoutMs) {
+  return new Error(
+    `${repo.slug} could not complete its activation repository evidence within ${timeoutMs}ms; recovery_code=activation-repository-evidence-timeout. Keep v1 protection active, repair or wait for the named control-plane or canary evidence drift, then start a fresh quiesce/activation preview.`,
+  );
+}
+
+function activationOrganizationEvidenceDeadlineError(timeoutMs) {
+  return new Error(
+    `Organization activation control-plane evidence could not complete within ${timeoutMs}ms; recovery_code=activation-organization-evidence-timeout. Keep v1 protection active, repair or wait for the named organization evidence drift, then start a fresh quiesce/activation preview.`,
+  );
+}
+
 function activationSnapshotRuntime(runtime) {
-  const supplied = runtime.stableSnapshotOptions ?? {};
+  const supplied = runtime?.stableSnapshotOptions ?? runtime ?? {};
   const sleep = supplied.sleep ?? delay;
   const intervalMs = supplied.intervalMs ?? ACTIVATION_STABILITY_INTERVAL_MS;
   const now = supplied.now ?? performance.now.bind(performance);
@@ -3785,66 +3894,196 @@ function activationSnapshotRuntime(runtime) {
   return { sleep, now, intervalMs };
 }
 
-async function loadActivationCoverageRound(manifest, runtime) {
-  const { sleep } = activationSnapshotRuntime(runtime);
+function activationSchedulerStableSnapshotOptions(manifest, runtime) {
+  const supplied = runtime?.stableSnapshotOptions ?? {};
+  const { intervalMs } = activationSnapshotRuntime(runtime);
+  const timeoutMs = supplied.timeoutMs ?? 60_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < intervalMs) {
+    return supplied;
+  }
+  return {
+    ...supplied,
+    timeoutMs: Math.max(
+      timeoutMs,
+      2 * manifest.activation.scheduler_snapshot_timeout_ms + intervalMs,
+    ),
+  };
+}
+
+async function loadBoundedActivationPhase(
+  runtime,
+  {
+    timeoutMs,
+    outerDeadlineAt = undefined,
+    label,
+    onOwnDeadline,
+    loader,
+  },
+) {
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    typeof label !== "string" ||
+    label === "" ||
+    typeof onOwnDeadline !== "function" ||
+    typeof loader !== "function" ||
+    (outerDeadlineAt !== undefined && !Number.isFinite(outerDeadlineAt))
+  ) {
+    throw new Error("Activation bounded phase configuration is invalid.");
+  }
+  const { now } = activationSnapshotRuntime(runtime);
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error(`${label} clock returned an invalid start time.`);
+  }
+  const ownDeadlineAt = startedAt + timeoutMs;
+  if (!Number.isFinite(ownDeadlineAt)) {
+    throw new Error(`${label} deadline is invalid.`);
+  }
+  const deadlineAt =
+    outerDeadlineAt === undefined
+      ? ownDeadlineAt
+      : Math.min(outerDeadlineAt, ownDeadlineAt);
+  const ownDeadlineWins = ownDeadlineAt <= deadlineAt;
+  const ownDeadlineError = () => {
+    const error = onOwnDeadline();
+    if (!(error instanceof Error)) {
+      throw new Error(`${label} own-deadline callback must return an Error.`);
+    }
+    return error;
+  };
+  if (deadlineAt <= startedAt) {
+    if (ownDeadlineWins) throw ownDeadlineError();
+    throw new DeadlineExceededError(label);
+  }
+  try {
+    const result = await withGhDeadline(deadlineAt, label, () => loader(deadlineAt));
+    const completedAt = now();
+    if (!Number.isFinite(completedAt)) {
+      throw new Error(`${label} clock returned an invalid completion time.`);
+    }
+    if (completedAt >= deadlineAt) {
+      if (ownDeadlineWins) throw ownDeadlineError();
+      throw new DeadlineExceededError(label);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof DeadlineExceededError && ownDeadlineWins) {
+      throw ownDeadlineError();
+    }
+    throw error;
+  }
+}
+
+async function loadBoundedActivationSchedulerSnapshot(
+  manifest,
+  runtime,
+  snapshotOptions,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const repo = activationSchedulerRepository(manifest);
+  const timeoutMs = manifest.activation.scheduler_snapshot_timeout_ms;
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs,
+    outerDeadlineAt,
+    label: `${repo.slug} activation scheduler snapshot`,
+    onOwnDeadline: () =>
+      activationSchedulerSnapshotDeadlineError(repo, timeoutMs),
+    loader: () => loadActivationSchedulerSnapshot(manifest, snapshotOptions),
+  });
+}
+
+async function loadBoundedActivationSchedulerEvidence(
+  manifest,
+  schedulerRuntime,
+  { outerDeadlineAt = undefined, clockRuntime = schedulerRuntime } = {},
+) {
+  return loadQuiescedActivationSchedulerEvidence(manifest, schedulerRuntime, {
+    outerDeadlineAt,
+    snapshotRuntime: clockRuntime,
+  });
+}
+
+async function loadBoundedActivationRepositoryEvidence(
+  repo,
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const timeoutMs = manifest.activation.repository_evidence_timeout_ms;
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs,
+    outerDeadlineAt,
+    label: `${repo.slug} activation repository evidence`,
+    onOwnDeadline: () => activationRepositoryEvidenceDeadlineError(repo, timeoutMs),
+    loader: () =>
+      loadRepositoryEvidence(repo, {
+        manifest,
+        legacyEvidenceRuntime: runtime.legacyEvidenceRuntime,
+      }),
+  });
+}
+
+async function loadBoundedActivationOrganizationEvidence(
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const timeoutMs = manifest.activation.organization_evidence_timeout_ms;
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs,
+    outerDeadlineAt,
+    label: "Organization activation control-plane evidence",
+    onOwnDeadline: () => activationOrganizationEvidenceDeadlineError(timeoutMs),
+    loader: () => loadOrganizationRound(manifest),
+  });
+}
+
+async function loadActivationCoverageRound(
+  manifest,
+  runtime,
+  { outerDeadlineAt = undefined } = {},
+) {
+  const { sleep, now } = activationSnapshotRuntime(runtime);
   const schedulerRuntime = { ...(runtime.schedulerDrainRuntime ?? {}) };
   if (schedulerRuntime.sleep === undefined) schedulerRuntime.sleep = sleep;
-  const scheduler = await loadQuiescedActivationSchedulerEvidence(
+  if (schedulerRuntime.now === undefined) schedulerRuntime.now = now;
+  const scheduler = await loadBoundedActivationSchedulerEvidence(
     manifest,
     schedulerRuntime,
+    { outerDeadlineAt, clockRuntime: runtime },
   );
-  const coverage = await loadCoverageRound(manifest, {
-    legacyEvidenceRuntime: runtime.legacyEvidenceRuntime,
-  });
+  const coverage = await awaitCoverageEvidence(
+    loadBoundedActivationOrganizationEvidence(manifest, runtime, {
+      outerDeadlineAt,
+    }),
+    mapWithConcurrency(
+      manifest.repositories,
+      REPOSITORY_EVIDENCE_CONCURRENCY,
+      (repo) =>
+        loadBoundedActivationRepositoryEvidence(repo, manifest, runtime, {
+          outerDeadlineAt,
+        }),
+    ),
+  );
+  assertEffectiveOrganizationGateCoverage(coverage, manifest);
   return { ...coverage, activation_scheduler_quiescence: scheduler };
 }
 
 async function loadBoundedActivationCoverageRound(
   manifest,
   runtime,
-  { pairDeadlineAt, label },
+  { outerDeadlineAt = undefined, label },
 ) {
-  const { now } = activationSnapshotRuntime(runtime);
-  const startedAt = now();
-  if (!Number.isFinite(startedAt)) {
-    throw new Error("Activation coverage round clock returned an invalid start time.");
-  }
   const roundTimeoutMs = manifest.activation.coverage_round_timeout_ms;
-  const requestedRoundDeadlineAt = startedAt + roundTimeoutMs;
-  if (!Number.isFinite(requestedRoundDeadlineAt)) {
-    throw new Error("Activation coverage round deadline is invalid.");
-  }
-  const deadlineAt = Math.min(pairDeadlineAt, requestedRoundDeadlineAt);
-  const roundOwnsDeadline = requestedRoundDeadlineAt <= pairDeadlineAt;
-  if (deadlineAt <= startedAt) {
-    if (roundOwnsDeadline) {
-      throw activationCoverageRoundDeadlineError(label, roundTimeoutMs);
-    }
-    throw new DeadlineExceededError(label);
-  }
-  try {
-    const snapshot = await withGhDeadline(
-      deadlineAt,
-      `${label} coverage round`,
-      () => loadActivationCoverageRound(manifest, runtime),
-    );
-    const completedAt = now();
-    if (!Number.isFinite(completedAt)) {
-      throw new Error("Activation coverage round clock returned an invalid completion time.");
-    }
-    if (completedAt >= deadlineAt) {
-      if (roundOwnsDeadline) {
-        throw activationCoverageRoundDeadlineError(label, roundTimeoutMs);
-      }
-      throw new DeadlineExceededError(label);
-    }
-    return snapshot;
-  } catch (error) {
-    if (error instanceof DeadlineExceededError && roundOwnsDeadline) {
-      throw activationCoverageRoundDeadlineError(label, roundTimeoutMs);
-    }
-    throw error;
-  }
+  return loadBoundedActivationPhase(runtime, {
+    timeoutMs: roundTimeoutMs,
+    outerDeadlineAt,
+    label: `${label} coverage round`,
+    onOwnDeadline: () => activationCoverageRoundDeadlineError(label, roundTimeoutMs),
+    loader: (deadlineAt) =>
+      loadActivationCoverageRound(manifest, runtime, { outerDeadlineAt: deadlineAt }),
+  });
 }
 
 async function loadStableActivationCoverage(manifest, runtime, label) {
@@ -3869,12 +4108,12 @@ async function loadStableActivationCoverage(manifest, runtime, label) {
     try {
       const snapshot = await withGhDeadline(deadlineAt, label, async () => {
         const first = await loadBoundedActivationCoverageRound(manifest, runtime, {
-          pairDeadlineAt: deadlineAt,
+          outerDeadlineAt: deadlineAt,
           label,
         });
         await sleep(Math.min(intervalMs, Math.max(0, remaining())));
         const second = await loadBoundedActivationCoverageRound(manifest, runtime, {
-          pairDeadlineAt: deadlineAt,
+          outerDeadlineAt: deadlineAt,
           label,
         });
         if (canonicalJson(first) !== canonicalJson(second)) {
@@ -3901,22 +4140,7 @@ async function loadStableActivationCoverage(manifest, runtime, label) {
 }
 
 async function loadActivationCoverageRevalidation(manifest, runtime, label) {
-  const { now } = activationSnapshotRuntime(runtime);
-  const timeoutMs = manifest.activation.coverage_round_timeout_ms;
-  const deadlineAt = now() + timeoutMs;
-  if (!Number.isFinite(deadlineAt)) {
-    throw new Error("Activation coverage revalidation deadline is invalid.");
-  }
-  try {
-    return await withGhDeadline(deadlineAt, label, () =>
-      loadActivationCoverageRound(manifest, runtime),
-    );
-  } catch (error) {
-    if (error instanceof DeadlineExceededError) {
-      throw activationCoverageDeadlineError(label, timeoutMs);
-    }
-    throw error;
-  }
+  return loadBoundedActivationCoverageRound(manifest, runtime, { label });
 }
 
 async function loadPostActivationRound(manifest) {
@@ -4544,8 +4768,13 @@ async function runQuiesceSchedulerMode(manifest, options, runtime) {
   const label = "Activation scheduler quiesce precondition";
   const snapshot = await loadStable(
     label,
-    () => loadActivationSchedulerSnapshot(manifest, { expectedState: "active" }),
-    runtime.stableSnapshotOptions,
+    () =>
+      loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        { expectedState: "active" },
+      ),
+    activationSchedulerStableSnapshotOptions(manifest, runtime),
   );
   const action = mutationDescriptor(
     "PUT",
@@ -4565,19 +4794,27 @@ async function runQuiesceSchedulerMode(manifest, options, runtime) {
     };
   }
   await revalidateUnchangedBeforeMutation(label, snapshot, () =>
-    loadActivationSchedulerSnapshot(manifest, { expectedState: "active" }),
+    loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      { expectedState: "active" },
+    ),
   );
   let disabled;
   try {
     await ghJson(action.endpoint, { method: "PUT" });
-    disabled = await loadActivationSchedulerSnapshot(manifest, {
-      expectedState: "disabled_manually",
-    });
+    disabled = await loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      { expectedState: "disabled_manually" },
+    );
   } catch (error) {
     try {
-      disabled = await loadActivationSchedulerSnapshot(manifest, {
-        expectedState: "disabled_manually",
-      });
+      disabled = await loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        { expectedState: "disabled_manually" },
+      );
     } catch (recoveryError) {
       throw new Error(
         `Activation scheduler disable outcome is unknown; recovery_code=activation-scheduler-state-unknown. Do not replay the disable request. Inspect the manifest-bound scheduler state, then run a fresh quiesce preview if it is active or restore-scheduler only if disabled_manually is intentional.`,
@@ -4591,9 +4828,13 @@ async function runQuiesceSchedulerMode(manifest, options, runtime) {
     if (schedulerRuntime.sleep === undefined) {
       schedulerRuntime.sleep = activationSnapshotRuntime(runtime).sleep;
     }
+    if (schedulerRuntime.now === undefined) {
+      schedulerRuntime.now = activationSnapshotRuntime(runtime).now;
+    }
     const drained = await loadQuiescedActivationSchedulerEvidence(
       manifest,
       schedulerRuntime,
+      { snapshotRuntime: runtime },
     );
     assertSchedulerTransition(
       disabled,
@@ -4627,11 +4868,15 @@ async function runRestoreSchedulerMode(manifest, options, runtime) {
   const snapshot = await loadStable(
     label,
     () =>
-      loadActivationSchedulerSnapshot(manifest, {
-        expectedState: ["active", "disabled_manually"],
-        requireCanaryBase: false,
-      }),
-    runtime.stableSnapshotOptions,
+      loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        {
+          expectedState: ["active", "disabled_manually"],
+          requireCanaryBase: false,
+        },
+      ),
+    activationSchedulerStableSnapshotOptions(manifest, runtime),
   );
   const action =
     snapshot.workflow.state === "disabled_manually"
@@ -4654,24 +4899,36 @@ async function runRestoreSchedulerMode(manifest, options, runtime) {
     };
   }
   await revalidateUnchangedBeforeMutation(label, snapshot, () =>
-    loadActivationSchedulerSnapshot(manifest, {
-      expectedState: "disabled_manually",
-      requireCanaryBase: false,
-    }),
+    loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      {
+        expectedState: "disabled_manually",
+        requireCanaryBase: false,
+      },
+    ),
   );
   let active;
   try {
     await ghJson(action.endpoint, { method: "PUT" });
-    active = await loadActivationSchedulerSnapshot(manifest, {
-      expectedState: "active",
-      requireCanaryBase: false,
-    });
-  } catch (error) {
-    try {
-      active = await loadActivationSchedulerSnapshot(manifest, {
+    active = await loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      {
         expectedState: "active",
         requireCanaryBase: false,
-      });
+      },
+    );
+  } catch (error) {
+    try {
+      active = await loadBoundedActivationSchedulerSnapshot(
+        manifest,
+        runtime,
+        {
+          expectedState: "active",
+          requireCanaryBase: false,
+        },
+      );
     } catch (recoveryError) {
       throw new Error(
         `Activation scheduler enable outcome is unknown; recovery_code=activation-scheduler-state-unknown. Do not replay the enable request. Inspect the manifest-bound scheduler state before choosing a fresh restore preview.`,
@@ -4718,9 +4975,11 @@ async function runActivateMode(manifest, options, runtime) {
     // the legacy-writer proof; quiesce-scheduler owns that state transition.
     // Keep it inside the recovery boundary: quiesce may already have left the
     // scheduler disabled_manually when a transient control-plane read fails.
-    await loadActivationSchedulerSnapshot(manifest, {
-      expectedState: "disabled_manually",
-    });
+    await loadBoundedActivationSchedulerSnapshot(
+      manifest,
+      runtime,
+      { expectedState: "disabled_manually" },
+    );
     const snapshot = await loadStableActivationCoverage(
       manifest,
       runtime,

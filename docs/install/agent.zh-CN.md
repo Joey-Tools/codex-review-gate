@@ -83,7 +83,8 @@ temporary bridge 的 Git blob SHA 与 SHA-256、effective CODEOWNERS identity、
 repository v2 ruleset，以及每个活动 repository legacy-cleanup before/after action。每个 canary 必须把 exact open、
 non-draft、same-repository PR 绑定到 current head/base/test-merge SHAs、v2 CheckRun/run/
 workflow/attempt/job IDs，以及最新 successful legacy commit-status ID。Version 3 还绑定单个
-repository 的 legacy-evidence window、full-cohort coverage-round capacity、two-round
+repository 的 legacy-evidence window、完整 repository-evidence、scheduler-snapshot 与
+organization-evidence phase capacities、full-cohort coverage-round capacity、two-round
 coverage-stability capacity、每个 repository 的 `legacy_writer_scan_timeout_ms`，以及唯一一份
 `scheduler_quiescence` descriptor。该 descriptor 只允许属于
 `Joey-Tools/codex-private-workflows` 的
@@ -92,8 +93,9 @@ initial `active` state 与 drain timeout。任意字段不完整、活动成员�
 意外的 scheduler descriptor 或 unsupported surface 都必须停止。
 
 精确的 `activation` keys 是 `legacy_evidence_stability_timeout_ms`、
-`coverage_round_timeout_ms` 与 `coverage_stability_timeout_ms`。它们是 manifest-bound 的
-plan input，绝不是临时 CLI override。
+`repository_evidence_timeout_ms`、`scheduler_snapshot_timeout_ms`、
+`organization_evidence_timeout_ms`、`coverage_round_timeout_ms` 与
+`coverage_stability_timeout_ms`。它们是 manifest-bound 的 plan input，绝不是临时 CLI override。
 
 这是当前的 v2 handoff 路径。此前已签发的 v1 output 与 schema-1 receipt 只构成历史 11 仓
 closure evidence；不得用它为本 cohort 执行 installation、staging、activation、cleanup 或
@@ -464,18 +466,34 @@ remote binding 与 local identity/content checks，并非连续锁。不得编�
 
 普通 authoritative helper success boundary 先读取一份完整 snapshot，等待 5 秒，再读一份。
 Selected evidence 或 policy 不同就重新开始这一对读取。Activation 改用 manifest-bound capacity
-contract，不使用通用 60 秒上限：单个 repository 的 legacy evidence 为 900 秒；一次
-full-cohort coverage round 为 7,200 秒，由 2,100 秒 scheduler drain、`ceil(10 / 2) * 900`
-秒的五个 legacy-evidence window，以及 600 秒 control-plane/API margin 组成；一组
-two-round stable pair 加 5 秒 interval 为 14,405 秒。Pre-write 与 post-write stable coverage
-同时使用两层约束：每个 coverage round 独立受 round cap 限制，完整 pair 受 pair cap 限制；
-immediate revalidation 只使用 round cap。这样可防止单轮过长耗尽 pair budget，并延长
-scheduler 的 `disabled_manually` 状态。这些是 upper capacity limit，不是 `activate` 的总
-wall-clock，也不表示 GitHub Actions minutes free；正常执行会在实际读取结束时
-完成。任何 capacity limit 都不允许 incomplete pagination 或改变后的 execution epoch。
-Deadline 到期或 evidence 改变时，结论为 inconclusive、不允许下一次 write；读取
-`recovery_code` 后再运行对应 fresh preview。恢复时绝不能 disable v2 或删除旧 organization
-rule。
+contract，不使用通用 60 秒上限：单个 repository 的 legacy evidence 为 900 秒；每次完整
+repository-evidence read 为 1,200 秒；每次 scheduler snapshot（包括 activation preflight）为
+120 秒；organization evidence 为 120 秒。一次 full-cohort coverage round 的 cap 是 9,000
+秒。其成功 topology 的明确上界为 8,340 秒：
+`2,100 + 2 * 120 + max(120, ceil(10 / 2) * 1,200)`。Scheduler drain 与其两次 state
+snapshots 先完成；随后 organization evidence 与五个两 repository evidence waves 并行。剩余
+660 秒是有意保留的 slack。two-round stable pair 的 cap 是 18,005 秒：两次 round 加 5 秒
+interval。Pre-write 与 post-write stable coverage 同时使用两层约束：每个 coverage round 独立
+受 round cap 限制，完整 pair 受 pair cap 限制；immediate revalidation 只使用 round cap。
+这样可防止单轮过长耗尽 pair budget，并延长 scheduler 的 `disabled_manually` 状态。每次
+scheduler snapshot、repository-evidence read 与 organization-evidence read 都有独立强制的
+deadline。
+
+Scheduler evidence 完成后，organization 与 repository branches 并行运行。任一 branch failure
+时，保留最先观察到的 error，但先等待另一 branch 与所有已启动的 repository workers 完成后才返回。
+因此，早期的 organization failure 可能等待 repository phase 的剩余有界 timeout；这项有意的
+fail-closed draining 防止 stale reads 与后续 recovery attempt 重叠。
+
+Workflow YAML inventory、Actions workflow inventory 与 local repository ruleset inventory 各有
+32-entry hard admission cap。超出上限即为 inconclusive 并 fail closed。不要从这个 admission
+cap 推导 paginated GitHub read 具有固定数量的 HTTP pagination requests；其 wall-clock boundary
+是 phase deadline。经过 review 的 deployment manifest 可以提高 soft limits，但只能分别提高到
+每 repository 1,800 秒、每 scheduler snapshot 300 秒、organization evidence 600 秒、每 round
+15,000 秒、每 stable pair 30,000 秒以内，并仍必须满足 topology formula。这些是 upper capacity
+limits，不是 `activate` 的总 wall-clock，也不表示 GitHub Actions minutes free；正常执行会在
+实际读取结束时完成。任何 capacity limit 都不允许 incomplete pagination 或改变后的 execution
+epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允许下一次 write；读取
+`recovery_code` 后再运行对应 fresh preview。恢复时绝不能 disable v2 或删除旧 organization rule。
 
 ## 阶段 1：准备并合并 migration PR
 

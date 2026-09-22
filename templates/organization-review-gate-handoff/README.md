@@ -50,12 +50,27 @@ legacy-writer work during the organization handoff:
 
 - `activation.legacy_evidence_stability_timeout_ms` is the bounded retry window
   for one repository's legacy-status proof. The template uses 900,000 ms.
+- `activation.repository_evidence_timeout_ms` bounds every repository's complete
+  activation evidence read, including its legacy proof and control-plane read.
+  The template uses 1,200,000 ms.
+- `activation.scheduler_snapshot_timeout_ms` bounds each scheduler state
+  snapshot. The template uses 120,000 ms. The activation preflight and both
+  scheduler snapshots surrounding the drain each use this bound independently.
+- `activation.organization_evidence_timeout_ms` bounds the organization
+  control-plane read in a coverage round. The template uses 120,000 ms.
 - `activation.coverage_round_timeout_ms` caps one complete full-cohort coverage
-  round. The template uses 7,200,000 ms: 2,100 seconds for the scheduler
-  drain, `ceil(10 / 2) * 900` seconds for the five two-repository legacy
-  windows, and 600 seconds of control-plane/API margin.
+  round. The template uses 9,000,000 ms. A successful round has the explicit
+  8,340-second topology bound: 2,100 seconds for scheduler drain, two
+  120-second scheduler snapshots, then `max(120, ceil(10 / 2) * 1,200)`
+  seconds while the organization read and five two-repository evidence waves
+  run in parallel. The remaining 660 seconds are intentional round slack.
+- After the scheduler sequence, a branch failure retains the first observed
+  error but waits for the sibling branch and every already-started repository
+  worker to finish before returning. An early organization failure can therefore
+  wait for the remaining bounded repository phase; this is intentional
+  fail-closed draining.
 - `activation.coverage_stability_timeout_ms` caps one two-round stable coverage
-  pair. The template uses 14,405,000 ms, exactly two 7,200-second rounds plus
+  pair. The template uses 18,005,000 ms, exactly two 9,000-second rounds plus
   the five-second stable-read interval.
 - Every repository binds `legacy_writer_scan_timeout_ms`. The normal value is
   60,000 ms; `Joey-Tools/codex-private-workflows` alone uses 300,000 ms for its
@@ -66,6 +81,19 @@ legacy-writer work during the organization handoff:
   SHA-256 identities, the required initial `active` state, and a 2,100,000 ms
   drain timeout. It is not a verifier or legacy bridge descriptor, and no
   other workflow or repository is permitted to opt into this mechanism.
+
+The workflow YAML inventory, Actions workflow inventory, and local repository
+ruleset inventory each have a hard 32-entry admission cap. Exceeding one is
+inconclusive and fails closed rather than expanding a control-plane read without
+bound. These caps do not claim a hard upper bound on HTTP pagination requests;
+the separately enforced phase deadlines remain the wall-clock boundary for
+paginated GitHub reads.
+
+The reviewed deployment manifest may raise its soft limits only within the
+validated maxima: 1,800 seconds per repository, 300 seconds per scheduler
+snapshot, 600 seconds for organization evidence, 15,000 seconds per round, and
+30,000 seconds per stable pair. Any raised values must still satisfy the
+manifest topology formula; they are reviewed input, not ad hoc CLI overrides.
 
 The private scheduler is the only workflow that is temporarily disabled. It
 can start a repository sync which in turn starts the retained v1/v2 producers;
@@ -83,7 +111,10 @@ coverage apply both bounds: each constituent coverage round independently has
 the one-round cap, and the complete pair has the two-round cap. Immediate
 revalidation has only the one-round cap. The per-round bound prevents one
 overlong read from consuming the pair budget and keeping the scheduler
-`disabled_manually` longer than its own capacity.
+`disabled_manually` longer than its own capacity. Every scheduler snapshot,
+repository evidence read, and organization evidence read also has its own
+deadline, so a single slow control-plane phase cannot silently consume the
+whole round.
 
 Before the initial stage, literal JSON `null` at `v2_ruleset.id` is the only
 permitted incomplete manifest value. If `stage --apply` may have created the

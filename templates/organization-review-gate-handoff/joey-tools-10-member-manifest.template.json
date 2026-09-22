@@ -70,8 +70,11 @@
   },
   "activation": {
     "legacy_evidence_stability_timeout_ms": 900000,
-    "coverage_round_timeout_ms": 7200000,
-    "coverage_stability_timeout_ms": 14405000
+    "repository_evidence_timeout_ms": 1200000,
+    "scheduler_snapshot_timeout_ms": 120000,
+    "organization_evidence_timeout_ms": 120000,
+    "coverage_round_timeout_ms": 9000000,
+    "coverage_stability_timeout_ms": 18005000
   },
   "repositories": [
     {

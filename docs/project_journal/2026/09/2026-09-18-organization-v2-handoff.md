@@ -487,27 +487,58 @@ the global cutover is closed.
   It binds a per-repository legacy-writer scan timeout (300 seconds only for
   the measured private history; 60 seconds elsewhere), a 900-second bounded
   `D0 -> S0 -> D1 -> S1` legacy-evidence stabilization window, and separate
-  activation budgets for one complete coverage round and its stable two-round
-  pair. The 7,200-second round capacity is the explicit 2,100-second
-  scheduler-drain budget plus five repository-evidence waves at 900 seconds
-  each (the active cohort is 10 and its reader concurrency is 2), plus a
-  600-second control-plane/API margin. The 14,405-second pair is exactly two
-  rounds plus the five-second stable-read interval. This fixes the prior
-  under-budgeted 1,805-second pair, which could fail closed before a valid
-  slow five-wave read completed. The round/pair limits are capacity bounds,
-  not a wall-clock budget for the complete `activate --apply` operation:
-  preview and post-write readback establish a stable pair, while immediate
-  revalidation is deliberately limited to one round. The published
+  1,200-second repository-evidence, 120-second scheduler-snapshot, and
+  120-second organization-evidence phase budgets. The activation preflight and
+  both scheduler snapshots surrounding drain each independently use the
+  snapshot bound. A successful round is bounded by the explicit topology
+  `2,100 + 2 * 120 + max(120, ceil(10 / 2) * 1,200) = 8,340` seconds: scheduler
+  drain and its two snapshots complete first, then organization evidence runs
+  in parallel with five two-repository waves. The reviewed 9,000-second round
+  cap retains 660 seconds of intentional slack; the 18,005-second stable pair
+  is two rounds plus the five-second read interval. The round/pair limits are
+  capacity bounds, not a wall-clock budget for the complete `activate --apply`
+  operation: preview and post-write readback establish a stable pair, while
+  immediate revalidation is deliberately limited to one round. The published
   output/receipt wire format remains `output/v2` / receipt schema `2`, whose
   manifest digest binds the reviewed v3 input.
+- A fresh formal GPT-5.6 Terra review found that the earlier 7,200-second
+  calculation treated complete repository and organization control-plane reads
+  as an unproven 600-second margin. It also lacked bounded workflow-inventory
+  admission, so it could not prove a whole-round upper bound under a growing
+  control plane. The correction gives each scheduler snapshot, repository
+  evidence read, and organization evidence read its own enforced deadline, and
+  limits workflow YAML inventory, Actions workflow inventory, and local
+  repository ruleset inventory to 32 entries each. Exceeding a cap fails closed;
+  this deliberately does not claim a hard upper bound on paginated HTTP request
+  count, because the phase deadline is the wall-clock bound. The correction
+  prevents an unbounded scan from holding the scheduler `disabled_manually` or
+  allowing repeated scheduler execution drift to undermine the stable epoch
+  proof.
+- The deployment manifest may raise reviewed soft limits only within 1,800
+  seconds per repository, 300 seconds per scheduler snapshot, 600 seconds for
+  organization evidence, 15,000 seconds per round, and 30,000 seconds per
+  stable pair. Any raised configuration must continue to satisfy the topology
+  formula; these are reviewed manifest fields rather than ad hoc CLI inputs.
+- The parallel evidence boundary now has an explicit convergence contract.
+  Scheduler evidence completes first; organization evidence and repository
+  evidence then run concurrently. If either branch fails, the helper preserves
+  the first observed failure as the returned error, but waits for the sibling
+  branch and every repository worker already started in that phase to finish
+  before returning it. This deliberately may delay an early organization error
+  until the remaining bounded repository phase expires or completes. It is a
+  fail-closed trade-off: returning early would let stale pagination or
+  repository scans continue issuing API work while the caller starts a later
+  stable-read retry, and would let asynchronous work survive into test cleanup.
+  The convergence wait establishes that the prior round has no remaining
+  started reader before recovery or another stable read may begin.
 - A pre-commit audit found that applying only the two-round pair deadline
   would still let either constituent round consume the whole pair. The helper
   therefore applies `coverage_round_timeout_ms` independently to each round
   inside the pair as well as to immediate revalidation, with the pair deadline
-  retained as the outer cap. This preserves the stated scheduler-drain and
-  five-wave capacity boundary, avoids unnecessarily extending the
-  `disabled_manually` interval, and fails closed before a second round starts
-  when the first round exceeds its own cap.
+  retained as the outer cap. Together with the phase-local deadlines, this
+  preserves the stated scheduler/drain and parallel-evidence capacity boundary,
+  avoids unnecessarily extending the `disabled_manually` interval, and fails
+  closed before a second round starts when the first round exceeds its own cap.
 - The measured private repository has one separately bound workflow,
   `Scheduled Private Overlay Sync Release` (Actions workflow `281807666`,
   `.github/workflows/scheduled-sync-release.yml`). It schedules overlay-sync
@@ -526,10 +557,11 @@ the global cutover is closed.
   guessing at an enable. The operator receives an explicit recovery code and
   must use a fresh preview of `restore-scheduler` after inspecting whether the
   interrupted activation reached dual enforcement. The first activation
-  scheduler preflight belongs to the same recovery boundary, so even a
-  transient preflight read failure reports the reconcile path instead of
-  bypassing recovery guidance. There is no durable operation ledger: GitHub
-  state plus a fresh complete readback remains the recovery authority.
+  scheduler preflight and every scheduler state snapshot are independently
+  subject to the 120-second snapshot cap, so even a transient preflight read
+  failure reports the reconcile path instead of bypassing recovery guidance.
+  There is no durable operation ledger: GitHub state plus a fresh complete
+  readback remains the recovery authority.
 
 ## Failure And Recovery Boundary
 
@@ -548,16 +580,22 @@ the global cutover is closed.
   three manifest-bound scopes instead: one complete legacy-writer inventory
   may take the repository's 60- or 300-second budget; `D0 -> S0 -> D1 -> S1`
   may retry known run/pagination/epoch instability for at most 900 seconds.
-  One full activation coverage round has 7,200 seconds of manifest-bound
-  capacity: scheduler drain, five bounded repository-evidence waves, and the
-  explicit control-plane/API margin. Its two-read stable pair has 14,405
-  seconds; immediate pre-write revalidation receives only the one-round cap.
-  A changed fingerprint restarts the relevant pair, but malformed responses,
-  unknown run states, policy/identity mismatch, and a bad legacy status remain
-  immediate fail-closed errors. These scopes are not the total wall-clock
-  allowance for preview, revalidation, and post-write readback. The
-  comparisons protect selected policy/evidence content, not benign transport
-  metadata.
+  Each complete repository evidence read has a 1,200-second cap; each
+  scheduler snapshot (including activation preflight) and organization evidence
+  read has a 120-second cap. One full activation coverage round has a
+  9,000-second manifest-bound cap over the explicit 8,340-second topology:
+  2,100 seconds of scheduler drain, two 120-second snapshots, then the maximum
+  of a 120-second organization read and five 1,200-second two-repository
+  waves. Its two-read stable pair has 18,005 seconds; immediate pre-write
+  revalidation receives only the one-round cap. Workflow YAML, Actions workflow,
+  and local ruleset inventories each admit at most 32 entries; an excess is
+  fail closed, while phase deadlines—not a claimed fixed pagination page
+  count—bound their wall-clock read. A changed fingerprint restarts the
+  relevant pair, but malformed responses, unknown run states, policy/identity
+  mismatch, and a bad legacy status remain immediate fail-closed errors. These
+  scopes are not the total wall-clock allowance for preview, revalidation, and
+  post-write readback. The comparisons protect selected policy/evidence
+  content, not benign transport metadata.
 - Before activation, the manifest-bound private overlay scheduler must be
   explicitly quiesced and read back as `disabled_manually`; its complete
   unfiltered run inventory must reach two equal terminal epochs. No `status`,

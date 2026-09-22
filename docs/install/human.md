@@ -193,9 +193,11 @@ active repository-level legacy-cleanup before/after snapshot. Each canary entry 
 same-repository PR to its exact current head, base and test-merge SHAs; the v2
 CheckRun plus its workflow run, attempt and job identities; and the latest
 successful legacy commit-status ID. Version 3 additionally binds the
-per-repository legacy-evidence window, one full-cohort coverage-round capacity,
-the two-round coverage-stability capacity, every repository's full
-legacy-writer scan budget, and exactly one private scheduler descriptor. That descriptor is
+per-repository legacy-evidence window, the complete repository-evidence,
+scheduler-snapshot, and organization-evidence phase capacities, one
+full-cohort coverage-round capacity, the two-round coverage-stability capacity,
+every repository's full legacy-writer scan budget, and exactly one private
+scheduler descriptor. That descriptor is
 limited to `Joey-Tools/codex-private-workflows` workflow
 `.github/workflows/scheduled-sync-release.yml`; it binds its workflow ID,
 source blob/SHA-256, required initial `active` state, and drain budget. Missing,
@@ -203,9 +205,10 @@ extra or reordered members, or any scheduler descriptor on another repository,
 are hard failures.
 
 The exact `activation` fields are
-`legacy_evidence_stability_timeout_ms`, `coverage_round_timeout_ms`, and
-`coverage_stability_timeout_ms`; they are manifest-bound plan input, not ad
-hoc CLI overrides.
+`legacy_evidence_stability_timeout_ms`, `repository_evidence_timeout_ms`,
+`scheduler_snapshot_timeout_ms`, `organization_evidence_timeout_ms`,
+`coverage_round_timeout_ms`, and `coverage_stability_timeout_ms`; they are
+manifest-bound plan input, not ad hoc CLI overrides.
 
 This is the current v2 handoff path. A previously issued v1 output with a
 schema-1 receipt is historical eleven-member closure evidence only; do not use
@@ -574,21 +577,43 @@ produce a fresh final read-only verify output under a new freeze. Never use the
 Every ordinary authoritative success boundary reads one complete snapshot,
 waits five seconds, and reads it again. If selected evidence or policy differs,
 the pair restarts. Activation uses the manifest-bound capacity contract instead
-of a generic 60-second cap: 900 seconds for one repository's legacy evidence;
-7,200 seconds for one full-cohort coverage round, sized as the 2,100-second
-scheduler drain plus `ceil(10 / 2) * 900` seconds for five legacy-evidence
-windows and 600 seconds of control-plane/API margin; and 14,405 seconds for a
-two-round stable pair plus its five-second interval. Pre-write and post-write
-stable coverage use both bounds: every individual coverage round has the round
-cap, and the complete pair has the pair cap. Immediate revalidation uses only
-the round cap. This prevents one overlong round from consuming the pair budget
-and prolonging the scheduler's `disabled_manually` state. These are upper
-capacity limits rather than total `activate`
-wall-clock or GitHub Actions-minutes-free promises: normal execution ends when
-actual reads finish. None permits partial pagination or a changed execution
-epoch. When one expires or evidence changes, the result is inconclusive and no
-next write is allowed; read its `recovery_code` and start a fresh relevant
-preview.
+of a generic 60-second cap: 900 seconds for one repository's legacy evidence,
+1,200 seconds for each complete repository-evidence read, 120 seconds for each
+scheduler snapshot (including the activation preflight), and 120 seconds for
+the organization-evidence read. One full-cohort coverage round has a 9,000-second
+cap. Its successful topology is explicitly bounded at 8,340 seconds:
+`2,100 + 2 * 120 + max(120, ceil(10 / 2) * 1,200)`. The scheduler drain and its
+two state snapshots finish first; organization evidence then runs in parallel
+with five two-repository evidence waves. The 660 seconds left in the round cap
+are intentional slack. A stable pair has an 18,005-second cap: two rounds plus
+the five-second interval. Pre-write and post-write stable coverage use both
+bounds: every individual coverage round has the round cap, and the complete
+pair has the pair cap. Immediate revalidation uses only the round cap. This
+prevents one overlong round from consuming the pair budget and prolonging the
+scheduler's `disabled_manually` state. Every scheduler snapshot, repository
+evidence read, and organization read also has an independently enforced
+deadline.
+
+After scheduler evidence completes, the organization and repository branches
+run concurrently. If either branch fails, the helper retains the first observed
+error but waits for the sibling branch and already-started repository workers
+to finish before returning. An early organization failure can therefore wait
+for the remaining bounded repository phase; this is intentional fail-closed
+draining.
+
+The workflow YAML inventory, Actions workflow inventory, and local repository
+ruleset inventory each have a hard 32-entry admission cap. An excess is
+inconclusive and fails closed. This does not claim that a paginated GitHub API
+endpoint has a fixed number of HTTP requests; the phase deadline is its
+wall-clock boundary. A reviewed deployment manifest may raise soft limits only
+within 1,800 seconds per repository, 300 seconds per scheduler snapshot, 600
+seconds for organization evidence, 15,000 seconds per round, and 30,000
+seconds per stable pair, while still satisfying the topology formula. These are
+upper capacity limits rather than total `activate` wall-clock or GitHub
+Actions-minutes-free promises: normal execution ends when actual reads finish.
+None permits partial pagination or a changed execution epoch. When one expires
+or evidence changes, the result is inconclusive and no next write is allowed;
+read its `recovery_code` and start a fresh relevant preview.
 
 After that closure, open a separate PR in every active cohort member to remove
 the canonical bridge. Do not prepare one for the archived legacy-only

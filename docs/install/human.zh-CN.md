@@ -158,7 +158,8 @@ before/after snapshots。每个 canary entry
 把 open、non-draft、
 same-repository PR 绑定到 exact current head/base/test-merge SHAs、v2 CheckRun 及其 workflow
 run/attempt/job identities，以及最新 successful legacy commit-status ID。Version 3 还绑定单个
-repository 的 legacy-evidence window、一次 full-cohort coverage-round capacity、two-round
+repository 的 legacy-evidence window、完整 repository-evidence、scheduler-snapshot 与
+organization-evidence phase capacities、一次 full-cohort coverage-round capacity、two-round
 coverage-stability capacity、每个 repository 的完整 legacy-writer scan budget，以及唯一一份
 private scheduler descriptor。该 descriptor 只能属于
 `Joey-Tools/codex-private-workflows` 的
@@ -167,8 +168,9 @@ required initial `active` state 与 drain budget。成员缺失、额外或顺�
 scheduler descriptor，都会 hard fail。
 
 精确的 `activation` fields 是 `legacy_evidence_stability_timeout_ms`、
-`coverage_round_timeout_ms` 与 `coverage_stability_timeout_ms`；它们是 manifest-bound 的
-plan input，不是临时 CLI override。
+`repository_evidence_timeout_ms`、`scheduler_snapshot_timeout_ms`、
+`organization_evidence_timeout_ms`、`coverage_round_timeout_ms` 与
+`coverage_stability_timeout_ms`；它们是 manifest-bound 的 plan input，不是临时 CLI override。
 
 这是当前的 v2 handoff 路径。此前已签发的 v1 output 与 schema-1 receipt 只构成历史 11 仓
 closure evidence；不得用它为本 cohort 执行 installation、stage、activation、cleanup 或
@@ -481,16 +483,33 @@ repository policy mutation，则保留所有 bridges，修复 drift，并在新�
 普通 authoritative success boundary 先读取一份完整 snapshot，等待 5 秒后再读一份。若
 selected evidence 或 policy 不一致，就重新开始这一对读取。Activation 改用 manifest-bound
 capacity contract，而不是通用的 60 秒上限：单个 repository 的 legacy evidence 为 900 秒；
-一次 full-cohort coverage round 为 7,200 秒，其容量由 2,100 秒 scheduler drain、
-`ceil(10 / 2) * 900` 秒的五个 legacy-evidence window，以及 600 秒 control-plane/API margin
-组成；two-round stable pair 加 5 秒 interval 为 14,405 秒。Pre-write 与 post-write stable
-coverage 同时受两层约束：其中每个 coverage round 独立使用 round cap，完整 pair 使用 pair
-cap；immediate revalidation 只使用 round cap。单轮上限避免一轮过长耗尽 pair budget，并让
-scheduler 的 `disabled_manually` 状态超过其自身容量。这些是 upper capacity limit，不是
-`activate` 的总 wall-clock 时间，也不表示 GitHub Actions minutes free；正常路径在实际
-读取完成时结束。任一 budget 都不允许 partial pagination 或改变后的 execution epoch。任一
-deadline 到期或 evidence 变化时，结论均为 inconclusive，不允许下一次 write；读取
-`recovery_code` 后重新运行对应的 fresh preview。
+每次完整 repository-evidence read 为 1,200 秒；每次 scheduler snapshot（包括 activation
+preflight）为 120 秒；organization-evidence read 为 120 秒。一次 full-cohort coverage round
+的 cap 是 9,000 秒。其成功 topology 的明确上界为 8,340 秒：
+`2,100 + 2 * 120 + max(120, ceil(10 / 2) * 1,200)`。Scheduler drain 与其两次 state snapshot
+先完成；随后 organization evidence 与五个两 repository evidence waves 并行。round cap 中
+剩余的 660 秒是有意保留的 slack。two-round stable pair 的 cap 是 18,005 秒：两次 round 加
+5 秒 interval。Pre-write 与 post-write stable coverage 同时受两层约束：其中每个 coverage
+round 独立使用 round cap，完整 pair 使用 pair cap；immediate revalidation 只使用 round cap。
+单轮上限避免一轮过长耗尽 pair budget，并让 scheduler 的 `disabled_manually` 状态超过其自身
+容量。每次 scheduler snapshot、repository evidence read 与 organization read 都有独立强制的
+deadline。
+
+Scheduler evidence 完成后，organization 与 repository branches 并行运行。任一 branch failure
+时，helper 保留最先观察到的 error，但会等待另一 branch 与所有已启动的 repository workers 完成
+后才返回。因此，早期的 organization failure 可能等待 repository phase 的剩余有界 timeout；这是
+有意的 fail-closed draining。
+
+Workflow YAML inventory、Actions workflow inventory 与 local repository ruleset inventory 各有
+32-entry hard admission cap。超出上限即为 inconclusive 并 fail closed。这里不声称 paginated
+GitHub API endpoint 有固定数量的 HTTP requests；其 wall-clock boundary 是 phase deadline。经过
+review 的 deployment manifest 可以提高 soft limits，但只能分别提高到每 repository 1,800 秒、
+每 scheduler snapshot 300 秒、organization evidence 600 秒、每 round 15,000 秒、每 stable
+pair 30,000 秒以内，并仍必须满足 topology formula。这些是 upper capacity limits，不是
+`activate` 的总 wall-clock 时间，也不表示 GitHub Actions minutes free；正常路径在实际读取
+完成时结束。任一 budget 都不允许 partial pagination 或改变后的 execution epoch。任一 deadline
+到期或 evidence 变化时，结论均为 inconclusive，不允许下一次 write；读取 `recovery_code` 后
+重新运行对应的 fresh preview。
 
 Closure 完成后，每个活动 cohort member 另开一个 PR，移除 canonical bridge。不得为已归档、
 仅属于 legacy 的 repository 创建此类 PR：
