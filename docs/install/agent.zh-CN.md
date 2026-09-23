@@ -37,8 +37,9 @@ GitHub.com/default-branch PR scope 时停止。
 - `workflow_dispatch` 是唯一 manual entry；
 - 使用不带 feature ref 的 `gh workflow run`，随后 read back 并证明 run 来自
   `DEFAULT_BRANCH`；
-- 优先直接发 `@codex review`；只有 request creation 与更新 verifier attempt 需要
-  controller 协调时才用 `begin-review`；
+- 优先把直接发 `@codex review` 作为 provider-side attempt；它不授予 provider capability，
+  也不保证 Codex 会启动。只有 request creation 与更新 verifier attempt 需要 controller
+  协调时才用 `begin-review`；
 - 每个 exact-head review generation 只选择一个 request producer。只有该 head 上没有
   `request_review=true` 的 active controller `begin-review` 时，才优先 direct request。
   一旦该 run 已 dispatch、正在启动或已经发出 hidden marker，就不得再手动发送 direct
@@ -47,8 +48,9 @@ GitHub.com/default-branch PR scope 时停止。
 - limit profile 只允许通过 protected repository variable
   `CODEX_REVIEW_GATE_LIMITS_PROFILE` 选择 `default` 与 `expanded`，不得增加 dispatch
   或 numeric override；
-- `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION` 是 protected wrapper configuration：
-  只有 exact `any` 覆盖默认 `write`，绝不把它新增为 Action input。
+- canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`。不要给普通
+  consumer workflow 新增 repository variable、Action input 或 strict policy；`write` 仅保留给
+  将来可读取 collaborator permission 的 nonstandard verifier identity。
 - 每次调用 bootstrap 都显式保留同一个 `CONTROL_PLANE_OWNER`。默认值是
   `@JoeyTeng`；非 Joey 仓库必须替换成自己的合格 GitHub user。
 
@@ -836,10 +838,13 @@ steps 从 protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派�
 `limits_profile=default|expanded`；public outputs 只有 `execution_health`、`gate_outcome`、
 `recovery_code` 与 `retry_safe`。Finding counts 仅是 summary/sticky diagnostics。
 
-Wrapper 把 protected repository variable
-`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION` 映射到 Action environment。Exact `any`
-允许任意 permission 的普通 request author；其他值要求 `write`、`maintain` 或 `admin`。
-它只影响 ordinary request 是否能建立 generation，不会让合格 finding 失去阻塞效力。
+Canonical workflow 直接设定
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`：它让 verifier 接受已观察到的 exact
+ordinary request author，且不查询 collaborator permission。这不授予 commenter 调用 Codex
+的权限，也不保证 Codex 会启动；provider-side eligibility 与 delivery 独立决定，缺少
+official-bot evidence 时仍保持 pending。不要把 nonstandard `write`/`maintain`/`admin` policy
+加入普通 consumer：它需要 verifier identity 可读取 collaborator permission，而 bundled
+read-only verifier token 无法可靠做到。该设置不会让合格 finding 失去阻塞效力。
 
 ## 阶段 2：暂存并验证 Disabled ruleset
 

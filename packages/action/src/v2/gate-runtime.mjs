@@ -2868,7 +2868,7 @@ function readV2Config(environment) {
     throw new Error("GITHUB_RUN_ID must be one canonical positive decimal id");
   }
   const requestAuthorPermission = String(
-    environment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION || "write",
+    environment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION || "any",
   ).trim();
   if (requestAuthorPermission !== "write" && requestAuthorPermission !== "any") {
     throw new Error(

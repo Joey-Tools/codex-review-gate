@@ -58,8 +58,11 @@ shell quoting 增加 visible text。不要手工构造 workflow-owned hidden mar
 producer 必须互斥。不确定 ownership 时，应读取 controller run、canonical marker、sticky
 diagnostic 与 provider evidence，不得盲目再发一条 request。
 
-普通 request author 的默认最低权限是 `write`、`maintain` 或 `admin`，除非受保护的
-default-branch configuration 明确选择 `any`。
+普通 request author 默认在任意 repository permission 下都可被接受。这只会建立一个
+gate generation boundary，并不授予 commenter 启动或控制 Codex review 的权限。canonical
+workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；不要在普通 consumer
+workflow 添加 strict policy。`write`/`maintain`/`admin` 仅保留给将来可以读取 collaborator
+permission 的 nonstandard verifier identity。
 
 ### Workflow-coordinated review
 
@@ -136,9 +139,10 @@ gh workflow run "$WORKFLOW" \
 
 1. 证明 target 是指向 default branch 的 open、non-draft、same-repository PR，
    并读取其 exact head。
-2. 需要新 review generation 时，按上文选择直接 exact `@codex review` 或
-   `begin-review`。
-3. 等待 Codex。不要创建 cron 或反复盲发 request loop。
+2. 需要新 review generation 时，按上文选择直接 exact `@codex review` 的 provider-side
+   attempt 或 `begin-review`。
+3. 等待 provider evidence。直接 comment 不保证 Codex 会启动；没有 official evidence 时
+   gate 保持 pending。不要创建 cron 或反复盲发 request loop。
 4. 为 exact head dispatch `reconcile`。
 5. 读取四个 Action outputs 和 Actions summary：`execution_health`、
    `gate_outcome`、`recovery_code`、`retry_safe`。

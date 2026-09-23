@@ -68,7 +68,7 @@ jobs:
         id: controller
         uses: JoeyTeng/codex-review-gate-action@v2
         env:
-          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}
+          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}

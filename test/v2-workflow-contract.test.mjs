@@ -245,7 +245,7 @@ test("canonical verifier is read-only, latest-wins, and uses the direct Action",
   );
   assert.match(
     templateVerifier,
-    /^        env:\n          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: \$\{\{ vars\.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' \|\| 'write' \}\}$/mu,
+    /^        env:\n          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any$/mu,
   );
   assert.match(
     templateVerifier,

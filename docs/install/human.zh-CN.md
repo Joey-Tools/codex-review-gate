@@ -60,12 +60,14 @@ uses: JoeyTeng/codex-review-gate-action@v2
   comment；GitHub 的 issue-comment REST endpoint 对该目标接受 pull-request write。两者都
   没有 `issues: write`、`statuses: write`、`checks: write` 或 `contents: write`。
 
-默认情况下，普通用户发出的 `@codex review` 只有在 author 当前拥有 `write`、
-`maintain` 或 `admin` 权限时，才能建立新的 review generation。若仓库明确接受任意
-commenter 的 request，可以把受保护 repository Actions variable 设置为
-`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；其他任何值都映射为更安全的
-`write` policy。这是 wrapper-owned protected configuration，不是 public Action input。
-它不会削弱 finding authority：任何合格 Codex finding 仍然阻塞。
+默认情况下，普通用户发出的 exact `@codex review` 在 `any` policy 下、任意 repository
+permission 都可作为 review-generation boundary 被接受。这是 gate attribution 决策，不是调用 Codex 的
+权限，也不保证 Codex 会启动；provider-side eligibility 与 delivery 独立决定。没有合格的
+official-bot evidence 时，gate 仍保持 pending。canonical workflow 直接设定
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；不要给普通 consumer 添加 repository
+variable、public Action input 或 strict policy。`write`/`maintain`/`admin` path 仅保留给将来
+可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only verifier
+token 无法可靠做到。它不会削弱 finding authority：任何合格 Codex finding 仍然阻塞。
 
 Consumer workflows 没有 cron、`repository_dispatch`、`pull_request_target`、自动
 `pull_request_review` writer、runtime GitHub App、status bridge 或 ledger。evidence

@@ -205,9 +205,11 @@ same-run marker 的可见性稳定；若它仍不存在，只 rerun 原 workflow
 不能阻止 GitHub 替换尚未启动的 pending run。因此 caller 必须观察 exact
 `begin-review` run 完成，才能把它视为 barrier 或发送依赖它的 request。
 
-check 尚未通过时，agent 通常直接发送 exact `@codex review` 启动 Codex，从而在其他
-checks 运行期间避免 Actions runner。`begin-review` 保留为 coordinated path，尤其
-适用于 deliberate same-head re-review：它必须建立更新的 verifier generation。
+check 尚未通过时，agent 通常直接发送 exact `@codex review` 作为低成本 provider-side
+attempt，从而在其他 checks 运行期间避免 Actions runner。该 comment 不授予 provider
+capability，也不保证 delivery；缺少 official Codex evidence 时保持 pending。
+`begin-review` 保留为 coordinated path，尤其适用于 deliberate same-head re-review：
+它必须建立更新的 verifier generation。
 
 ### `reconcile`
 
@@ -257,9 +259,13 @@ finding 都会阻塞。
 
 authorised generation 只能由一条 exact、未编辑的 `@codex review` request 建立。
 其 first visible line 必须 exact，且没有其他 visible text。普通 request author 默认
-必须有 `write`、`maintain` 或 `admin` repository permission。受保护的
-default-branch configuration 可以明确把 threshold 设为 `any`。workflow-authored
-request 还需要 exact v2 marker，绑定 full head 和 run。
+不受 repository permission 阈值限制。这只是 gate attribution：不授予 commenter 调用或
+控制 Codex review 的权限，provider 是否真正启动仍由 GitHub/Codex 决定。canonical
+workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不暴露 standard
+strict-policy setting。更严格的 `write` threshold（`write`、`maintain` 或 `admin`）仅保留给
+将来可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only
+verifier token 无法可靠做到。workflow-authored request 还需要 exact v2 marker，绑定 full
+head 和 run。
 
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。
@@ -268,7 +274,7 @@ terminal clean text 与符合条件的 provider `+1`，只有在没有 base epoc
 lineage 的第一个物理 generation 中才是同等 clean carriers。物理 boundary 识别与
 positive authority 必须分开。每条可能触发 provider 的 request-shaped comment 都恰好是
 一个 boundary，包括 duplicate marker，以及 edited、malformed、wrong-author 或 denied
-request。physical-only boundary 没有 binding 或 positive authority。在默认 `write`
+request。physical-only boundary 没有 binding 或 positive authority。在 nonstandard `write`
 threshold 下，形状合法的 ordinary request 必须先查询 author permission（同一 snapshot
 内按 author 缓存），才能判定为 denied；判定后不再触发 reaction 或 exact-refetch
 fan-out。更早因 shape、author 或 binding 无效而拒绝的 boundary，不触发 permission、

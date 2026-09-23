@@ -62,9 +62,12 @@ head generation. If ownership is uncertain, inspect the controller run,
 canonical marker, sticky diagnostic, and provider evidence instead of sending
 another request.
 
-An ordinary request author's default minimum permission is `write`, `maintain`
-or `admin`, unless protected default-branch configuration deliberately selects
-`any`.
+An ordinary request author is accepted at any repository permission by default.
+That admits a gate generation boundary only; it does not grant the commenter
+permission to start or control Codex review. Canonical workflows fix
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`; do not add a strict policy
+to an ordinary consumer workflow. `write`/`maintain`/`admin` is reserved for a
+nonstandard future verifier identity that can read collaborator permissions.
 
 ### Workflow-coordinated review
 
@@ -146,9 +149,11 @@ default branch.
 
 1. Prove the target is an open, non-draft, same-repository PR to the default
    branch and read its exact head.
-2. If a new review generation is needed, choose direct exact
-   `@codex review` or `begin-review` as described above.
-3. Wait for Codex. Do not create a cron or repeated blind request loop.
+2. If a new review generation is needed, choose a direct exact
+   `@codex review` provider-side attempt or `begin-review` as described above.
+3. Wait for provider evidence. A direct comment does not guarantee that Codex
+   starts; without official evidence the gate remains pending. Do not create a
+   cron or repeated blind request loop.
 4. Dispatch `reconcile` for the exact head.
 5. Read the four Action outputs and the Actions summary:
    `execution_health`, `gate_outcome`, `recovery_code`, `retry_safe`.

@@ -43,8 +43,10 @@ Maintain these invariants:
 - `workflow_dispatch` is the sole manual entry point;
 - invoke `gh workflow run` without `--ref`, then read the created run back and
   prove that it used `DEFAULT_BRANCH`;
-- prefer direct `@codex review`; use `begin-review` only when request creation
-  and a newer verifier attempt need controller coordination;
+- prefer a direct `@codex review` provider-side attempt; it does not grant
+  provider capability or guarantee that Codex starts. Use `begin-review` only
+  when request creation and a newer verifier attempt need controller
+  coordination;
 - select exactly one request producer for each exact-head review generation.
   A direct request is preferred only while no controller `begin-review` with
   `request_review=true` is active for that head. Once such a run has been
@@ -53,9 +55,10 @@ Maintain these invariants:
   canonical marker, sticky diagnostic, and provider evidence before mutating;
 - select only `default` and `expanded` through protected repository variable
   `CODEX_REVIEW_GATE_LIMITS_PROFILE`, never dispatch or numeric overrides.
-- treat `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION` as protected wrapper
-  configuration: unset or any value other than exact `any` means `write`;
-  never add it as an Action input.
+- canonical workflows fix `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`.
+  Do not add a repository variable, Action input, or strict policy to an
+  ordinary consumer workflow; `write` is reserved for a future nonstandard
+  verifier identity that can read collaborator permissions.
 - keep `CONTROL_PLANE_OWNER` explicit in every bootstrap invocation. It
   defaults to `@JoeyTeng`, but a non-Joey repository must substitute its own
   eligible GitHub user.
@@ -969,12 +972,16 @@ The canonical workflows must have this contract after the merge:
 - no cron, `repository_dispatch`, `pull_request_target`, writable
   `pull_request_review`, status bridge, runtime App, or ledger.
 
-The wrapper maps protected repository variable
-`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION` into the Action environment.
-Exact `any` accepts an ordinary request author at any repository permission;
-otherwise the runtime requires `write`, `maintain`, or `admin`. This setting
-affects only which ordinary request may establish a generation. It never makes
-a qualifying Codex finding non-blocking.
+Canonical workflows set
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly. This accepts an
+already-observed exact ordinary request author at any repository permission
+without a collaborator lookup. It does not grant the commenter permission to
+invoke Codex or ensure that Codex starts; provider-side eligibility and delivery
+remain independent, and missing official-bot evidence stays pending. Do not add
+the nonstandard `write`/`maintain`/`admin` policy to an ordinary consumer: it
+needs a verifier identity allowed to read collaborator permissions, which the
+bundled read-only verifier token cannot reliably do. The setting never makes a
+qualifying Codex finding non-blocking.
 
 The controller Action step must use underscore input names:
 `github_token`, `pr_number`, `expected_head_sha`, `operation`,

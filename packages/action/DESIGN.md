@@ -233,10 +233,12 @@ but cannot prevent GitHub from replacing a not-yet-started pending run. A
 caller therefore observes the exact `begin-review` run complete before treating
 it as a barrier or posting a dependent request.
 
-Agents normally start Codex directly with exact `@codex review` when the check
-is not already passing, avoiding an Actions runner while other checks run.
-`begin-review` remains the coordinated path, especially for a deliberate
-same-head re-review that must establish a newer verifier generation.
+Agents normally make a low-cost provider-side attempt with exact `@codex review`
+when the check is not already passing, avoiding an Actions runner while other
+checks run. The comment does not grant provider capability or guarantee
+delivery; absent official Codex evidence remains pending. `begin-review`
+remains the coordinated path, especially for a deliberate same-head re-review
+that must establish a newer verifier generation.
 
 ### `reconcile`
 
@@ -294,10 +296,16 @@ affect blocking: any qualifying finding blocks.
 
 An authorised generation begins only with an exact, unedited
 `@codex review` request. Its first visible line is exact and there is no other
-visible text. By default, an ordinary request author must have `write`,
-`maintain` or `admin` repository permission. Protected default-branch
-configuration may deliberately set the threshold to `any`. A workflow-authored
-request additionally needs the exact v2 marker binding the full head and run.
+visible text. By default, an ordinary request author is accepted at any
+repository permission. This is only gate attribution: it does not grant the
+commenter permission to invoke or control Codex review, whose actual provider
+start remains GitHub/Codex-controlled. Canonical workflows fix
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` and do not expose a standard
+strict-policy setting. The stricter `write` threshold (`write`, `maintain`, or
+`admin`) is reserved for a nonstandard future verifier identity allowed to read
+collaborator permissions; the bundled read-only verifier token cannot reliably
+do so. A workflow-authored request additionally needs the exact v2 marker
+binding the full head and run.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
@@ -309,7 +317,7 @@ lineage. Physical boundary recognition is deliberately separate from positive
 authority. Every provider-triggerable request-shaped comment is one boundary,
 including same-run duplicate markers and edited, malformed, wrong-author, or
 denied requests. Physical-only boundaries are unbound and receive no positive
-authority. Under the default `write` threshold, a syntactically valid ordinary
+authority. Under the nonstandard `write` threshold, a syntactically valid ordinary
 request must undergo a permission lookup, cached per author within each
 snapshot, before it can be classified as denied; once denied, it causes no
 reaction or exact-refetch fan-out. Boundaries rejected earlier for invalid

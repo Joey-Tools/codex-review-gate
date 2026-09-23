@@ -321,6 +321,7 @@ test("output failure preserves a proven finding verdict and recovery", async (co
   const environment = runtimeEnvironment(context, {
     suffix: "finding-output-persistence-failure",
   });
+  environment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   mkdirSync(environment.GITHUB_OUTPUT);
 
   const { result } = await runGate(environment, github);
@@ -3508,7 +3509,7 @@ test("ordinary writer request admits exact terminal line endings and queries liv
   );
 });
 
-test("ordinary request author permission is enforced without letting a 404 commenter DoS", async (context) => {
+test("request-author write policy is opt-in and the default any policy skips collaborator lookup", async (context) => {
   const request = ordinaryRequest({ user: READER });
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
@@ -3520,6 +3521,7 @@ test("ordinary request author permission is enforced without letting a 404 comme
     permissionMissingLogins: new Set([READER.login]),
   });
   const environment = runtimeEnvironment(context, { suffix: "permission-404" });
+  environment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.executionHealth, "healthy");
@@ -3528,11 +3530,31 @@ test("ordinary request author permission is enforced without letting a 404 comme
     false,
   );
 
-  const anyGitHub = createGitHubMock({ issueComments: [request, terminal] });
-  const anyEnvironment = runtimeEnvironment(context, { suffix: "permission-any" });
-  anyEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "any";
-  const { result: anyResult } = await runGate(anyEnvironment, anyGitHub);
-  assert.equal(anyResult.report.gateOutcome, "success");
+  const forbiddenGitHub = createGitHubMock({
+    issueComments: [request, terminal],
+    requestInterceptor: ({ method, path }) =>
+      method === "GET" &&
+      path === `/repos/${REPOSITORY}/collaborators/${READER.login}/permission`
+        ? jsonResponse({ message: "Must have push access to view collaborator permission" }, 403)
+        : undefined,
+  });
+  const forbiddenEnvironment = runtimeEnvironment(context, { suffix: "permission-403" });
+  forbiddenEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
+  const { result: forbiddenResult } = await runGate(forbiddenEnvironment, forbiddenGitHub);
+  assert.equal(forbiddenResult.exitCode, 1);
+  assert.equal(forbiddenResult.report.executionHealth, "unhealthy");
+  assert.equal(forbiddenResult.report.gateOutcome, "pending");
+  assert.equal(forbiddenResult.report.recoveryCode, "repair_permissions");
+  assert.equal(forbiddenGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const defaultGitHub = createGitHubMock({ issueComments: [request, terminal] });
+  const defaultEnvironment = runtimeEnvironment(context, { suffix: "permission-default-any" });
+  const { result: defaultResult } = await runGate(defaultEnvironment, defaultGitHub);
+  assert.equal(defaultResult.report.gateOutcome, "success");
+  assert.equal(
+    defaultGitHub.calls.some((call) => /\/collaborators\/[^/]+\/permission$/u.test(call.path)),
+    false,
+  );
 });
 
 test("a denied exact request remains a lineage boundary without granting clean authority", async (context) => {
@@ -3560,6 +3582,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
   const ambiguousEnvironment = runtimeEnvironment(context, {
     suffix: "denied-request-lineage-boundary",
   });
+  ambiguousEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: ambiguous } = await runGate(ambiguousEnvironment, ambiguousGitHub);
   assert.equal(ambiguous.exitCode, 1);
   assert.equal(ambiguous.report.gateOutcome, "pending");
@@ -3586,6 +3609,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
   const lateFindingEnvironment = runtimeEnvironment(context, {
     suffix: "denied-request-late-finding",
   });
+  lateFindingEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: lateFinding } = await runGate(
     lateFindingEnvironment,
     lateFindingGitHub,
@@ -3613,6 +3637,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
   const directRecoveryEnvironment = runtimeEnvironment(context, {
     suffix: "denied-request-direct-authorized-recovery",
   });
+  directRecoveryEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: directRecovery } = await runGate(
     directRecoveryEnvironment,
     directRecoveryGitHub,
@@ -3637,6 +3662,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
   const staleDirectEnvironment = runtimeEnvironment(context, {
     suffix: "denied-request-after-direct-clean",
   });
+  staleDirectEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: staleDirect } = await runGate(staleDirectEnvironment, staleDirectGitHub);
   assert.equal(staleDirect.exitCode, 1);
   assert.equal(staleDirect.report.gateOutcome, "pending");
@@ -3654,6 +3680,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
   const refreshedDirectEnvironment = runtimeEnvironment(context, {
     suffix: "denied-request-before-refreshed-direct-clean",
   });
+  refreshedDirectEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: refreshedDirect } = await runGate(
     refreshedDirectEnvironment,
     refreshedDirectGitHub,
@@ -4079,7 +4106,7 @@ test("only exact unedited Actions sticky diagnostics are outside physical lineag
   }
 });
 
-test("authority filtering caches permissions and avoids exact-refetch DoS", async (context) => {
+test("opt-in write policy caches permissions and avoids exact-refetch DoS", async (context) => {
   const deniedRequests = Array.from({ length: 70 }, (_, index) => {
     const id = 1_000 + index;
     return ordinaryRequest({
@@ -4101,6 +4128,7 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
   const deniedEnvironment = runtimeEnvironment(context, {
     suffix: "denied-request-refetch-budget",
   });
+  deniedEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: deniedResult } = await runGate(deniedEnvironment, deniedGitHub);
   assert.equal(deniedResult.exitCode, 1);
   assert.equal(deniedResult.report.executionHealth, "healthy");
@@ -4169,6 +4197,7 @@ test("authority filtering caches permissions and avoids exact-refetch DoS", asyn
   const authoritativeEnvironment = runtimeEnvironment(context, {
     suffix: "authoritative-refetch-scope",
   });
+  authoritativeEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: authoritativeResult } = await runGate(
     authoritativeEnvironment,
     authoritativeGitHub,
@@ -8002,6 +8031,7 @@ test("finding recovery distinguishes authorized ordinary and latest physical-onl
   const physicalEnvironment = runtimeEnvironment(context, {
     suffix: "finding-latest-physical-only-boundary",
   });
+  physicalEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: physical } = await runGate(
     physicalEnvironment,
     physicalGitHub,

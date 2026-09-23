@@ -298,7 +298,7 @@ test("consumer permissions and runtime shape cannot read or execute pull-request
   assert.equal(itemScalar(verifier.steps[0], "uses"), MARKETPLACE_ACTION);
   assert.deepEqual(blockScalarMapping(verifier.env), {
     CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION:
-      "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+      "any",
   });
   assertNoForbiddenExecutionKeys(templateConsumer);
   assertNoForbiddenExecutionKeys(templateController);
@@ -2318,8 +2318,8 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
       "    timeout-minutes: 14\n    <<: *attacker-job",
     ),
     templateConsumer.replace(
-      "vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write'",
-      "vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
+      "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
+      "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: write",
     ),
   ];
   const controllerMutations = [
@@ -2622,12 +2622,19 @@ test("installation guides preserve the feature-head CheckRun and test-merge exec
   }
 });
 
-test("installation guides preserve the protected request-author policy boundary", () => {
+test("installation guides preserve the default-any request-author and provider-authority boundary", () => {
   for (const [name, guide] of Object.entries(installGuides)) {
     assert.match(guide, /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION/u, name);
     assert.match(guide, /\bwrite\b/u, name);
     assert.match(guide, /\bany\b/u, name);
     assert.match(guide, /finding/u, name);
+    assert.match(guide, /provider/iu, name);
+    assert.match(guide, /pending/iu, name);
+    assert.match(
+      guide,
+      /(?:does not grant[^.]{0,160}(?:invoke|start)[^.]{0,160}Codex|not permission to invoke Codex|不授予[^。]{0,160}(?:调用|启动)[^。]{0,160}Codex|不是调用[^。]{0,160}Codex[^。]{0,160}权限)/u,
+      name,
+    );
   }
   const inputs = section(action, "inputs", "outputs");
   assert.doesNotMatch(inputs, /request_author_permission/u);
@@ -2836,7 +2843,7 @@ function parseClosedActionStep(job, expectedWithKeys) {
   ]);
   assert.equal(
     blockScalar(envBlock, "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION"),
-    "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    "any",
   );
   const withBlock = itemChildBlock(steps[0], "with");
   assert.deepEqual(blockDirectKeys(withBlock), expectedWithKeys);

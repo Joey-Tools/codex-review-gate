@@ -3671,8 +3671,8 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2WorkflowContent(
         canonical.replace(
-          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write'",
-          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'write' || 'any'",
+          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
+          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: write",
         ),
       ),
     /missing required fragment: CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION/u,

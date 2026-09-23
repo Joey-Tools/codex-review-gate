@@ -76,14 +76,18 @@ boundaries that an Action step cannot define:
   REST endpoints. Neither workflow has `issues: write`, `statuses: write`,
   `checks: write`, or `contents: write`.
 
-By default, an ordinary human-authored `@codex review` request establishes a
-new review generation only when its author currently has `write`, `maintain`,
-or `admin` permission. A repository that intentionally accepts requests from
-any commenter may set the protected Actions variable
-`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`; every other value maps to
-the safer `write` policy. This is wrapper-owned protected configuration, not a
-public Action input. It never weakens Codex finding authority: every qualifying
-finding remains blocking regardless of request-author permission.
+By default, an ordinary human-authored exact `@codex review` request is accepted
+as a review-generation boundary at any repository permission. This is a gate
+attribution decision, not permission to invoke Codex and not a guarantee that
+Codex starts; provider-side eligibility and delivery decide that separately.
+Without qualifying official-bot evidence, the gate remains pending. Canonical
+workflows set `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly; do
+not add a repository variable, public Action input, or strict policy to an
+ordinary consumer. The `write`/`maintain`/`admin` path is reserved for a future
+nonstandard verifier identity allowed to read collaborator permissions, which
+the bundled read-only verifier token cannot reliably do. It never weakens Codex
+finding authority: every qualifying finding remains blocking regardless of
+request-author permission.
 
 The consumer workflows have no cron, `repository_dispatch`,
 `pull_request_target`, automatic `pull_request_review` writer, runtime GitHub

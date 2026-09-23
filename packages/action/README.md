@@ -205,9 +205,12 @@ unique canonical job/CheckRun. An ambiguous POST or invisible attempt remains
 blocking; concurrency is scheduling, not a mutation fence.
 
 For the usual low-cost path, an agent may post exact `@codex review` directly
-while other checks run and invoke GHA only when reconciliation is needed. Use
-`begin-review` when the workflow must coordinate the pending transition and
-request, including a deliberate same-head re-review after an earlier success.
+as a provider-side attempt while other checks run and invoke GHA only when
+reconciliation is needed. The comment does not promise that Codex starts; its
+eligibility and delivery remain provider-controlled. The gate waits for
+official evidence and stays pending if none arrives. Use `begin-review` when
+the workflow must coordinate the pending transition and request, including a
+deliberate same-head re-review after an earlier success.
 
 ### `reconcile`
 
@@ -226,12 +229,18 @@ the ruleset's “all conversations resolved” requirement is their authority.
 
 A review generation begins with an exact, unedited `@codex review` request.
 The visible first line is exact and contains no additional visible text. An
-ordinary request author needs `write`, `maintain` or `admin` permission by
-default; protected default-branch configuration may deliberately relax this
-to `any`. A workflow-authored request additionally carries the canonical v2
-hidden marker binding the full head SHA, current base repository/ref/SHA and
-workflow run. Qualifying Codex findings block regardless of request-author
-permission.
+ordinary request author is accepted at any repository permission by default.
+This controls only gate attribution of an exact ordinary request; it does not
+grant that commenter permission to invoke or control Codex review. GitHub and
+Codex still decide whether a provider review starts, and missing qualifying
+official-bot evidence remains pending. Canonical workflows set
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly and do not expose a
+standard strict-policy setting. `write` (`write`, `maintain` or `admin`) is
+reserved for a nonstandard future verifier identity allowed to read collaborator
+permissions; the bundled read-only verifier token cannot reliably do so. A
+workflow-authored request additionally carries the canonical v2 hidden marker
+binding the full head SHA, current base repository/ref/SHA and workflow run.
+Qualifying Codex findings block regardless of request-author permission.
 
 Every snapshot also reads the latest GitHub PR timeline
 `BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
@@ -252,7 +261,7 @@ lineage. Every provider-triggerable request-shaped comment is a physical
 generation boundary, including duplicate hidden markers, edited or malformed
 requests, and requests that fail authorisation. Boundary status records an
 unknown provider flight; it does not grant positive authority. Under the
-default `write` threshold, an otherwise valid ordinary request requires a
+nonstandard `write` threshold, an otherwise valid ordinary request requires a
 permission lookup, cached per author within each snapshot, before it can be
 classified as denied. Once denied, it causes no reaction or exact-refetch fan-
 out. Boundaries rejected earlier for invalid shape, author, or binding also

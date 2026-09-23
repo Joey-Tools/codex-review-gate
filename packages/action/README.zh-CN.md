@@ -175,9 +175,10 @@ verifier attempt `A`、要求没有 competing canonical attempt、只请求一�
 不可见时仍保持 blocking；concurrency 只是 scheduling，不是 mutation fence。
 
 普通低成本路径中，agent 可以在其他 checks 运行时直接发送 exact
-`@codex review`，只在需要 reconcile 时调用 GHA。workflow 必须协调 pending
-transition 和 request 时使用 `begin-review`；这也包括旧 success 后的 deliberate
-same-head re-review。
+`@codex review` 作为 provider-side attempt，只在需要 reconcile 时调用 GHA。该 comment
+不保证 Codex 会启动；eligibility 与 delivery 仍由 provider 控制。gate 等待 official
+evidence，若未到达则保持 pending。workflow 必须协调 pending transition 和 request 时使用
+`begin-review`；这也包括旧 success 后的 deliberate same-head re-review。
 
 ### `reconcile`
 
@@ -194,11 +195,16 @@ resolved” 要求才是其 authority。
 ## Evidence 语义
 
 review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
-line 必须 exact，且不得有其他 visible text。普通 request author 默认需要
-`write`、`maintain` 或 `admin` 权限；受保护 default-branch configuration 可以明确
-放宽为 `any`。workflow-authored request 还必须带 canonical v2 hidden marker，绑定
-完整 head SHA、当前 base repository/ref/SHA 和 workflow run。符合条件的 Codex
-findings 不受 request-author permission 影响，始终阻塞。
+line 必须 exact，且不得有其他 visible text。普通 request author 默认不受 repository
+permission 阈值限制。这只决定 gate 如何把 exact ordinary request 归因为 generation，
+并不授予 commenter 调用或控制 Codex review 的权限；是否真的启动 provider review 仍由
+GitHub 与 Codex 决定，缺少符合条件的 official-bot evidence 时仍保持 pending。canonical
+workflow 直接固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不会把它暴露成
+standard strict-policy setting。`write` threshold（`write`、`maintain` 或 `admin`）仅保留给
+将来具有 collaborator permission 读取能力的 nonstandard verifier identity；bundled
+read-only verifier token 无法可靠完成这个读取。workflow-authored request 还必须带
+canonical v2 hidden marker，绑定完整 head SHA、当前 base repository/ref/SHA 和 workflow
+run。符合条件的 Codex findings 不受 request-author permission 影响，始终阻塞。
 
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base
@@ -214,7 +220,7 @@ terminal clean 文本和符合条件的 provider `+1`，只有在没有 base epo
 lineage 的第一个物理 generation 中才具有相同 clean authority。每条可能触发 provider
 的 request-shaped comment 都是物理 generation boundary，包括 duplicate hidden marker、
 edited/malformed request 和 authorisation 失败的 request。boundary 只表示可能存在未知
-provider flight，不授予 positive authority。在默认 `write` threshold 下，其他条件均合法的
+provider flight，不授予 positive authority。在 nonstandard `write` threshold 下，其他条件均合法的
 ordinary request 必须先查询 permission（同一 snapshot 内按 author 缓存），才能判定为
 denied；判定后不再触发 reaction 或 exact-refetch fan-out。更早因 shape、author 或 binding
 无效而拒绝的 boundary，也不触发 permission、reaction 或 exact-refetch fan-out。每个已观察

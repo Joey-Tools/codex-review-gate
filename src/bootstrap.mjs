@@ -1679,7 +1679,7 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
     "operation: reconcile",
     "request_review: false",
     "CODEX_REVIEW_GATE_LIMITS_PROFILE",
-    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
     "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
   ]) {
     if (!value.includes(fragment)) {
@@ -1797,7 +1797,7 @@ function validateV2ControllerWorkflowContent(value, {
     ["jobs.codex-review-gate-controller.steps.uses", CANONICAL_V2_WORKFLOW_USES],
     [
       "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
-      "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+      "any",
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.github_token",
@@ -1854,7 +1854,7 @@ function validateV2ControllerWorkflowContent(value, {
     "request_review:",
     "CODEX_REVIEW_GATE_LIMITS_PROFILE",
     "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
-    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
   ]) {
     if (!value.includes(fragment)) {
       throw new Error(`Canonical v2 controller workflow is missing required fragment: ${fragment}`);

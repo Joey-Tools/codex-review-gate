@@ -858,6 +858,31 @@ evidence that a prior freeze remains in force.
   created-only validator. The historical fixture and the Action documentation
   make the distinction explicit: runtime compatibility may parse `edited`, but
   it is not a canonical automatic controller ingress.
+- Live source-bootstrap evidence exposed that the standard read-only verifier
+  token cannot read `GET /repos/{owner}/{repo}/collaborators/{login}/permission`:
+  a direct `@codex review` by `JoeyTeng-Codex` reached that endpoint under the
+  prior default `write` policy and GitHub returned `403 Must have push access to
+  view collaborator permission`. The verifier must remain read-only, so this is
+  not repaired by granting it repository write authority or by introducing a
+  runtime GitHub App.
+- The adopted standard is therefore a fixed `any`. Canonical
+  verifier/controller wrappers set
+  `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly, and the runtime
+  fallback is also `any`; they expose no repository variable or public Action
+  input for strict policy. `write` remains only a nonstandard future runtime
+  mode for a verifier identity that can read collaborator permissions.
+- `any` relaxes only the gate's attribution of an already-observed exact,
+  unedited ordinary `@codex review` comment as a generation boundary. It does
+  not grant the commenter permission to invoke Codex and does not guarantee
+  provider eligibility or delivery. Missing official Codex evidence remains
+  pending, while every qualifying Codex finding remains blocking. This accepts
+  the limited cost/pending-denial surface without permitting a synthetic pass.
+- Existing consumer workflow copies that map an unset variable to `write` must
+  receive the new hard-coded-`any` canonical wrapper before they gain this
+  default; the floating Action alias alone cannot override an environment value
+  already supplied by an old copied workflow. Publish the runtime patch, update
+  those copies, and use fresh canary evidence before treating the change as
+  deployed.
 
 ## Next Steps
 
