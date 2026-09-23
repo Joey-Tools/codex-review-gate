@@ -849,15 +849,21 @@ evidence that a prior freeze remains in force.
   removal requires a source-local closure proof; the organization schema-2
   receipt cannot authorize it.
 - The completed 10-repository organization receipt intentionally remains bound
-  to the historical controller identity that admitted `created` and `edited`.
-  All ten deployed cohort controllers still have that exact frozen identity;
-  the new source template's created-only rule must not rewrite the completed
-  receipt. The handoff reader therefore has one dedicated historical inventory
-  validator, usable only after its per-workflow manifest identity readback.
-  Ordinary consumer installation and source bootstrap continue to use the
-  created-only validator. The historical fixture and the Action documentation
-  make the distinction explicit: runtime compatibility may parse `edited`, but
-  it is not a canonical automatic controller ingress.
+  to all three historical workflow identities: the verifier and controller use
+  the former request-author variable expression, the controller admits
+  `created` and `edited`, and the bridge keeps its deployed v1 envelope. All
+  ten cohort repositories still have those exact manifest-bound bytes; the
+  current created-only, literal-`any` source template must not rewrite or
+  reinterpret that completed receipt.
+- The handoff reader first binds each live verifier, controller, and bridge to
+  its frozen manifest blob SHA and content SHA-256, then applies a dedicated
+  historical structural validator. It does not reuse evolving current-template
+  byte equality or current request-author policy for the historical cohort.
+  Tests likewise use immutable fixtures for all three workflows, preventing a
+  current template from leaking into fake GitHub handoff evidence. Ordinary
+  consumer installation and source bootstrap continue to use the created-only,
+  literal-`any` validator. Runtime compatibility may parse `edited`, but it is
+  not a canonical automatic controller ingress.
 - Live source-bootstrap evidence exposed that the standard read-only verifier
   token cannot read `GET /repos/{owner}/{repo}/collaborators/{login}/permission`:
   a direct `@codex review` by `JoeyTeng-Codex` reached that endpoint under the

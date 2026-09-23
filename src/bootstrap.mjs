@@ -104,6 +104,9 @@ const FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(
 `);
 const CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES = "[created]";
 const FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES = "[created, edited]";
+const CANONICAL_REQUEST_AUTHOR_PERMISSION = "any";
+const FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION =
+  "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}";
 
 const DEFAULT_REF_CONDITIONS = {
   ref_name: {
@@ -1565,6 +1568,20 @@ export function validateCanonicalV2WorkflowContent(value) {
 }
 
 export function validateCanonicalLegacyBridgeWorkflowContent(value) {
+  return validateLegacyBridgeWorkflowContent(value, {
+    requireCurrentCanonicalBytes: true,
+  });
+}
+
+function validateFrozenHandoffLegacyBridgeWorkflowContent(value) {
+  return validateLegacyBridgeWorkflowContent(value, {
+    requireCurrentCanonicalBytes: false,
+  });
+}
+
+function validateLegacyBridgeWorkflowContent(value, {
+  requireCurrentCanonicalBytes,
+}) {
   if (typeof value !== "string" || value === "") {
     throw new Error(
       "Canonical legacy bridge workflow must be non-empty UTF-8 text.",
@@ -1616,7 +1633,10 @@ export function validateCanonicalLegacyBridgeWorkflowContent(value) {
       "Canonical legacy bridge workflow may write only issues and legacy commit statuses.",
     );
   }
-  if (value !== CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT) {
+  if (
+    requireCurrentCanonicalBytes &&
+    value !== CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT
+  ) {
     throw new Error(
       "Canonical legacy bridge workflow must exactly match the closed temporary event, permission, concurrency, and single-caller envelope.",
     );
@@ -1625,6 +1645,20 @@ export function validateCanonicalLegacyBridgeWorkflowContent(value) {
 }
 
 export function validateCanonicalV2VerifierWorkflowContent(value) {
+  return validateV2VerifierWorkflowContent(value, {
+    requestAuthorPermission: CANONICAL_REQUEST_AUTHOR_PERMISSION,
+  });
+}
+
+function validateFrozenHandoffV2VerifierWorkflowContent(value) {
+  return validateV2VerifierWorkflowContent(value, {
+    requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
+  });
+}
+
+function validateV2VerifierWorkflowContent(value, {
+  requestAuthorPermission,
+}) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 verifier workflow must be non-empty UTF-8 text.");
   }
@@ -1679,7 +1713,7 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
     "operation: reconcile",
     "request_review: false",
     "CODEX_REVIEW_GATE_LIMITS_PROFILE",
-    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
+    `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${requestAuthorPermission}`,
     "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
   ]) {
     if (!value.includes(fragment)) {
@@ -1708,12 +1742,14 @@ function validateFrozenHandoffV2ControllerWorkflowContent(value) {
   return validateV2ControllerWorkflowContent(value, {
     jobIfExpression: FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION,
     issueCommentTypes: FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES,
+    requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
   });
 }
 
 function validateV2ControllerWorkflowContent(value, {
   jobIfExpression: expectedJobIfExpression,
   issueCommentTypes,
+  requestAuthorPermission = CANONICAL_REQUEST_AUTHOR_PERMISSION,
 }) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
@@ -1797,7 +1833,7 @@ function validateV2ControllerWorkflowContent(value, {
     ["jobs.codex-review-gate-controller.steps.uses", CANONICAL_V2_WORKFLOW_USES],
     [
       "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
-      "any",
+      requestAuthorPermission,
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.github_token",
@@ -1854,7 +1890,7 @@ function validateV2ControllerWorkflowContent(value, {
     "request_review:",
     "CODEX_REVIEW_GATE_LIMITS_PROFILE",
     "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
-    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
+    `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${requestAuthorPermission}`,
   ]) {
     if (!value.includes(fragment)) {
       throw new Error(`Canonical v2 controller workflow is missing required fragment: ${fragment}`);
@@ -2553,7 +2589,9 @@ export function validateCanonicalV2WorkflowInventory(
     canonicalWorkflows,
     {
       legacyBridge,
+      validateVerifier: validateCanonicalV2VerifierWorkflowContent,
       validateController: validateCanonicalV2ControllerWorkflowContent,
+      validateLegacyBridge: validateCanonicalLegacyBridgeWorkflowContent,
     },
   );
 }
@@ -2572,7 +2610,9 @@ export function validateFrozenHandoffV2WorkflowInventory(
     canonicalWorkflows,
     {
       legacyBridge,
+      validateVerifier: validateFrozenHandoffV2VerifierWorkflowContent,
       validateController: validateFrozenHandoffV2ControllerWorkflowContent,
+      validateLegacyBridge: validateFrozenHandoffLegacyBridgeWorkflowContent,
     },
   );
 }
@@ -2580,7 +2620,12 @@ export function validateFrozenHandoffV2WorkflowInventory(
 function validateV2WorkflowInventory(
   workflowFiles,
   canonicalWorkflows,
-  { legacyBridge, validateController },
+  {
+    legacyBridge,
+    validateVerifier,
+    validateController,
+    validateLegacyBridge,
+  },
 ) {
   if (!Array.isArray(workflowFiles)) {
     throw new Error("Default-branch workflow inventory must be an array.");
@@ -2590,7 +2635,12 @@ function validateV2WorkflowInventory(
   }
   const canonicalEntries = normalizeCanonicalWorkflowEntries(
     canonicalWorkflows,
-    { legacyBridge, validateController },
+    {
+      legacyBridge,
+      validateVerifier,
+      validateController,
+      validateLegacyBridge,
+    },
   );
   for (const { path, content, role } of canonicalEntries) {
     const matches = workflowFiles.filter((file) => file?.path === path);
@@ -2600,11 +2650,11 @@ function validateV2WorkflowInventory(
       );
     }
     if (role === "verifier") {
-      validateCanonicalV2VerifierWorkflowContent(matches[0].content);
+      validateVerifier(matches[0].content);
     } else if (role === "controller") {
       validateController(matches[0].content);
     } else {
-      validateCanonicalLegacyBridgeWorkflowContent(matches[0].content);
+      validateLegacyBridge(matches[0].content);
     }
     if (!installedWorkflowMatchesCanonical(matches[0].content, content)) {
       throw new Error(
@@ -2651,7 +2701,12 @@ function validateV2WorkflowInventory(
 
 function normalizeCanonicalWorkflowEntries(
   canonicalWorkflows,
-  { legacyBridge = false, validateController = validateCanonicalV2ControllerWorkflowContent } = {},
+  {
+    legacyBridge = false,
+    validateVerifier = validateCanonicalV2VerifierWorkflowContent,
+    validateController = validateCanonicalV2ControllerWorkflowContent,
+    validateLegacyBridge = validateCanonicalLegacyBridgeWorkflowContent,
+  } = {},
 ) {
   if (
     canonicalWorkflows === null ||
@@ -2662,12 +2717,16 @@ function normalizeCanonicalWorkflowEntries(
       "Canonical workflow inventory must provide verifier and controller workflow bytes.",
     );
   }
-  if (typeof validateController !== "function") {
-    throw new Error("Canonical workflow inventory controller validator must be a function.");
+  if (
+    typeof validateVerifier !== "function" ||
+    typeof validateController !== "function" ||
+    typeof validateLegacyBridge !== "function"
+  ) {
+    throw new Error("Canonical workflow inventory validators must be functions.");
   }
   const verifier = canonicalWorkflows.verifier;
   const controller = canonicalWorkflows.controller;
-  validateCanonicalV2VerifierWorkflowContent(verifier);
+  validateVerifier(verifier);
   validateController(controller);
   const entries = [
     {
@@ -2683,7 +2742,7 @@ function normalizeCanonicalWorkflowEntries(
   ];
   if (legacyBridge) {
     const bridge = canonicalWorkflows.legacyBridge;
-    validateCanonicalLegacyBridgeWorkflowContent(bridge);
+    validateLegacyBridge(bridge);
     entries.push({
       role: "legacy bridge",
       path: DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,

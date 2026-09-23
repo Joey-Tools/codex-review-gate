@@ -83,15 +83,35 @@ const HISTORICAL_HANDOFF_CONTROLLER_BYTES = readFileSync(
     import.meta.url,
   ),
 );
+const HISTORICAL_HANDOFF_VERIFIER_BYTES = readFileSync(
+  new URL(
+    "./fixtures/organization-review-gate-handoff/codex-review-gate.verifier.v2-with-request-author-variable.yml",
+    import.meta.url,
+  ),
+);
+const HISTORICAL_HANDOFF_LEGACY_BRIDGE_BYTES = readFileSync(
+  new URL(
+    "./fixtures/organization-review-gate-handoff/codex-review-gate-legacy-bridge.v1.yml",
+    import.meta.url,
+  ),
+);
+const HISTORICAL_HANDOFF_WORKFLOW_BYTES = Object.freeze({
+  verifier: HISTORICAL_HANDOFF_VERIFIER_BYTES,
+  controller: HISTORICAL_HANDOFF_CONTROLLER_BYTES,
+  legacy_bridge: HISTORICAL_HANDOFF_LEGACY_BRIDGE_BYTES,
+});
 
 function historicalHandoffWorkflowBytes(key, identity) {
-  // The organization handoff is a completed, immutable cohort receipt. Its
-  // controller descriptor deliberately remains the then-installed
-  // created-or-edited workflow, even as the source template evolves.
-  if (key === "controller") return HISTORICAL_HANDOFF_CONTROLLER_BYTES;
-  return readFileSync(
-    new URL(`../templates/codex-gated-repo/${identity.path}`, import.meta.url),
-  );
+  // The organization handoff is a completed immutable cohort receipt. Its
+  // three workflow descriptors deliberately remain byte-for-byte frozen even
+  // as the current source template evolves.
+  if (
+    identity?.path === undefined ||
+    !(key in HISTORICAL_HANDOFF_WORKFLOW_BYTES)
+  ) {
+    throw new Error(`Missing historical handoff workflow fixture for ${String(key)}.`);
+  }
+  return HISTORICAL_HANDOFF_WORKFLOW_BYTES[key];
 }
 
 const ORGANIZATION = {
@@ -2019,10 +2039,23 @@ test("frozen organization handoff admission remains distinct from current contro
     ]),
   );
   const currentWorkflows = {
-    ...frozenWorkflows,
+    verifier: readFileSync(
+      new URL(
+        "../templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
     controller: readFileSync(
       new URL(
         "../templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+    legacyBridge: readFileSync(
+      new URL(
+        "../.github/workflows/codex-review-gate-legacy-bridge.yml",
         import.meta.url,
       ),
       "utf8",
@@ -2045,13 +2078,13 @@ test("frozen organization handoff admission remains distinct from current contro
     () => validateCanonicalV2WorkflowInventory(inventory, frozenWorkflows, {
       legacyBridge: true,
     }),
-    /job\.if must exactly match the closed runner-admission expression/u,
+    /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any/u,
   );
   assert.throws(
     () => validateFrozenHandoffV2WorkflowInventory(inventory, currentWorkflows, {
       legacyBridge: true,
     }),
-    /job\.if must exactly match the closed runner-admission expression/u,
+    /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: \$\{\{ vars\.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION/u,
   );
 });
 
