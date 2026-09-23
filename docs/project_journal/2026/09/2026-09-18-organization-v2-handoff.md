@@ -321,11 +321,13 @@ the global cutover is closed.
   A new push, reopen, or documented draft-to-ready transition creates that
   verifier; controller reconcile can only rerun an already-existing exact
   verifier and deliberately cannot synthesize a new pull-request event.
-- Joey confirmed the final policy order: the new organization ruleset has v2
-  as its sole required status context; the old ruleset retains deletion and
-  non-fast-forward protection until the final, receipt-bound removal of its v1
-  context. No organization-policy mutation is authorized before all ten active
-  members have reached the dual-protection proof boundary.
+- Joey confirmed the original policy order: the new organization ruleset has
+  v2 as its sole required status context; the old ruleset retains deletion and
+  non-fast-forward protection until the planned, receipt-bound removal of its
+  v1 context. The 2026-09-23 execution update records Joey's later,
+  scope-limited switch-first exception to that final ordering: it removed only
+  the v1 status rule after narrow exact API readback, preserved the old
+  non-status protections, and did not authorize bridge removal.
 - Activation also requires a durable independent control-plane Codeowner path.
   The managed `/.github/**` owner currently names `@JoeyTeng`, while some
   cohort repositories have no other writable principal. That does not block
@@ -618,6 +620,15 @@ the global cutover is closed.
 
 ## Failure And Recovery Boundary
 
+The following is the original fail-closed execution contract. The 2026-09-23
+Execution Update and Current State above take precedence for the already
+completed organization cutover: the final stable readers became inconclusive,
+then Joey explicitly authorized the narrow exact API recovery recorded there.
+That exception did not weaken the policy payload, alter the frozen cohort, or
+authorize any bridge removal. All future mutations still require their own
+fresh preview/readback and applicable freeze; this historical contract is not
+evidence that a prior freeze remains in force.
+
 - Any changed selector, active or legacy-only repository identity/default
   branch/archive state, workflow bytes, bridge bytes, complete workflow
   inventory, Actions default token permission, repository policy, canary
@@ -795,10 +806,12 @@ the global cutover is closed.
 
 ## Next Steps
 
-1. Keep the temporary legacy bridges installed. Before any bridge-removal PR,
+1. Keep the temporary legacy bridges installed. Before any active-cohort
+   bridge-removal PR, obtain a fresh applicable policy-mutation freeze and
    repair or extend the post-activation stable-reader path enough to mint the
    canonical schema-2 final read-only closure receipt against the now-cut-over
-   state.
+   state. That receipt cannot authorize a source-local bridge outside the
+   frozen cohort.
 2. Treat the cohort v1 status transition as complete: do not restore
    `codex/review-gate` in the old organization rule or on any fixed active
    cohort repository. The old organization ruleset intentionally remains Active
