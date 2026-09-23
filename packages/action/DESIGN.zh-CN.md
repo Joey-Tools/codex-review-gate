@@ -45,7 +45,7 @@ pull_request opened/reopened/synchronize/ready_for_review
  ruleset: expected source + Code Owner review + stale dismissal
           + up to date + conversations resolved + no force-push
 
-Codex issue_comment created/edited       protected workflow_dispatch
+Codex issue_comment created               protected workflow_dispatch
                  |                                  |
                  +----------------------------------+
                                 v
@@ -124,10 +124,12 @@ current feature head 与 default-branch base SHA。这个 execution binding 使 
 feature-head CheckRun 能证明它评估了 exact current test-merge；CheckRun 本身并不属于
 test-merge SHA。
 
-controller 接收 `issue_comment` `created`/`edited` 与 default-branch
+controller 只接收 `issue_comment` `created` 与 default-branch
 `workflow_dispatch`。comment admission 在 runner 分配前，把 event sender 与 comment
 author 都精确校验为 login `chatgpt-codex-connector[bot]`、type `Bot`。Action 在
-admission 后再次校验，因为两次校验保护不同边界。
+admission 后再次校验，因为两次校验保护不同边界。edited Codex comment 需要受保护的
+manual reconcile；runtime 为 direct caller 保留的 `edited` 兼容性不是 canonical
+automatic ingress。
 
 唯一 manual entry 是使用受保护 default-branch workflow 的 `workflow_dispatch`。
 manual inputs 是 closed typed schema，详见 [README.zh-CN.md](README.zh-CN.md)。
@@ -137,8 +139,8 @@ allowlist。
 
 没有 cron、`repository_dispatch`、`pull_request_target` 或可写自动
 `pull_request_review` job。没有 cron 可以避免 private repositories 为
-no-op run 支付费用。未创建或编辑符合条件 issue comment 的
-review-object/reaction change，通过 manual reconcile 收敛。
+no-op run 支付费用。review-object/reaction change 以及符合条件 issue comment 的 edit，
+除非创建新的符合条件 comment，均通过 manual reconcile 收敛。
 
 所有 runtime jobs 都只调用 API，不 checkout 或执行 consumer/PR code。verifier
 read-only；只有 controller 拥有创建 request 与 rerun exact verifier 所需的窄 mutation

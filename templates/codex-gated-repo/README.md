@@ -16,7 +16,7 @@ This directory contains the canonical consumer-side assets:
 Copy both workflows unchanged. The verifier runs for pull-request `opened`,
 `reopened`, `synchronize`, and `ready_for_review` events and emits the sole
 required native CheckRun. The controller provides `issue_comment`
-`created`/`edited` bot filtering before runner allocation and the sole manual
+`created` bot filtering before runner allocation and the sole manual
 entry point, `workflow_dispatch`. One manual run targets one PR and exact
 expected head. Neither workflow has cron, `repository_dispatch`, an automatic
 `pull_request_review` job, a runtime GitHub App, or a ledger.

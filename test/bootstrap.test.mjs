@@ -5716,7 +5716,7 @@ test("activation requires a staged disabled repository ruleset and preserves act
         "disabled-incomplete",
         [disabledIncomplete],
         1,
-        /disabled but not an exact complete staged v2 policy/u,
+        /disabled but not an exact staged complete v2 gate policy/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);

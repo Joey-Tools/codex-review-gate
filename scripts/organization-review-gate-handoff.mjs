@@ -14,7 +14,7 @@ import { pathToFileURL } from "node:url";
 import {
   decodeGitHubBlobContent,
   rulesetCoversDefaultBranch,
-  validateCanonicalV2WorkflowInventory,
+  validateFrozenHandoffV2WorkflowInventory,
 } from "../src/bootstrap.mjs";
 
 export const MANIFEST_SCHEMA_VERSION =
@@ -1902,7 +1902,7 @@ async function loadWorkflowInventoryEvidence(repo, revision) {
     canonicalWorkflows[key === "legacy_bridge" ? "legacyBridge" : key] = file.content;
   }
   try {
-    validateCanonicalV2WorkflowInventory(
+    validateFrozenHandoffV2WorkflowInventory(
       workflowFiles,
       canonicalWorkflows,
       { legacyBridge: true },

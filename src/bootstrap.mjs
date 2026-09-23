@@ -84,6 +84,26 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
     )
   }}
 `);
+const FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
+  \${{
+    (
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch
+    ) ||
+    (
+      github.event_name == 'issue_comment' &&
+      (github.event.action == 'created' || github.event.action == 'edited') &&
+      github.event.issue.pull_request &&
+      github.event.sender.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.sender.type == 'Bot' &&
+      github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.comment.user.type == 'Bot'
+    )
+  }}
+`);
+const CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES = "[created]";
+const FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES = "[created, edited]";
 
 const DEFAULT_REF_CONDITIONS = {
   ref_name: {
@@ -1678,6 +1698,23 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
 }
 
 export function validateCanonicalV2ControllerWorkflowContent(value) {
+  return validateV2ControllerWorkflowContent(value, {
+    jobIfExpression: CANONICAL_CONTROLLER_JOB_IF_EXPRESSION,
+    issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
+  });
+}
+
+function validateFrozenHandoffV2ControllerWorkflowContent(value) {
+  return validateV2ControllerWorkflowContent(value, {
+    jobIfExpression: FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION,
+    issueCommentTypes: FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES,
+  });
+}
+
+function validateV2ControllerWorkflowContent(value, {
+  jobIfExpression: expectedJobIfExpression,
+  issueCommentTypes,
+}) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
   }
@@ -1690,17 +1727,17 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
   }
 
   const jobIfExpression = extractCanonicalJobIfExpression(value);
-  if (jobIfExpression !== CANONICAL_CONTROLLER_JOB_IF_EXPRESSION) {
+  if (jobIfExpression !== expectedJobIfExpression) {
     throw new Error(
       "Canonical v2 controller workflow job.if must exactly match the closed runner-admission expression.",
     );
   }
   if (
-    !/^  issue_comment:\n    types: \[created\]$/m.test(value) ||
+    !value.includes(`  issue_comment:\n    types: ${issueCommentTypes}`) ||
     !/^  workflow_dispatch:\s*$/m.test(value)
   ) {
     throw new Error(
-      "Canonical v2 controller workflow must expose issue_comment created and workflow_dispatch.",
+      `Canonical v2 controller workflow must expose issue_comment ${issueCommentTypes} and workflow_dispatch.`,
     );
   }
   for (const forbiddenEvent of [
@@ -1728,7 +1765,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
   assertControllerMappingScalar(
     controllerMappings,
     "on.issue_comment.types",
-    "[created]",
+    issueCommentTypes,
   );
   for (const [path, expected] of [
     ["on.workflow_dispatch.inputs.operation.required", "true"],
@@ -2511,6 +2548,40 @@ export function validateCanonicalV2WorkflowInventory(
   canonicalWorkflows,
   { legacyBridge = false } = {},
 ) {
+  return validateV2WorkflowInventory(
+    workflowFiles,
+    canonicalWorkflows,
+    {
+      legacyBridge,
+      validateController: validateCanonicalV2ControllerWorkflowContent,
+    },
+  );
+}
+
+// This entry point is intentionally limited to immutable organization-handoff
+// evidence that predates the created-only controller admission rule. It is not
+// an installation or bootstrap policy: callers must separately bind each
+// workflow to its frozen manifest identity before using this validator.
+export function validateFrozenHandoffV2WorkflowInventory(
+  workflowFiles,
+  canonicalWorkflows,
+  { legacyBridge = false } = {},
+) {
+  return validateV2WorkflowInventory(
+    workflowFiles,
+    canonicalWorkflows,
+    {
+      legacyBridge,
+      validateController: validateFrozenHandoffV2ControllerWorkflowContent,
+    },
+  );
+}
+
+function validateV2WorkflowInventory(
+  workflowFiles,
+  canonicalWorkflows,
+  { legacyBridge, validateController },
+) {
   if (!Array.isArray(workflowFiles)) {
     throw new Error("Default-branch workflow inventory must be an array.");
   }
@@ -2519,7 +2590,7 @@ export function validateCanonicalV2WorkflowInventory(
   }
   const canonicalEntries = normalizeCanonicalWorkflowEntries(
     canonicalWorkflows,
-    { legacyBridge },
+    { legacyBridge, validateController },
   );
   for (const { path, content, role } of canonicalEntries) {
     const matches = workflowFiles.filter((file) => file?.path === path);
@@ -2531,7 +2602,7 @@ export function validateCanonicalV2WorkflowInventory(
     if (role === "verifier") {
       validateCanonicalV2VerifierWorkflowContent(matches[0].content);
     } else if (role === "controller") {
-      validateCanonicalV2ControllerWorkflowContent(matches[0].content);
+      validateController(matches[0].content);
     } else {
       validateCanonicalLegacyBridgeWorkflowContent(matches[0].content);
     }
@@ -2580,7 +2651,7 @@ export function validateCanonicalV2WorkflowInventory(
 
 function normalizeCanonicalWorkflowEntries(
   canonicalWorkflows,
-  { legacyBridge = false } = {},
+  { legacyBridge = false, validateController = validateCanonicalV2ControllerWorkflowContent } = {},
 ) {
   if (
     canonicalWorkflows === null ||
@@ -2591,10 +2662,13 @@ function normalizeCanonicalWorkflowEntries(
       "Canonical workflow inventory must provide verifier and controller workflow bytes.",
     );
   }
+  if (typeof validateController !== "function") {
+    throw new Error("Canonical workflow inventory controller validator must be a function.");
+  }
   const verifier = canonicalWorkflows.verifier;
   const controller = canonicalWorkflows.controller;
   validateCanonicalV2VerifierWorkflowContent(verifier);
-  validateCanonicalV2ControllerWorkflowContent(controller);
+  validateController(controller);
   const entries = [
     {
       role: "verifier",

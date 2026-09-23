@@ -131,7 +131,7 @@ The canonical verifier has one entry:
 
 The protected-default-branch controller has only these entries:
 
-- `issue_comment` with activity types `created` and `edited`; and
+- `issue_comment` with activity type `created`; and
 - `workflow_dispatch` for one explicitly selected pull request.
 
 There is no cron, `repository_dispatch`, `pull_request_target`, writable
@@ -148,8 +148,10 @@ when a Codex result arrives only as a review or reaction.
 An automatic comment job is admitted before runner allocation only when both
 the event sender and comment author are the exact Codex provider:
 `chatgpt-codex-connector[bot]`, GitHub type `Bot`. The Action repeats identity
-and scope checks after the runner starts. An edited Codex comment may invalidate
-an earlier decision, which is why both `created` and `edited` are admitted.
+and scope checks after the runner starts. An edited Codex comment does not
+automatically start the canonical controller; use protected manual `reconcile`
+for that recovery. The Action still parses an `edited` event for compatibility
+with direct callers, but that is not a canonical automatic ingress.
 The verifier fails closed unless the PR is same-repository, open, ready and
 targets the current default branch. A base retarget does not create a current
 verifier because `pull_request.edited` is intentionally absent. For a ready PR,

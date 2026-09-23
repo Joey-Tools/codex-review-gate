@@ -48,7 +48,7 @@ pull_request opened/reopened/synchronize/ready_for_review
  ruleset: expected source + Code Owner review + stale dismissal
           + up to date + conversations resolved + no force-push
 
-Codex issue_comment created/edited       protected workflow_dispatch
+Codex issue_comment created               protected workflow_dispatch
                  |                                  |
                  +----------------------------------+
                                 v
@@ -142,11 +142,13 @@ is the execution binding that lets a successful feature-head CheckRun prove
 evaluation of the exact current test-merge. The CheckRun itself does not
 belong to the test-merge SHA.
 
-The controller admits `issue_comment` `created`/`edited` and default-branch
+The controller admits only `issue_comment` `created` and default-branch
 `workflow_dispatch`. Comment admission checks both event sender and comment
 author against exact login `chatgpt-codex-connector[bot]` and exact type `Bot`
 before runner allocation. The Action revalidates the admitted event because
-the two checks protect different boundaries.
+the two checks protect different boundaries. An edited Codex comment requires
+a protected manual reconcile; direct runtime compatibility for `edited` is not
+a canonical automatic ingress.
 
 The only manual entry is `workflow_dispatch` using the protected default-
 branch workflow. The manual inputs are closed and typed as documented in
@@ -157,8 +159,8 @@ explicit trust boundary; v2 does not maintain a hard-coded actor allowlist.
 There is no cron, `repository_dispatch`, `pull_request_target` or writable
 automatic `pull_request_review` job. The absence of cron avoids
 billable no-op runs in private repositories. Review-object and reaction
-changes that do not create or edit a qualifying issue comment converge through
-manual reconcile.
+changes, including edits to a qualifying issue comment, converge through manual
+reconcile unless they create a new qualifying issue comment.
 
 All runtime jobs are API-only. They do not check out or execute consumer or PR
 code. The verifier is read-only. The controller alone receives the narrow

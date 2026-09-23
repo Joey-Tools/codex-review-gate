@@ -115,7 +115,7 @@ canonical verifier 只有一个入口：
 
 受保护 default branch 上的 controller 只有以下入口：
 
-- activity types 为 `created` 和 `edited` 的 `issue_comment`；
+- activity type 为 `created` 的 `issue_comment`；
 - 为单个明确指定 PR 运行的 `workflow_dispatch`。
 
 没有 cron、`repository_dispatch`、`pull_request_target`、可写自动
@@ -125,7 +125,9 @@ reaction-only completion 由之后的 authoritative verifier reconcile 发现。
 只有 event sender 和 comment author 都是 exact Codex provider
 `chatgpt-codex-connector[bot]`、GitHub type `Bot` 时，自动 comment job 才会在
 runner 分配前被 admit。Action 在 runner 启动后再次校验 identity 和 scope。
-edited Codex comment 可能使旧决策失效，所以 `created` 与 `edited` 都必须 admit。
+edited Codex comment 不会自动启动 canonical controller；应使用受保护的 manual
+`reconcile` 进行恢复。Action 为 direct caller 的兼容性仍可解析 `edited` event，
+但这不是 canonical automatic ingress。
 verifier 会在 PR 不是 same-repository、open、ready 或 current-default-base 时 fail
 closed。`pull_request.edited` 被明确排除，所以 base retarget 不会生成 current verifier。
 对于 ready PR，先转为 draft 再 mark ready；对于已经是 draft 的 PR，直接 mark ready。

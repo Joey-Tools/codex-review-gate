@@ -81,7 +81,7 @@ describe this as cryptographic single-workflow provenance.
 
 Retain the verifier's closed `pull_request` activity types `opened`, `reopened`,
 `synchronize` and `ready_for_review`. It is read-only and has no authoritative
-write API. Retain the controller's closed `issue_comment` `created`/`edited`
+write API. Retain the controller's closed `issue_comment` `created`
 and default-branch-only `workflow_dispatch` entries, exact pre-runner Codex
 sender/author filtering, and narrow `actions: write` plus `pull-requests: write`
 surface. GitHub accepts pull-request write authority for the issue-comment
@@ -89,6 +89,8 @@ endpoints when their target is a pull request; the controller never targets a
 standalone issue. Neither workflow receives `issues: write`, `statuses: write`,
 `checks: write`, contents write, or OIDC authority. There is no
 `pull_request_target`, cron, runtime GitHub App, webhook or durable ledger.
+An edited provider comment does not allocate a canonical controller runner;
+recover it through protected manual reconcile instead.
 
 Only the verifier job's GitHub-managed CheckRun on the exact current PR
 feature-head SHA is the protected signal. Its success is valid only when the

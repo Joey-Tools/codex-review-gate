@@ -16,6 +16,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   validateOrganizationFinalClosureOutput,
+  validateCanonicalV2WorkflowInventory,
+  validateFrozenHandoffV2WorkflowInventory,
 } from "../src/bootstrap.mjs";
 import {
   CANONICAL_WORKFLOW_IDENTITIES,
@@ -74,6 +76,23 @@ const JOEY_TEMPLATE = JSON.parse(
     "utf8",
   ),
 );
+
+const HISTORICAL_HANDOFF_CONTROLLER_BYTES = readFileSync(
+  new URL(
+    "./fixtures/organization-review-gate-handoff/codex-review-gate-controller.v2-with-edited.yml",
+    import.meta.url,
+  ),
+);
+
+function historicalHandoffWorkflowBytes(key, identity) {
+  // The organization handoff is a completed, immutable cohort receipt. Its
+  // controller descriptor deliberately remains the then-installed
+  // created-or-edited workflow, even as the source template evolves.
+  if (key === "controller") return HISTORICAL_HANDOFF_CONTROLLER_BYTES;
+  return readFileSync(
+    new URL(`../templates/codex-gated-repo/${identity.path}`, import.meta.url),
+  );
+}
 
 const ORGANIZATION = {
   login: "Joey-Tools",
@@ -768,9 +787,7 @@ function createFakeGhHarness(
   const workflowBytes = Object.fromEntries(
     Object.entries(CANONICAL_WORKFLOW_IDENTITIES).map(([key, identity]) => [
       key,
-      readFileSync(
-        new URL(`../templates/codex-gated-repo/${identity.path}`, import.meta.url),
-      ),
+      historicalHandoffWorkflowBytes(key, identity),
     ]),
   );
   let cleanupIdentityResponse = null;
@@ -1992,6 +2009,50 @@ test("exports the closed organization handoff protocol constants", () => {
       sha256: "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef",
     },
   });
+});
+
+test("frozen organization handoff admission remains distinct from current controller policy", () => {
+  const frozenWorkflows = Object.fromEntries(
+    Object.entries(CANONICAL_WORKFLOW_IDENTITIES).map(([key, identity]) => [
+      key === "legacy_bridge" ? "legacyBridge" : key,
+      historicalHandoffWorkflowBytes(key, identity).toString("utf8"),
+    ]),
+  );
+  const currentWorkflows = {
+    ...frozenWorkflows,
+    controller: readFileSync(
+      new URL(
+        "../templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  };
+  const inventory = Object.entries(CANONICAL_WORKFLOW_IDENTITIES).map(
+    ([key, identity]) => ({
+      path: identity.path,
+      content: frozenWorkflows[key === "legacy_bridge" ? "legacyBridge" : key],
+    }),
+  );
+
+  assert.deepEqual(
+    validateFrozenHandoffV2WorkflowInventory(inventory, frozenWorkflows, {
+      legacyBridge: true,
+    }),
+    frozenWorkflows,
+  );
+  assert.throws(
+    () => validateCanonicalV2WorkflowInventory(inventory, frozenWorkflows, {
+      legacyBridge: true,
+    }),
+    /job\.if must exactly match the closed runner-admission expression/u,
+  );
+  assert.throws(
+    () => validateFrozenHandoffV2WorkflowInventory(inventory, currentWorkflows, {
+      legacyBridge: true,
+    }),
+    /job\.if must exactly match the closed runner-admission expression/u,
+  );
 });
 
 test("CLI help is read-only and invalid apply shapes fail before reading a manifest", () => {
@@ -5113,10 +5174,8 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
       node_id: "MDQ6VXNlcjEyNTI0Njgw",
     });
   }
-  for (const identity of Object.values(CANONICAL_WORKFLOW_IDENTITIES)) {
-    const bytes = readFileSync(
-      new URL(`../templates/codex-gated-repo/${identity.path}`, import.meta.url),
-    );
+  for (const [key, identity] of Object.entries(CANONICAL_WORKFLOW_IDENTITIES)) {
+    const bytes = historicalHandoffWorkflowBytes(key, identity);
     const gitBlobHeader = Buffer.from(`blob ${bytes.length}\0`, "utf8");
     assert.equal(
       createHash("sha1").update(gitBlobHeader).update(bytes).digest("hex"),

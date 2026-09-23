@@ -848,6 +848,16 @@ evidence that a prior freeze remains in force.
 - The source is not in the fixed active organization cohort. Its later bridge
   removal requires a source-local closure proof; the organization schema-2
   receipt cannot authorize it.
+- The completed 10-repository organization receipt intentionally remains bound
+  to the historical controller identity that admitted `created` and `edited`.
+  All ten deployed cohort controllers still have that exact frozen identity;
+  the new source template's created-only rule must not rewrite the completed
+  receipt. The handoff reader therefore has one dedicated historical inventory
+  validator, usable only after its per-workflow manifest identity readback.
+  Ordinary consumer installation and source bootstrap continue to use the
+  created-only validator. The historical fixture and the Action documentation
+  make the distinction explicit: runtime compatibility may parse `edited`, but
+  it is not a canonical automatic controller ingress.
 
 ## Next Steps
 
