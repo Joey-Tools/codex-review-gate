@@ -25,11 +25,21 @@
   guidance, explicit per-phase capacity limits, and bounded inventory
   admission. This remains a source-helper hardening; it performs no
   organization-policy mutation by itself.
-- [ ] Update the reviewed live manifest to the v3 phase-capacity contract
-  (900/1,200/120/120/9,000/18,005 seconds), then execute a fresh
-  quiesce-scheduler -> activate -> restore-scheduler transaction with matching
-  previews/digests. Do not start v1 cleanup or cutover before stable
-  dual-protection readback and scheduler restoration.
+- [x] Apply the reviewed v3 phase-capacity contract and complete the
+  quiesce-scheduler -> activate -> restore-scheduler cutover. The old
+  organization rule no longer requires `codex/review-gate`, and all eight
+  repository-local legacy cleanup surfaces in the fixed active 10-member cohort
+  now require only `test`; the scheduler is Active again.
+- [ ] Bootstrap `Joey-Tools/codex-review-gate` separately, then replace its
+  independent local ruleset `16410326` v1 `codex/review-gate` self-gate by
+  staging and activating a separate v2 rule, then removing only the old status
+  rule. This source-local exception is outside the fixed cohort and must not
+  be used to expand organization receipt or bridge-removal scope.
+- [ ] Mint the canonical schema-2 final read-only closure receipt for the
+  already-cut-over fixed active 10-member cohort, then use it to authorize
+  separate cohort temporary-bridge removal work. Keep every cohort bridge
+  installed until the receipt exists and validates; a source-local bridge
+  requires its own later removal proof.
 
 ## Later
 
