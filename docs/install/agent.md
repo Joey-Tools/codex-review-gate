@@ -105,7 +105,10 @@ else.
 4. Carry `--ruleset-name "$V2_RULESET_NAME"`, `--ruleset-profile status-only`,
    and `--legacy-bridge` through every later remote canary activation and
    read-only cleanup derivation/verification invocation. Do not fall back to
-   the default `full` profile for this source exception. Verify that the new
+   the default `full` profile for this source exception. While the legacy
+   required status exists, the CLI rejects this source-only profile without
+   `--legacy-bridge`, so a drifted bridge cannot strand `codex/review-gate`
+   with no producer. Verify that the new
    rule contains only the strict GitHub-Actions-bound
    `codex/github-review-gate` requirement. It must be a second rule: the
    existing source rule keeps deletion, non-fast-forward, pull-request, and
@@ -947,8 +950,9 @@ The canonical workflows must have this contract after the merge:
   `synchronize`, `ready_for_review`, and required job
   `codex/github-review-gate` on the exact PR feature-head SHA;
 - controller path `.github/workflows/codex-review-gate-controller.yml`, workflow
-  name `Codex Review Gate Controller`, exact Codex `issue_comment`
-  `created`/`edited`, and default-branch `workflow_dispatch`. It intentionally
+  name `Codex Review Gate Controller`, exact Codex `issue_comment` `created`,
+  and default-branch `workflow_dispatch`. An edited comment does not allocate a
+  runner; use protected manual `reconcile` if it needs evaluation. It intentionally
   excludes `pull_request_review`: GitHub binds review events to the PR merge
   ref, so a controller with narrow write authority must not execute that
   ref. Reconcile review- or reaction-only evidence through the protected
@@ -1095,9 +1099,9 @@ legacy before v2 is Active and read back.
    request with exactly one terminal LF or CRLF; those two storage forms are
    equivalent to exact `@codex review`. Do not accept or emit any other
    whitespace, visible text, or hidden comment. A qualifying Codex bot `issue_comment`
-   `created` or `edited` event will wake the installed workflow. A review or
-   reaction alone does not have an automatic consumer job; use manual
-   `reconcile` when a later evaluation is needed.
+   `created` event will wake the installed workflow. Editing an existing comment
+   does not; use manual `reconcile` when that carrier needs a later evaluation.
+   A review or reaction alone does not have an automatic consumer job.
 
    ### Dual-protection legacy-status recovery
 

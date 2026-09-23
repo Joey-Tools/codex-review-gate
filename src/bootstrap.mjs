@@ -75,7 +75,7 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
     ) ||
     (
       github.event_name == 'issue_comment' &&
-      (github.event.action == 'created' || github.event.action == 'edited') &&
+      github.event.action == 'created' &&
       github.event.issue.pull_request &&
       github.event.sender.login == 'chatgpt-codex-connector[bot]' &&
       github.event.sender.type == 'Bot' &&
@@ -1505,15 +1505,27 @@ function buildStatusOnlyUpdateRulesetPayload(
   });
   return {
     changed:
-      rulesetWritableFingerprint(ruleset) !== rulesetWritableFingerprint(payload),
+      rulesetWritableFingerprint(ruleset, {
+        profile: RULESET_PROFILE_STATUS_ONLY,
+      }) !==
+      rulesetWritableFingerprint(payload, {
+        profile: RULESET_PROFILE_STATUS_ONLY,
+      }),
     payload,
   };
 }
 
-export function rulesetWritableFingerprint(ruleset) {
+export function rulesetWritableFingerprint(
+  ruleset,
+  { profile = DEFAULT_RULESET_PROFILE } = {},
+) {
   if (ruleset === null || typeof ruleset !== "object" || Array.isArray(ruleset)) {
     throw new Error("Ruleset readback must be an object before update.");
   }
+  const normalizedProfile = normalizeRulesetProfile(profile);
+  const rules = Array.isArray(ruleset.rules)
+    ? ruleset.rules.map(stripRuleForRulesetPayload)
+    : ruleset.rules;
   return canonicalJson({
     name: ruleset.name,
     target: ruleset.target,
@@ -1522,9 +1534,9 @@ export function rulesetWritableFingerprint(ruleset) {
       ? ruleset.bypass_actors.map(stripBypassActorForRulesetPayload)
       : ruleset.bypass_actors,
     conditions: structuredCloneSafe(ruleset.conditions),
-    rules: Array.isArray(ruleset.rules)
-      ? ruleset.rules.map(stripRuleForRulesetPayload)
-      : ruleset.rules,
+    rules: normalizedProfile === RULESET_PROFILE_STATUS_ONLY && Array.isArray(rules)
+      ? rules.map(normalizeStatusOnlyRequiredStatusRuleForComparison)
+      : rules,
   });
 }
 
@@ -1684,11 +1696,11 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     );
   }
   if (
-    !/^  issue_comment:\n    types: \[created, edited\]$/m.test(value) ||
+    !/^  issue_comment:\n    types: \[created\]$/m.test(value) ||
     !/^  workflow_dispatch:\s*$/m.test(value)
   ) {
     throw new Error(
-      "Canonical v2 controller workflow must expose issue_comment created/edited and workflow_dispatch.",
+      "Canonical v2 controller workflow must expose issue_comment created and workflow_dispatch.",
     );
   }
   for (const forbiddenEvent of [
@@ -1716,7 +1728,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
   assertControllerMappingScalar(
     controllerMappings,
     "on.issue_comment.types",
-    "[created, edited]",
+    "[created]",
   );
   for (const [path, expected] of [
     ["on.workflow_dispatch.inputs.operation.required", "true"],
@@ -1792,7 +1804,6 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     "github.ref_name == github.event.repository.default_branch",
     "github.event_name == 'issue_comment'",
     "github.event.action == 'created'",
-    "github.event.action == 'edited'",
     "github.event.sender.login",
     "github.event.sender.type",
     "github.event.comment.user.login",
@@ -2781,6 +2792,7 @@ function assertStatusOnlyRulesetEnforcement(enforcement) {
 function normalizeStatusOnlyRequiredStatusRuleForComparison(rule) {
   const normalized = stripRuleForRulesetPayload(rule);
   if (
+    normalized.type === "required_status_checks" &&
     normalized.parameters !== undefined &&
     !Object.prototype.hasOwnProperty.call(
       normalized.parameters,

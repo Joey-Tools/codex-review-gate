@@ -828,6 +828,23 @@ evidence that a prior freeze remains in force.
   `codex/review-gate` from the old rule and compares every remaining security
   field across stable snapshots, so deletion, non-fast-forward, and
   pull-request/CODEOWNERS protections cannot be silently lost.
+- The source controller admits only an exact Codex-bot `issue_comment`
+  `created` event before allocating a runner. An edited comment cannot restart
+  reconciliation automatically; operators use protected manual `reconcile`,
+  and base-retarget recovery remains draft-to-ready followed by a fresh
+  verifier. This implements the final event-cost and race boundary without
+  weakening the comment-author/sender checks.
+- The source-only profile treats an omitted API
+  `do_not_enforce_on_create` field as the documented `false` default only for
+  its otherwise exact status-only shape. Every create, update, activation, and
+  cleanup comparison uses that same semantic normalization; `true`, extra
+  rules/contexts, bypass actors, or branch-condition drift still fail closed.
+- Remote `status-only` now requires `--legacy-bridge` at CLI admission while
+  the source-local v1 requirement exists. It cannot stage a v2 replacement
+  after an unobserved bridge deletion and strand the old required status with
+  no writer. The source self-install test also inventories every
+  `.github/workflows/` file and rejects an additional v1/v2 caller, status
+  writer, or reserved v2 CheckRun producer.
 - The source is not in the fixed active organization cohort. Its later bridge
   removal requires a source-local closure proof; the organization schema-2
   receipt cannot authorize it.

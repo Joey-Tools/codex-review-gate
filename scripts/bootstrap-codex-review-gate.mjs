@@ -421,8 +421,12 @@ async function main() {
       rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
         integrationId: undefined,
       }) ||
-      rulesetWritableFingerprint(payload) !==
-        rulesetWritableFingerprint(expectedActivationPayload)
+      rulesetWritableFingerprint(payload, {
+        profile: options.rulesetProfile,
+      }) !==
+        rulesetWritableFingerprint(expectedActivationPayload, {
+          profile: options.rulesetProfile,
+        })
     ) {
       throw new Error(
         `Repository ruleset "${options.rulesetName}" is disabled but not an exact staged ${rulesetProfileDescription(options.rulesetProfile)}. Run a plain --apply to repair and read back the disabled stage; --activate may change only enforcement from disabled to active.`,
@@ -503,8 +507,12 @@ async function main() {
     },
   );
   if (
-    rulesetWritableFingerprint(currentFullRuleset) !==
-    rulesetWritableFingerprint(fullRuleset)
+    rulesetWritableFingerprint(currentFullRuleset, {
+      profile: options.rulesetProfile,
+    }) !==
+    rulesetWritableFingerprint(fullRuleset, {
+      profile: options.rulesetProfile,
+    })
   ) {
     throw new Error(
       `Ruleset ${fullRuleset.id} changed after planning; refusing a lost-update overwrite. Re-run bootstrap against the latest ruleset.`,
@@ -552,8 +560,12 @@ async function main() {
     },
   );
   if (
-    rulesetWritableFingerprint(finalFullRuleset) !==
-    rulesetWritableFingerprint(fullRuleset)
+    rulesetWritableFingerprint(finalFullRuleset, {
+      profile: options.rulesetProfile,
+    }) !==
+    rulesetWritableFingerprint(fullRuleset, {
+      profile: options.rulesetProfile,
+    })
   ) {
     throw new Error(
       `Ruleset ${fullRuleset.id} changed during the final legacy-inventory readback; refusing a lost-update overwrite. Re-run bootstrap against the latest ruleset.`,
@@ -682,6 +694,14 @@ function readCliOptions() {
   ) {
     throw new Error(
       `--ruleset-profile ${rulesetProfile} is reserved for the ${SOURCE_SELF_HOSTING_REPOSITORY_SLUG} source self-hosting migration. Ordinary consumers must use ${DEFAULT_RULESET_PROFILE}.`,
+    );
+  }
+  if (
+    rulesetProfile === RULESET_PROFILE_STATUS_ONLY &&
+    !values["legacy-bridge"]
+  ) {
+    throw new Error(
+      `--ruleset-profile ${RULESET_PROFILE_STATUS_ONLY} requires --legacy-bridge while ${LEGACY_STATUS_CONTEXT} remains a source-local required status. A later source-local bridge removal needs separate closure proof; do not stage or activate without the exact temporary bridge.`,
     );
   }
   if (values["legacy-bridge"] && values["remove-legacy-bridge"]) {
@@ -1411,9 +1431,13 @@ async function assertRulesetReadback({
       integrationId,
     }) ||
     (exactWritableFields
-      ? rulesetWritableFingerprint(ruleset) !==
-        rulesetWritableFingerprint(expectedPayload)
-      : !createReadbackMatchesPlannedShape(ruleset, expectedPayload))
+      ? rulesetWritableFingerprint(ruleset, { profile: rulesetProfile }) !==
+        rulesetWritableFingerprint(expectedPayload, { profile: rulesetProfile })
+      : !createReadbackMatchesPlannedShape(
+        ruleset,
+        expectedPayload,
+        rulesetProfile,
+      ))
   ) {
     throw new Error(
       `Ruleset readback for id ${rulesetId} is incomplete or drifted: expected exact writable fields with ${enforcement} default-branch coverage and ${rulesetProfileReadbackExpectation(rulesetProfile, context, integrationId)}.${inconclusiveWriteEnforcement === null ? "" : ` ${postWriteRecoveryGuidance(inconclusiveWriteEnforcement, rulesetId)}`}`,
@@ -1454,7 +1478,13 @@ function valueContainsExactPlannedShape(actual, planned) {
   return Object.is(actual, planned);
 }
 
-function createReadbackMatchesPlannedShape(actual, planned) {
+function createReadbackMatchesPlannedShape(actual, planned, rulesetProfile) {
+  if (normalizeRulesetProfile(rulesetProfile) === RULESET_PROFILE_STATUS_ONLY) {
+    return (
+      rulesetWritableFingerprint(actual, { profile: rulesetProfile }) ===
+      rulesetWritableFingerprint(planned, { profile: rulesetProfile })
+    );
+  }
   if (!valueContainsExactPlannedShape(actual, planned)) {
     return false;
   }
@@ -2308,16 +2338,25 @@ async function loadCleanupSecurityClosure({
   return {
     legacyInventory,
     legacyInventoryBytes,
+    rulesetProfile: options.rulesetProfile,
     selectedV2,
     state: buildCleanupSecurityState({
       repoSlug: options.repo.slug,
       securitySnapshot,
       rulesets,
+      selectedV2,
+      rulesetProfile: options.rulesetProfile,
     }),
   };
 }
 
-function buildCleanupSecurityState({ repoSlug, securitySnapshot, rulesets }) {
+function buildCleanupSecurityState({
+  repoSlug,
+  securitySnapshot,
+  rulesets,
+  selectedV2,
+  rulesetProfile,
+}) {
   return {
     schema_version: 1,
     repository: {
@@ -2338,19 +2377,28 @@ function buildCleanupSecurityState({ repoSlug, securitySnapshot, rulesets }) {
     },
     classic_branch_protection: securitySnapshot.classicBranchProtection,
     rulesets: rulesets
-      .map(rulesetSecurityProjection)
+      .map((ruleset) =>
+        rulesetSecurityProjection(
+          ruleset,
+          ruleset.id === selectedV2.id
+            ? rulesetProfile
+            : DEFAULT_RULESET_PROFILE,
+        ))
       .sort((left, right) => left.id - right.id),
   };
 }
 
-function rulesetSecurityProjection(ruleset) {
+function rulesetSecurityProjection(
+  ruleset,
+  rulesetProfile = DEFAULT_RULESET_PROFILE,
+) {
   return {
     id: ruleset.id,
     name: ruleset.name,
     source_type: ruleset.source_type,
     source: ruleset.source,
     writable: canonicalizeSecurityApiValue(
-      JSON.parse(rulesetWritableFingerprint(ruleset)),
+      JSON.parse(rulesetWritableFingerprint(ruleset, { profile: rulesetProfile })),
     ),
   };
 }
@@ -2475,8 +2523,14 @@ function assertCleanupClosureStable(first, second, phase) {
   if (
     first.legacyInventoryBytes !== second.legacyInventoryBytes ||
     canonicalSecurityBytes(first.state) !== canonicalSecurityBytes(second.state) ||
-    postCleanupRulesetFingerprint(first.selectedV2) !==
-      postCleanupRulesetFingerprint(second.selectedV2)
+    postCleanupRulesetFingerprint(
+      first.selectedV2,
+      first.rulesetProfile,
+    ) !==
+      postCleanupRulesetFingerprint(
+        second.selectedV2,
+        second.rulesetProfile,
+      )
   ) {
     throw new Error(
       `Repository security state changed across the two complete ${phase} readbacks; the result is inconclusive and must be rerun against a stable repository.`,
@@ -2512,13 +2566,16 @@ function assertSelectedRepositoryRulesetIdentity(
   return fullRuleset;
 }
 
-function postCleanupRulesetFingerprint(ruleset) {
+function postCleanupRulesetFingerprint(
+  ruleset,
+  rulesetProfile = DEFAULT_RULESET_PROFILE,
+) {
   return canonicalSecurityJson({
     id: ruleset.id,
     source_type: ruleset.source_type,
     source: ruleset.source,
     writable: canonicalizeSecurityApiValue(
-      JSON.parse(rulesetWritableFingerprint(ruleset)),
+      JSON.parse(rulesetWritableFingerprint(ruleset, { profile: rulesetProfile })),
     ),
   });
 }

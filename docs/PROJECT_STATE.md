@@ -12,7 +12,8 @@
   exact temporary v1 bridge, while independent repository ruleset `16410326`
   remains a temporary v1 `codex/review-gate` self-gate until a separate
   status-only v2 rule is staged and activated, then only its v1 status rule is
-  removed.
+  removed. The controller admits only exact Codex-bot `issue_comment` `created`
+  events; edited carriers use protected manual reconciliation.
 - Per-workstream details live under `docs/project_journal/`; keep this file as a short repo-wide recovery entrypoint.
 
 ## Recovery Pointers

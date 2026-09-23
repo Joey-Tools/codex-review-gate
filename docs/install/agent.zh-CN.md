@@ -93,7 +93,8 @@ GitHub.com/default-branch PR scope 时停止。
 4. 每一条后续 remote canary activation、read-only cleanup derivation/verification invocation
    都必须继续带上 `--ruleset-name "$V2_RULESET_NAME"`、
    `--ruleset-profile status-only` 与 `--legacy-bridge`。这个 source exception 不能回退到
-   默认 `full` profile。验证新 rule 只包含 strict、GitHub-Actions-bound 的
+   默认 `full` profile。legacy required status 仍存在时，CLI 会拒绝未带 `--legacy-bridge` 的
+   这个 source-only profile，避免 bridge 漂移后让 `codex/review-gate` 没有 producer。验证新 rule 只包含 strict、GitHub-Actions-bound 的
    `codex/github-review-gate` requirement。它必须是第二条 rule：现有 source rule 保留
    deletion、non-fast-forward、pull-request 与相关 CODEOWNERS protection。在独立 canary
    通过且 source-specific rule 激活后，legacy v1 status 与 v2 CheckRun 都必须继续 required，
@@ -811,8 +812,9 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   `synchronize`、`ready_for_review`，以及 exact PR feature-head SHA 上的 required job
   `codex/github-review-gate`；
 - controller path `.github/workflows/codex-review-gate-controller.yml`、workflow
-  name `Codex Review Gate Controller`、exact Codex `issue_comment`
-  `created`/`edited`，以及 default-branch `workflow_dispatch`。它刻意排除
+  name `Codex Review Gate Controller`、exact Codex `issue_comment` `created`，以及
+  default-branch `workflow_dispatch`。编辑既有 comment 不会分配 runner；需要重新评估时走受保护的
+  手动 `reconcile`。它刻意排除
   `pull_request_review`：GitHub 将 review event 绑定到 PR merge ref，因此具有狭窄 write
   authority 的 controller 不得在该 ref 执行。只由 review 或 reaction 承载的 evidence 必须通过
   受保护 default branch dispatch reconcile；
@@ -942,8 +944,8 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    GitHub 可能把这条单行 direct request 保存为末尾恰好一个 LF 或 CRLF；这两种存储
    形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。
    Caller-authored event 会被 pre-runner bot filter 跳过，Codex bot 之后的
-   合格 `issue_comment` `created` 或 `edited` event 才启动 controller workflow。Review 或
-   reaction 本身没有自动 consumer job，需要时手动 reconcile。
+   合格 `issue_comment` `created` event 才启动 controller workflow。编辑既有 comment 不会启动它，
+   需要重新评估时手动 reconcile。Review 或 reaction 本身没有自动 consumer job。
 
    ### Dual-protection legacy-status recovery
 

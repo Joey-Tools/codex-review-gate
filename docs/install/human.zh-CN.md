@@ -44,7 +44,8 @@ uses: JoeyTeng/codex-review-gate-action@v2
 - read-only verifier 只接受 `pull_request` 的 `opened`、`reopened`、`synchronize`
   与 `ready_for_review`；它在 exact PR feature-head SHA 上的 native
   `codex/github-review-gate` CheckRun 是 required signal；
-- controller 自动 wake-up 只接受 `issue_comment` 的 `created` 与 `edited`。它刻意不订阅
+- controller 自动 wake-up 只接受 `issue_comment` 的 `created`。编辑既有 comment 不会分配 runner；
+  若该 edited carrier 需要重新评估，走受保护 default branch 的手动 `reconcile`。它刻意不订阅
   `pull_request_review`：GitHub 把该 event 绑定到 PR merge ref，而 controller 保留了狭窄的
   write authority。只由 review 或 reaction 携带的 Codex 结果因此必须走受保护 default branch
   的手动 `reconcile`；
@@ -156,7 +157,8 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
 在继续执行下方普通的 canary、activation 与 cleanup-proof sections 时，每一条后续 remote
 invocation 都必须继续带上 `--ruleset-name "$V2_RULESET_NAME"`、
 `--ruleset-profile status-only` 和 `--legacy-bridge`。这个 source exception 不能回退到默认
-`full` profile。
+`full` profile。legacy required status 仍存在时，CLI 会拒绝未带 `--legacy-bridge` 的这个
+source-only profile，避免 bridge 漂移后让 `codex/review-gate` 没有 producer。
 
 新 rule 只包含 strict、GitHub-Actions-bound 的 `codex/github-review-gate` requirement。
 它是第二条 rule：现有 source rule 继续负责 deletion、non-fast-forward、pull-request 与相关
@@ -885,8 +887,9 @@ test -n "$CANARY_HEAD_REF"
 GitHub 可能把这条单行 direct request 保存为末尾恰好一个 LF 或 CRLF；这两种存储
 形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。
 这条路径不会为了创建 request 消耗 Actions minutes。后续满足条件的 Codex bot
-`issue_comment` `created` 或 `edited` event 会启动 controller，由它建立严格更新的 full
-verifier attempt；若结果只出现在 review 或 reaction，或者需要恢复，再手动 reconcile。
+`issue_comment` `created` event 会启动 controller，由它建立严格更新的 full verifier attempt；
+编辑既有 comment 不会启动 controller，若该 carrier 需要重新评估则手动 reconcile。若结果只出现在
+review 或 reaction，或者需要恢复，也手动 reconcile。
 
 ### Dual-protection legacy-status recovery
 

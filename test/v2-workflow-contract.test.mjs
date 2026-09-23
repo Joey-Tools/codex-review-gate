@@ -154,7 +154,7 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
 
 test("canonical controller starts runners only for default-branch dispatches or exact Codex comments", () => {
   assert.match(templateController, /^name: Codex Review Gate Controller$/mu);
-  assert.match(templateController, /^  issue_comment:\n    types: \[created, edited\]$/mu);
+  assert.match(templateController, /^  issue_comment:\n    types: \[created\]$/mu);
   assert.match(templateController, /^  workflow_dispatch:$/mu);
   assert.doesNotMatch(
     templateController,
@@ -169,7 +169,7 @@ test("canonical controller starts runners only for default-branch dispatches or 
   );
   assert.match(templateController, /github\.event_name == 'issue_comment'/u);
   assert.match(templateController, /github\.event\.action == 'created'/u);
-  assert.match(templateController, /github\.event\.action == 'edited'/u);
+  assert.doesNotMatch(templateController, /github\.event\.action == 'edited'/u);
   assert.match(templateController, /github\.event\.issue\.pull_request/u);
   assert.match(
     templateController,

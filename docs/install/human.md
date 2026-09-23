@@ -52,8 +52,10 @@ boundaries that an Action step cannot define:
   `reopened`, `synchronize`, and `ready_for_review`; its native
   `codex/github-review-gate` CheckRun on the exact PR feature-head SHA is
   required;
-- controller automatic wake-ups use only `issue_comment` activity types
-  `created` and `edited`. It deliberately excludes `pull_request_review`:
+- controller automatic wake-ups use only the `issue_comment` activity type
+  `created`. Editing an existing comment does not allocate a runner; use the
+  protected default-branch manual `reconcile` path when an edited carrier needs
+  a new evaluation. It deliberately excludes `pull_request_review`:
   GitHub binds that event to the PR merge ref, while the controller holds
   narrow write authority. A Codex result carried only by a review or reaction
   therefore uses the protected default-branch manual `reconcile` path;
@@ -185,7 +187,9 @@ When following the ordinary canary, activation, and cleanup-proof sections
 below, carry `--ruleset-name "$V2_RULESET_NAME"`,
 `--ruleset-profile status-only`, and `--legacy-bridge` through every later
 remote invocation. Do not fall back to the default `full` profile for this
-source exception.
+source exception. While the legacy required status exists, the CLI rejects this
+source-only profile without `--legacy-bridge`, so a drifted bridge cannot strand
+`codex/review-gate` with no producer.
 
 The new rule contains only the strict, GitHub-Actions-bound
 `codex/github-review-gate` requirement. It is a second rule: the existing
@@ -1058,10 +1062,11 @@ equivalent to exact `@codex review`. Do not accept or emit any other
 whitespace, visible text, or hidden comment.
 
 This is the preferred path because it does not spend Actions minutes merely to
-create the request. A later qualifying `created` or `edited` Codex bot comment
-wakes the controller, which establishes a strictly newer full verifier attempt.
-If the provider result arrives only as a review or reaction, or another
-recovery is needed, run a manual reconcile.
+create the request. A later qualifying `created` Codex bot comment wakes the
+controller, which establishes a strictly newer full verifier attempt. Editing
+an existing comment does not wake the controller; if that edited carrier needs
+evaluation, run a manual reconcile. If the provider result arrives only as a
+review or reaction, or another recovery is needed, run a manual reconcile.
 
 ### Dual-protection legacy-status recovery
 

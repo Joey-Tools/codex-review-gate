@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -16,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import {
   canonicalLegacyReviewGateInventoryBytes,
   validateCanonicalV2ControllerWorkflowContent,
+  validateCanonicalV2WorkflowInventory,
   validateCanonicalLegacyBridgeWorkflowContent,
   workflowSingleProducerPolicyViolations,
 } from "../src/bootstrap.mjs";
@@ -36,6 +38,7 @@ const sourceLegacyBridgePath = join(
 );
 const sourceCodeownersPath = join(repoRoot, ".github/CODEOWNERS");
 const sourceStateMachinePath = join(repoRoot, ".github/workflows/state-machine.yml");
+const sourceWorkflowDirectory = join(repoRoot, ".github/workflows");
 const templateConsumerPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
@@ -136,7 +139,7 @@ const CLOSED_JOB_IF = [
   ") ||",
   "(",
   "github.event_name == 'issue_comment' &&",
-  "(github.event.action == 'created' || github.event.action == 'edited') &&",
+  "github.event.action == 'created' &&",
   "github.event.issue.pull_request &&",
   `github.event.sender.login == '${EXACT_BOT}' &&`,
   "github.event.sender.type == 'Bot' &&",
@@ -167,6 +170,50 @@ test("source self-installation matches canonical v2 assets and contains its temp
       /\.github\/workflows\/codex-review-gate\.yml@|workflow_call|secrets:\s*inherit/u,
     );
   }
+
+  const inventory = sourceWorkflowInventory();
+  const canonicalWorkflows = {
+    verifier: templateConsumer,
+    controller: templateController,
+    legacyBridge: sourceLegacyBridge,
+  };
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(inventory, canonicalWorkflows, {
+      legacyBridge: true,
+    }),
+    canonicalWorkflows,
+  );
+  for (const [name, content, expected] of [
+    [
+      "additional v1 caller",
+      "name: unexpected\njobs:\n  bridge:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+      /Additional v1\/v2 gate callers/u,
+    ],
+    [
+      "additional status writer",
+      "name: unexpected\npermissions:\n  statuses: write\njobs: {}\n",
+      /single-producer policy/u,
+    ],
+    [
+      "additional reserved check producer",
+      "name: unexpected\njobs:\n  producer:\n    name: codex/github-review-gate\n    runs-on: ubuntu-latest\n",
+      /single-producer policy/u,
+    ],
+  ]) {
+    assert.throws(
+      () =>
+        validateCanonicalV2WorkflowInventory(
+          [...inventory, {
+            path: `.github/workflows/${name.replaceAll(" ", "-")}.yml`,
+            content,
+          }],
+          canonicalWorkflows,
+          { legacyBridge: true },
+        ),
+      expected,
+      name,
+    );
+  }
 });
 
 test("source state-machine check names have a static non-reserved prefix", () => {
@@ -188,7 +235,7 @@ test("automatic runner admission separates read-only PR verification from exact 
   });
   assert.deepEqual(blockDirectKeys(workflow.events), ["issue_comment", "workflow_dispatch"]);
   assert.deepEqual(blockScalarMapping(workflow.issueComment), {
-    types: "[created, edited]",
+    types: "[created]",
   });
 
   const jobIf = foldedScalarBody(workflow.job, "if");
@@ -198,7 +245,6 @@ test("automatic runner admission separates read-only PR verification from exact 
     "github.ref_name == github.event.repository.default_branch",
     "github.event_name == 'issue_comment'",
     "github.event.action == 'created'",
-    "github.event.action == 'edited'",
     "github.event.issue.pull_request",
     `github.event.sender.login == '${EXACT_BOT}'`,
     "github.event.sender.type == 'Bot'",
@@ -2282,8 +2328,8 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
       "github.event.comment.user.type == 'Bot' || true",
     ),
     templateController.replace(
+      "github.event.action == 'created'",
       "github.event.action == 'created' || github.event.action == 'edited'",
-      "github.event.action == 'edited' || github.event.action == 'created'",
     ),
   ];
   for (const mutation of verifierMutations) {
@@ -2626,6 +2672,16 @@ test("the JavaScript Action exposes only the adopted public input ABI", () => {
     /^  (?:github-token|pull-request|request-review|max-pages|max-objects|temporary|result-path|report-path|receipt|ledger|wakeup):/mu,
   );
 });
+
+function sourceWorkflowInventory() {
+  return readdirSync(sourceWorkflowDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.ya?ml$/u.test(entry.name))
+    .map((entry) => ({
+      path: `.github/workflows/${entry.name}`,
+      content: readFileSync(join(sourceWorkflowDirectory, entry.name), "utf8"),
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path, "en"));
+}
 
 function parseVerifierWorkflow(source) {
   assertNoForbiddenExecutionKeys(source);

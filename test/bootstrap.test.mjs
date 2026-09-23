@@ -314,6 +314,8 @@ test("updates exact status-only profiles idempotently and fails closed on drift"
   const disabled = buildCreateRulesetPayload({
     profile: RULESET_PROFILE_STATUS_ONLY,
   });
+  const omittedFalseDefault = structuredClone(disabled);
+  delete omittedFalseDefault.rules[0].parameters.do_not_enforce_on_create;
   const before = structuredClone(disabled);
   const idempotent = buildUpdateRulesetPayload(disabled, {
     profile: RULESET_PROFILE_STATUS_ONLY,
@@ -333,6 +335,21 @@ test("updates exact status-only profiles idempotently and fails closed on drift"
 
   assert.equal(idempotent.changed, false);
   assert.deepEqual(idempotent.payload, disabled);
+  assert.equal(
+    rulesetWritableFingerprint(disabled, {
+      profile: RULESET_PROFILE_STATUS_ONLY,
+    }),
+    rulesetWritableFingerprint(omittedFalseDefault, {
+      profile: RULESET_PROFILE_STATUS_ONLY,
+    }),
+    "the API's omitted false default is equivalent only for status-only readback",
+  );
+  assert.equal(
+    buildUpdateRulesetPayload(omittedFalseDefault, {
+      profile: RULESET_PROFILE_STATUS_ONLY,
+    }).changed,
+    false,
+  );
   assert.deepEqual(disabled, before, "status-only update must not mutate its input");
   assert.equal(activated.changed, true);
   assert.equal(activated.payload.enforcement, "active");
@@ -434,6 +451,16 @@ test("reserves the status-only profile for the source self-hosting remote migrat
         "unexpected",
       ],
       /must be "full" or "status-only"/u,
+    ],
+    [
+      "source remote without legacy bridge",
+      [
+        "--repo",
+        "Joey-Tools/codex-review-gate",
+        "--ruleset-profile",
+        RULESET_PROFILE_STATUS_ONLY,
+      ],
+      /status-only requires --legacy-bridge/u,
     ],
   ]) {
     const result = runBootstrap(args, {
@@ -3671,8 +3698,8 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2ControllerWorkflowContent(
         CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "github.event.action == 'created'",
           "github.event.action == 'created' || github.event.action == 'edited'",
-          "github.event.action == 'edited' || github.event.action == 'created'",
         ),
       ),
     /job\.if must exactly match/u,
@@ -4631,6 +4658,7 @@ test("stages an exact status-only source v2 ruleset without rewriting the retain
       name: v2RulesetName,
       enforcement: "disabled",
     });
+    delete disabledV2.rules[0].parameters.do_not_enforce_on_create;
     const responses = {
       ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
       ...legacyInventory.responses,
@@ -5126,6 +5154,8 @@ test("activates only the staged status-only source v2 ruleset after its canary p
       name: v2RulesetName,
       enforcement: "active",
     });
+    delete disabledV2.rules[0].parameters.do_not_enforce_on_create;
+    delete activeV2.rules[0].parameters.do_not_enforce_on_create;
     const responses = {
       ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
       ...legacyInventory.responses,
