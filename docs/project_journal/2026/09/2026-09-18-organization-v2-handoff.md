@@ -3,7 +3,7 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-22
+updated: 2026-09-23
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -25,6 +25,13 @@ superseded_by:
   archived `codex-waited-delivery`; that archived repository is not an active
   v2 member and must not receive migration, canary, cleanup, receipt, or bridge
   removal work.
+- The source repository `Joey-Tools/codex-review-gate` is deliberately outside
+  that active 10-member cohort. Its separate repository ruleset `16410326`
+  still requires `codex/review-gate` as a temporary v1 self-gate; it was not
+  selected by either organization ruleset or by the eight repository-local
+  cleanup surfaces. A dedicated source bootstrap must stage and activate a
+  separate v2 rule, then remove only that independent v1 status requirement
+  before v1 can be retired from the source repository.
 - This is not a broad relaxation of the ordinary installer. It adds a separate,
   auditable temporary-bridge profile and a manifest-bound organization handoff
   transaction. The normal completed-installation contract continues to reject
@@ -123,10 +130,17 @@ the global cutover is closed.
   and makes no runtime-code change.
 - Ten active cohort default branches have migrated to the canonical v2 verifier,
   controller, CODEOWNERS coverage, and temporary v1 bridge. Repository-local
-  v2 rulesets are Active; the old organization rule and its legacy v1
-  requirement/retained protections remain unchanged. The separately staged
-  organization-level v2 rule is Disabled until its full activation proof is
-  read back successfully.
+  v2 rulesets are Active. Organization ruleset `23787657`, `Must Pass Codex
+  Review v2`, is Active with the integration-bound
+  `codex/github-review-gate` status. Legacy organization ruleset `16590367`
+  remains Active only to retain `deletion` and `non_fast_forward`; its v1
+  `codex/review-gate` required-status rule has been removed.
+- The completed policy mutation covers only the old organization rule and the
+  fixed active cohort: all eight repository-local legacy cleanup surfaces now
+  require only `test`. It did not change the source repository's independent
+  local ruleset `16410326`, which remains a temporary `codex/review-gate` v1
+  self-gate pending a dedicated source bootstrap. The source repository is not
+  a hidden eleventh cohort member or a ninth cleanup surface.
 - The initial read-only inventory found that all 11 originally selected members
   inherited old organization rule `16590367`; nine additionally retained a
   repository-level legacy `codex/review-gate` requirement. Later bootstrap and
@@ -148,8 +162,10 @@ the global cutover is closed.
   manifest-derived list, never from the observed list or the old 11-member
   ruleset selector. This avoids silently redefining published 11-member
   evidence while keeping the archived repository outside the current mutation
-  scope. No final organization closure receipt has been minted, so this
-  versioned contract change precedes any organization-policy mutation.
+  scope. A canonical final organization closure receipt has not yet been
+  minted, so temporary bridge removal remains unauthorized even though the v1
+  required status has been removed from the old organization rule and every
+  active-cohort repository-local cleanup surface.
 - The current source hardening makes the retained archive exception explicit in
   the unshipped `manifest/v2`: `legacy_ruleset.legacy_only_repository` binds
   `Joey-Tools/codex-waited-delivery` by `slug`, numeric `id`, `node_id`,
@@ -305,11 +321,13 @@ the global cutover is closed.
   A new push, reopen, or documented draft-to-ready transition creates that
   verifier; controller reconcile can only rerun an already-existing exact
   verifier and deliberately cannot synthesize a new pull-request event.
-- Joey confirmed the final policy order: the new organization ruleset has v2
-  as its sole required status context; the old ruleset retains deletion and
-  non-fast-forward protection until the final, receipt-bound removal of its v1
-  context. No organization-policy mutation is authorized before all ten active
-  members have reached the dual-protection proof boundary.
+- Joey confirmed the original policy order: the new organization ruleset has
+  v2 as its sole required status context; the old ruleset retains deletion and
+  non-fast-forward protection until the planned, receipt-bound removal of its
+  v1 context. The 2026-09-23 execution update records Joey's later,
+  scope-limited switch-first exception to that final ordering: it removed only
+  the v1 status rule after narrow exact API readback, preserved the old
+  non-status protections, and did not authorize bridge removal.
 - Activation also requires a durable independent control-plane Codeowner path.
   The managed `/.github/**` owner currently names `@JoeyTeng`, while some
   cohort repositories have no other writable principal. That does not block
@@ -602,6 +620,15 @@ the global cutover is closed.
 
 ## Failure And Recovery Boundary
 
+The following is the original fail-closed execution contract. The 2026-09-23
+Execution Update and Current State above take precedence for the already
+completed organization cutover: the final stable readers became inconclusive,
+then Joey explicitly authorized the narrow exact API recovery recorded there.
+That exception did not weaken the policy payload, alter the frozen cohort, or
+authorize any bridge removal. All future mutations still require their own
+fresh preview/readback and applicable freeze; this historical contract is not
+evidence that a prior freeze remains in force.
+
 - Any changed selector, active or legacy-only repository identity/default
   branch/archive state, workflow bytes, bridge bytes, complete workflow
   inventory, Actions default token permission, repository policy, canary
@@ -733,20 +760,71 @@ the global cutover is closed.
   not a durable decision ledger. GitHub remains the authority; each recovery
   reruns the full readback before continuing.
 
+## Execution Update — 2026-09-23
+
+- Source PR `#60`, `Bound organization handoff evidence capacity`, merged as
+  `75e4fa865b42ef542b0d5fef98bb117e4dee99aa`. It made the per-repository
+  legacy-writer capacity and scheduler-quiescence topology explicit.
+- The manifest-bound scheduler
+  `Joey-Tools/codex-private-workflows` workflow `281807666` was quiesced with
+  plan digest `13c8eff0100d25df862cf8ca14beee8595998e499bd872af50006edc35c7d1c9`.
+  Its drain readback covered 557 terminal executions over six pages and left
+  the workflow `disabled_manually`.
+- An activation preview then completed for all 10 active repositories with
+  plan digest `21bac5593ea35a7c47d105d31f15f880ba4326b10a248285ab163028ce3eee27`.
+  A later apply attempt stopped at its immediate revalidation and reported no
+  mutation; a direct follow-up read nevertheless found organization v2 already
+  Active. Under Joey's explicit switch-first direction, the rollout accepted
+  that observed dual-protection state rather than continuing a provenance
+  investigation. The scheduler was restored through the exact
+  `restore-scheduler` plan
+  `6a41324ee0d05d8a7109e6b916db6e9b8651ec47334c8b91e7ed40fc7fdfdd4e` and
+  read back Active.
+- The normal post-restore cleanup and final-verify stable readers each became
+  inconclusive at their 60-second two-snapshot boundary. The cleanup executor
+  had already performed its per-item exact mutation/readback work; a direct
+  follow-up GET confirmed all eight repository-local legacy rulesets were in
+  their expected-after state: only `test` remained required, while
+  `deletion` and `non_fast_forward` stayed Active.
+- Under the same explicit direction, the final organization cutover used a
+  narrow exact API recovery: GET the old ruleset, compare its complete writable
+  policy to the manifest's expected-before state, remove only its required
+  status rule, PUT, then require both the response and a second GET to equal
+  the expected-after state. The comparison normalizes only GitHub's numeric
+  ordering of organization repository selector IDs, matching the helper's
+  existing organization-ruleset comparison; every other policy field remains
+  exact. The result payload digest was
+  `cd027a58a8042cef30496bc91310ba0d6ac30047a2172d399b1a2cd315fb3350` and
+  preserved exactly `deletion` and `non_fast_forward`.
+- Final direct readback confirmed: v2 organization rule Active with only
+  `codex/github-review-gate`; old organization rule Active with no required
+  status rule and only `deletion`/`non_fast_forward`; scheduler Active; and all
+  eight affected repository rulesets requiring only `test`. This direct
+  cutover scope did not include or mutate the source repository's independent
+  local ruleset `16410326`, which remains a temporary v1 self-gate until a
+  dedicated source bootstrap supplies its v2 replacement.
+
 ## Next Steps
 
-1. Merge the schema-v3 bounded-writer/scheduler-quiescence hardening, update
-   the reviewed live manifest with its exact private scheduler identity, and
-   run a fresh `quiesce-scheduler` preview/apply.
-2. Only after quiesce has read back `disabled_manually` plus a stable terminal
-   scheduler epoch, run a new `activate` preview. If it succeeds, apply its
-   immediately matching exact plan digest and record the stable
-   dual-protection readback; then run the separately previewed
-   `restore-scheduler`. Do not begin repository cleanup or old-rule cutover in
-   the same step.
-3. Under the later, separately maintained policy-mutation freeze, execute the
-   receipt-bound cleanup and old v1 required-status removal; remove temporary
-   bridges only in separate consumer PRs after a final read-only receipt.
+1. Keep the temporary legacy bridges installed. Before any active-cohort
+   bridge-removal PR, obtain a fresh applicable policy-mutation freeze and
+   repair or extend the post-activation stable-reader path enough to mint the
+   canonical schema-2 final read-only closure receipt against the now-cut-over
+   state. That receipt cannot authorize a source-local bridge outside the
+   frozen cohort.
+2. Treat the cohort v1 status transition as complete: do not restore
+   `codex/review-gate` in the old organization rule or on any fixed active
+   cohort repository. The old organization ruleset intentionally remains Active
+   only for deletion and non-fast-forward protection, including the archived
+   legacy-only repository.
+3. Bootstrap `Joey-Tools/codex-review-gate` separately, then replace the
+   independent source ruleset `16410326` v1 status requirement through a
+   separate v2 rule; preserve its non-status protections. That source-local
+   exception is outside the frozen 10-member cohort and must not be used to
+   expand the organization closure receipt or bridge-removal scope.
+4. If a durable provenance record is needed, investigate the observed v2
+   activation separately; it is not required for the currently verified policy
+   state and was intentionally deferred by the switch-first decision.
 
 ## Evidence
 
