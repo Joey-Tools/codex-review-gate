@@ -2098,10 +2098,14 @@ test("package docs preserve reaction liveness and pending recovery semantics", (
       /ordinary[\s\S]{0,100}\+1[\s\S]{0,100}(?:cannot|does not|不能|不得)[\s\S]{0,80}(?:head-bind|绑定)/iu,
       name,
     );
-    assert.match(guide, /same(?:-time| timestamp)?\/later official `?eyes`?\/progress/iu, name);
     assert.match(
       guide,
-      /later\s+provider\s+event\s+or\s+manual\s+reconcile/iu,
+      /(?:same(?:-time| timestamp)?\/later official `?eyes`?\/progress|official[\s\S]{0,80}`?eyes`?[\s\S]{0,120}progress[\s\S]{0,160}(?:same(?:-time| timestamp)?|later|同时|更晚))/iu,
+      name,
+    );
+    assert.match(
+      guide,
+      /later\s+provider\s+event\s+(?:or|或)\s+manual\s+reconcile/iu,
       name,
     );
     assert.match(

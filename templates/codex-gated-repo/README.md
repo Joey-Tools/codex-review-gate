@@ -33,12 +33,14 @@ The default runner is `ubuntu-slim`. Set the repository Actions variable
 may set `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`. There are no numeric limit
 overrides.
 
-Ordinary review-request authors are accepted at any repository permission by
-default. This is only the gate's generation-attribution policy: it recognizes
-an exact ordinary request as a generation boundary. It does not grant the
-commenter permission to invoke or control Codex review; GitHub and Codex still
-decide whether a provider review starts. Without qualifying official-bot
-evidence, the gate remains pending. Canonical workflows set
+Ordinary review-request authors are admitted as candidates at any repository
+permission by default. This is only the gate's generation-attribution policy:
+an exact ordinary request becomes a boundary only after the official Codex Bot
+directly attaches a strictly post-revision `eyes` or `+1` receipt to that same
+comment. It does not grant the commenter permission to invoke or control Codex
+review; GitHub and Codex still decide whether a provider review starts. An
+unconfirmed candidate cannot preempt or invalidate an existing clean.
+Canonical workflows set
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly and do not expose it
 as a repository variable or Action input. The strict `write`/`maintain`/`admin`
 path is reserved for a nonstandard future verifier identity that can read

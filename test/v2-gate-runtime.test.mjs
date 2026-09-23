@@ -1014,13 +1014,8 @@ test("after a base epoch only a direct canonical-request +1 can recover clean", 
     crossedBoundaryEnvironment,
     crossedBoundaryGitHub,
   );
-  assert.equal(crossedBoundary.report.gateOutcome, "pending");
-  assert.equal(crossedBoundary.report.recoveryCode, "request_clean_generation");
-  assert.match(crossedBoundary.report.reason, /newer request 102 already existed/iu);
-  assert.equal(
-    crossedBoundaryGitHub.statusWrites.some(({ state }) => state === "success"),
-    false,
-  );
+  assert.equal(crossedBoundary.report.gateOutcome, "success");
+  assert.equal(crossedBoundary.report.recoveryCode, "none");
 });
 
 test("same-head old-base requests remain physical after a base epoch without positive authority", async (context) => {
@@ -3059,8 +3054,13 @@ test("semantic safe reads retry GraphQL and GET transport or decode failures", a
 
   for (const { suffix, route, firstResponse } of cases) {
     let intercepted = false;
+    const request = ordinaryRequest();
     const github = createGitHubMock({
-      issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+      issueComments: [request, cleanIssueComment(HEAD)],
+      reactionsByCommentId: new Map([[String(request.id), [reaction({
+        content: "eyes",
+        created_at: "2026-08-25T08:00:30Z",
+      })]]]),
       requestInterceptor: (request) => {
         if (!intercepted && route(request)) {
           intercepted = true;
@@ -3147,8 +3147,13 @@ test("safe-read exhaustion is retry-safe but deterministic schema and size failu
 });
 
 test("base-epoch GraphQL accepts unrelated timeline items with no filtered event", async (context) => {
+  const request = ordinaryRequest();
   const github = createGitHubMock({
-    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    issueComments: [request, cleanIssueComment(HEAD)],
+    reactionsByCommentId: new Map([[String(request.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:00:30Z",
+    })]]]),
     baseEpochResponseMutator: (response) => ({
       ...response,
       data: {
@@ -3203,11 +3208,19 @@ test("pull_request edited is rejected before GitHub API access", async (context)
 });
 
 test("pull_request verifier fails closed for altered launch or target bindings", async (context) => {
-  const successEvidence = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  const successRequest = ordinaryRequest();
+  const successEvidence = [successRequest, cleanIssueComment(HEAD)];
+  const successReactions = new Map([[String(successRequest.id), [reaction({
+    content: "eyes",
+    created_at: "2026-08-25T08:00:30Z",
+  })]]]);
   const bindingReason =
     "The pull_request verifier is not bound to the exact current PR head, base, and " +
     "test-merge commit";
-  const controlGitHub = createGitHubMock({ issueComments: successEvidence });
+  const controlGitHub = createGitHubMock({
+    issueComments: successEvidence,
+    reactionsByCommentId: successReactions,
+  });
   const controlEnvironment = runtimeEnvironment(context, {
     suffix: "pull-request-binding-control",
   });
@@ -3336,6 +3349,7 @@ test("pull_request verifier fails closed for altered launch or target bindings",
     scenario.mutateEnvironment?.(environment);
     const github = createGitHubMock({
       issueComments: successEvidence,
+      reactionsByCommentId: successReactions,
       ...scenario.githubOptions,
     });
     const { result } = await runGate(environment, github);
@@ -3357,7 +3371,12 @@ test("pull_request verifier fails closed for altered launch or target bindings",
 });
 
 test("pull_request verifier accepts an unavailable or historical event test-merge SHA", async (context) => {
-  const successEvidence = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  const successRequest = ordinaryRequest();
+  const successEvidence = [successRequest, cleanIssueComment(HEAD)];
+  const successReactions = new Map([[String(successRequest.id), [reaction({
+    content: "eyes",
+    created_at: "2026-08-25T08:00:30Z",
+  })]]]);
   for (const [label, mergeCommitSha] of [
     ["missing", null],
     ["historical", NEXT_HEAD],
@@ -3368,7 +3387,10 @@ test("pull_request verifier accepts an unavailable or historical event test-merg
       suffix: `pull-request-event-test-merge-${label}`,
       event,
     });
-    const github = createGitHubMock({ issueComments: successEvidence });
+    const github = createGitHubMock({
+      issueComments: successEvidence,
+      reactionsByCommentId: successReactions,
+    });
     const { result } = await runGate(environment, github);
     assert.equal(result.exitCode, 0, label);
     assert.equal(result.report.gateOutcome, "success", label);
@@ -3406,8 +3428,13 @@ test("pull_request verifier fails closed when the fresh PR has no test-merge SHA
 });
 
 test("test-merge drift between complete snapshots invalidates verifier success", async (context) => {
+  const request = ordinaryRequest();
   const github = createGitHubMock({
-    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    issueComments: [request, cleanIssueComment(HEAD)],
+    reactionsByCommentId: new Map([[String(request.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:00:30Z",
+    })]]]),
     pullRequestSequence: [
       {},
       {},
@@ -3432,7 +3459,7 @@ test("terminal clean without an authorized request generation cannot pass", asyn
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("ordinary writer request admits exact terminal line endings and queries liveness reactions", async (context) => {
+test("default-any ordinary requests need an official direct receipt before becoming generations", async (context) => {
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
     updated_at: "2026-08-25T08:02:00Z",
@@ -3446,7 +3473,8 @@ test("ordinary writer request admits exact terminal line endings and queries liv
     const terminalGitHub = createGitHubMock({ issueComments: [ordinary, terminal] });
     const terminalEnvironment = runtimeEnvironment(context, { suffix });
     const { result: terminalResult } = await runGate(terminalEnvironment, terminalGitHub);
-    assert.equal(terminalResult.report.gateOutcome, "success", suffix);
+    assert.equal(terminalResult.report.gateOutcome, "pending", suffix);
+    assert.equal(terminalResult.report.recoveryCode, "wait_provider", suffix);
     assert.equal(
       terminalGitHub.calls.some((call) => call.path.endsWith(`/commits/${HEAD}`)),
       false,
@@ -3460,6 +3488,38 @@ test("ordinary writer request admits exact terminal line endings and queries liv
   }
 
   const ordinary = ordinaryRequest();
+
+  const acknowledgedGitHub = createGitHubMock({
+    issueComments: [ordinary, terminal],
+    reactionsByCommentId: new Map([[String(ordinary.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
+  });
+  const acknowledgedEnvironment = runtimeEnvironment(context, {
+    suffix: "ordinary-official-acknowledgement",
+  });
+  const { result: acknowledgedResult } = await runGate(
+    acknowledgedEnvironment,
+    acknowledgedGitHub,
+  );
+  assert.equal(acknowledgedResult.report.gateOutcome, "success");
+
+  const plusOneAcknowledgedGitHub = createGitHubMock({
+    issueComments: [ordinary, terminal],
+    reactionsByCommentId: new Map([[String(ordinary.id), [reaction({
+      content: "+1",
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
+  });
+  const plusOneAcknowledgedEnvironment = runtimeEnvironment(context, {
+    suffix: "ordinary-official-plus-one-acknowledgement",
+  });
+  const { result: plusOneAcknowledgedResult } = await runGate(
+    plusOneAcknowledgedEnvironment,
+    plusOneAcknowledgedGitHub,
+  );
+  assert.equal(plusOneAcknowledgedResult.report.gateOutcome, "success");
 
   for (const [suffix, createdAt] of [
     ["ordinary-active-same-time", "2026-08-25T08:02:00Z"],
@@ -3494,7 +3554,8 @@ test("ordinary writer request admits exact terminal line endings and queries liv
     untrustedEyesEnvironment,
     untrustedEyesGitHub,
   );
-  assert.equal(untrustedEyesResult.report.gateOutcome, "success");
+  assert.equal(untrustedEyesResult.report.gateOutcome, "pending");
+  assert.equal(untrustedEyesResult.report.recoveryCode, "wait_provider");
 
   const reactionGitHub = createGitHubMock({
     issueComments: [ordinary],
@@ -3507,6 +3568,93 @@ test("ordinary writer request admits exact terminal line endings and queries liv
     reactionGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
     true,
   );
+});
+
+test("an unacknowledged default-any request cannot preempt an established generation", async (context) => {
+  const generation = workflowRequest({
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:00:00Z",
+  });
+  const unacknowledged = ordinaryRequest({
+    id: 102,
+    user: READER,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const clean = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [generation, unacknowledged, clean],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "unacknowledged-default-any-cannot-preempt",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(
+    github.calls.some((call) => /\/collaborators\/[^/]+\/permission$/u.test(call.path)),
+    false,
+  );
+});
+
+test("an official receipt promotes a default-any candidate into a new generation", async (context) => {
+  const generation = workflowRequest({
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:00:00Z",
+  });
+  const clean = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const candidate = ordinaryRequest({
+    id: 102,
+    user: READER,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const acknowledgedGitHub = createGitHubMock({
+    issueComments: [generation, clean, candidate],
+    reactionsByCommentId: new Map([[String(candidate.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const acknowledgedEnvironment = runtimeEnvironment(context, {
+    suffix: "default-any-official-receipt-preempts",
+  });
+  const { result: acknowledged } = await runGate(
+    acknowledgedEnvironment,
+    acknowledgedGitHub,
+  );
+  assert.equal(acknowledged.exitCode, 1);
+  assert.equal(acknowledged.report.gateOutcome, "pending");
+  assert.equal(acknowledged.report.recoveryCode, "wait_provider");
+
+  const laterClean = cleanIssueComment(HEAD, {
+    id: 202,
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const settledGitHub = createGitHubMock({
+    issueComments: [generation, clean, candidate, laterClean],
+    reactionsByCommentId: new Map([[String(candidate.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:03:00Z",
+    })]]]),
+  });
+  const settledEnvironment = runtimeEnvironment(context, {
+    suffix: "default-any-official-receipt-settled",
+  });
+  const { result: settled } = await runGate(settledEnvironment, settledGitHub);
+  assert.equal(settled.exitCode, 1);
+  assert.equal(settled.report.gateOutcome, "pending");
+  assert.equal(settled.report.recoveryCode, "request_clean_generation");
+  assert.match(settled.report.reason, /cannot be uniquely attributed/u);
 });
 
 test("request-author write policy is opt-in and the default any policy skips collaborator lookup", async (context) => {
@@ -3547,7 +3695,13 @@ test("request-author write policy is opt-in and the default any policy skips col
   assert.equal(forbiddenResult.report.recoveryCode, "repair_permissions");
   assert.equal(forbiddenGitHub.statusWrites.some(({ state }) => state === "success"), false);
 
-  const defaultGitHub = createGitHubMock({ issueComments: [request, terminal] });
+  const defaultGitHub = createGitHubMock({
+    issueComments: [request, terminal],
+    reactionsByCommentId: new Map([[String(request.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
+  });
   const defaultEnvironment = runtimeEnvironment(context, { suffix: "permission-default-any" });
   const { result: defaultResult } = await runGate(defaultEnvironment, defaultGitHub);
   assert.equal(defaultResult.report.gateOutcome, "success");
@@ -5827,7 +5981,14 @@ test("short Reviewed commit is accepted only through GitHub unambiguous resoluti
     created_at: "2026-08-25T08:02:00Z",
     updated_at: "2026-08-25T08:02:00Z",
   });
-  const github = createGitHubMock({ issueComments: [request, terminal] });
+  const requestAcknowledgement = new Map([[String(request.id), [reaction({
+    content: "eyes",
+    created_at: "2026-08-25T08:01:00Z",
+  })]]]);
+  const github = createGitHubMock({
+    issueComments: [request, terminal],
+    reactionsByCommentId: requestAcknowledgement,
+  });
   const environment = runtimeEnvironment(context, { suffix: "short-resolved" });
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "success");
@@ -5835,6 +5996,7 @@ test("short Reviewed commit is accepted only through GitHub unambiguous resoluti
 
   const ambiguousGitHub = createGitHubMock({
     issueComments: [request, terminal],
+    reactionsByCommentId: requestAcknowledgement,
     commitResolution: () => ({ status: 422, message: "short SHA is ambiguous" }),
   });
   const ambiguousEnvironment = runtimeEnvironment(context, { suffix: "short-ambiguous" });
@@ -5850,6 +6012,7 @@ test("short Reviewed commit is accepted only through GitHub unambiguous resoluti
   });
   const redirectedGitHub = createGitHubMock({
     issueComments: [request, redirectedTerminal],
+    reactionsByCommentId: requestAcknowledgement,
     commitResolution: () => ({ data: { sha: HEAD } }),
   });
   const redirectedEnvironment = runtimeEnvironment(context, {
@@ -5868,9 +6031,15 @@ test("short Reviewed commit is accepted only through GitHub unambiguous resoluti
 
 test("approved review short commit also requires GitHub resolution and native commit agreement", async (context) => {
   const short = HEAD.slice(0, 10);
+  const request = ordinaryRequest();
+  const requestAcknowledgement = new Map([[String(request.id), [reaction({
+    content: "eyes",
+    created_at: "2026-08-25T08:01:00Z",
+  })]]]);
   const resolvedGitHub = createGitHubMock({
-    issueComments: [ordinaryRequest()],
+    issueComments: [request],
     reviews: [approvedReview(short)],
+    reactionsByCommentId: requestAcknowledgement,
   });
   const resolvedEnvironment = runtimeEnvironment(context, { suffix: "approved-short" });
   const { result: resolved } = await runGate(resolvedEnvironment, resolvedGitHub);
@@ -5878,8 +6047,9 @@ test("approved review short commit also requires GitHub resolution and native co
   assert.ok(resolvedGitHub.calls.some((call) => call.path.endsWith(`/commits/${short}`)));
 
   const ambiguousGitHub = createGitHubMock({
-    issueComments: [ordinaryRequest()],
+    issueComments: [request],
     reviews: [approvedReview(short)],
+    reactionsByCommentId: requestAcknowledgement,
     commitResolution: () => ({ status: 422, message: "short SHA is ambiguous" }),
   });
   const ambiguousEnvironment = runtimeEnvironment(context, {
@@ -6019,15 +6189,20 @@ test("a current cross-channel timestamp ambiguity cannot publish success", async
 });
 
 test("historical findings are counted without being silently treated as current", async (context) => {
+  const request = ordinaryRequest();
   const github = createGitHubMock({
     issueComments: [
-      ordinaryRequest(),
+      request,
       cleanIssueComment(HEAD, {
         created_at: "2026-08-25T08:10:00Z",
         updated_at: "2026-08-25T08:10:00Z",
       }),
     ],
     reviews: [findingReview(OLD_HEAD, { submitted_at: "2026-08-25T08:05:00Z" })],
+    reactionsByCommentId: new Map([[String(request.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
   });
   const environment = runtimeEnvironment(context);
   const { result } = await runGate(environment, github);
@@ -6076,6 +6251,10 @@ test("older malformed and provider-identity errors become historical after a str
   });
   const github = createGitHubMock({
     issueComments: [malformed, invalidProvider, generation, clean],
+    reactionsByCommentId: new Map([[String(generation.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:12:00Z",
+    })]]]),
   });
   const environment = runtimeEnvironment(context, { suffix: "historical-malformed" });
   const { result } = await runGate(environment, github);
@@ -6169,6 +6348,10 @@ test("old-head malformed review errors can recover but current-generation provid
   const recoveredGitHub = createGitHubMock({
     issueComments: [generation, clean],
     reviews: [oldHeadMalformed, oldHeadInvalidProvider],
+    reactionsByCommentId: new Map([[String(generation.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:12:00Z",
+    })]]]),
   });
   const recoveredEnvironment = runtimeEnvironment(context, {
     suffix: "old-head-malformed-recovered",

@@ -258,10 +258,14 @@ finding 都会阻塞。
 ### Review generations
 
 authorised generation 只能由一条 exact、未编辑的 `@codex review` request 建立。
-其 first visible line 必须 exact，且没有其他 visible text。普通 request author 默认
-不受 repository permission 阈值限制。这只是 gate attribution：不授予 commenter 调用或
-控制 Codex review 的权限，provider 是否真正启动仍由 GitHub/Codex 决定。canonical
-workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不暴露 standard
+其 first visible line 必须 exact，且没有其他 visible text。默认 `any` policy 下，任意
+repository permission 的 ordinary request author 只会作为未确认 candidate 被纳入。
+只有 official Codex Bot 在同一 comment 上添加严格晚于当前 revision 的直接 `eyes` 或
+`+1` receipt，它才成为 generation boundary。仅仅在 PR 其他位置后来出现 terminal 或
+progress carrier 不能建立这个因果链接。这只是 gate attribution：不授予 commenter 调用或
+控制 Codex review 的权限，provider 是否真正启动仍由 GitHub/Codex 决定。未确认 candidate
+不能 reset、抢占或使已建立的 clean 失效。canonical workflow 固定
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不暴露 standard
 strict-policy setting。更严格的 `write` threshold（`write`、`maintain` 或 `admin`）仅保留给
 将来可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only
 verifier token 无法可靠做到。workflow-authored request 还需要 exact v2 marker，绑定 full
@@ -272,10 +276,11 @@ provider findings 不受 request-author permission 影响，始终阻塞。
 
 terminal clean text 与符合条件的 provider `+1`，只有在没有 base epoch、single-flight
 lineage 的第一个物理 generation 中才是同等 clean carriers。物理 boundary 识别与
-positive authority 必须分开。每条可能触发 provider 的 request-shaped comment 都恰好是
-一个 boundary，包括 duplicate marker，以及 edited、malformed、wrong-author 或 denied
-request。physical-only boundary 没有 binding 或 positive authority。在 nonstandard `write`
-threshold 下，形状合法的 ordinary request 必须先查询 author permission（同一 snapshot
+positive authority 必须分开。未确认 default-`any` ordinary candidate 明确不是 physical
+boundary。其他每条可能触发 provider 的 request-shaped comment 都恰好是一个 boundary，
+包括 duplicate marker，以及 edited、malformed、wrong-author 或 denied request。
+physical-only boundary 没有 binding 或 positive authority。在 nonstandard `write` threshold
+下，形状合法的 ordinary request 必须先查询 author permission（同一 snapshot
 内按 author 缓存），才能判定为 denied；判定后不再触发 reaction 或 exact-refetch
 fan-out。更早因 shape、author 或 binding 无效而拒绝的 boundary，不触发 permission、
 reaction 或 exact-refetch fan-out。每个已观察到的 `CommentDeletedEvent` 都在事件时间形成
@@ -311,10 +316,12 @@ liveness，也不能给其他 carrier 同样豁免。
 base 的 canonical workflow request 上的合格 `+1`，才能作为 positive 或
 superseding carrier。无法归因的 terminal clean 只保留为 diagnostic evidence，不能
 pass 或清除 finding。这是 carrier parity 的明确 fail-closed 例外。
-ordinary request reactions 仅用于 provider liveness；ordinary `+1` 不能 head-bind
-clean。same-time/later official `eyes`/progress from Codex 会 veto candidate clean
-evidence。由于 reaction change 不触发 consumer workflow，必须由 later provider
-event or manual reconcile 观察 settled state。terminal carrier 包含 reviewed commit
+未确认 default-`any` ordinary candidate 上，official 直接且严格 post-revision 的 `eyes`
+或 `+1` 先是 receipt，用于把它升级为 boundary。升级后 ordinary request reactions 才
+仅用于 provider liveness；ordinary `+1` 不能 head-bind clean。same-time/later official
+`eyes`/progress from Codex 会 veto candidate clean evidence。由于 reaction change 不触发
+consumer workflow，必须由 later provider event or manual reconcile 观察 settled state。
+terminal carrier 包含 reviewed commit
 时，只有 GitHub 能把 full/abbreviated SHA 无歧义
 解析为 current bound head 才接受。对于 PR review，resolved commit 还必须等于
 native `commit_id`。没有 match 或存在多个 relevant match 的 short prefix 属于

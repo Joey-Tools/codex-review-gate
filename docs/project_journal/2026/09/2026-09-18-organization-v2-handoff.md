@@ -877,12 +877,26 @@ evidence that a prior freeze remains in force.
   fallback is also `any`; they expose no repository variable or public Action
   input for strict policy. `write` remains only a nonstandard future runtime
   mode for a verifier identity that can read collaborator permissions.
-- `any` relaxes only the gate's attribution of an already-observed exact,
-  unedited ordinary `@codex review` comment as a generation boundary. It does
-  not grant the commenter permission to invoke Codex and does not guarantee
-  provider eligibility or delivery. Missing official Codex evidence remains
-  pending, while every qualifying Codex finding remains blocking. This accepts
-  the limited cost/pending-denial surface without permitting a synthetic pass.
+- `any` relaxes only the verifier's collaborator-permission lookup. An
+  already-observed exact, unedited ordinary `@codex review` comment is an
+  unconfirmed candidate, not a generation boundary: it becomes one only after
+  the official Codex Bot directly attaches a strictly post-revision `eyes` or
+  `+1` receipt to that exact comment. A later terminal/progress carrier
+  elsewhere cannot establish this causal receipt. This does not grant the
+  commenter permission to invoke Codex and does not guarantee provider
+  eligibility or delivery. Missing official Codex evidence remains pending,
+  while every qualifying Codex finding remains blocking.
+- This candidate/receipt split repairs a P1 denial-of-service regression in
+  the initial literal-`any` implementation: any commenter able to post the
+  exact text could otherwise create an unbound successor boundary after a
+  legitimate generation, making its clean terminal unlineaged and forcing the
+  required check back to pending even when Codex never accepted the new
+  comment. Candidates remain in the fully paginated snapshot, exact-refetch
+  and reaction inventory so a later receipt is observed through the existing
+  stable-snapshot protocol; only generation/lineage reduction excludes them
+  before that receipt. This preserves fail-closed behavior for findings and
+  genuine provider-confirmed flights without treating arbitrary user comments
+  as provider capability.
 - Existing consumer workflow copies that map an unset variable to `write` must
   receive the new hard-coded-`any` canonical wrapper before they gain this
   default; the floating Action alias alone cannot override an environment value

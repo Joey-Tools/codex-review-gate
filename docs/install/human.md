@@ -76,12 +76,16 @@ boundaries that an Action step cannot define:
   REST endpoints. Neither workflow has `issues: write`, `statuses: write`,
   `checks: write`, or `contents: write`.
 
-By default, an ordinary human-authored exact `@codex review` request is accepted
-as a review-generation boundary at any repository permission. This is a gate
-attribution decision, not permission to invoke Codex and not a guarantee that
-Codex starts; provider-side eligibility and delivery decide that separately.
-Without qualifying official-bot evidence, the gate remains pending. Canonical
-workflows set `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly; do
+By default, an ordinary human-authored exact `@codex review` request is admitted
+as a candidate at any repository permission, not as an immediate
+review-generation boundary. It becomes a boundary only when the official Codex
+Bot directly adds a strictly post-revision `eyes` or `+1` receipt to that exact
+comment. This is a gate attribution decision, not permission to invoke Codex
+and not a guarantee that Codex starts; provider-side eligibility and delivery
+decide that separately. A terminal or progress carrier elsewhere on the PR
+cannot establish that causal receipt, so an unconfirmed candidate cannot
+preempt an existing clean. Canonical workflows set
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly; do
 not add a repository variable, public Action input, or strict policy to an
 ordinary consumer. The `write`/`maintain`/`admin` path is reserved for a future
 nonstandard verifier identity allowed to read collaborator permissions, which
@@ -93,13 +97,16 @@ The consumer workflows have no cron, `repository_dispatch`,
 `pull_request_target`, automatic `pull_request_review` writer, runtime GitHub
 App, status bridge or ledger. Evidence is rebuilt by the selected verifier.
 
-Reactions on a qualifying ordinary, unmarked `@codex review` request are read
-only as provider-liveness evidence. An ordinary `+1` cannot independently
-create head-bound clean evidence. An official Codex `eyes` reaction or
-progress artifact at the same time as or later than candidate terminal clean
-evidence vetoes success because review activity is still current. Reaction
-changes do not themselves start a consumer job, so let a later qualifying bot
-comment run the gate or dispatch a manual exact-head `reconcile`.
+An official Codex `eyes` or `+1` reaction directly attached to an unconfirmed
+ordinary, unmarked `@codex review` request and strictly after its current
+revision is first its receipt: it promotes that candidate into a boundary.
+After promotion, reactions are read as provider-liveness evidence. An ordinary
+`+1` still cannot independently create head-bound clean evidence. An official
+Codex `eyes` reaction or progress artifact at the same time as or later than
+candidate terminal clean evidence vetoes success because review activity is
+still current. Reaction changes do not themselves start a consumer job, so let
+a later qualifying bot comment run the gate or dispatch a manual exact-head
+`reconcile`.
 For predecessor-to-successor generation closure, liveness at the same timestamp
 as the successor request is also ambiguous and keeps the predecessor open.
 Once a second physical request boundary exists, an unbound terminal cannot
@@ -110,9 +117,11 @@ directly on the corresponding canonical request. With a base epoch, every gap
 does. Physical boundaries and positive authority are separate: an edited,
 malformed, wrong-author, denied, or stale-base request can remain a boundary
 without gaining authority. A new head recovers an unclosed gap only when every
-ambiguous predecessor is explicitly bound to a different full head. If any
-predecessor is ordinary, deleted, or otherwise unbound, create a replacement
-PR, run one canonical producer there, validate it, and close the ambiguous PR.
+ambiguous predecessor is explicitly bound to a different full head. An
+unconfirmed default-`any` ordinary candidate is not a predecessor. If any
+provider-confirmed ordinary, deleted, or otherwise unbound predecessor
+remains, create a replacement PR, run one canonical producer there, validate
+it, and close the ambiguous PR.
 Explicitly commit-bound progress is scoped to that head. Every unbound progress
 carrier remains in the current inventory because nearby request timestamps do
 not prove its source. An edited terminal also contributes an unbound unknown-
@@ -1066,11 +1075,14 @@ equivalent to exact `@codex review`. Do not accept or emit any other
 whitespace, visible text, or hidden comment.
 
 This is the preferred path because it does not spend Actions minutes merely to
-create the request. A later qualifying `created` Codex bot comment wakes the
-controller, which establishes a strictly newer full verifier attempt. Editing
-an existing comment does not wake the controller; if that edited carrier needs
-evaluation, run a manual reconcile. If the provider result arrives only as a
-review or reaction, or another recovery is needed, run a manual reconcile.
+create the request. Until the official Codex Bot directly attaches a strictly
+post-revision `eyes` or `+1` receipt to that exact comment, it is only a
+candidate and cannot invalidate an existing clean. A later qualifying
+`created` Codex bot comment wakes the controller, which establishes a strictly
+newer full verifier attempt. Editing an existing comment does not wake the
+controller; if that edited carrier needs evaluation, run a manual reconcile.
+If the provider result arrives only as a review or reaction, or another
+recovery is needed, run a manual reconcile.
 
 ### Dual-protection legacy-status recovery
 
@@ -1380,8 +1392,9 @@ If the head changes, stop and reread the summary plus the complete physical
 lineage; never accept success from an older commit or automatically start a
 same-PR generation. Continue on the new head only when every ambiguous
 predecessor is explicitly bound to a different full head. An unclosable
-ordinary, edited, malformed, denied, deleted, or otherwise unbound predecessor
-requires a replacement PR.
+provider-confirmed ordinary, edited, malformed, denied, deleted, or otherwise
+unbound predecessor requires a replacement PR. An unconfirmed default-`any`
+ordinary candidate does not.
 
 ## 4. Activate and close the canary
 

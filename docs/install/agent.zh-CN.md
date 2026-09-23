@@ -840,10 +840,12 @@ steps 从 protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派�
 
 Canonical workflow 直接设定
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`：它让 verifier 接受已观察到的 exact
-ordinary request author，且不查询 collaborator permission。这不授予 commenter 调用 Codex
-的权限，也不保证 Codex 会启动；provider-side eligibility 与 delivery 独立决定，缺少
-official-bot evidence 时仍保持 pending。不要把 nonstandard `write`/`maintain`/`admin` policy
-加入普通 consumer：它需要 verifier identity 可读取 collaborator permission，而 bundled
+ordinary request author 作为 candidate，且不查询 collaborator permission。只有 official
+Codex Bot 在同一 comment 上直接添加严格晚于当前 revision 的 `eyes` 或 `+1` receipt，它才
+成为 generation boundary。这不授予 commenter 调用 Codex 的权限，也不保证 Codex 会启动；
+provider-side eligibility 与 delivery 独立决定，未确认 candidate 不能抢占既有 clean。不要把
+nonstandard `write`/`maintain`/`admin` policy 加入普通 consumer：它需要 verifier identity
+可读取 collaborator permission，而 bundled
 read-only verifier token 无法可靠做到。该设置不会让合格 finding 失去阻塞效力。
 
 ## 阶段 2：暂存并验证 Disabled ruleset
@@ -950,7 +952,9 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。
    Caller-authored event 会被 pre-runner bot filter 跳过，Codex bot 之后的
    合格 `issue_comment` `created` event 才启动 controller workflow。编辑既有 comment 不会启动它，
-   需要重新评估时手动 reconcile。Review 或 reaction 本身没有自动 consumer job。
+   需要重新评估时手动 reconcile。Review 或 reaction 本身没有自动 consumer job。把这个
+   direct comment 只当作 candidate，直到 official Codex Bot 在同一条 comment 上直接添加
+   严格 post-revision 的 `eyes` 或 `+1` reaction；PR 其他位置的 terminal 不能代替该 receipt。
 
    ### Dual-protection legacy-status recovery
 
@@ -1104,22 +1108,25 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    加入 `workflow_dispatch`、`pull_request_review`、`pull_request_review_comment`、cron 或新的 status
    writer。
 
-   Authorized ordinary、无 marker request 上的 reactions 只表示 liveness；普通 request 上
-   的 `+1` 不能独立产生 head-bound clean evidence。若 official Codex `eyes` reaction 或
-   progress artifact 的时间与候选 terminal clean 相同或更晚，则 veto success。若该 liveness
-   变化没有伴随后续合格 bot comment event，必须手动 dispatch exact-head `reconcile` 才能
-   观察到它。
+   未确认 default-`any` ordinary、无 marker request 上，official 直接且严格 post-revision
+   的 `eyes` 或 `+1` reaction 首先是 receipt：它把 candidate 升级为 boundary。升级后
+   reactions 才只表示 liveness；普通 request 上的 `+1` 不能独立产生 head-bound clean
+   evidence。若 official Codex `eyes` reaction 或 progress artifact 的时间与候选 terminal
+   clean 相同或更晚，则 veto success。若该 liveness 变化没有伴随后续合格 bot comment event，
+   必须手动 dispatch exact-head `reconcile` 才能观察到它。
 
    在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
    liveness 也无法排序，必须保持 predecessor open。原 gap 外的 evidence 不能修补它。
    只有每个歧义 predecessor 都显式绑定另一个 full head 时，新 head 才是有效 reset；若
-   存在 ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，并在其中
-   只运行一个 canonical review generation。
+   未确认 default-`any` ordinary candidate 不是 predecessor。若存在 provider-confirmed
+   ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，并在其中只运行一个
+   canonical review generation。
 
-   把每条物理 request 都视为 generation boundary。没有 base epoch 时，unbound provider
-   terminal evidence 只能闭合第一个 gap；只要前面已有物理 request，之后的每个 gap 和
-   positive/superseding authority 都必须来自直接附着在对应 canonical request 上的合格
-   `+1`。有 base epoch 时，每个 gap 都必须使用 direct `+1`。绝不能只按 timestamp 把
+   把每条物理 request（未确认 default-`any` ordinary candidate 除外）都视为 generation
+   boundary。没有 base epoch 时，unbound provider terminal evidence 只能闭合第一个 gap；
+   只要前面已有物理 request，之后的每个 gap 和 positive/superseding authority 都必须来自
+   直接附着在对应 canonical request 上的合格 `+1`。有 base epoch 时，每个 gap 都必须使用
+   direct `+1`。绝不能只按 timestamp 把
    later terminal 归给新 generation；它可能是旧 flight 的延迟或重复 carrier。每条可能
    触发 provider 的 request shape 都是物理 boundary，即使它 edited、malformed、
    wrong-author、denied 或 stale-base；这些条件只移除 positive authority，不移除可能的
@@ -1153,8 +1160,8 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
      `request_review=true`；要求生成的 request 上出现合格 direct `+1` 后再 reconcile。
    - 若存在 historical gap，但每个歧义 predecessor 都显式绑定另一个 full head，则创建
      一个有实际意义的新 head，并在其中只运行一个 canonical generation。
-   - 若 reason 指出不可闭合的 historical gap，且其中含 ordinary、edited、malformed、
-     denied、deleted 或其他 unbound predecessor，不得在该 PR/head 再发送 direct 或 controller
+   - 若 reason 指出不可闭合的 historical gap，且其中含 provider-confirmed ordinary、edited、
+     malformed、denied、deleted 或其他 unbound predecessor，不得在该 PR/head 再发送 direct 或 controller
      request，也不能依赖仅修改 commit 来 reset。应从目标 branch/commits 新建 replacement
      PR，只运行一个 canonical producer；验证通过后关闭旧歧义 PR。
 
@@ -1179,13 +1186,14 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    `request_review=false` 是高级 best-effort path。若使用，先等该 controller run 完成，
    再发 fresh direct request。
 
-   同一 head 上绝不重叠 direct 与 controller producers。每条 request 都会开始一个 review
-   generation，而 Codex terminal text 不携带 originating request ID。前一 generation 尚未
+   同一 head 上绝不重叠 direct 与 controller producers。每条 provider-confirmed request 才会
+   开始一个 review generation，而 Codex terminal text 不携带 originating request ID。前一 generation 尚未
    terminal-closed 时出现新 request，v2 会刻意保留 unclosed lineage gap 并让 verifier
    保持 pending；原 predecessor-to-successor window 外到达的 evidence 不能修复已经发生的
    ordering。若每个歧义 predecessor 都 canonical 绑定到另一个 full head，生成一个有实际
-   意义的新 head，只允许一个 canonical generation 运行。若存在 ordinary、edited、
-   malformed、denied、deleted 或其他 unbound predecessor，应从目标 branch/commits 新建 replacement
+   意义的新 head，只允许一个 canonical generation 运行。未确认 default-`any` ordinary candidate
+   不是 predecessor。若存在 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他
+   unbound predecessor，应从目标 branch/commits 新建 replacement
    PR，只运行一个 canonical generation；验证通过后关闭旧歧义 PR。
 
 5. 每次 dispatch 后只列出 `DISPATCHED_AT` 之后的新 run：
@@ -1209,8 +1217,9 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
 
 1. 刷新 `CANARY_HEAD`。发生变化时先停止，重读 summary 与完整 physical lineage；不得自动在
    同一 PR 启动另一 generation。只有每个歧义 predecessor 都显式绑定不同 full head 时，
-   才能在 new head 继续。若 ordinary、edited、malformed、denied、deleted 或其他 unbound
-   predecessor 留下不可闭合的 historical gap，应按上文改用 replacement PR。
+   才能在 new head 继续。未确认 default-`any` ordinary candidate 不是 predecessor。若
+   provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor
+   留下不可闭合的 historical gap，应按上文改用 replacement PR。
 2. 执行 final exact-head reconcile：
 
    ```bash

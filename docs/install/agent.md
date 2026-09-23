@@ -974,11 +974,14 @@ The canonical workflows must have this contract after the merge:
 
 Canonical workflows set
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly. This accepts an
-already-observed exact ordinary request author at any repository permission
-without a collaborator lookup. It does not grant the commenter permission to
-invoke Codex or ensure that Codex starts; provider-side eligibility and delivery
-remain independent, and missing official-bot evidence stays pending. Do not add
-the nonstandard `write`/`maintain`/`admin` policy to an ordinary consumer: it
+already-observed exact ordinary request author at any repository permission as
+a candidate without a collaborator lookup. It becomes a generation boundary
+only after the official Codex Bot directly adds a strictly post-revision
+`eyes` or `+1` receipt to that same comment. It does not grant the commenter
+permission to invoke Codex or ensure that Codex starts; provider-side
+eligibility and delivery remain independent, and an unconfirmed candidate
+cannot preempt an existing clean. Do not add the nonstandard
+`write`/`maintain`/`admin` policy to an ordinary consumer: it
 needs a verifier identity allowed to read collaborator permissions, which the
 bundled read-only verifier token cannot reliably do. The setting never makes a
 qualifying Codex finding non-blocking.
@@ -1108,7 +1111,10 @@ legacy before v2 is Active and read back.
    whitespace, visible text, or hidden comment. A qualifying Codex bot `issue_comment`
    `created` event will wake the installed workflow. Editing an existing comment
    does not; use manual `reconcile` when that carrier needs a later evaluation.
-   A review or reaction alone does not have an automatic consumer job.
+   A review or reaction alone does not have an automatic consumer job. Treat
+   this direct comment as only a candidate until the official Codex Bot adds a
+   strictly post-revision `eyes` or `+1` reaction directly to it; a terminal
+   elsewhere on the PR is not a substitute for that receipt.
 
    ### Dual-protection legacy-status recovery
 
@@ -1303,25 +1309,30 @@ legacy before v2 is Active and read back.
    `workflow_dispatch`, `pull_request_review`, `pull_request_review_comment`,
    cron, or a new status writer to recover v1.
 
-   Reactions on an authorized ordinary, unmarked request are liveness-only.
-   An ordinary `+1` cannot independently create head-bound clean evidence. An
-   official Codex `eyes` reaction or progress artifact whose timestamp is the
-   same as or later than candidate terminal clean evidence vetoes success. If
-   that liveness change arrives without a later qualifying bot comment event,
-   dispatch a manual exact-head `reconcile` to observe it.
+   On an unconfirmed default-`any` ordinary, unmarked request, an official
+   direct strictly post-revision `eyes` or `+1` reaction is first its receipt:
+   it promotes the candidate into a boundary. Afterwards, reactions are
+   liveness-only. An ordinary `+1` cannot independently create head-bound
+   clean evidence. An official Codex `eyes` reaction or progress artifact
+   whose timestamp is the same as or later than candidate terminal clean
+   evidence vetoes success. If that liveness change arrives without a later
+   qualifying bot comment event, dispatch a manual exact-head `reconcile` to
+   observe it.
 
    For predecessor-to-successor generation closure, liveness whose timestamp
    equals the successor request is also ambiguous and keeps the predecessor
    open. Evidence outside the original gap cannot repair it. A new head is a
    valid reset only when every ambiguous predecessor is explicitly bound to a
-   different full head. If any predecessor is ordinary, deleted, or otherwise
-   unbound, open a replacement PR and run one canonical review generation
-   there.
+   different full head. An unconfirmed default-`any` ordinary candidate is not
+   a predecessor. If any provider-confirmed ordinary, deleted, or otherwise
+   unbound predecessor remains, open a replacement PR and run one canonical
+   review generation there.
 
-   Treat every physical request as a generation boundary. Without a base
-   epoch, unbound provider terminal evidence can close only the first gap; once
-   any predecessor exists, every later gap and positive/superseding authority
-   require a qualifying `+1` directly on the corresponding canonical request.
+   Treat every physical request except an unconfirmed default-`any` ordinary
+   candidate as a generation boundary. Without a base epoch, unbound provider
+   terminal evidence can close only the first gap; once any predecessor exists,
+   every later gap and positive/superseding authority require a qualifying `+1`
+   directly on the corresponding canonical request.
    With a base epoch, every gap requires direct `+1` evidence. Never attribute
    a later terminal to a newer generation merely by timestamp; it may be a
    delayed or duplicate carrier from an older flight. Treat edited unbound
@@ -1367,9 +1378,9 @@ legacy before v2 is Active and read back.
    - If a historical gap exists but every ambiguous predecessor is explicitly
      bound to another full head, create a legitimate new head and run exactly
      one canonical generation there.
-   - If the reason identifies an unclosable historical gap containing an
-     ordinary, edited, malformed, denied, deleted, or otherwise unbound
-     predecessor, do not post another direct or controller request on that
+   - If the reason identifies an unclosable historical gap containing a
+     provider-confirmed ordinary, edited, malformed, denied, deleted, or
+     otherwise unbound predecessor, do not post another direct or controller request on that
      PR/head and do not rely on a commit-only reset. Open a replacement PR from the intended
      branch/commits, run one canonical producer there, validate it, and close
      the ambiguous PR.
@@ -1398,15 +1409,16 @@ legacy before v2 is Active and read back.
    for that controller run to complete before posting a new direct request.
 
    Never overlap the direct and controller producers for the same head. Each
-   request starts a review generation, while terminal Codex text has no
+   provider-confirmed request starts a review generation, while terminal Codex text has no
    originating request ID. If a newer request appears before the previous
    generation is terminally closed, v2 intentionally preserves an unclosed
    lineage gap and keeps the verifier pending; evidence arriving outside the
    original predecessor-to-successor window cannot repair that ordering. If
    every ambiguous predecessor is canonically bound to another full head,
    create a legitimate new head and allow exactly one canonical generation.
-   If any predecessor is ordinary, edited, malformed, denied, deleted, or
-   otherwise unbound, open a replacement PR from the intended branch/commits,
+   An unconfirmed default-`any` ordinary candidate is not a predecessor. If any
+   provider-confirmed ordinary, edited, malformed, denied, deleted, or otherwise
+   unbound predecessor remains, open a replacement PR from the intended branch/commits,
    run one canonical generation there, validate it, and close the ambiguous
    PR.
 
@@ -1434,9 +1446,10 @@ legacy before v2 is Active and read back.
 1. Refresh `CANARY_HEAD`. If it changed, stop and reread the summary plus the
    complete physical lineage; do not automatically start another generation on
    the same PR. Continue on the new head only when every ambiguous predecessor
-   is explicitly bound to a different full head. If an ordinary, edited,
-   malformed, denied, deleted, or otherwise unbound predecessor leaves an
-   unclosable historical gap, use a replacement PR as described above.
+   is explicitly bound to a different full head. An unconfirmed default-`any`
+   ordinary candidate is not a predecessor. If a provider-confirmed ordinary,
+   edited, malformed, denied, deleted, or otherwise unbound predecessor leaves
+   an unclosable historical gap, use a replacement PR as described above.
 2. Dispatch a final exact-head reconcile without `--ref`:
 
    ```bash

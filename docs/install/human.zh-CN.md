@@ -61,9 +61,12 @@ uses: JoeyTeng/codex-review-gate-action@v2
   没有 `issues: write`、`statuses: write`、`checks: write` 或 `contents: write`。
 
 默认情况下，普通用户发出的 exact `@codex review` 在 `any` policy 下、任意 repository
-permission 都可作为 review-generation boundary 被接受。这是 gate attribution 决策，不是调用 Codex 的
-权限，也不保证 Codex 会启动；provider-side eligibility 与 delivery 独立决定。没有合格的
-official-bot evidence 时，gate 仍保持 pending。canonical workflow 直接设定
+permission 都只会作为 candidate 被纳入，而不是立刻成为 review-generation boundary。只有
+official Codex Bot 在同一条 comment 上直接添加严格晚于当前 revision 的 `eyes` 或 `+1`
+receipt，它才升级为 boundary。这是 gate attribution 决策，不是调用 Codex 的权限，也不保证
+Codex 会启动；provider-side eligibility 与 delivery 独立决定。PR 其他位置后来出现的
+terminal 或 progress carrier 不能建立该因果 receipt，所以未确认 candidate 不能抢占既有
+clean。canonical workflow 直接设定
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；不要给普通 consumer 添加 repository
 variable、public Action input 或 strict policy。`write`/`maintain`/`admin` path 仅保留给将来
 可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only verifier
@@ -73,11 +76,13 @@ Consumer workflows 没有 cron、`repository_dispatch`、`pull_request_target`�
 `pull_request_review` writer、runtime GitHub App、status bridge 或 ledger。evidence
 由所选 verifier 从 PR 重建。
 
-合格的普通、无 marker `@codex review` request 上的 reactions 只作为 provider liveness
-evidence 读取。普通 request 上的 `+1` 不能独立产生 head-bound clean evidence。若 official
-Codex `eyes` reaction 或 progress artifact 与候选 terminal clean 同时或更晚，则说明 review
-activity 仍然有效并 veto success。Reaction 变化本身不会启动 consumer job，因此需要等待
-后续合格 bot comment 触发，或手动 dispatch exact-head `reconcile`。
+未确认的普通、无 marker `@codex review` request 上，official Codex 直接添加且严格晚于
+当前 revision 的 `eyes` 或 `+1` reaction 首先充当 receipt，把 candidate 升级为 boundary。
+升级后 reactions 才作为 provider liveness evidence 读取。普通 request 上的 `+1` 仍不能
+独立产生 head-bound clean evidence。若 official Codex `eyes` reaction 或 progress artifact
+与候选 terminal clean 同时或更晚，则说明 review activity 仍然有效并 veto success。Reaction
+变化本身不会启动 consumer job，因此需要等待后续合格 bot comment 触发，或手动 dispatch
+exact-head `reconcile`。
 在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
 liveness 也无法排序，必须保持 predecessor open。
 一旦出现第二个物理 request boundary，unbound terminal 就无法证明自己属于新 request，
@@ -87,8 +92,9 @@ liveness 也无法排序，必须保持 predecessor open。
 已经无法在原始窗口内闭合，必须先区分 physical boundary 与 positive authority：edited、
 malformed、wrong-author、denied 或 stale-base request 可以保留为 boundary，但没有
 authority。只有每个歧义 predecessor 都显式绑定另一个 full head 时，新 head 才能恢复。
-若存在 ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，只运行
-一个 canonical producer；验证 replacement 后关闭旧歧义 PR。
+未确认 default-`any` ordinary candidate 不是 predecessor。若仍存在 provider-confirmed
+ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，只运行一个 canonical
+producer；验证 replacement 后关闭旧歧义 PR。
 显式 commit-bound progress 直接归入对应 head；所有 unbound progress 都保留在 current
 inventory，因为邻近 request timestamp 不能证明来源。edited terminal 还会产生从创建到
 terminal revision 的 unbound unknown-activity interval。provider terminal 只有在
@@ -888,10 +894,11 @@ test -n "$CANARY_HEAD_REF"
 
 GitHub 可能把这条单行 direct request 保存为末尾恰好一个 LF 或 CRLF；这两种存储
 形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。
-这条路径不会为了创建 request 消耗 Actions minutes。后续满足条件的 Codex bot
-`issue_comment` `created` event 会启动 controller，由它建立严格更新的 full verifier attempt；
-编辑既有 comment 不会启动 controller，若该 carrier 需要重新评估则手动 reconcile。若结果只出现在
-review 或 reaction，或者需要恢复，也手动 reconcile。
+这条路径不会为了创建 request 消耗 Actions minutes。在 official Codex Bot 直接在同一条
+comment 上添加严格 post-revision 的 `eyes` 或 `+1` receipt 前，它只是 candidate，不能使既有
+clean 失效。后续满足条件的 Codex bot `issue_comment` `created` event 会启动 controller，由它
+建立严格更新的 full verifier attempt；编辑既有 comment 不会启动 controller，若该 carrier 需要
+重新评估则手动 reconcile。若结果只出现在 review 或 reaction，或者需要恢复，也手动 reconcile。
 
 ### Dual-protection legacy-status recovery
 
@@ -1134,8 +1141,9 @@ scoped controller reconcile。manual dispatch 没有 limits-profile 或 numeric 
 
 Head 变化后先停止并重读 summary 与完整 physical lineage；不得接受旧 commit 的 success，
 也不得自动在同一 PR 启动 generation。只有每个歧义 predecessor 都显式绑定不同 full head
-时，才能在 new head 继续。若 ordinary、edited、malformed、denied、deleted 或其他 unbound
-predecessor 留下不可闭合 gap，必须使用 replacement PR。
+时，才能在 new head 继续。若 provider-confirmed ordinary、edited、malformed、denied、deleted
+或其他 unbound predecessor 留下不可闭合 gap，必须使用 replacement PR；未确认 default-`any`
+ordinary candidate 不会单独形成该 gap。
 
 ## 4. 启用 ruleset 并关闭 canary
 
