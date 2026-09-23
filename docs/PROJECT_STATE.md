@@ -8,9 +8,11 @@
   active cohort: the old organization rule no longer requires v1, and all eight
   affected repository-local legacy surfaces now require only `test`.
 - The source repository `Joey-Tools/codex-review-gate` is not part of that
-  cohort. Its independent repository ruleset `16410326` remains a temporary
-  v1 `codex/review-gate` self-gate until a dedicated source bootstrap replaces
-  it through a separate v2 ruleset and removes only its v1 status rule.
+  cohort. Its canonical v2 verifier and controller are installed alongside an
+  exact temporary v1 bridge, while independent repository ruleset `16410326`
+  remains a temporary v1 `codex/review-gate` self-gate until a separate
+  status-only v2 rule is staged and activated, then only its v1 status rule is
+  removed.
 - Per-workstream details live under `docs/project_journal/`; keep this file as a short repo-wide recovery entrypoint.
 
 ## Recovery Pointers
@@ -28,9 +30,11 @@
   cohort.
 - The source repository's local ruleset `16410326` still requires
   `codex/review-gate`. It is an independent temporary v1 self-gate, not a
-  member of the fixed organization cohort or a repository-cleanup surface. A
-  dedicated source bootstrap is required before that source-local v1 exception
-  can be replaced; it must not broaden the organization receipt scope.
+  member of the fixed organization cohort or a repository-cleanup surface. Its
+  canonical v2 verifier/controller and temporary bridge are installed, but a
+  separate status-only v2 rule must still be staged and activated before the
+  source-local v1 exception can be replaced; this must not broaden the
+  organization receipt scope.
 - The old rule's original 11-repository legacy selector remains intact,
   including archived `Joey-Tools/codex-waited-delivery`. The completed final
   cutover removed only the v1 required-status rule; it retains `deletion` and

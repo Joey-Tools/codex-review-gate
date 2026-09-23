@@ -60,14 +60,73 @@ Maintain these invariants:
   defaults to `@JoeyTeng`, but a non-Joey repository must substitute its own
   eligible GitHub user.
 
+## Narrow source-repository self-hosting exception
+
+Use this path only when `REPO` is exactly `Joey-Tools/codex-review-gate` and
+the task is to migrate that source repository itself. It is not an alternative
+ordinary-consumer or repository-level cohort installation mode: the importable
+template and the bootstrap default `full` profile remain mandatory everywhere
+else.
+
+1. Prepare the source migration PR with the canonical v2 verifier and
+   controller plus the exact temporary legacy bridge. Use `--legacy-bridge` on
+   the source worktree preparation; do not pass `--ruleset-profile status-only`
+   there, because that profile is remote-stage-only.
+2. Merge that PR while the existing source legacy rule remains Active. Record
+   the owner-approved `LEGACY_INVENTORY_SHA256`; do not synthesize or replace
+   its value.
+3. Stage the distinct disabled source rule remotely, preserving the temporary
+   bridge and exact legacy inventory boundary:
+
+   ```bash
+   REPO="Joey-Tools/codex-review-gate"
+   CONTROL_PLANE_OWNER=@JoeyTeng
+   V2_RULESET_NAME="Must Pass Codex Review v2"
+   # Set this from the owner-approved legacy inventory snapshot.
+   LEGACY_INVENTORY_SHA256=OWNER_APPROVED_LEGACY_INVENTORY_SHA256
+
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --apply
+   ```
+
+4. Carry `--ruleset-name "$V2_RULESET_NAME"`, `--ruleset-profile status-only`,
+   and `--legacy-bridge` through every later remote canary activation and
+   read-only cleanup derivation/verification invocation. Do not fall back to
+   the default `full` profile for this source exception. Verify that the new
+   rule contains only the strict GitHub-Actions-bound
+   `codex/github-review-gate` requirement. It must be a second rule: the
+   existing source rule keeps deletion, non-fast-forward, pull-request, and
+   associated CODEOWNERS protection. After the separate canary passes and the
+   source-specific rule becomes Active, both the legacy v1 status and v2
+   CheckRun remain required until an owner-approved cleanup action removes
+   only the legacy requirement and the post-cleanup proof succeeds. Do not
+   remove or broaden legacy protection.
+5. Never use an organization schema-2 final-closure receipt to remove this
+   source bridge. Stop until a separately authorized, recorded source-local
+   closure proof exists.
+
 ## Advanced controlled handoff for an active ten-repository v2 cohort
 
 Use this execution path only when the authorized scope is exactly one reviewed
 active ten-repository v2 cohort covered by a shared v1 organization ruleset.
 The old v1 rule retains its original eleven-repository legacy selector. This
-is not a reusable `allow-v1` switch. The ordinary phases below continue to
-reject every v1 caller, and the advanced path must return every active member
-to that same final no-v1 contract.
+is not a reusable `allow-v1` switch. Outside the separately documented source
+self-hosting exception above, the ordinary phases below continue to reject
+every v1 caller, and the advanced path must return every active member to that
+same final no-v1 contract.
 
 `Joey-Tools/codex-waited-delivery` is archived and legacy-only. It stays in the
 old rule's original eleven-repository selector so `deletion` and

@@ -16,6 +16,8 @@ import { fileURLToPath } from "node:url";
 import {
   canonicalLegacyReviewGateInventoryBytes,
   validateCanonicalV2ControllerWorkflowContent,
+  validateCanonicalLegacyBridgeWorkflowContent,
+  workflowSingleProducerPolicyViolations,
 } from "../src/bootstrap.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -24,6 +26,16 @@ const sourceConsumerPath = join(
   repoRoot,
   ".github/workflows/codex-review-gate.yml",
 );
+const sourceControllerPath = join(
+  repoRoot,
+  ".github/workflows/codex-review-gate-controller.yml",
+);
+const sourceLegacyBridgePath = join(
+  repoRoot,
+  ".github/workflows/codex-review-gate-legacy-bridge.yml",
+);
+const sourceCodeownersPath = join(repoRoot, ".github/CODEOWNERS");
+const sourceStateMachinePath = join(repoRoot, ".github/workflows/state-machine.yml");
 const templateConsumerPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
@@ -100,6 +112,10 @@ const ACTIVE_V2_READBACK_PATTERN =
 
 const action = readFileSync(actionPath, "utf8");
 const sourceConsumer = readFileSync(sourceConsumerPath, "utf8");
+const sourceController = readFileSync(sourceControllerPath, "utf8");
+const sourceLegacyBridge = readFileSync(sourceLegacyBridgePath, "utf8");
+const sourceCodeowners = readFileSync(sourceCodeownersPath, "utf8");
+const sourceStateMachine = readFileSync(sourceStateMachinePath, "utf8");
 const templateConsumer = readFileSync(templateConsumerPath, "utf8");
 const templateController = readFileSync(templateControllerPath, "utf8");
 const templateCodeowners = readFileSync(templateCodeownersPath, "utf8");
@@ -130,15 +146,16 @@ const CLOSED_JOB_IF = [
   "}}",
 ].join(" ");
 
-test("the v2 installation template is isolated from the still-live v1 source caller", () => {
-  const verifier = parseVerifierWorkflow(templateConsumer);
-  const controller = parseControllerWorkflow(templateController);
-  assert.notEqual(sourceConsumer, templateConsumer);
-  assert.match(
-    sourceConsumer,
-    /uses: JoeyTeng\/codex-review-gate-action\/\.github\/workflows\/codex-review-gate\.yml@v1/u,
+test("source self-installation matches canonical v2 assets and contains its temporary v1 bridge", () => {
+  const verifier = parseVerifierWorkflow(sourceConsumer);
+  const controller = parseControllerWorkflow(sourceController);
+  assert.equal(sourceConsumer, templateConsumer);
+  assert.equal(sourceController, templateController);
+  assert.equal(sourceCodeowners, templateCodeowners);
+  assert.equal(
+    validateCanonicalLegacyBridgeWorkflowContent(sourceLegacyBridge),
+    sourceLegacyBridge,
   );
-  assert.doesNotMatch(sourceConsumer, /codex-review-gate-action@v2/u);
   for (const path of retiredPackageWorkflowPaths) {
     assert.equal(existsSync(path), false);
   }
@@ -150,6 +167,16 @@ test("the v2 installation template is isolated from the still-live v1 source cal
       /\.github\/workflows\/codex-review-gate\.yml@|workflow_call|secrets:\s*inherit/u,
     );
   }
+});
+
+test("source state-machine check names have a static non-reserved prefix", () => {
+  assert.match(
+    sourceStateMachine,
+    /^    name: Review gate state machine\$\{\{ matrix\.check-suffix \}\}$/mu,
+  );
+  assert.match(sourceStateMachine, /^            check-suffix: ""$/mu);
+  assert.match(sourceStateMachine, /^            check-suffix: " Node\.js 24"$/mu);
+  assert.deepEqual(workflowSingleProducerPolicyViolations(sourceStateMachine), []);
 });
 
 test("automatic runner admission separates read-only PR verification from exact Codex comments", () => {
@@ -1842,7 +1869,43 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       /V2_RULESET_NAME\s*=[^\n]*Must Pass Codex Review/u,
       name,
     );
-    const remoteCommands = bootstrapRemoteCommands(guide);
+    const { ordinaryGuide, sourceSelfHostingGuide } = splitSourceSelfHostingGuide(
+      guide,
+      name,
+    );
+    const sourceCommands = bootstrapRemoteCommands(sourceSelfHostingGuide);
+    assert.equal(
+      sourceCommands.length,
+      2,
+      `${name}: source self-hosting has only status-only stage preview/apply`,
+    );
+    for (const { text } of sourceCommands) {
+      assert.match(text, /--repo "\$REPO"/u, `${name}: ${text}`);
+      assert.match(
+        text,
+        /--ruleset-name "\$V2_RULESET_NAME"/u,
+        `${name}: ${text}`,
+      );
+      assert.match(text, /--ruleset-profile status-only/u, `${name}: ${text}`);
+      assert.match(text, /--legacy-bridge/u, `${name}: ${text}`);
+      assert.match(
+        text,
+        /--expected-legacy-inventory-sha256/u,
+        `${name}: ${text}`,
+      );
+      assert.doesNotMatch(
+        text,
+        /--activate|--derive-post-cleanup-plan|--verify-post-cleanup/u,
+        `${name}: source staging stays distinct from canary and cleanup`,
+      );
+    }
+    assert.equal(
+      sourceCommands.filter(({ text }) => text.includes("--apply")).length,
+      1,
+      `${name}: source self-hosting has one stage apply`,
+    );
+
+    const remoteCommands = bootstrapRemoteCommands(ordinaryGuide);
     assert.equal(
       remoteCommands.length,
       6,
@@ -1909,7 +1972,7 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       `${name}: final probe must bind the pre-derived post-state`,
     );
     assert.match(
-      guide.slice(deriveCommand.end, finalProbe.start),
+      ordinaryGuide.slice(deriveCommand.end, finalProbe.start),
       /(?:legacy cleanup|cleanup[\s\S]{0,100}legacy|(?:移除|删除)[\s\S]{0,100}legacy)/iu,
       `${name}: legacy cleanup must separate derivation from final closure`,
     );
@@ -3466,4 +3529,18 @@ function bootstrapRemoteCommands(markdown) {
     }
   }
   return commands;
+}
+
+function splitSourceSelfHostingGuide(markdown, name) {
+  const heading = name.endsWith(".zh-CN.md")
+    ? "## 窄范围 source repository self-hosting 例外"
+    : "## Narrow source-repository self-hosting exception";
+  const start = markdown.indexOf(heading);
+  assert.ok(start >= 0, `${name}: source self-hosting exception heading`);
+  const endOffset = markdown.indexOf("\n## ", start + heading.length);
+  const end = endOffset === -1 ? markdown.length : endOffset + 1;
+  return {
+    sourceSelfHostingGuide: markdown.slice(start, end),
+    ordinaryGuide: `${markdown.slice(0, start)}${markdown.slice(end)}`,
+  };
 }

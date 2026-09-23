@@ -804,6 +804,34 @@ evidence that a prior freeze remains in force.
   local ruleset `16410326`, which remains a temporary v1 self-gate until a
   dedicated source bootstrap supplies its v2 replacement.
 
+## Execution Update — 2026-09-23 (source bootstrap)
+
+- `Joey-Tools/codex-review-gate` now carries the canonical v2 verifier and
+  controller, the exact temporary v1 bridge, and canonical workflow
+  CODEOWNERS ownership. The source `State Machine CI` keeps its required
+  `Review gate state machine` check name while using a static non-reserved
+  prefix, so bootstrap admission cannot mistake it for the v2 CheckRun.
+- This change deliberately does not mutate source repository ruleset
+  `16410326`: it continues to require legacy `codex/review-gate` while the
+  bridge preserves that producer. A separately authorized source policy stage
+  must create and activate a status-only v2 rule, then remove only the legacy
+  status rule from `16410326`, retaining its other protections.
+- The explicit remote-only `--ruleset-profile status-only` is reserved in the
+  helper for this exact source repository; all ordinary consumers retain the
+  default `full` profile and importable template. Its selected rule is exactly
+  one strict, GitHub-Actions-bound `codex/github-review-gate` check with no
+  bypass actors or other rules. The profile treats GitHub's
+  `do_not_enforce_on_create: false` readback default as canonical and refuses
+  to repair any extra rule, context, bypass actor, or branch-condition drift.
+- The existing read-only cleanup derivation and verification are profile-aware
+  for this narrow source rule. Their derived state removes only
+  `codex/review-gate` from the old rule and compares every remaining security
+  field across stable snapshots, so deletion, non-fast-forward, and
+  pull-request/CODEOWNERS protections cannot be silently lost.
+- The source is not in the fixed active organization cohort. Its later bridge
+  removal requires a source-local closure proof; the organization schema-2
+  receipt cannot authorize it.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -817,11 +845,12 @@ evidence that a prior freeze remains in force.
    cohort repository. The old organization ruleset intentionally remains Active
    only for deletion and non-fast-forward protection, including the archived
    legacy-only repository.
-3. Bootstrap `Joey-Tools/codex-review-gate` separately, then replace the
-   independent source ruleset `16410326` v1 status requirement through a
-   separate v2 rule; preserve its non-status protections. That source-local
-   exception is outside the frozen 10-member cohort and must not be used to
-   expand the organization closure receipt or bridge-removal scope.
+3. Stage and activate a status-only v2 rule for `Joey-Tools/codex-review-gate`,
+   verify its source-local canary, then remove only the independent source
+   ruleset `16410326` v1 status requirement while preserving its non-status
+   protections. This source-local exception is outside the frozen 10-member
+   cohort and must not be used to expand the organization closure receipt or
+   bridge-removal scope.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.

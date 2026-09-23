@@ -14,6 +14,9 @@ export const DEFAULT_CONTROLLER_WORKFLOW_PATH =
 export const DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-legacy-bridge.yml";
 export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
+export const RULESET_PROFILE_FULL = "full";
+export const RULESET_PROFILE_STATUS_ONLY = "status-only";
+export const DEFAULT_RULESET_PROFILE = RULESET_PROFILE_FULL;
 export const DEFAULT_CONTROL_PLANE_OWNER = "@JoeyTeng";
 export const DEFAULT_CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const CANONICAL_V2_WORKFLOW_USES =
@@ -88,6 +91,19 @@ const DEFAULT_REF_CONDITIONS = {
     exclude: [],
   },
 };
+const STATUS_ONLY_RULESET_ENFORCEMENTS = new Set(["disabled", "active"]);
+
+export function normalizeRulesetProfile(value = DEFAULT_RULESET_PROFILE) {
+  if (
+    value === RULESET_PROFILE_FULL ||
+    value === RULESET_PROFILE_STATUS_ONLY
+  ) {
+    return value;
+  }
+  throw new Error(
+    `Ruleset profile must be "${RULESET_PROFILE_FULL}" or "${RULESET_PROFILE_STATUS_ONLY}".`,
+  );
+}
 
 export function directoryWitnessFromMetadata(path, metadata, label = "Directory") {
   if (metadata === null || metadata === undefined) {
@@ -779,6 +795,75 @@ export function rulesetHasGatePolicy(
   );
 }
 
+export function rulesetHasStatusOnlyPolicy(
+  ruleset,
+  context = DEFAULT_STATUS_CONTEXT,
+  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  assertStatusOnlyProfileBinding(context, integrationId);
+  if (
+    ruleset === null ||
+    typeof ruleset !== "object" ||
+    Array.isArray(ruleset) ||
+    !Array.isArray(ruleset.bypass_actors) ||
+    ruleset.bypass_actors.length !== 0 ||
+    !Array.isArray(ruleset.rules) ||
+    ruleset.rules.length !== 1
+  ) {
+    return false;
+  }
+
+  const [rule] = ruleset.rules;
+  if (
+    rule === null ||
+    typeof rule !== "object" ||
+    Array.isArray(rule) ||
+    rule.type !== "required_status_checks"
+  ) {
+    return false;
+  }
+
+  return canonicalJson(
+    normalizeStatusOnlyRequiredStatusRuleForComparison(rule),
+  ) === canonicalJson(
+    buildRequiredStatusChecksRule({
+      context,
+      integrationId,
+      strict: true,
+      doNotEnforceOnCreate: false,
+    }),
+  );
+}
+
+export function rulesetHasStatusOnlyProfile(
+  ruleset,
+  context = DEFAULT_STATUS_CONTEXT,
+  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  return (
+    rulesetHasStatusOnlyPolicy(ruleset, context, { integrationId }) &&
+    ruleset.target === "branch" &&
+    STATUS_ONLY_RULESET_ENFORCEMENTS.has(ruleset.enforcement) &&
+    canonicalJson(ruleset.conditions) === canonicalJson(DEFAULT_REF_CONDITIONS)
+  );
+}
+
+export function rulesetHasPolicyForProfile(
+  ruleset,
+  profile = DEFAULT_RULESET_PROFILE,
+  context = DEFAULT_STATUS_CONTEXT,
+  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  switch (normalizeRulesetProfile(profile)) {
+    case RULESET_PROFILE_FULL:
+      return rulesetHasGatePolicy(ruleset, context, { integrationId });
+    case RULESET_PROFILE_STATUS_ONLY:
+      return rulesetHasStatusOnlyPolicy(ruleset, context, { integrationId });
+    default:
+      throw new Error("Ruleset profile normalization returned an unsupported value.");
+  }
+}
+
 export function requiredStatusCheckContexts(ruleset) {
   return requiredStatusChecks(ruleset)
     .map((check) => check?.context)
@@ -828,6 +913,36 @@ export function findEffectiveRulesetWithGatePolicy(
       rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
       rulesetHasGatePolicy(ruleset, context, { integrationId }),
   );
+}
+
+export function findEffectiveRulesetWithStatusOnlyPolicy(
+  rulesets,
+  context = DEFAULT_STATUS_CONTEXT,
+  { defaultBranch = null, integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  assertStatusOnlyProfileBinding(context, integrationId);
+  return rulesets.find(
+    (ruleset) =>
+      ruleset.enforcement === "active" &&
+      rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
+      rulesetHasStatusOnlyProfile(ruleset, context, { integrationId }),
+  );
+}
+
+export function findEffectiveRulesetWithProfilePolicy(
+  rulesets,
+  profile = DEFAULT_RULESET_PROFILE,
+  context = DEFAULT_STATUS_CONTEXT,
+  options = {},
+) {
+  switch (normalizeRulesetProfile(profile)) {
+    case RULESET_PROFILE_FULL:
+      return findEffectiveRulesetWithGatePolicy(rulesets, context, options);
+    case RULESET_PROFILE_STATUS_ONLY:
+      return findEffectiveRulesetWithStatusOnlyPolicy(rulesets, context, options);
+    default:
+      throw new Error("Ruleset profile normalization returned an unsupported value.");
+  }
 }
 
 export function assertCompleteRulesetApiObject(ruleset) {
@@ -1233,7 +1348,34 @@ export function buildCreateRulesetPayload({
   enforcement = DEFAULT_RULESET_ENFORCEMENT,
   strict = true,
   doNotEnforceOnCreate = undefined,
+  profile = DEFAULT_RULESET_PROFILE,
 } = {}) {
+  const normalizedProfile = normalizeRulesetProfile(profile);
+  if (normalizedProfile === RULESET_PROFILE_STATUS_ONLY) {
+    assertStatusOnlyProfileOptions({
+      context,
+      integrationId,
+      strict,
+      doNotEnforceOnCreate,
+    });
+    assertStatusOnlyRulesetEnforcement(enforcement);
+    return {
+      name,
+      target: "branch",
+      enforcement,
+      bypass_actors: [],
+      conditions: structuredCloneSafe(DEFAULT_REF_CONDITIONS),
+      rules: [
+        buildRequiredStatusChecksRule({
+          context,
+          integrationId,
+          strict,
+          doNotEnforceOnCreate: doNotEnforceOnCreate ?? false,
+        }),
+      ],
+    };
+  }
+
   const { rules } = ensureGatePolicyInRules([], context, {
     integrationId,
     strict,
@@ -1259,8 +1401,20 @@ export function buildUpdateRulesetPayload(
     enforcement = undefined,
     strict = true,
     doNotEnforceOnCreate = undefined,
+    profile = DEFAULT_RULESET_PROFILE,
   } = {},
 ) {
+  const normalizedProfile = normalizeRulesetProfile(profile);
+  if (normalizedProfile === RULESET_PROFILE_STATUS_ONLY) {
+    return buildStatusOnlyUpdateRulesetPayload(ruleset, {
+      context,
+      integrationId,
+      enforcement,
+      strict,
+      doNotEnforceOnCreate,
+    });
+  }
+
   const requiredTarget = "branch";
   if (ruleset.target !== undefined && ruleset.target !== requiredTarget) {
     throw new Error(
@@ -1314,6 +1468,46 @@ export function buildUpdateRulesetPayload(
   }
 
   return { changed, payload };
+}
+
+function buildStatusOnlyUpdateRulesetPayload(
+  ruleset,
+  {
+    context,
+    integrationId,
+    enforcement,
+    strict,
+    doNotEnforceOnCreate,
+  },
+) {
+  assertStatusOnlyProfileOptions({
+    context,
+    integrationId,
+    strict,
+    doNotEnforceOnCreate,
+  });
+  if (!rulesetHasStatusOnlyProfile(ruleset, context, { integrationId })) {
+    throw new Error(
+      `Ruleset "${ruleset?.name ?? "<unnamed>"}" is not an exact status-only profile; refusing to remove or rewrite additional protections.`,
+    );
+  }
+
+  const requiredEnforcement = enforcement ?? ruleset.enforcement;
+  assertStatusOnlyRulesetEnforcement(requiredEnforcement);
+  const payload = buildCreateRulesetPayload({
+    name: ruleset.name,
+    context,
+    integrationId,
+    enforcement: requiredEnforcement,
+    strict,
+    doNotEnforceOnCreate,
+    profile: RULESET_PROFILE_STATUS_ONLY,
+  });
+  return {
+    changed:
+      rulesetWritableFingerprint(ruleset) !== rulesetWritableFingerprint(payload),
+    payload,
+  };
 }
 
 export function rulesetWritableFingerprint(ruleset) {
@@ -2539,6 +2733,61 @@ export function normalizeWorkflowPath(value) {
     throw new Error(
       `Workflow path must be a .github/workflows/*.yml or *.yaml file: ${value}`,
     );
+  }
+  return normalized;
+}
+
+function assertStatusOnlyProfileBinding(context, integrationId) {
+  if (context !== DEFAULT_STATUS_CONTEXT) {
+    throw new Error(
+      `Status-only rulesets require the ${DEFAULT_STATUS_CONTEXT} status context.`,
+    );
+  }
+  if (integrationId !== DEFAULT_STATUS_INTEGRATION_ID) {
+    throw new Error(
+      `Status-only rulesets require the GitHub Actions source integration id ${DEFAULT_STATUS_INTEGRATION_ID}.`,
+    );
+  }
+}
+
+function assertStatusOnlyProfileOptions({
+  context,
+  integrationId,
+  strict,
+  doNotEnforceOnCreate,
+}) {
+  assertStatusOnlyProfileBinding(context, integrationId);
+  if (strict !== true) {
+    throw new Error("Status-only rulesets require strict required status checks.");
+  }
+  if (
+    doNotEnforceOnCreate !== undefined &&
+    doNotEnforceOnCreate !== false
+  ) {
+    throw new Error(
+      "Status-only rulesets require do_not_enforce_on_create to be false.",
+    );
+  }
+}
+
+function assertStatusOnlyRulesetEnforcement(enforcement) {
+  if (!STATUS_ONLY_RULESET_ENFORCEMENTS.has(enforcement)) {
+    throw new Error(
+      "Status-only ruleset enforcement must be disabled or active.",
+    );
+  }
+}
+
+function normalizeStatusOnlyRequiredStatusRuleForComparison(rule) {
+  const normalized = stripRuleForRulesetPayload(rule);
+  if (
+    normalized.parameters !== undefined &&
+    !Object.prototype.hasOwnProperty.call(
+      normalized.parameters,
+      "do_not_enforce_on_create",
+    )
+  ) {
+    normalized.parameters.do_not_enforce_on_create = false;
   }
   return normalized;
 }

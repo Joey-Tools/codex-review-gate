@@ -52,12 +52,62 @@ GitHub.com/default-branch PR scope 时停止。
 - 每次调用 bootstrap 都显式保留同一个 `CONTROL_PLANE_OWNER`。默认值是
   `@JoeyTeng`；非 Joey 仓库必须替换成自己的合格 GitHub user。
 
+## 窄范围 source repository self-hosting 例外
+
+只有 `REPO` 精确等于 `Joey-Tools/codex-review-gate`、且任务就是迁移该 source repository
+自身时才使用此路径。它不是普通 consumer 或 repository-level cohort 的替代安装模式：其他任何
+位置仍必须使用 importable template 与 bootstrap 默认的 `full` profile。
+
+1. 用 canonical v2 verifier、controller 与 exact temporary legacy bridge 准备 source
+   migration PR。source worktree preparation 必须传 `--legacy-bridge`；不要在那里传
+   `--ruleset-profile status-only`，因为该 profile 只允许用于 remote stage。
+2. 在 source 现有 legacy rule 保持 Active 时合并该 PR。记录 owner-approved 的
+   `LEGACY_INVENTORY_SHA256`；不得编造或替换其值。
+3. 在 remote 暂存独立的 Disabled source rule，并保留 temporary bridge 和 exact legacy
+   inventory boundary：
+
+   ```bash
+   REPO="Joey-Tools/codex-review-gate"
+   CONTROL_PLANE_OWNER=@JoeyTeng
+   V2_RULESET_NAME="Must Pass Codex Review v2"
+   # Set this from the owner-approved legacy inventory snapshot.
+   LEGACY_INVENTORY_SHA256=OWNER_APPROVED_LEGACY_INVENTORY_SHA256
+
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --apply
+   ```
+
+4. 每一条后续 remote canary activation、read-only cleanup derivation/verification invocation
+   都必须继续带上 `--ruleset-name "$V2_RULESET_NAME"`、
+   `--ruleset-profile status-only` 与 `--legacy-bridge`。这个 source exception 不能回退到
+   默认 `full` profile。验证新 rule 只包含 strict、GitHub-Actions-bound 的
+   `codex/github-review-gate` requirement。它必须是第二条 rule：现有 source rule 保留
+   deletion、non-fast-forward、pull-request 与相关 CODEOWNERS protection。在独立 canary
+   通过且 source-specific rule 激活后，legacy v1 status 与 v2 CheckRun 都必须继续 required，
+   直到 owner-approved cleanup action 只移除 legacy requirement、且 post-cleanup proof
+   成功。不得移除或扩大 legacy protection。
+5. 不得用 organization schema-2 final-closure receipt 删除该 source bridge。没有单独授权、
+   已记录的 source-local closure proof 时必须停止。
+
 ## Advanced：活动 v2 10 仓 organization handoff
 
 只有当授权 scope 精确等于一个经过审阅、受共享 v1 organization ruleset 保护的活动 v2 10 仓
 cohort 时，才使用本执行路径。旧 v1 rule 仍保留其原始 11 仓 legacy selector。它不是可复用的
-`allow-v1` 开关。下方普通 phases 仍拒绝所有 v1 caller；advanced path 最终也必须让每个活动
-成员回到同一个 no-v1 contract。
+`allow-v1` 开关。除了上面单独记录的 source self-hosting 例外，下方普通 phases 仍拒绝所有
+v1 caller；advanced path 最终也必须让每个活动成员回到同一个 no-v1 contract。
 
 `Joey-Tools/codex-waited-delivery` 已归档且仅属于 legacy。它留在旧 rule 的原始 11 仓
 selector 中，使 `deletion` 和 `non_fast_forward` 在 cutover 后仍受保护。它不需要 v2

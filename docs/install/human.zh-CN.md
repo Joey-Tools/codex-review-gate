@@ -11,9 +11,9 @@
 
 Canary 验证完成后关闭、不合并。
 
-活动 v2 10 仓组织级 handoff 是唯一允许 migration PR 暂不移除 v1 的受控例外。旧 v1
-organization ruleset 仍保留原始 11 仓 legacy selector。修改任何活动 cohort member 前，
-必须先阅读下方 advanced section。
+活动 v2 10 仓组织级 handoff 是针对 shared organization ruleset 的受控例外；旧 v1
+organization ruleset 仍保留原始 11 仓 legacy selector。下方另有窄范围的 source repository
+self-hosting 例外，它不属于该 cohort。修改任一例外 scope 前，必须先阅读对应 section。
 
 ## 安装内容
 
@@ -116,6 +116,56 @@ adopted compound boundary。
 variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派生 `limits_profile`；公开 outputs 只有
 `execution_health`、`gate_outcome`、`recovery_code` 与 `retry_safe`。Finding counts
 只出现在 summary 与 sticky diagnostic，不是 outputs。
+
+## 窄范围 source repository self-hosting 例外
+
+此例外只适用于 `Joey-Tools/codex-review-gate` 迁移它自己的 default branch。它不会削弱
+普通 consumer path：importable ruleset 与 bootstrap helper 默认的 `full` profile 仍适用于
+所有普通 consumer 和每个 repository-level cohort installation。不得把此 profile 复制到通用
+installation template。
+
+先合并 source migration PR：它必须同时安装 exact canonical v2 verifier、controller 和
+exact temporary legacy bridge，并保持 source 现有 legacy rule Active。之后才 remote 暂存这个
+source-only v2 rule；`--ruleset-profile status-only` 只允许配合 `--repo`，不能传给
+`--prepare-worktree`：
+
+```bash
+REPO="Joey-Tools/codex-review-gate"
+CONTROL_PLANE_OWNER=@JoeyTeng
+V2_RULESET_NAME="Must Pass Codex Review v2"
+# Use the value recorded in the owner-approved legacy inventory snapshot.
+LEGACY_INVENTORY_SHA256=OWNER_APPROVED_LEGACY_INVENTORY_SHA256
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --apply
+```
+
+在继续执行下方普通的 canary、activation 与 cleanup-proof sections 时，每一条后续 remote
+invocation 都必须继续带上 `--ruleset-name "$V2_RULESET_NAME"`、
+`--ruleset-profile status-only` 和 `--legacy-bridge`。这个 source exception 不能回退到默认
+`full` profile。
+
+新 rule 只包含 strict、GitHub-Actions-bound 的 `codex/github-review-gate` requirement。
+它是第二条 rule：现有 source rule 继续负责 deletion、non-fast-forward、pull-request 与相关
+CODEOWNERS protection。source-specific rule 激活后，legacy v1 status 与新 v2 CheckRun 会
+双重保护 source。此阶段不得移除或扩大任何 legacy protection；只有经过独立 canary 与
+owner-approved cleanup 后，才可以只移除 legacy status requirement。
+
+不得使用 organization schema-2 final-closure receipt 删除 source 的 temporary bridge。
+该 bridge 必须有单独记录的 source-local closure proof 与独立授权。
 
 ## Advanced：活动 v2 10 仓组织 cohort 的受控 handoff
 

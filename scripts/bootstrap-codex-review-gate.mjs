@@ -27,6 +27,8 @@ import {
   DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
   DEFAULT_RULESET_ENFORCEMENT,
   DEFAULT_RULESET_NAME,
+  DEFAULT_RULESET_PROFILE,
+  RULESET_PROFILE_STATUS_ONLY,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
   DEFAULT_VERIFIER_RUN_NAME_PREFIX,
@@ -43,15 +45,17 @@ import {
   decodeGitHubBlobContent,
   directoryWitnessFromMetadata,
   ensureControlPlaneCodeownersContent,
-  findEffectiveRulesetWithGatePolicy,
+  findEffectiveRulesetWithProfilePolicy,
   installedWorkflowMatchesCanonical,
   normalizeControlPlaneOwner,
+  normalizeRulesetProfile,
   normalizeWorkflowPath,
   parseGitHubRepositoryRemote,
   parseRepoSlug,
   rulesetCoversDefaultBranch,
-  rulesetHasGatePolicy,
+  rulesetHasPolicyForProfile,
   rulesetHasRequiredStatusContext,
+  rulesetHasStatusOnlyProfile,
   rulesetWritableFingerprint,
   validateCanonicalV2ControllerWorkflowContent,
   validateCanonicalLegacyBridgeWorkflowContent,
@@ -80,6 +84,7 @@ const CANONICAL_LEGACY_BRIDGE_WORKFLOW_SOURCE = join(
 const GH_NOT_FOUND = Symbol("GitHub API not found");
 const GITHUB_PULL_REQUEST_FILES_LIMIT = 3_000;
 const GITHUB_PULL_REQUEST_FILES_PAGE_SIZE = 100;
+const SOURCE_SELF_HOSTING_REPOSITORY_SLUG = "Joey-Tools/codex-review-gate";
 
 async function main() {
   const options = readCliOptions();
@@ -142,6 +147,7 @@ async function main() {
 
   console.log(`Repository: ${options.repo.slug}`);
   console.log(`Default branch: ${defaultBranch}`);
+  console.log(`Ruleset profile: ${options.rulesetProfile}`);
   console.log(`Verifier: ${DEFAULT_WORKFLOW_PATH} exactly matches the canonical v2 verifier`);
   console.log(`Controller: ${DEFAULT_CONTROLLER_WORKFLOW_PATH} exactly matches the canonical v2 controller`);
   if (options.legacyBridge) {
@@ -190,24 +196,28 @@ async function main() {
 
   if (
     repoRuleset?.enforcement === "active" &&
-    (!rulesetCoversDefaultBranch(repoRuleset, defaultBranch) ||
-      !rulesetHasGatePolicy(repoRuleset, options.context, {
-        integrationId: options.integrationId,
-      }))
+    !rulesetMatchesProfileAtDefaultBranch({
+      ruleset: repoRuleset,
+      rulesetProfile: options.rulesetProfile,
+      defaultBranch,
+      context: options.context,
+      integrationId: options.integrationId,
+    })
   ) {
     throw new Error(
       `Repository ruleset "${options.rulesetName}" is an active legacy or incomplete gate; refusing to disable or replace it during v2 staging. Keep it active and rerun with a distinct --ruleset-name for the disabled v2 ruleset.`,
     );
   }
 
-  const existingEffective = findEffectiveRulesetWithGatePolicy(
+  const existingEffective = findEffectiveRulesetWithProfilePolicy(
     effectiveRulesets,
+    options.rulesetProfile,
     options.context,
     { defaultBranch, integrationId: options.integrationId },
   );
   if (repoRuleset === undefined && existingEffective !== undefined) {
     console.log(
-      `No change: the complete v2 gate policy is already enforced by ${rulesetLabel(existingEffective)}.`,
+      `No change: the ${rulesetProfileDescription(options.rulesetProfile)} is already enforced by ${rulesetLabel(existingEffective)}.`,
     );
     return;
   }
@@ -223,6 +233,7 @@ async function main() {
       context: options.context,
       integrationId: options.integrationId,
       enforcement: DEFAULT_RULESET_ENFORCEMENT,
+      profile: options.rulesetProfile,
     });
 
     if (!options.apply) {
@@ -292,6 +303,7 @@ async function main() {
           defaultBranch,
           context: options.context,
           integrationId: options.integrationId,
+          rulesetProfile: options.rulesetProfile,
           enforcement: payload.enforcement,
           expectedPayload: payload,
           exactWritableFields: false,
@@ -325,6 +337,7 @@ async function main() {
           defaultBranch,
           context: options.context,
           integrationId: options.integrationId,
+          rulesetProfile: options.rulesetProfile,
           enforcement: payload.enforcement,
           expectedPayload: payload,
           exactWritableFields: false,
@@ -358,8 +371,11 @@ async function main() {
   if (
     options.activate &&
     fullRuleset?.enforcement === "active" &&
-    rulesetCoversDefaultBranch(fullRuleset, defaultBranch) &&
-    rulesetHasGatePolicy(fullRuleset, options.context, {
+    rulesetMatchesProfileAtDefaultBranch({
+      ruleset: fullRuleset,
+      rulesetProfile: options.rulesetProfile,
+      defaultBranch,
+      context: options.context,
       integrationId: options.integrationId,
     })
   ) {
@@ -373,7 +389,7 @@ async function main() {
       );
     }
     console.log(
-      `No change: the complete v2 gate policy is already enforced by ${rulesetLabel(fullRuleset)}.`,
+      `No change: the ${rulesetProfileDescription(options.rulesetProfile)} is already enforced by ${rulesetLabel(fullRuleset)}.`,
     );
     return;
   }
@@ -387,6 +403,7 @@ async function main() {
     integrationId: options.integrationId,
     defaultBranch,
     ...(options.activate ? { enforcement: "active" } : {}),
+    profile: options.rulesetProfile,
   });
   if (options.activate) {
     const expectedActivationPayload = {
@@ -394,9 +411,11 @@ async function main() {
       enforcement: "active",
     };
     if (
-      fullRuleset.target !== "branch" ||
-      !rulesetCoversDefaultBranch(fullRuleset, defaultBranch) ||
-      !rulesetHasGatePolicy(fullRuleset, options.context, {
+      !rulesetMatchesProfileAtDefaultBranch({
+        ruleset: fullRuleset,
+        rulesetProfile: options.rulesetProfile,
+        defaultBranch,
+        context: options.context,
         integrationId: options.integrationId,
       }) ||
       rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
@@ -406,7 +425,7 @@ async function main() {
         rulesetWritableFingerprint(expectedActivationPayload)
     ) {
       throw new Error(
-        `Repository ruleset "${options.rulesetName}" is disabled but not an exact complete staged v2 policy. Run a plain --apply to repair and read back the disabled stage; --activate may change only enforcement from disabled to active.`,
+        `Repository ruleset "${options.rulesetName}" is disabled but not an exact staged ${rulesetProfileDescription(options.rulesetProfile)}. Run a plain --apply to repair and read back the disabled stage; --activate may change only enforcement from disabled to active.`,
       );
     }
     await assertCanaryCheckRunSource({
@@ -561,6 +580,7 @@ async function main() {
         defaultBranch,
         context: options.context,
         integrationId: options.integrationId,
+        rulesetProfile: options.rulesetProfile,
         enforcement: payload.enforcement,
         expectedPayload: payload,
         exactWritableFields: true,
@@ -594,6 +614,7 @@ async function main() {
         defaultBranch,
         context: options.context,
         integrationId: options.integrationId,
+        rulesetProfile: options.rulesetProfile,
         enforcement: payload.enforcement,
         expectedPayload: payload,
         exactWritableFields: true,
@@ -620,6 +641,7 @@ function readCliOptions() {
       "expected-legacy-inventory-sha256": { type: "string" },
       "expected-post-cleanup-security-sha256": { type: "string" },
       "ruleset-name": { type: "string", default: DEFAULT_RULESET_NAME },
+      "ruleset-profile": { type: "string", default: DEFAULT_RULESET_PROFILE },
       "control-plane-owner": {
         type: "string",
         default: DEFAULT_CONTROL_PLANE_OWNER,
@@ -640,12 +662,27 @@ function readCliOptions() {
 
   const hasRepo = values.repo !== undefined;
   const hasPrepareWorktree = values["prepare-worktree"] !== undefined;
+  const repo = hasRepo ? parseRepoSlug(values.repo) : null;
+  const rulesetProfile = normalizeRulesetProfile(values["ruleset-profile"]);
   if (hasRepo === hasPrepareWorktree) {
     printUsage();
     throw new Error("Choose exactly one mode: --prepare-worktree PATH or --repo OWNER/REPO.");
   }
   if (hasPrepareWorktree && values.activate) {
     throw new Error("--activate is only valid with --repo after the canary passes.");
+  }
+  if (hasPrepareWorktree && rulesetProfile !== DEFAULT_RULESET_PROFILE) {
+    throw new Error(
+      `--ruleset-profile ${rulesetProfile} is remote-only; --prepare-worktree always installs the canonical full consumer control plane.`,
+    );
+  }
+  if (
+    rulesetProfile !== DEFAULT_RULESET_PROFILE &&
+    repo?.slug !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG
+  ) {
+    throw new Error(
+      `--ruleset-profile ${rulesetProfile} is reserved for the ${SOURCE_SELF_HOSTING_REPOSITORY_SLUG} source self-hosting migration. Ordinary consumers must use ${DEFAULT_RULESET_PROFILE}.`,
+    );
   }
   if (values["legacy-bridge"] && values["remove-legacy-bridge"]) {
     throw new Error(
@@ -761,7 +798,7 @@ function readCliOptions() {
   }
 
   return {
-    repo: hasRepo ? parseRepoSlug(values.repo) : null,
+    repo,
     prepareWorktree: hasPrepareWorktree ? resolve(values["prepare-worktree"]) : null,
     apply: values.apply,
     activate: values.activate,
@@ -779,6 +816,7 @@ function readCliOptions() {
     derivePostCleanupPlan: values["derive-post-cleanup-plan"],
     verifyPostCleanup: values["verify-post-cleanup"],
     rulesetName: values["ruleset-name"],
+    rulesetProfile,
     controlPlaneOwner: normalizeControlPlaneOwner(values["control-plane-owner"]),
     context: values.context,
     integrationId: DEFAULT_STATUS_INTEGRATION_ID,
@@ -801,10 +839,10 @@ function readCliOptions() {
 function printUsage() {
   console.log(`Usage:
   node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--legacy-bridge | --remove-legacy-bridge --final-closure-receipt PATH --expected-final-closure-receipt-sha256 SHA256] [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--legacy-bridge] [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--legacy-bridge] [--control-plane-owner @USER] [--apply]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --derive-post-cleanup-plan [--legacy-bridge] [--control-plane-owner @USER]
-  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --verify-post-cleanup --expected-post-cleanup-security-sha256 SHA256 [--legacy-bridge] [--control-plane-owner @USER]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--ruleset-profile full] [--legacy-bridge] [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--ruleset-profile full] [--legacy-bridge] [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --derive-post-cleanup-plan [--ruleset-profile full] [--legacy-bridge] [--control-plane-owner @USER]
+  node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --verify-post-cleanup --expected-post-cleanup-security-sha256 SHA256 [--ruleset-profile full] [--legacy-bridge] [--control-plane-owner @USER]
 
 Options:
   --prepare-worktree PATH Prepare a local consumer checkout for one installation PR.
@@ -827,6 +865,8 @@ Options:
   --canary-pr NUMBER      Open canary PR to verify before activation.
   --canary-head SHA       Exact lowercase 40-hex canary head to verify before activation.
   --ruleset-name NAME     Repo ruleset to create or update. Defaults to "${DEFAULT_RULESET_NAME}".
+  --ruleset-profile PROFILE
+                          Ruleset policy profile. Defaults to "${DEFAULT_RULESET_PROFILE}". "status-only" is reserved for ${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}'s source self-hosting migration and cannot be used for a local install or another repository.
   --control-plane-owner   GitHub user owning workflow and CODEOWNERS changes. Defaults to "${DEFAULT_CONTROL_PLANE_OWNER}".
   --context CONTEXT       Required CheckRun name. Must remain "${DEFAULT_STATUS_CONTEXT}".
   --workflow PATH         Verifier path; fixed to "${DEFAULT_WORKFLOW_PATH}" while both workflows are verified.
@@ -1331,6 +1371,7 @@ async function assertRulesetReadback({
   defaultBranch,
   context,
   integrationId,
+  rulesetProfile,
   enforcement,
   expectedPayload,
   exactWritableFields,
@@ -1362,22 +1403,29 @@ async function assertRulesetReadback({
     ruleset.source !== repoSlug ||
     ruleset?.target !== "branch" ||
     ruleset?.enforcement !== enforcement ||
-    !rulesetCoversDefaultBranch(ruleset, defaultBranch) ||
-    !rulesetHasGatePolicy(ruleset, context, { integrationId }) ||
+    !rulesetMatchesProfileAtDefaultBranch({
+      ruleset,
+      rulesetProfile,
+      defaultBranch,
+      context,
+      integrationId,
+    }) ||
     (exactWritableFields
       ? rulesetWritableFingerprint(ruleset) !==
         rulesetWritableFingerprint(expectedPayload)
       : !createReadbackMatchesPlannedShape(ruleset, expectedPayload))
   ) {
     throw new Error(
-      `Ruleset readback for id ${rulesetId} is incomplete or drifted: expected exact writable fields with ${enforcement} default-branch coverage, strict ${context} from GitHub Actions (${integrationId}), code-owner review without weakening an existing approval count, resolved conversations, non-fast-forward protection, and explicit empty bypass actors.${inconclusiveWriteEnforcement === null ? "" : ` ${postWriteRecoveryGuidance(inconclusiveWriteEnforcement, rulesetId)}`}`,
+      `Ruleset readback for id ${rulesetId} is incomplete or drifted: expected exact writable fields with ${enforcement} default-branch coverage and ${rulesetProfileReadbackExpectation(rulesetProfile, context, integrationId)}.${inconclusiveWriteEnforcement === null ? "" : ` ${postWriteRecoveryGuidance(inconclusiveWriteEnforcement, rulesetId)}`}`,
     );
   }
 
   if (logSuccess) {
-    console.log(
-      `Ruleset readback: ${rulesetLabel(ruleset)} is complete with ${enforcement} enforcement.`,
-    );
+    console.log(rulesetReadbackSuccessMessage({
+      ruleset,
+      rulesetProfile,
+      enforcement,
+    }));
   }
   return ruleset;
 }
@@ -2174,7 +2222,7 @@ async function verifyExpectedPostCleanupState({ options, canonicalWorkflows }) {
     );
   }
   console.log(
-    `Post-cleanup verified across two complete stable security snapshots: both legacy requirement surfaces are clear, every unrelated protection matches the pre-derived state, and ${rulesetLabel(second.selectedV2)} remains the complete Active v2 gate.`,
+    `Post-cleanup verified across two complete stable security snapshots: both legacy requirement surfaces are clear, every unrelated protection matches the pre-derived state, and ${rulesetLabel(second.selectedV2)} remains the ${rulesetProfileDescription(options.rulesetProfile, { active: true })}.`,
   );
 }
 
@@ -2197,8 +2245,11 @@ async function loadCleanupSecurityClosure({
     selectedV2 === undefined ||
     selectedV2.target !== "branch" ||
     selectedV2.enforcement !== "active" ||
-    !rulesetCoversDefaultBranch(selectedV2, securitySnapshot.defaultBranch) ||
-    !rulesetHasGatePolicy(selectedV2, options.context, {
+    !rulesetMatchesProfileAtDefaultBranch({
+      ruleset: selectedV2,
+      rulesetProfile: options.rulesetProfile,
+      defaultBranch: securitySnapshot.defaultBranch,
+      context: options.context,
       integrationId: options.integrationId,
     }) ||
     (requireLegacyClear &&
@@ -2207,7 +2258,7 @@ async function loadCleanupSecurityClosure({
       }))
   ) {
     throw new Error(
-      `Cleanup closure requires the unique repository ruleset "${options.rulesetName}" to remain the complete Active v2 policy${requireLegacyClear ? ` without ${LEGACY_STATUS_CONTEXT}` : ""}.`,
+      `Cleanup closure requires the unique repository ruleset "${options.rulesetName}" to remain the ${rulesetProfileDescription(options.rulesetProfile, { active: true })}${requireLegacyClear ? ` without ${LEGACY_STATUS_CONTEXT}` : ""}.`,
     );
   }
 
@@ -2593,11 +2644,66 @@ function assertCodeownersActivationDoesNotExpandPolicy({
   }
 }
 
+function rulesetMatchesProfileAtDefaultBranch({
+  ruleset,
+  rulesetProfile,
+  defaultBranch,
+  context,
+  integrationId,
+}) {
+  if (!rulesetCoversDefaultBranch(ruleset, defaultBranch)) {
+    return false;
+  }
+  if (normalizeRulesetProfile(rulesetProfile) === RULESET_PROFILE_STATUS_ONLY) {
+    return rulesetHasStatusOnlyProfile(ruleset, context, { integrationId });
+  }
+  return rulesetHasPolicyForProfile(
+    ruleset,
+    rulesetProfile,
+    context,
+    { integrationId },
+  );
+}
+
+function rulesetProfileDescription(profile, { active = false } = {}) {
+  switch (normalizeRulesetProfile(profile)) {
+    case DEFAULT_RULESET_PROFILE:
+      return active ? "complete Active v2 policy" : "complete v2 gate policy";
+    case RULESET_PROFILE_STATUS_ONLY:
+      return active ? "status-only Active v2 policy" : "status-only v2 policy";
+    default:
+      throw new Error("Ruleset profile normalization returned an unsupported value.");
+  }
+}
+
+function rulesetProfileReadbackExpectation(profile, context, integrationId) {
+  switch (normalizeRulesetProfile(profile)) {
+    case DEFAULT_RULESET_PROFILE:
+      return `strict ${context} from GitHub Actions (${integrationId}), code-owner review without weakening an existing approval count, resolved conversations, non-fast-forward protection, and explicit empty bypass actors`;
+    case RULESET_PROFILE_STATUS_ONLY:
+      return `one strict ${context} check bound to GitHub Actions (${integrationId}), default source conditions, explicit empty bypass actors, and no other rules`;
+    default:
+      throw new Error("Ruleset profile normalization returned an unsupported value.");
+  }
+}
+
+function rulesetReadbackSuccessMessage({
+  ruleset,
+  rulesetProfile,
+  enforcement,
+}) {
+  if (normalizeRulesetProfile(rulesetProfile) === DEFAULT_RULESET_PROFILE) {
+    return `Ruleset readback: ${rulesetLabel(ruleset)} is complete with ${enforcement} enforcement.`;
+  }
+  return `Ruleset readback: ${rulesetLabel(ruleset)} is an exact status-only v2 policy with ${enforcement} enforcement.`;
+}
+
 function printDryRun(action, options, payload, existingRuleset = null) {
   console.log(`Dry run: would ${action} repository ruleset "${payload.name}".`);
   if (existingRuleset !== null) {
     console.log(`Existing ruleset: ${rulesetLabel(existingRuleset)}`);
   }
+  console.log(`Ruleset profile: ${options.rulesetProfile}`);
   console.log(`Required status: ${options.context}`);
   console.log(`Enforcement: ${payload.enforcement}`);
   console.log(`Required source: GitHub Actions (${options.integrationId})`);

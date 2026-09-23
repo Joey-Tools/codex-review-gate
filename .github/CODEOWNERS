@@ -1,0 +1,4 @@
+# BEGIN codex-review-gate control-plane
+/.github/workflows/ @JoeyTeng
+/.github/CODEOWNERS @JoeyTeng
+# END codex-review-gate control-plane
