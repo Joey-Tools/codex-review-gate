@@ -903,6 +903,11 @@ evidence that a prior freeze remains in force.
   already supplied by an old copied workflow. Publish the runtime patch, update
   those copies, and use fresh canary evidence before treating the change as
   deployed.
+- Source PR `#62` carries the runtime receipt hardening. Its separately
+  reviewed `v2.0.2` release intent freezes that already-merged payload against
+  the published `v2.0.1` target head; source self-bootstrap remains pending
+  until the privileged publisher has advanced the stable floating `v2` alias
+  to that release.
 
 ## Next Steps
 
