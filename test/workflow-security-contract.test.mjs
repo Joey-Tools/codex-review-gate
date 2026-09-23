@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -16,6 +17,9 @@ import { fileURLToPath } from "node:url";
 import {
   canonicalLegacyReviewGateInventoryBytes,
   validateCanonicalV2ControllerWorkflowContent,
+  validateCanonicalV2WorkflowInventory,
+  validateCanonicalLegacyBridgeWorkflowContent,
+  workflowSingleProducerPolicyViolations,
 } from "../src/bootstrap.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -24,6 +28,17 @@ const sourceConsumerPath = join(
   repoRoot,
   ".github/workflows/codex-review-gate.yml",
 );
+const sourceControllerPath = join(
+  repoRoot,
+  ".github/workflows/codex-review-gate-controller.yml",
+);
+const sourceLegacyBridgePath = join(
+  repoRoot,
+  ".github/workflows/codex-review-gate-legacy-bridge.yml",
+);
+const sourceCodeownersPath = join(repoRoot, ".github/CODEOWNERS");
+const sourceStateMachinePath = join(repoRoot, ".github/workflows/state-machine.yml");
+const sourceWorkflowDirectory = join(repoRoot, ".github/workflows");
 const templateConsumerPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
@@ -100,6 +115,10 @@ const ACTIVE_V2_READBACK_PATTERN =
 
 const action = readFileSync(actionPath, "utf8");
 const sourceConsumer = readFileSync(sourceConsumerPath, "utf8");
+const sourceController = readFileSync(sourceControllerPath, "utf8");
+const sourceLegacyBridge = readFileSync(sourceLegacyBridgePath, "utf8");
+const sourceCodeowners = readFileSync(sourceCodeownersPath, "utf8");
+const sourceStateMachine = readFileSync(sourceStateMachinePath, "utf8");
 const templateConsumer = readFileSync(templateConsumerPath, "utf8");
 const templateController = readFileSync(templateControllerPath, "utf8");
 const templateCodeowners = readFileSync(templateCodeownersPath, "utf8");
@@ -120,7 +139,7 @@ const CLOSED_JOB_IF = [
   ") ||",
   "(",
   "github.event_name == 'issue_comment' &&",
-  "(github.event.action == 'created' || github.event.action == 'edited') &&",
+  "github.event.action == 'created' &&",
   "github.event.issue.pull_request &&",
   `github.event.sender.login == '${EXACT_BOT}' &&`,
   "github.event.sender.type == 'Bot' &&",
@@ -130,15 +149,16 @@ const CLOSED_JOB_IF = [
   "}}",
 ].join(" ");
 
-test("the v2 installation template is isolated from the still-live v1 source caller", () => {
-  const verifier = parseVerifierWorkflow(templateConsumer);
-  const controller = parseControllerWorkflow(templateController);
-  assert.notEqual(sourceConsumer, templateConsumer);
-  assert.match(
-    sourceConsumer,
-    /uses: JoeyTeng\/codex-review-gate-action\/\.github\/workflows\/codex-review-gate\.yml@v1/u,
+test("source self-installation matches canonical v2 assets and contains its temporary v1 bridge", () => {
+  const verifier = parseVerifierWorkflow(sourceConsumer);
+  const controller = parseControllerWorkflow(sourceController);
+  assert.equal(sourceConsumer, templateConsumer);
+  assert.equal(sourceController, templateController);
+  assert.equal(sourceCodeowners, templateCodeowners);
+  assert.equal(
+    validateCanonicalLegacyBridgeWorkflowContent(sourceLegacyBridge),
+    sourceLegacyBridge,
   );
-  assert.doesNotMatch(sourceConsumer, /codex-review-gate-action@v2/u);
   for (const path of retiredPackageWorkflowPaths) {
     assert.equal(existsSync(path), false);
   }
@@ -150,6 +170,60 @@ test("the v2 installation template is isolated from the still-live v1 source cal
       /\.github\/workflows\/codex-review-gate\.yml@|workflow_call|secrets:\s*inherit/u,
     );
   }
+
+  const inventory = sourceWorkflowInventory();
+  const canonicalWorkflows = {
+    verifier: templateConsumer,
+    controller: templateController,
+    legacyBridge: sourceLegacyBridge,
+  };
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(inventory, canonicalWorkflows, {
+      legacyBridge: true,
+    }),
+    canonicalWorkflows,
+  );
+  for (const [name, content, expected] of [
+    [
+      "additional v1 caller",
+      "name: unexpected\njobs:\n  bridge:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+      /Additional v1\/v2 gate callers/u,
+    ],
+    [
+      "additional status writer",
+      "name: unexpected\npermissions:\n  statuses: write\njobs: {}\n",
+      /single-producer policy/u,
+    ],
+    [
+      "additional reserved check producer",
+      "name: unexpected\njobs:\n  producer:\n    name: codex/github-review-gate\n    runs-on: ubuntu-latest\n",
+      /single-producer policy/u,
+    ],
+  ]) {
+    assert.throws(
+      () =>
+        validateCanonicalV2WorkflowInventory(
+          [...inventory, {
+            path: `.github/workflows/${name.replaceAll(" ", "-")}.yml`,
+            content,
+          }],
+          canonicalWorkflows,
+          { legacyBridge: true },
+        ),
+      expected,
+      name,
+    );
+  }
+});
+
+test("source state-machine check names have a static non-reserved prefix", () => {
+  assert.match(
+    sourceStateMachine,
+    /^    name: Review gate state machine\$\{\{ matrix\.check-suffix \}\}$/mu,
+  );
+  assert.match(sourceStateMachine, /^            check-suffix: ""$/mu);
+  assert.match(sourceStateMachine, /^            check-suffix: " Node\.js 24"$/mu);
+  assert.deepEqual(workflowSingleProducerPolicyViolations(sourceStateMachine), []);
 });
 
 test("automatic runner admission separates read-only PR verification from exact Codex comments", () => {
@@ -161,7 +235,7 @@ test("automatic runner admission separates read-only PR verification from exact 
   });
   assert.deepEqual(blockDirectKeys(workflow.events), ["issue_comment", "workflow_dispatch"]);
   assert.deepEqual(blockScalarMapping(workflow.issueComment), {
-    types: "[created, edited]",
+    types: "[created]",
   });
 
   const jobIf = foldedScalarBody(workflow.job, "if");
@@ -171,7 +245,6 @@ test("automatic runner admission separates read-only PR verification from exact 
     "github.ref_name == github.event.repository.default_branch",
     "github.event_name == 'issue_comment'",
     "github.event.action == 'created'",
-    "github.event.action == 'edited'",
     "github.event.issue.pull_request",
     `github.event.sender.login == '${EXACT_BOT}'`,
     "github.event.sender.type == 'Bot'",
@@ -225,7 +298,7 @@ test("consumer permissions and runtime shape cannot read or execute pull-request
   assert.equal(itemScalar(verifier.steps[0], "uses"), MARKETPLACE_ACTION);
   assert.deepEqual(blockScalarMapping(verifier.env), {
     CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION:
-      "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+      "any",
   });
   assertNoForbiddenExecutionKeys(templateConsumer);
   assertNoForbiddenExecutionKeys(templateController);
@@ -1842,7 +1915,43 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       /V2_RULESET_NAME\s*=[^\n]*Must Pass Codex Review/u,
       name,
     );
-    const remoteCommands = bootstrapRemoteCommands(guide);
+    const { ordinaryGuide, sourceSelfHostingGuide } = splitSourceSelfHostingGuide(
+      guide,
+      name,
+    );
+    const sourceCommands = bootstrapRemoteCommands(sourceSelfHostingGuide);
+    assert.equal(
+      sourceCommands.length,
+      2,
+      `${name}: source self-hosting has only status-only stage preview/apply`,
+    );
+    for (const { text } of sourceCommands) {
+      assert.match(text, /--repo "\$REPO"/u, `${name}: ${text}`);
+      assert.match(
+        text,
+        /--ruleset-name "\$V2_RULESET_NAME"/u,
+        `${name}: ${text}`,
+      );
+      assert.match(text, /--ruleset-profile status-only/u, `${name}: ${text}`);
+      assert.match(text, /--legacy-bridge/u, `${name}: ${text}`);
+      assert.match(
+        text,
+        /--expected-legacy-inventory-sha256/u,
+        `${name}: ${text}`,
+      );
+      assert.doesNotMatch(
+        text,
+        /--activate|--derive-post-cleanup-plan|--verify-post-cleanup/u,
+        `${name}: source staging stays distinct from canary and cleanup`,
+      );
+    }
+    assert.equal(
+      sourceCommands.filter(({ text }) => text.includes("--apply")).length,
+      1,
+      `${name}: source self-hosting has one stage apply`,
+    );
+
+    const remoteCommands = bootstrapRemoteCommands(ordinaryGuide);
     assert.equal(
       remoteCommands.length,
       6,
@@ -1909,7 +2018,7 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       `${name}: final probe must bind the pre-derived post-state`,
     );
     assert.match(
-      guide.slice(deriveCommand.end, finalProbe.start),
+      ordinaryGuide.slice(deriveCommand.end, finalProbe.start),
       /(?:legacy cleanup|cleanup[\s\S]{0,100}legacy|(?:移除|删除)[\s\S]{0,100}legacy)/iu,
       `${name}: legacy cleanup must separate derivation from final closure`,
     );
@@ -1989,10 +2098,14 @@ test("package docs preserve reaction liveness and pending recovery semantics", (
       /ordinary[\s\S]{0,100}\+1[\s\S]{0,100}(?:cannot|does not|不能|不得)[\s\S]{0,80}(?:head-bind|绑定)/iu,
       name,
     );
-    assert.match(guide, /same(?:-time| timestamp)?\/later official `?eyes`?\/progress/iu, name);
     assert.match(
       guide,
-      /later\s+provider\s+event\s+or\s+manual\s+reconcile/iu,
+      /(?:same(?:-time| timestamp)?\/later official `?eyes`?\/progress|official[\s\S]{0,80}`?eyes`?[\s\S]{0,120}progress[\s\S]{0,160}(?:same(?:-time| timestamp)?|later|同时|更晚))/iu,
+      name,
+    );
+    assert.match(
+      guide,
+      /later\s+provider\s+event\s+(?:or|或)\s+manual\s+reconcile/iu,
       name,
     );
     assert.match(
@@ -2209,8 +2322,8 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
       "    timeout-minutes: 14\n    <<: *attacker-job",
     ),
     templateConsumer.replace(
-      "vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write'",
-      "vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
+      "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
+      "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: write",
     ),
   ];
   const controllerMutations = [
@@ -2219,8 +2332,8 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
       "github.event.comment.user.type == 'Bot' || true",
     ),
     templateController.replace(
+      "github.event.action == 'created'",
       "github.event.action == 'created' || github.event.action == 'edited'",
-      "github.event.action == 'edited' || github.event.action == 'created'",
     ),
   ];
   for (const mutation of verifierMutations) {
@@ -2513,12 +2626,19 @@ test("installation guides preserve the feature-head CheckRun and test-merge exec
   }
 });
 
-test("installation guides preserve the protected request-author policy boundary", () => {
+test("installation guides preserve the default-any request-author and provider-authority boundary", () => {
   for (const [name, guide] of Object.entries(installGuides)) {
     assert.match(guide, /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION/u, name);
     assert.match(guide, /\bwrite\b/u, name);
     assert.match(guide, /\bany\b/u, name);
     assert.match(guide, /finding/u, name);
+    assert.match(guide, /provider/iu, name);
+    assert.match(guide, /pending/iu, name);
+    assert.match(
+      guide,
+      /(?:does not grant[^.]{0,160}(?:invoke|start)[^.]{0,160}Codex|not permission to invoke Codex|不授予[^。]{0,160}(?:调用|启动)[^。]{0,160}Codex|不是调用[^。]{0,160}Codex[^。]{0,160}权限)/u,
+      name,
+    );
   }
   const inputs = section(action, "inputs", "outputs");
   assert.doesNotMatch(inputs, /request_author_permission/u);
@@ -2563,6 +2683,16 @@ test("the JavaScript Action exposes only the adopted public input ABI", () => {
     /^  (?:github-token|pull-request|request-review|max-pages|max-objects|temporary|result-path|report-path|receipt|ledger|wakeup):/mu,
   );
 });
+
+function sourceWorkflowInventory() {
+  return readdirSync(sourceWorkflowDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.ya?ml$/u.test(entry.name))
+    .map((entry) => ({
+      path: `.github/workflows/${entry.name}`,
+      content: readFileSync(join(sourceWorkflowDirectory, entry.name), "utf8"),
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path, "en"));
+}
 
 function parseVerifierWorkflow(source) {
   assertNoForbiddenExecutionKeys(source);
@@ -2717,7 +2847,7 @@ function parseClosedActionStep(job, expectedWithKeys) {
   ]);
   assert.equal(
     blockScalar(envBlock, "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION"),
-    "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    "any",
   );
   const withBlock = itemChildBlock(steps[0], "with");
   assert.deepEqual(blockDirectKeys(withBlock), expectedWithKeys);
@@ -3466,4 +3596,18 @@ function bootstrapRemoteCommands(markdown) {
     }
   }
   return commands;
+}
+
+function splitSourceSelfHostingGuide(markdown, name) {
+  const heading = name.endsWith(".zh-CN.md")
+    ? "## 窄范围 source repository self-hosting 例外"
+    : "## Narrow source-repository self-hosting exception";
+  const start = markdown.indexOf(heading);
+  assert.ok(start >= 0, `${name}: source self-hosting exception heading`);
+  const endOffset = markdown.indexOf("\n## ", start + heading.length);
+  const end = endOffset === -1 ? markdown.length : endOffset + 1;
+  return {
+    sourceSelfHostingGuide: markdown.slice(start, end),
+    ordinaryGuide: `${markdown.slice(0, start)}${markdown.slice(end)}`,
+  };
 }

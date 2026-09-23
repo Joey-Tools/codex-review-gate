@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
+import { validateCanonicalLegacyBridgeWorkflowContent } from "../src/bootstrap.mjs";
 
 const action = readFileSync(
   new URL("../packages/action/action.yml", import.meta.url),
@@ -8,6 +9,18 @@ const action = readFileSync(
 );
 const sourceConsumer = readFileSync(
   new URL("../.github/workflows/codex-review-gate.yml", import.meta.url),
+  "utf8",
+);
+const sourceController = readFileSync(
+  new URL("../.github/workflows/codex-review-gate-controller.yml", import.meta.url),
+  "utf8",
+);
+const sourceLegacyBridge = readFileSync(
+  new URL("../.github/workflows/codex-review-gate-legacy-bridge.yml", import.meta.url),
+  "utf8",
+);
+const sourceCodeowners = readFileSync(
+  new URL("../.github/CODEOWNERS", import.meta.url),
   "utf8",
 );
 const templateVerifier = readFileSync(
@@ -22,6 +35,10 @@ const templateController = readFileSync(
     "../templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
     import.meta.url,
   ),
+  "utf8",
+);
+const templateCodeowners = readFileSync(
+  new URL("../templates/codex-gated-repo/.github/CODEOWNERS", import.meta.url),
   "utf8",
 );
 
@@ -93,14 +110,20 @@ test("v2 Action exposes only the closed operation, request, and limits-profile A
   );
 });
 
-test("source remains on v1 until the v2 alias exists", () => {
-  assert.notEqual(sourceConsumer, templateVerifier);
-  assert.notEqual(sourceConsumer, templateController);
+test("source self-installation matches canonical v2 assets while retaining its temporary v1 bridge", () => {
+  assert.equal(sourceConsumer, templateVerifier);
+  assert.equal(sourceController, templateController);
+  assert.equal(sourceCodeowners, templateCodeowners);
+  assert.equal(
+    validateCanonicalLegacyBridgeWorkflowContent(sourceLegacyBridge),
+    sourceLegacyBridge,
+  );
   assert.match(
-    sourceConsumer,
+    sourceLegacyBridge,
     /uses: JoeyTeng\/codex-review-gate-action\/\.github\/workflows\/codex-review-gate\.yml@v1/u,
   );
-  assert.doesNotMatch(sourceConsumer, /codex-review-gate-action@v2/u);
+  assert.match(sourceConsumer, /uses: JoeyTeng\/codex-review-gate-action@v2/u);
+  assert.match(sourceController, /uses: JoeyTeng\/codex-review-gate-action@v2/u);
 });
 
 test("canonical verifier owns the native required CheckRun on selected pull-request events", () => {
@@ -131,7 +154,7 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
 
 test("canonical controller starts runners only for default-branch dispatches or exact Codex comments", () => {
   assert.match(templateController, /^name: Codex Review Gate Controller$/mu);
-  assert.match(templateController, /^  issue_comment:\n    types: \[created, edited\]$/mu);
+  assert.match(templateController, /^  issue_comment:\n    types: \[created\]$/mu);
   assert.match(templateController, /^  workflow_dispatch:$/mu);
   assert.doesNotMatch(
     templateController,
@@ -146,7 +169,7 @@ test("canonical controller starts runners only for default-branch dispatches or 
   );
   assert.match(templateController, /github\.event_name == 'issue_comment'/u);
   assert.match(templateController, /github\.event\.action == 'created'/u);
-  assert.match(templateController, /github\.event\.action == 'edited'/u);
+  assert.doesNotMatch(templateController, /github\.event\.action == 'edited'/u);
   assert.match(templateController, /github\.event\.issue\.pull_request/u);
   assert.match(
     templateController,
@@ -222,7 +245,7 @@ test("canonical verifier is read-only, latest-wins, and uses the direct Action",
   );
   assert.match(
     templateVerifier,
-    /^        env:\n          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: \$\{\{ vars\.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' \|\| 'write' \}\}$/mu,
+    /^        env:\n          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any$/mu,
   );
   assert.match(
     templateVerifier,

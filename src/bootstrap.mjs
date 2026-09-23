@@ -14,6 +14,9 @@ export const DEFAULT_CONTROLLER_WORKFLOW_PATH =
 export const DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-legacy-bridge.yml";
 export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
+export const RULESET_PROFILE_FULL = "full";
+export const RULESET_PROFILE_STATUS_ONLY = "status-only";
+export const DEFAULT_RULESET_PROFILE = RULESET_PROFILE_FULL;
 export const DEFAULT_CONTROL_PLANE_OWNER = "@JoeyTeng";
 export const DEFAULT_CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const CANONICAL_V2_WORKFLOW_USES =
@@ -72,6 +75,24 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
     ) ||
     (
       github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.event.issue.pull_request &&
+      github.event.sender.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.sender.type == 'Bot' &&
+      github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.comment.user.type == 'Bot'
+    )
+  }}
+`);
+const FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
+  \${{
+    (
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch
+    ) ||
+    (
+      github.event_name == 'issue_comment' &&
       (github.event.action == 'created' || github.event.action == 'edited') &&
       github.event.issue.pull_request &&
       github.event.sender.login == 'chatgpt-codex-connector[bot]' &&
@@ -81,6 +102,11 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
     )
   }}
 `);
+const CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES = "[created]";
+const FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES = "[created, edited]";
+const CANONICAL_REQUEST_AUTHOR_PERMISSION = "any";
+const FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION =
+  "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}";
 
 const DEFAULT_REF_CONDITIONS = {
   ref_name: {
@@ -88,6 +114,19 @@ const DEFAULT_REF_CONDITIONS = {
     exclude: [],
   },
 };
+const STATUS_ONLY_RULESET_ENFORCEMENTS = new Set(["disabled", "active"]);
+
+export function normalizeRulesetProfile(value = DEFAULT_RULESET_PROFILE) {
+  if (
+    value === RULESET_PROFILE_FULL ||
+    value === RULESET_PROFILE_STATUS_ONLY
+  ) {
+    return value;
+  }
+  throw new Error(
+    `Ruleset profile must be "${RULESET_PROFILE_FULL}" or "${RULESET_PROFILE_STATUS_ONLY}".`,
+  );
+}
 
 export function directoryWitnessFromMetadata(path, metadata, label = "Directory") {
   if (metadata === null || metadata === undefined) {
@@ -779,6 +818,75 @@ export function rulesetHasGatePolicy(
   );
 }
 
+export function rulesetHasStatusOnlyPolicy(
+  ruleset,
+  context = DEFAULT_STATUS_CONTEXT,
+  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  assertStatusOnlyProfileBinding(context, integrationId);
+  if (
+    ruleset === null ||
+    typeof ruleset !== "object" ||
+    Array.isArray(ruleset) ||
+    !Array.isArray(ruleset.bypass_actors) ||
+    ruleset.bypass_actors.length !== 0 ||
+    !Array.isArray(ruleset.rules) ||
+    ruleset.rules.length !== 1
+  ) {
+    return false;
+  }
+
+  const [rule] = ruleset.rules;
+  if (
+    rule === null ||
+    typeof rule !== "object" ||
+    Array.isArray(rule) ||
+    rule.type !== "required_status_checks"
+  ) {
+    return false;
+  }
+
+  return canonicalJson(
+    normalizeStatusOnlyRequiredStatusRuleForComparison(rule),
+  ) === canonicalJson(
+    buildRequiredStatusChecksRule({
+      context,
+      integrationId,
+      strict: true,
+      doNotEnforceOnCreate: false,
+    }),
+  );
+}
+
+export function rulesetHasStatusOnlyProfile(
+  ruleset,
+  context = DEFAULT_STATUS_CONTEXT,
+  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  return (
+    rulesetHasStatusOnlyPolicy(ruleset, context, { integrationId }) &&
+    ruleset.target === "branch" &&
+    STATUS_ONLY_RULESET_ENFORCEMENTS.has(ruleset.enforcement) &&
+    canonicalJson(ruleset.conditions) === canonicalJson(DEFAULT_REF_CONDITIONS)
+  );
+}
+
+export function rulesetHasPolicyForProfile(
+  ruleset,
+  profile = DEFAULT_RULESET_PROFILE,
+  context = DEFAULT_STATUS_CONTEXT,
+  { integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  switch (normalizeRulesetProfile(profile)) {
+    case RULESET_PROFILE_FULL:
+      return rulesetHasGatePolicy(ruleset, context, { integrationId });
+    case RULESET_PROFILE_STATUS_ONLY:
+      return rulesetHasStatusOnlyPolicy(ruleset, context, { integrationId });
+    default:
+      throw new Error("Ruleset profile normalization returned an unsupported value.");
+  }
+}
+
 export function requiredStatusCheckContexts(ruleset) {
   return requiredStatusChecks(ruleset)
     .map((check) => check?.context)
@@ -828,6 +936,36 @@ export function findEffectiveRulesetWithGatePolicy(
       rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
       rulesetHasGatePolicy(ruleset, context, { integrationId }),
   );
+}
+
+export function findEffectiveRulesetWithStatusOnlyPolicy(
+  rulesets,
+  context = DEFAULT_STATUS_CONTEXT,
+  { defaultBranch = null, integrationId = DEFAULT_STATUS_INTEGRATION_ID } = {},
+) {
+  assertStatusOnlyProfileBinding(context, integrationId);
+  return rulesets.find(
+    (ruleset) =>
+      ruleset.enforcement === "active" &&
+      rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
+      rulesetHasStatusOnlyProfile(ruleset, context, { integrationId }),
+  );
+}
+
+export function findEffectiveRulesetWithProfilePolicy(
+  rulesets,
+  profile = DEFAULT_RULESET_PROFILE,
+  context = DEFAULT_STATUS_CONTEXT,
+  options = {},
+) {
+  switch (normalizeRulesetProfile(profile)) {
+    case RULESET_PROFILE_FULL:
+      return findEffectiveRulesetWithGatePolicy(rulesets, context, options);
+    case RULESET_PROFILE_STATUS_ONLY:
+      return findEffectiveRulesetWithStatusOnlyPolicy(rulesets, context, options);
+    default:
+      throw new Error("Ruleset profile normalization returned an unsupported value.");
+  }
 }
 
 export function assertCompleteRulesetApiObject(ruleset) {
@@ -1233,7 +1371,34 @@ export function buildCreateRulesetPayload({
   enforcement = DEFAULT_RULESET_ENFORCEMENT,
   strict = true,
   doNotEnforceOnCreate = undefined,
+  profile = DEFAULT_RULESET_PROFILE,
 } = {}) {
+  const normalizedProfile = normalizeRulesetProfile(profile);
+  if (normalizedProfile === RULESET_PROFILE_STATUS_ONLY) {
+    assertStatusOnlyProfileOptions({
+      context,
+      integrationId,
+      strict,
+      doNotEnforceOnCreate,
+    });
+    assertStatusOnlyRulesetEnforcement(enforcement);
+    return {
+      name,
+      target: "branch",
+      enforcement,
+      bypass_actors: [],
+      conditions: structuredCloneSafe(DEFAULT_REF_CONDITIONS),
+      rules: [
+        buildRequiredStatusChecksRule({
+          context,
+          integrationId,
+          strict,
+          doNotEnforceOnCreate: doNotEnforceOnCreate ?? false,
+        }),
+      ],
+    };
+  }
+
   const { rules } = ensureGatePolicyInRules([], context, {
     integrationId,
     strict,
@@ -1259,8 +1424,20 @@ export function buildUpdateRulesetPayload(
     enforcement = undefined,
     strict = true,
     doNotEnforceOnCreate = undefined,
+    profile = DEFAULT_RULESET_PROFILE,
   } = {},
 ) {
+  const normalizedProfile = normalizeRulesetProfile(profile);
+  if (normalizedProfile === RULESET_PROFILE_STATUS_ONLY) {
+    return buildStatusOnlyUpdateRulesetPayload(ruleset, {
+      context,
+      integrationId,
+      enforcement,
+      strict,
+      doNotEnforceOnCreate,
+    });
+  }
+
   const requiredTarget = "branch";
   if (ruleset.target !== undefined && ruleset.target !== requiredTarget) {
     throw new Error(
@@ -1316,10 +1493,62 @@ export function buildUpdateRulesetPayload(
   return { changed, payload };
 }
 
-export function rulesetWritableFingerprint(ruleset) {
+function buildStatusOnlyUpdateRulesetPayload(
+  ruleset,
+  {
+    context,
+    integrationId,
+    enforcement,
+    strict,
+    doNotEnforceOnCreate,
+  },
+) {
+  assertStatusOnlyProfileOptions({
+    context,
+    integrationId,
+    strict,
+    doNotEnforceOnCreate,
+  });
+  if (!rulesetHasStatusOnlyProfile(ruleset, context, { integrationId })) {
+    throw new Error(
+      `Ruleset "${ruleset?.name ?? "<unnamed>"}" is not an exact status-only profile; refusing to remove or rewrite additional protections.`,
+    );
+  }
+
+  const requiredEnforcement = enforcement ?? ruleset.enforcement;
+  assertStatusOnlyRulesetEnforcement(requiredEnforcement);
+  const payload = buildCreateRulesetPayload({
+    name: ruleset.name,
+    context,
+    integrationId,
+    enforcement: requiredEnforcement,
+    strict,
+    doNotEnforceOnCreate,
+    profile: RULESET_PROFILE_STATUS_ONLY,
+  });
+  return {
+    changed:
+      rulesetWritableFingerprint(ruleset, {
+        profile: RULESET_PROFILE_STATUS_ONLY,
+      }) !==
+      rulesetWritableFingerprint(payload, {
+        profile: RULESET_PROFILE_STATUS_ONLY,
+      }),
+    payload,
+  };
+}
+
+export function rulesetWritableFingerprint(
+  ruleset,
+  { profile = DEFAULT_RULESET_PROFILE } = {},
+) {
   if (ruleset === null || typeof ruleset !== "object" || Array.isArray(ruleset)) {
     throw new Error("Ruleset readback must be an object before update.");
   }
+  const normalizedProfile = normalizeRulesetProfile(profile);
+  const rules = Array.isArray(ruleset.rules)
+    ? ruleset.rules.map(stripRuleForRulesetPayload)
+    : ruleset.rules;
   return canonicalJson({
     name: ruleset.name,
     target: ruleset.target,
@@ -1328,9 +1557,9 @@ export function rulesetWritableFingerprint(ruleset) {
       ? ruleset.bypass_actors.map(stripBypassActorForRulesetPayload)
       : ruleset.bypass_actors,
     conditions: structuredCloneSafe(ruleset.conditions),
-    rules: Array.isArray(ruleset.rules)
-      ? ruleset.rules.map(stripRuleForRulesetPayload)
-      : ruleset.rules,
+    rules: normalizedProfile === RULESET_PROFILE_STATUS_ONLY && Array.isArray(rules)
+      ? rules.map(normalizeStatusOnlyRequiredStatusRuleForComparison)
+      : rules,
   });
 }
 
@@ -1339,6 +1568,20 @@ export function validateCanonicalV2WorkflowContent(value) {
 }
 
 export function validateCanonicalLegacyBridgeWorkflowContent(value) {
+  return validateLegacyBridgeWorkflowContent(value, {
+    requireCurrentCanonicalBytes: true,
+  });
+}
+
+function validateFrozenHandoffLegacyBridgeWorkflowContent(value) {
+  return validateLegacyBridgeWorkflowContent(value, {
+    requireCurrentCanonicalBytes: false,
+  });
+}
+
+function validateLegacyBridgeWorkflowContent(value, {
+  requireCurrentCanonicalBytes,
+}) {
   if (typeof value !== "string" || value === "") {
     throw new Error(
       "Canonical legacy bridge workflow must be non-empty UTF-8 text.",
@@ -1390,7 +1633,10 @@ export function validateCanonicalLegacyBridgeWorkflowContent(value) {
       "Canonical legacy bridge workflow may write only issues and legacy commit statuses.",
     );
   }
-  if (value !== CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT) {
+  if (
+    requireCurrentCanonicalBytes &&
+    value !== CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT
+  ) {
     throw new Error(
       "Canonical legacy bridge workflow must exactly match the closed temporary event, permission, concurrency, and single-caller envelope.",
     );
@@ -1399,6 +1645,20 @@ export function validateCanonicalLegacyBridgeWorkflowContent(value) {
 }
 
 export function validateCanonicalV2VerifierWorkflowContent(value) {
+  return validateV2VerifierWorkflowContent(value, {
+    requestAuthorPermission: CANONICAL_REQUEST_AUTHOR_PERMISSION,
+  });
+}
+
+function validateFrozenHandoffV2VerifierWorkflowContent(value) {
+  return validateV2VerifierWorkflowContent(value, {
+    requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
+  });
+}
+
+function validateV2VerifierWorkflowContent(value, {
+  requestAuthorPermission,
+}) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 verifier workflow must be non-empty UTF-8 text.");
   }
@@ -1453,7 +1713,7 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
     "operation: reconcile",
     "request_review: false",
     "CODEX_REVIEW_GATE_LIMITS_PROFILE",
-    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${requestAuthorPermission}`,
     "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
   ]) {
     if (!value.includes(fragment)) {
@@ -1472,6 +1732,25 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
 }
 
 export function validateCanonicalV2ControllerWorkflowContent(value) {
+  return validateV2ControllerWorkflowContent(value, {
+    jobIfExpression: CANONICAL_CONTROLLER_JOB_IF_EXPRESSION,
+    issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
+  });
+}
+
+function validateFrozenHandoffV2ControllerWorkflowContent(value) {
+  return validateV2ControllerWorkflowContent(value, {
+    jobIfExpression: FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION,
+    issueCommentTypes: FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES,
+    requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
+  });
+}
+
+function validateV2ControllerWorkflowContent(value, {
+  jobIfExpression: expectedJobIfExpression,
+  issueCommentTypes,
+  requestAuthorPermission = CANONICAL_REQUEST_AUTHOR_PERMISSION,
+}) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
   }
@@ -1484,17 +1763,17 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
   }
 
   const jobIfExpression = extractCanonicalJobIfExpression(value);
-  if (jobIfExpression !== CANONICAL_CONTROLLER_JOB_IF_EXPRESSION) {
+  if (jobIfExpression !== expectedJobIfExpression) {
     throw new Error(
       "Canonical v2 controller workflow job.if must exactly match the closed runner-admission expression.",
     );
   }
   if (
-    !/^  issue_comment:\n    types: \[created, edited\]$/m.test(value) ||
+    !value.includes(`  issue_comment:\n    types: ${issueCommentTypes}`) ||
     !/^  workflow_dispatch:\s*$/m.test(value)
   ) {
     throw new Error(
-      "Canonical v2 controller workflow must expose issue_comment created/edited and workflow_dispatch.",
+      `Canonical v2 controller workflow must expose issue_comment ${issueCommentTypes} and workflow_dispatch.`,
     );
   }
   for (const forbiddenEvent of [
@@ -1522,7 +1801,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
   assertControllerMappingScalar(
     controllerMappings,
     "on.issue_comment.types",
-    "[created, edited]",
+    issueCommentTypes,
   );
   for (const [path, expected] of [
     ["on.workflow_dispatch.inputs.operation.required", "true"],
@@ -1554,7 +1833,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     ["jobs.codex-review-gate-controller.steps.uses", CANONICAL_V2_WORKFLOW_USES],
     [
       "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
-      "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+      requestAuthorPermission,
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.github_token",
@@ -1598,7 +1877,6 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     "github.ref_name == github.event.repository.default_branch",
     "github.event_name == 'issue_comment'",
     "github.event.action == 'created'",
-    "github.event.action == 'edited'",
     "github.event.sender.login",
     "github.event.sender.type",
     "github.event.comment.user.login",
@@ -1612,7 +1890,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     "request_review:",
     "CODEX_REVIEW_GATE_LIMITS_PROFILE",
     "CODEX_REVIEW_GATE_USE_UBUNTU_LATEST",
-    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${requestAuthorPermission}`,
   ]) {
     if (!value.includes(fragment)) {
       throw new Error(`Canonical v2 controller workflow is missing required fragment: ${fragment}`);
@@ -2306,6 +2584,49 @@ export function validateCanonicalV2WorkflowInventory(
   canonicalWorkflows,
   { legacyBridge = false } = {},
 ) {
+  return validateV2WorkflowInventory(
+    workflowFiles,
+    canonicalWorkflows,
+    {
+      legacyBridge,
+      validateVerifier: validateCanonicalV2VerifierWorkflowContent,
+      validateController: validateCanonicalV2ControllerWorkflowContent,
+      validateLegacyBridge: validateCanonicalLegacyBridgeWorkflowContent,
+    },
+  );
+}
+
+// This entry point is intentionally limited to immutable organization-handoff
+// evidence that predates the created-only controller admission rule. It is not
+// an installation or bootstrap policy: callers must separately bind each
+// workflow to its frozen manifest identity before using this validator.
+export function validateFrozenHandoffV2WorkflowInventory(
+  workflowFiles,
+  canonicalWorkflows,
+  { legacyBridge = false } = {},
+) {
+  return validateV2WorkflowInventory(
+    workflowFiles,
+    canonicalWorkflows,
+    {
+      legacyBridge,
+      validateVerifier: validateFrozenHandoffV2VerifierWorkflowContent,
+      validateController: validateFrozenHandoffV2ControllerWorkflowContent,
+      validateLegacyBridge: validateFrozenHandoffLegacyBridgeWorkflowContent,
+    },
+  );
+}
+
+function validateV2WorkflowInventory(
+  workflowFiles,
+  canonicalWorkflows,
+  {
+    legacyBridge,
+    validateVerifier,
+    validateController,
+    validateLegacyBridge,
+  },
+) {
   if (!Array.isArray(workflowFiles)) {
     throw new Error("Default-branch workflow inventory must be an array.");
   }
@@ -2314,7 +2635,12 @@ export function validateCanonicalV2WorkflowInventory(
   }
   const canonicalEntries = normalizeCanonicalWorkflowEntries(
     canonicalWorkflows,
-    { legacyBridge },
+    {
+      legacyBridge,
+      validateVerifier,
+      validateController,
+      validateLegacyBridge,
+    },
   );
   for (const { path, content, role } of canonicalEntries) {
     const matches = workflowFiles.filter((file) => file?.path === path);
@@ -2324,11 +2650,11 @@ export function validateCanonicalV2WorkflowInventory(
       );
     }
     if (role === "verifier") {
-      validateCanonicalV2VerifierWorkflowContent(matches[0].content);
+      validateVerifier(matches[0].content);
     } else if (role === "controller") {
-      validateCanonicalV2ControllerWorkflowContent(matches[0].content);
+      validateController(matches[0].content);
     } else {
-      validateCanonicalLegacyBridgeWorkflowContent(matches[0].content);
+      validateLegacyBridge(matches[0].content);
     }
     if (!installedWorkflowMatchesCanonical(matches[0].content, content)) {
       throw new Error(
@@ -2375,7 +2701,12 @@ export function validateCanonicalV2WorkflowInventory(
 
 function normalizeCanonicalWorkflowEntries(
   canonicalWorkflows,
-  { legacyBridge = false } = {},
+  {
+    legacyBridge = false,
+    validateVerifier = validateCanonicalV2VerifierWorkflowContent,
+    validateController = validateCanonicalV2ControllerWorkflowContent,
+    validateLegacyBridge = validateCanonicalLegacyBridgeWorkflowContent,
+  } = {},
 ) {
   if (
     canonicalWorkflows === null ||
@@ -2386,10 +2717,17 @@ function normalizeCanonicalWorkflowEntries(
       "Canonical workflow inventory must provide verifier and controller workflow bytes.",
     );
   }
+  if (
+    typeof validateVerifier !== "function" ||
+    typeof validateController !== "function" ||
+    typeof validateLegacyBridge !== "function"
+  ) {
+    throw new Error("Canonical workflow inventory validators must be functions.");
+  }
   const verifier = canonicalWorkflows.verifier;
   const controller = canonicalWorkflows.controller;
-  validateCanonicalV2VerifierWorkflowContent(verifier);
-  validateCanonicalV2ControllerWorkflowContent(controller);
+  validateVerifier(verifier);
+  validateController(controller);
   const entries = [
     {
       role: "verifier",
@@ -2404,7 +2742,7 @@ function normalizeCanonicalWorkflowEntries(
   ];
   if (legacyBridge) {
     const bridge = canonicalWorkflows.legacyBridge;
-    validateCanonicalLegacyBridgeWorkflowContent(bridge);
+    validateLegacyBridge(bridge);
     entries.push({
       role: "legacy bridge",
       path: DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
@@ -2539,6 +2877,62 @@ export function normalizeWorkflowPath(value) {
     throw new Error(
       `Workflow path must be a .github/workflows/*.yml or *.yaml file: ${value}`,
     );
+  }
+  return normalized;
+}
+
+function assertStatusOnlyProfileBinding(context, integrationId) {
+  if (context !== DEFAULT_STATUS_CONTEXT) {
+    throw new Error(
+      `Status-only rulesets require the ${DEFAULT_STATUS_CONTEXT} status context.`,
+    );
+  }
+  if (integrationId !== DEFAULT_STATUS_INTEGRATION_ID) {
+    throw new Error(
+      `Status-only rulesets require the GitHub Actions source integration id ${DEFAULT_STATUS_INTEGRATION_ID}.`,
+    );
+  }
+}
+
+function assertStatusOnlyProfileOptions({
+  context,
+  integrationId,
+  strict,
+  doNotEnforceOnCreate,
+}) {
+  assertStatusOnlyProfileBinding(context, integrationId);
+  if (strict !== true) {
+    throw new Error("Status-only rulesets require strict required status checks.");
+  }
+  if (
+    doNotEnforceOnCreate !== undefined &&
+    doNotEnforceOnCreate !== false
+  ) {
+    throw new Error(
+      "Status-only rulesets require do_not_enforce_on_create to be false.",
+    );
+  }
+}
+
+function assertStatusOnlyRulesetEnforcement(enforcement) {
+  if (!STATUS_ONLY_RULESET_ENFORCEMENTS.has(enforcement)) {
+    throw new Error(
+      "Status-only ruleset enforcement must be disabled or active.",
+    );
+  }
+}
+
+function normalizeStatusOnlyRequiredStatusRuleForComparison(rule) {
+  const normalized = stripRuleForRulesetPayload(rule);
+  if (
+    normalized.type === "required_status_checks" &&
+    normalized.parameters !== undefined &&
+    !Object.prototype.hasOwnProperty.call(
+      normalized.parameters,
+      "do_not_enforce_on_create",
+    )
+  ) {
+    normalized.parameters.do_not_enforce_on_create = false;
   }
   return normalized;
 }

@@ -131,7 +131,7 @@ The canonical verifier has one entry:
 
 The protected-default-branch controller has only these entries:
 
-- `issue_comment` with activity types `created` and `edited`; and
+- `issue_comment` with activity type `created`; and
 - `workflow_dispatch` for one explicitly selected pull request.
 
 There is no cron, `repository_dispatch`, `pull_request_target`, writable
@@ -148,8 +148,10 @@ when a Codex result arrives only as a review or reaction.
 An automatic comment job is admitted before runner allocation only when both
 the event sender and comment author are the exact Codex provider:
 `chatgpt-codex-connector[bot]`, GitHub type `Bot`. The Action repeats identity
-and scope checks after the runner starts. An edited Codex comment may invalidate
-an earlier decision, which is why both `created` and `edited` are admitted.
+and scope checks after the runner starts. An edited Codex comment does not
+automatically start the canonical controller; use protected manual `reconcile`
+for that recovery. The Action still parses an `edited` event for compatibility
+with direct callers, but that is not a canonical automatic ingress.
 The verifier fails closed unless the PR is same-repository, open, ready and
 targets the current default branch. A base retarget does not create a current
 verifier because `pull_request.edited` is intentionally absent. For a ready PR,
@@ -203,9 +205,15 @@ unique canonical job/CheckRun. An ambiguous POST or invisible attempt remains
 blocking; concurrency is scheduling, not a mutation fence.
 
 For the usual low-cost path, an agent may post exact `@codex review` directly
-while other checks run and invoke GHA only when reconciliation is needed. Use
-`begin-review` when the workflow must coordinate the pending transition and
-request, including a deliberate same-head re-review after an earlier success.
+as a provider-side attempt while other checks run and invoke GHA only when
+reconciliation is needed. The comment does not promise that Codex starts; its
+eligibility and delivery remain provider-controlled. The gate waits for
+official evidence and stays pending if none arrives. Under the canonical
+`any` policy, a direct ordinary comment is only a candidate until Codex
+directly acknowledges that exact comment; it cannot reset an already-passing
+generation before then. Use `begin-review` when the workflow must coordinate
+the pending transition and request, including a deliberate same-head re-review
+after an earlier success.
 
 ### `reconcile`
 
@@ -223,13 +231,24 @@ the ruleset's “all conversations resolved” requirement is their authority.
 ## Evidence semantics
 
 A review generation begins with an exact, unedited `@codex review` request.
-The visible first line is exact and contains no additional visible text. An
-ordinary request author needs `write`, `maintain` or `admin` permission by
-default; protected default-branch configuration may deliberately relax this
-to `any`. A workflow-authored request additionally carries the canonical v2
-hidden marker binding the full head SHA, current base repository/ref/SHA and
-workflow run. Qualifying Codex findings block regardless of request-author
-permission.
+The visible first line is exact and contains no additional visible text. With
+the default `any` policy, an ordinary request is admitted to the snapshot as a
+candidate at any repository permission, not as an immediate generation
+boundary. It becomes a provider-confirmed boundary only when the official
+Codex Bot adds a directly attached, strictly post-revision `eyes` or `+1`
+receipt to that exact comment. A later terminal or progress carrier elsewhere
+on the PR cannot supply that missing causal receipt. This controls only gate
+attribution; it does not grant the commenter permission to invoke or control
+Codex review. GitHub and Codex still decide whether a provider review starts,
+and an unconfirmed candidate cannot reset, preempt, or invalidate an existing
+clean. Canonical workflows set
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly and do not expose a
+standard strict-policy setting. `write` (`write`, `maintain` or `admin`) is
+reserved for a nonstandard future verifier identity allowed to read collaborator
+permissions; the bundled read-only verifier token cannot reliably do so. A
+workflow-authored request additionally carries the canonical v2 hidden marker
+binding the full head SHA, current base repository/ref/SHA and workflow run.
+Qualifying Codex findings block regardless of request-author permission.
 
 Every snapshot also reads the latest GitHub PR timeline
 `BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
@@ -240,17 +259,21 @@ uses a deliberately narrower recovery rule: only a qualifying provider `+1`
 attached directly to a strictly post-epoch, base-bound canonical workflow
 request can supply positive clean authority or supersede an older finding.
 Ordinary direct `@codex review` requests remain supported without a workflow
-marker on PRs that have no base epoch. Findings remain conservative across the
-epoch boundary, and an unlineaged terminal clean stays pending rather than
-being guessed into the new generation.
+marker on PRs that have no base epoch once the official Bot directly receipts
+the exact request. Findings remain conservative across the epoch boundary, and
+an unlineaged terminal clean stays pending rather than being guessed into the
+new generation.
 
 Terminal clean text and a qualifying provider `+1` have equal clean authority
 only for the first physical generation of a no-base-epoch, single-flight
-lineage. Every provider-triggerable request-shaped comment is a physical
-generation boundary, including duplicate hidden markers, edited or malformed
-requests, and requests that fail authorisation. Boundary status records an
-unknown provider flight; it does not grant positive authority. Under the
-default `write` threshold, an otherwise valid ordinary request requires a
+lineage. This applies after the generation has been established; an
+unconfirmed default-`any` ordinary candidate is an explicit exception and is
+not a physical boundary. Every other provider-triggerable request-shaped
+comment is a physical generation boundary, including duplicate hidden markers,
+edited or malformed requests, and requests that fail authorisation. Boundary
+status records an unknown provider flight; it does not grant positive
+authority. Under the
+nonstandard `write` threshold, an otherwise valid ordinary request requires a
 permission lookup, cached per author within each snapshot, before it can be
 classified as denied. Once denied, it causes no reaction or exact-refetch fan-
 out. Boundaries rejected earlier for invalid shape, author, or binding also
@@ -280,11 +303,14 @@ prove its originating flight or head. An edited terminal carrier additionally
 contributes an unbound unknown-activity interval from `created_at` through its
 terminal revision; only that carrier's own terminal endpoint is exempt from
 self-veto when evaluating the same terminal.
-Ordinary request reactions are provider liveness signals only; ordinary `+1`
-cannot head-bind clean by itself. Same-time/later official `eyes`/progress from
-Codex vetoes a candidate clean because review activity has not been proved
-terminal. Reaction-only changes have no automatic workflow event, so a later
-provider event or manual reconcile must observe them.
+For an unconfirmed default-`any` ordinary candidate, an official direct
+post-revision `eyes` or `+1` first serves as its receipt and upgrades it into a
+boundary. After that upgrade, ordinary request reactions are provider liveness
+signals only; ordinary `+1` still cannot head-bind clean by itself.
+Same-time/later official `eyes`/progress from Codex vetoes a candidate clean
+because review activity has not been proved terminal. Reaction-only changes
+have no automatic workflow event, so a later provider event or manual
+reconcile must observe them.
 When terminal evidence names a reviewed commit, it may use a full or short SHA.
 A short SHA is accepted only when GitHub resolves it unambiguously to the
 current PR head. For a pull-request review, the resolved SHA must also agree

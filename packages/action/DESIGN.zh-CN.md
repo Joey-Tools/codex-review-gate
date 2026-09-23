@@ -45,7 +45,7 @@ pull_request opened/reopened/synchronize/ready_for_review
  ruleset: expected source + Code Owner review + stale dismissal
           + up to date + conversations resolved + no force-push
 
-Codex issue_comment created/edited       protected workflow_dispatch
+Codex issue_comment created               protected workflow_dispatch
                  |                                  |
                  +----------------------------------+
                                 v
@@ -124,10 +124,12 @@ current feature head 与 default-branch base SHA。这个 execution binding 使 
 feature-head CheckRun 能证明它评估了 exact current test-merge；CheckRun 本身并不属于
 test-merge SHA。
 
-controller 接收 `issue_comment` `created`/`edited` 与 default-branch
+controller 只接收 `issue_comment` `created` 与 default-branch
 `workflow_dispatch`。comment admission 在 runner 分配前，把 event sender 与 comment
 author 都精确校验为 login `chatgpt-codex-connector[bot]`、type `Bot`。Action 在
-admission 后再次校验，因为两次校验保护不同边界。
+admission 后再次校验，因为两次校验保护不同边界。edited Codex comment 需要受保护的
+manual reconcile；runtime 为 direct caller 保留的 `edited` 兼容性不是 canonical
+automatic ingress。
 
 唯一 manual entry 是使用受保护 default-branch workflow 的 `workflow_dispatch`。
 manual inputs 是 closed typed schema，详见 [README.zh-CN.md](README.zh-CN.md)。
@@ -137,8 +139,8 @@ allowlist。
 
 没有 cron、`repository_dispatch`、`pull_request_target` 或可写自动
 `pull_request_review` job。没有 cron 可以避免 private repositories 为
-no-op run 支付费用。未创建或编辑符合条件 issue comment 的
-review-object/reaction change，通过 manual reconcile 收敛。
+no-op run 支付费用。review-object/reaction change 以及符合条件 issue comment 的 edit，
+除非创建新的符合条件 comment，均通过 manual reconcile 收敛。
 
 所有 runtime jobs 都只调用 API，不 checkout 或执行 consumer/PR code。verifier
 read-only；只有 controller 拥有创建 request 与 rerun exact verifier 所需的窄 mutation
@@ -203,9 +205,11 @@ same-run marker 的可见性稳定；若它仍不存在，只 rerun 原 workflow
 不能阻止 GitHub 替换尚未启动的 pending run。因此 caller 必须观察 exact
 `begin-review` run 完成，才能把它视为 barrier 或发送依赖它的 request。
 
-check 尚未通过时，agent 通常直接发送 exact `@codex review` 启动 Codex，从而在其他
-checks 运行期间避免 Actions runner。`begin-review` 保留为 coordinated path，尤其
-适用于 deliberate same-head re-review：它必须建立更新的 verifier generation。
+check 尚未通过时，agent 通常直接发送 exact `@codex review` 作为低成本 provider-side
+attempt，从而在其他 checks 运行期间避免 Actions runner。该 comment 不授予 provider
+capability，也不保证 delivery；缺少 official Codex evidence 时保持 pending。
+`begin-review` 保留为 coordinated path，尤其适用于 deliberate same-head re-review：
+它必须建立更新的 verifier generation。
 
 ### `reconcile`
 
@@ -254,20 +258,29 @@ finding 都会阻塞。
 ### Review generations
 
 authorised generation 只能由一条 exact、未编辑的 `@codex review` request 建立。
-其 first visible line 必须 exact，且没有其他 visible text。普通 request author 默认
-必须有 `write`、`maintain` 或 `admin` repository permission。受保护的
-default-branch configuration 可以明确把 threshold 设为 `any`。workflow-authored
-request 还需要 exact v2 marker，绑定 full head 和 run。
+其 first visible line 必须 exact，且没有其他 visible text。默认 `any` policy 下，任意
+repository permission 的 ordinary request author 只会作为未确认 candidate 被纳入。
+只有 official Codex Bot 在同一 comment 上添加严格晚于当前 revision 的直接 `eyes` 或
+`+1` receipt，它才成为 generation boundary。仅仅在 PR 其他位置后来出现 terminal 或
+progress carrier 不能建立这个因果链接。这只是 gate attribution：不授予 commenter 调用或
+控制 Codex review 的权限，provider 是否真正启动仍由 GitHub/Codex 决定。未确认 candidate
+不能 reset、抢占或使已建立的 clean 失效。canonical workflow 固定
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不暴露 standard
+strict-policy setting。更严格的 `write` threshold（`write`、`maintain` 或 `admin`）仅保留给
+将来可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only
+verifier token 无法可靠做到。workflow-authored request 还需要 exact v2 marker，绑定 full
+head 和 run。
 
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。
 
 terminal clean text 与符合条件的 provider `+1`，只有在没有 base epoch、single-flight
 lineage 的第一个物理 generation 中才是同等 clean carriers。物理 boundary 识别与
-positive authority 必须分开。每条可能触发 provider 的 request-shaped comment 都恰好是
-一个 boundary，包括 duplicate marker，以及 edited、malformed、wrong-author 或 denied
-request。physical-only boundary 没有 binding 或 positive authority。在默认 `write`
-threshold 下，形状合法的 ordinary request 必须先查询 author permission（同一 snapshot
+positive authority 必须分开。未确认 default-`any` ordinary candidate 明确不是 physical
+boundary。其他每条可能触发 provider 的 request-shaped comment 都恰好是一个 boundary，
+包括 duplicate marker，以及 edited、malformed、wrong-author 或 denied request。
+physical-only boundary 没有 binding 或 positive authority。在 nonstandard `write` threshold
+下，形状合法的 ordinary request 必须先查询 author permission（同一 snapshot
 内按 author 缓存），才能判定为 denied；判定后不再触发 reaction 或 exact-refetch
 fan-out。更早因 shape、author 或 binding 无效而拒绝的 boundary，不触发 permission、
 reaction 或 exact-refetch fan-out。每个已观察到的 `CommentDeletedEvent` 都在事件时间形成
@@ -303,10 +316,12 @@ liveness，也不能给其他 carrier 同样豁免。
 base 的 canonical workflow request 上的合格 `+1`，才能作为 positive 或
 superseding carrier。无法归因的 terminal clean 只保留为 diagnostic evidence，不能
 pass 或清除 finding。这是 carrier parity 的明确 fail-closed 例外。
-ordinary request reactions 仅用于 provider liveness；ordinary `+1` 不能 head-bind
-clean。same-time/later official `eyes`/progress from Codex 会 veto candidate clean
-evidence。由于 reaction change 不触发 consumer workflow，必须由 later provider
-event or manual reconcile 观察 settled state。terminal carrier 包含 reviewed commit
+未确认 default-`any` ordinary candidate 上，official 直接且严格 post-revision 的 `eyes`
+或 `+1` 先是 receipt，用于把它升级为 boundary。升级后 ordinary request reactions 才
+仅用于 provider liveness；ordinary `+1` 不能 head-bind clean。same-time/later official
+`eyes`/progress from Codex 会 veto candidate clean evidence。由于 reaction change 不触发
+consumer workflow，必须由 later provider event or manual reconcile 观察 settled state。
+terminal carrier 包含 reviewed commit
 时，只有 GitHub 能把 full/abbreviated SHA 无歧义
 解析为 current bound head 才接受。对于 PR review，resolved commit 还必须等于
 native `commit_id`。没有 match 或存在多个 relevant match 的 short prefix 属于

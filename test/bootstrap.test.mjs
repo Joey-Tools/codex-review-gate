@@ -24,6 +24,7 @@ import {
   DEFAULT_CONTROLLER_WORKFLOW_PATH,
   DEFAULT_CONTROL_PLANE_OWNER,
   DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+  DEFAULT_RULESET_PROFILE,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
   DEFAULT_VERIFIER_RUN_NAME,
@@ -32,6 +33,8 @@ import {
   LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   LEGACY_STATUS_CONTEXT,
   ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
+  RULESET_PROFILE_FULL,
+  RULESET_PROFILE_STATUS_ONLY,
   assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
@@ -48,9 +51,12 @@ import {
   ensurePullRequestPolicyInRules,
   ensureStatusContextInRules,
   findEffectiveRulesetWithGatePolicy,
+  findEffectiveRulesetWithProfilePolicy,
+  findEffectiveRulesetWithStatusOnlyPolicy,
   findEffectiveRulesetWithStatusContext,
   installedWorkflowMatchesCanonical,
   normalizeControlPlaneOwner,
+  normalizeRulesetProfile,
   normalizeWorkflowPath,
   organizationFinalClosurePlanSha256,
   parseGitHubRepositoryRemote,
@@ -59,8 +65,11 @@ import {
   rulesetCoversDefaultBranch,
   rulesetHasGatePolicy,
   rulesetHasNonFastForwardPolicy,
+  rulesetHasPolicyForProfile,
   rulesetHasRequiredPullRequestPolicy,
   rulesetHasRequiredStatusContext,
+  rulesetHasStatusOnlyPolicy,
+  rulesetHasStatusOnlyProfile,
   rulesetWritableFingerprint,
   validateCanonicalV2WorkflowContent,
   validateCanonicalV2ControllerWorkflowContent,
@@ -161,6 +170,305 @@ test("builds a disabled complete default-branch ruleset payload", () => {
     },
     { type: "non_fast_forward" },
   ]);
+});
+
+test("builds exact disabled and active status-only ruleset payloads", () => {
+  const disabled = buildCreateRulesetPayload({
+    profile: RULESET_PROFILE_STATUS_ONLY,
+  });
+  const expected = {
+    name: "Must Pass Codex Review",
+    target: "branch",
+    enforcement: "disabled",
+    bypass_actors: [],
+    conditions: {
+      ref_name: {
+        include: ["~DEFAULT_BRANCH"],
+        exclude: [],
+      },
+    },
+    rules: [
+      {
+        type: "required_status_checks",
+        parameters: {
+          do_not_enforce_on_create: false,
+          strict_required_status_checks_policy: true,
+          required_status_checks: [
+            {
+              context: DEFAULT_STATUS_CONTEXT,
+              integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  assert.deepEqual(disabled, expected);
+  assert.deepEqual(
+    buildCreateRulesetPayload({
+      profile: RULESET_PROFILE_STATUS_ONLY,
+      enforcement: "active",
+    }),
+    { ...expected, enforcement: "active" },
+  );
+  assert.throws(
+    () =>
+      buildCreateRulesetPayload({
+        profile: RULESET_PROFILE_STATUS_ONLY,
+        enforcement: "evaluate",
+      }),
+    /must be disabled or active/u,
+  );
+  assert.throws(
+    () =>
+      buildCreateRulesetPayload({
+        profile: RULESET_PROFILE_STATUS_ONLY,
+        context: "ci/test",
+      }),
+    /require the codex\/github-review-gate status context/u,
+  );
+  assert.throws(
+    () =>
+      buildCreateRulesetPayload({
+        profile: RULESET_PROFILE_STATUS_ONLY,
+        strict: false,
+      }),
+    /require strict required status checks/u,
+  );
+  assert.throws(
+    () =>
+      buildCreateRulesetPayload({
+        profile: RULESET_PROFILE_STATUS_ONLY,
+        doNotEnforceOnCreate: true,
+      }),
+    /require do_not_enforce_on_create to be false/u,
+  );
+});
+
+test("recognizes and selects only exact active status-only profiles", () => {
+  const active = buildCreateRulesetPayload({
+    profile: RULESET_PROFILE_STATUS_ONLY,
+    enforcement: "active",
+  });
+  const extraRule = structuredClone(active);
+  extraRule.rules.push({ type: "deletion" });
+  const extraContext = structuredClone(active);
+  extraContext.rules[0].parameters.required_status_checks.push({
+    context: "ci/test",
+    integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+  });
+  const bypass = structuredClone(active);
+  bypass.bypass_actors.push({
+    actor_id: 1,
+    actor_type: "RepositoryRole",
+    bypass_mode: "always",
+  });
+  const broaderConditions = structuredClone(active);
+  broaderConditions.conditions.ref_name.include = ["~ALL"];
+  const evaluated = { ...active, enforcement: "evaluate" };
+  const legacyApiShape = structuredClone(active);
+  delete legacyApiShape.rules[0].parameters.do_not_enforce_on_create;
+  const doNotEnforce = structuredClone(active);
+  doNotEnforce.rules[0].parameters.do_not_enforce_on_create = true;
+
+  assert.equal(rulesetHasStatusOnlyPolicy(active), true);
+  assert.equal(rulesetHasStatusOnlyProfile(active), true);
+  assert.equal(
+    rulesetHasStatusOnlyPolicy(legacyApiShape),
+    true,
+    "an older readback that omits the false default is semantically exact",
+  );
+  assert.equal(
+    rulesetHasPolicyForProfile(active, RULESET_PROFILE_STATUS_ONLY),
+    true,
+  );
+  for (const candidate of [extraRule, extraContext, bypass, doNotEnforce]) {
+    assert.equal(rulesetHasStatusOnlyPolicy(candidate), false);
+    assert.equal(rulesetHasStatusOnlyProfile(candidate), false);
+  }
+  assert.equal(rulesetHasStatusOnlyPolicy(broaderConditions), true);
+  assert.equal(rulesetHasStatusOnlyProfile(broaderConditions), false);
+  assert.equal(rulesetHasStatusOnlyPolicy(evaluated), true);
+  assert.equal(rulesetHasStatusOnlyProfile(evaluated), false);
+  assert.equal(
+    findEffectiveRulesetWithStatusOnlyPolicy(
+      [extraRule, extraContext, bypass, broaderConditions, active],
+      DEFAULT_STATUS_CONTEXT,
+      { defaultBranch: "master" },
+    ),
+    active,
+  );
+  assert.equal(
+    findEffectiveRulesetWithProfilePolicy(
+      [extraRule, extraContext, bypass, broaderConditions, active],
+      RULESET_PROFILE_STATUS_ONLY,
+      DEFAULT_STATUS_CONTEXT,
+      { defaultBranch: "master" },
+    ),
+    active,
+  );
+});
+
+test("updates exact status-only profiles idempotently and fails closed on drift", () => {
+  const disabled = buildCreateRulesetPayload({
+    profile: RULESET_PROFILE_STATUS_ONLY,
+  });
+  const omittedFalseDefault = structuredClone(disabled);
+  delete omittedFalseDefault.rules[0].parameters.do_not_enforce_on_create;
+  const before = structuredClone(disabled);
+  const idempotent = buildUpdateRulesetPayload(disabled, {
+    profile: RULESET_PROFILE_STATUS_ONLY,
+    defaultBranch: "master",
+  });
+  const activated = buildUpdateRulesetPayload(disabled, {
+    profile: RULESET_PROFILE_STATUS_ONLY,
+    enforcement: "active",
+  });
+  const activeIdempotent = buildUpdateRulesetPayload(activated.payload, {
+    profile: RULESET_PROFILE_STATUS_ONLY,
+  });
+  const deactivated = buildUpdateRulesetPayload(activated.payload, {
+    profile: RULESET_PROFILE_STATUS_ONLY,
+    enforcement: "disabled",
+  });
+
+  assert.equal(idempotent.changed, false);
+  assert.deepEqual(idempotent.payload, disabled);
+  assert.equal(
+    rulesetWritableFingerprint(disabled, {
+      profile: RULESET_PROFILE_STATUS_ONLY,
+    }),
+    rulesetWritableFingerprint(omittedFalseDefault, {
+      profile: RULESET_PROFILE_STATUS_ONLY,
+    }),
+    "the API's omitted false default is equivalent only for status-only readback",
+  );
+  assert.equal(
+    buildUpdateRulesetPayload(omittedFalseDefault, {
+      profile: RULESET_PROFILE_STATUS_ONLY,
+    }).changed,
+    false,
+  );
+  assert.deepEqual(disabled, before, "status-only update must not mutate its input");
+  assert.equal(activated.changed, true);
+  assert.equal(activated.payload.enforcement, "active");
+  assert.equal(activeIdempotent.changed, false);
+  assert.equal(deactivated.changed, true);
+  assert.equal(deactivated.payload.enforcement, "disabled");
+
+  const full = buildCreateRulesetPayload();
+  const extraContext = structuredClone(disabled);
+  extraContext.rules[0].parameters.required_status_checks.push({
+    context: "ci/test",
+    integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+  });
+  const bypass = structuredClone(disabled);
+  bypass.bypass_actors.push({
+    actor_id: 1,
+    actor_type: "RepositoryRole",
+    bypass_mode: "always",
+  });
+  for (const candidate of [full, extraContext, bypass]) {
+    const candidateBefore = structuredClone(candidate);
+    assert.throws(
+      () =>
+        buildUpdateRulesetPayload(candidate, {
+          profile: RULESET_PROFILE_STATUS_ONLY,
+          enforcement: "active",
+        }),
+      /not an exact status-only profile; refusing to remove or rewrite additional protections/u,
+    );
+    assert.deepEqual(candidate, candidateBefore);
+  }
+});
+
+test("defaults profile-aware builders and predicates to the unchanged full gate", () => {
+  const defaultPayload = buildCreateRulesetPayload();
+  const explicitFullPayload = buildCreateRulesetPayload({
+    profile: RULESET_PROFILE_FULL,
+  });
+  const activeFull = { ...defaultPayload, enforcement: "active" };
+  const defaultUpdate = buildUpdateRulesetPayload(activeFull);
+  const explicitFullUpdate = buildUpdateRulesetPayload(activeFull, {
+    profile: RULESET_PROFILE_FULL,
+  });
+
+  assert.equal(DEFAULT_RULESET_PROFILE, RULESET_PROFILE_FULL);
+  assert.equal(normalizeRulesetProfile(), RULESET_PROFILE_FULL);
+  assert.equal(
+    normalizeRulesetProfile(RULESET_PROFILE_STATUS_ONLY),
+    RULESET_PROFILE_STATUS_ONLY,
+  );
+  assert.throws(() => normalizeRulesetProfile("legacy"), /must be "full" or "status-only"/u);
+  assert.equal(JSON.stringify(defaultPayload), JSON.stringify(explicitFullPayload));
+  assert.equal(rulesetHasGatePolicy(activeFull), true);
+  assert.equal(
+    rulesetHasPolicyForProfile(activeFull, RULESET_PROFILE_FULL),
+    true,
+  );
+  assert.equal(defaultUpdate.changed, false);
+  assert.deepEqual(defaultUpdate, explicitFullUpdate);
+  assert.equal(
+    findEffectiveRulesetWithProfilePolicy(
+      [activeFull],
+      RULESET_PROFILE_FULL,
+      DEFAULT_STATUS_CONTEXT,
+      { defaultBranch: "master" },
+    ),
+    activeFull,
+  );
+});
+
+test("reserves the status-only profile for the source self-hosting remote migration", () => {
+  for (const [name, args, expected] of [
+    [
+      "local install",
+      [
+        "--prepare-worktree",
+        "/definitely-not-a-worktree",
+        "--ruleset-profile",
+        RULESET_PROFILE_STATUS_ONLY,
+      ],
+      /remote-only/u,
+    ],
+    [
+      "ordinary remote consumer",
+      [
+        "--repo",
+        "Joey-Tools/consumer",
+        "--ruleset-profile",
+        RULESET_PROFILE_STATUS_ONLY,
+      ],
+      /reserved for the Joey-Tools\/codex-review-gate source self-hosting migration/u,
+    ],
+    [
+      "unknown profile",
+      [
+        "--repo",
+        "Joey-Tools/codex-review-gate",
+        "--ruleset-profile",
+        "unexpected",
+      ],
+      /must be "full" or "status-only"/u,
+    ],
+    [
+      "source remote without legacy bridge",
+      [
+        "--repo",
+        "Joey-Tools/codex-review-gate",
+        "--ruleset-profile",
+        RULESET_PROFILE_STATUS_ONLY,
+      ],
+      /status-only requires --legacy-bridge/u,
+    ],
+  ]) {
+    const result = runBootstrap(args, {
+      addExpectedLegacyInventoryDigest: false,
+    });
+    assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+    assert.match(result.stderr, expected, name);
+  }
 });
 
 test("ruleset writable fingerprints ignore response-only fields but bind every writable field", () => {
@@ -3363,8 +3671,8 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2WorkflowContent(
         canonical.replace(
-          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write'",
-          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'write' || 'any'",
+          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
+          "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: write",
         ),
       ),
     /missing required fragment: CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION/u,
@@ -3390,8 +3698,8 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2ControllerWorkflowContent(
         CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "github.event.action == 'created'",
           "github.event.action == 'created' || github.event.action == 'edited'",
-          "github.event.action == 'edited' || github.event.action == 'created'",
         ),
       ),
     /job\.if must exactly match/u,
@@ -4329,6 +4637,67 @@ test("stages a distinct disabled v2 ruleset while a legacy ruleset remains activ
   }
 });
 
+test("stages an exact status-only source v2 ruleset without rewriting the retained legacy protections", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-source-status-only-stage-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/codex-review-gate";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const retainedLegacy = sourceLegacyRulesetFixture(7, repoSlug);
+    const effectiveRulePages = [[
+      effectiveLegacyRequiredStatusChecksRule(retainedLegacy),
+    ]];
+    const legacyInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages,
+      rulesets: [retainedLegacy],
+    });
+    const disabledV2 = statusOnlyRulesetFixture(8, repoSlug, {
+      name: v2RulesetName,
+      enforcement: "disabled",
+    });
+    delete disabledV2.rules[0].parameters.do_not_enforce_on_create;
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+      ...legacyInventory.responses,
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: {
+        __fake_sequence: [
+          [[retainedLegacy]],
+          [[retainedLegacy]],
+          [[retainedLegacy, disabledV2]],
+        ],
+      },
+      [`repos/${repoSlug}/rulesets/7`]: retainedLegacy,
+      [`POST repos/${repoSlug}/rulesets`]: { id: 8, name: v2RulesetName },
+      [`GET repos/${repoSlug}/rulesets/8`]: disabledV2,
+    };
+    const result = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--ruleset-name",
+      v2RulesetName,
+      "--ruleset-profile",
+      RULESET_PROFILE_STATUS_ONLY,
+      "--legacy-bridge",
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Ruleset profile: status-only/u);
+    assert.match(result.stdout, /Created ruleset/u);
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("legacy ruleset disappearance or policy drift before staging prevents every write", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
@@ -4754,6 +5123,150 @@ test("activates a distinct v2 ruleset while a separate legacy ruleset remains ac
     const calls = readFileSync(callLog, "utf8");
     assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"));
     assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("activates only the staged status-only source v2 ruleset after its canary passes", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-source-status-only-activate-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/codex-review-gate";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    createFakeGhExecutable(fakeBin);
+    const retainedLegacy = sourceLegacyRulesetFixture(7, repoSlug);
+    const effectiveRulePages = [[
+      effectiveLegacyRequiredStatusChecksRule(retainedLegacy),
+    ]];
+    const legacyInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages,
+      rulesets: [retainedLegacy],
+    });
+    const validPullRequest = canaryPullRequestFixture(repoSlug, CANARY_HEAD_SHA);
+    const disabledV2 = statusOnlyRulesetFixture(8, repoSlug, {
+      name: v2RulesetName,
+      enforcement: "disabled",
+    });
+    const activeV2 = statusOnlyRulesetFixture(8, repoSlug, {
+      name: v2RulesetName,
+      enforcement: "active",
+    });
+    delete disabledV2.rules[0].parameters.do_not_enforce_on_create;
+    delete activeV2.rules[0].parameters.do_not_enforce_on_create;
+    const responses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+      ...legacyInventory.responses,
+      ...canaryRunResponses(repoSlug),
+      [`GET repos/${repoSlug}/pulls/7`]: {
+        __fake_sequence: [validPullRequest, validPullRequest, validPullRequest],
+      },
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+        [retainedLegacy, disabledV2],
+      ],
+      [`repos/${repoSlug}/rulesets/7`]: retainedLegacy,
+      [`GET repos/${repoSlug}/rulesets/8`]: {
+        __fake_sequence: [
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          disabledV2,
+          activeV2,
+          activeV2,
+        ],
+      },
+      [`PUT repos/${repoSlug}/rulesets/8`]: { id: 8, name: v2RulesetName },
+    };
+    const result = runBootstrap([
+      ...activationArguments(repoSlug, CANARY_HEAD_SHA),
+      "--ruleset-name",
+      v2RulesetName,
+      "--ruleset-profile",
+      RULESET_PROFILE_STATUS_ONLY,
+      "--legacy-bridge",
+    ], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Ruleset profile: status-only/u);
+    assert.match(result.stdout, /exact status-only v2 policy with active enforcement/u);
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"));
+    assert.doesNotMatch(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/7$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("rejects active source status-only profile drift before any write", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-source-status-only-drift-"));
+  const repoSlug = "Joey-Tools/codex-review-gate";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  try {
+    for (const [name, drift] of [
+      [
+        "broader conditions",
+        (ruleset) => {
+          ruleset.conditions.ref_name.include = ["~ALL"];
+        },
+      ],
+      [
+        "extra rule",
+        (ruleset) => {
+          ruleset.rules.push({ type: "deletion" });
+        },
+      ],
+      [
+        "bypass actor",
+        (ruleset) => {
+          ruleset.bypass_actors.push({
+            actor_id: 1,
+            actor_type: "RepositoryRole",
+            bypass_mode: "always",
+          });
+        },
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, `${name}-bin`);
+      const stateDir = join(fixtureRoot, `${name}-state`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const drifted = statusOnlyRulesetFixture(8, repoSlug, {
+        name: v2RulesetName,
+        enforcement: "active",
+      });
+      drift(drifted);
+      const result = runBootstrap([
+        "--repo",
+        repoSlug,
+        "--ruleset-name",
+        v2RulesetName,
+        "--ruleset-profile",
+        RULESET_PROFILE_STATUS_ONLY,
+        "--legacy-bridge",
+        "--apply",
+      ], {
+        env: fakeGhEnvironment({
+          fakeBin,
+          responses: {
+            ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+            [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+              [drifted],
+            ],
+            [`repos/${repoSlug}/rulesets/8`]: drifted,
+          },
+          stateDir,
+          callLog,
+        }),
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, /active legacy or incomplete gate/u, name);
+      assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT) /mu, name);
+    }
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -5203,7 +5716,7 @@ test("activation requires a staged disabled repository ruleset and preserves act
         "disabled-incomplete",
         [disabledIncomplete],
         1,
-        /disabled but not an exact complete staged v2 policy/u,
+        /disabled but not an exact staged complete v2 gate policy/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
@@ -7164,6 +7677,119 @@ test("pre-cleanup derivation authorizes only legacy elision and preserves unrela
   }
 });
 
+test("source status-only cleanup derivation preserves every retained legacy protection", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-source-status-only-cleanup-"));
+  const repoSlug = "Joey-Tools/codex-review-gate";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  const absentClassicProtection = {
+    __fake_http_error: 404,
+    message: "Branch not protected",
+  };
+  try {
+    const retainedLegacy = sourceLegacyRulesetFixture(7, repoSlug);
+    const activeV2 = statusOnlyRulesetFixture(8, repoSlug, {
+      name: v2RulesetName,
+      enforcement: "active",
+    });
+    const effectivePre = [[
+      effectiveLegacyRequiredStatusChecksRule(retainedLegacy),
+    ]];
+    const preInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages: effectivePre,
+      rulesets: [retainedLegacy],
+      classicRequiredStatusChecks: null,
+    });
+    const preBin = join(fixtureRoot, "pre-bin");
+    const preLog = join(fixtureRoot, "pre.log");
+    createFakeGhExecutable(preBin);
+    const derive = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--ruleset-name",
+      v2RulesetName,
+      "--ruleset-profile",
+      RULESET_PROFILE_STATUS_ONLY,
+      "--legacy-bridge",
+      "--derive-post-cleanup-plan",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: preBin,
+        responses: {
+          ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+          ...preInventory.responses,
+          [`repos/${repoSlug}/branches/master/protection`]: absentClassicProtection,
+          [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+            [retainedLegacy, activeV2],
+          ],
+          [`repos/${repoSlug}/rulesets/7`]: retainedLegacy,
+          [`repos/${repoSlug}/rulesets/8`]: activeV2,
+        },
+        stateDir: join(fixtureRoot, "pre-state"),
+        callLog: preLog,
+      }),
+    });
+    assert.equal(derive.status, 0, derive.stderr);
+    const plan = JSON.parse(derive.stdout);
+    assert.deepEqual(plan.cleanup_actions.rulesets, [{
+      id: 7,
+      name: retainedLegacy.name,
+      action: "remove-legacy-check-only",
+    }]);
+    const retainedProjection = plan.expected_post_cleanup_security_state.rulesets
+      .find((ruleset) => ruleset.id === retainedLegacy.id);
+    assert.ok(retainedProjection, "the retained legacy ruleset must not be deleted");
+    assert.deepEqual(
+      retainedProjection.writable.rules.map((rule) => rule.type).sort(),
+      ["deletion", "non_fast_forward", "pull_request"],
+    );
+    assert.doesNotMatch(readFileSync(preLog, "utf8"), /^(?:POST|PUT) /mu);
+
+    const retainedPostCleanup = structuredClone(retainedLegacy);
+    retainedPostCleanup.rules = retainedPostCleanup.rules.filter(
+      (rule) => rule.type !== "required_status_checks",
+    );
+    const postInventory = legacyInventoryResponseFixtures(repoSlug, {
+      classicRequiredStatusChecks: null,
+    });
+    const verifyBin = join(fixtureRoot, "verify-bin");
+    const verifyLog = join(fixtureRoot, "verify.log");
+    createFakeGhExecutable(verifyBin);
+    const verify = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--ruleset-name",
+      v2RulesetName,
+      "--ruleset-profile",
+      RULESET_PROFILE_STATUS_ONLY,
+      "--legacy-bridge",
+      "--verify-post-cleanup",
+      "--expected-post-cleanup-security-sha256",
+      plan.expected_post_cleanup_security_sha256,
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: verifyBin,
+        responses: {
+          ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+          ...postInventory.responses,
+          [`repos/${repoSlug}/branches/master/protection`]: absentClassicProtection,
+          [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [
+            [retainedPostCleanup, activeV2],
+          ],
+          [`repos/${repoSlug}/rulesets/7`]: retainedPostCleanup,
+          [`repos/${repoSlug}/rulesets/8`]: activeV2,
+        },
+        stateDir: join(fixtureRoot, "verify-state"),
+        callLog: verifyLog,
+      }),
+    });
+    assert.equal(verify.status, 0, verify.stderr);
+    assert.match(verify.stdout, /status-only Active v2 policy/u);
+    assert.doesNotMatch(readFileSync(verifyLog, "utf8"), /^(?:POST|PUT) /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("post-cleanup verification rejects legacy residuals and a non-active selected v2 gate", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
@@ -8199,6 +8825,34 @@ function completeDisabledRulesetFixture(id) {
     ...completeActiveRulesetFixture(id),
     enforcement: "disabled",
   };
+}
+
+function statusOnlyRulesetFixture(
+  id,
+  repoSlug,
+  { name = "Must Pass Codex Review", enforcement = "active" } = {},
+) {
+  return {
+    id,
+    source_type: "Repository",
+    source: repoSlug,
+    ...buildCreateRulesetPayload({
+      name,
+      enforcement,
+      profile: RULESET_PROFILE_STATUS_ONLY,
+    }),
+  };
+}
+
+function sourceLegacyRulesetFixture(id, repoSlug) {
+  const legacy = completeActiveRulesetFixture(id);
+  legacy.name = "Must Pass Codex Review";
+  legacy.source = repoSlug;
+  legacy.rules.find(
+    (rule) => rule.type === "required_status_checks",
+  ).parameters.required_status_checks = [{ context: LEGACY_STATUS_CONTEXT }];
+  legacy.rules.push({ type: "deletion" });
+  return legacy;
 }
 
 function activeLegacyRulesetFixture(

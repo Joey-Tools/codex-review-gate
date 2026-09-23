@@ -48,7 +48,7 @@ pull_request opened/reopened/synchronize/ready_for_review
  ruleset: expected source + Code Owner review + stale dismissal
           + up to date + conversations resolved + no force-push
 
-Codex issue_comment created/edited       protected workflow_dispatch
+Codex issue_comment created               protected workflow_dispatch
                  |                                  |
                  +----------------------------------+
                                 v
@@ -142,11 +142,13 @@ is the execution binding that lets a successful feature-head CheckRun prove
 evaluation of the exact current test-merge. The CheckRun itself does not
 belong to the test-merge SHA.
 
-The controller admits `issue_comment` `created`/`edited` and default-branch
+The controller admits only `issue_comment` `created` and default-branch
 `workflow_dispatch`. Comment admission checks both event sender and comment
 author against exact login `chatgpt-codex-connector[bot]` and exact type `Bot`
 before runner allocation. The Action revalidates the admitted event because
-the two checks protect different boundaries.
+the two checks protect different boundaries. An edited Codex comment requires
+a protected manual reconcile; direct runtime compatibility for `edited` is not
+a canonical automatic ingress.
 
 The only manual entry is `workflow_dispatch` using the protected default-
 branch workflow. The manual inputs are closed and typed as documented in
@@ -157,8 +159,8 @@ explicit trust boundary; v2 does not maintain a hard-coded actor allowlist.
 There is no cron, `repository_dispatch`, `pull_request_target` or writable
 automatic `pull_request_review` job. The absence of cron avoids
 billable no-op runs in private repositories. Review-object and reaction
-changes that do not create or edit a qualifying issue comment converge through
-manual reconcile.
+changes, including edits to a qualifying issue comment, converge through manual
+reconcile unless they create a new qualifying issue comment.
 
 All runtime jobs are API-only. They do not check out or execute consumer or PR
 code. The verifier is read-only. The controller alone receives the narrow
@@ -231,10 +233,12 @@ but cannot prevent GitHub from replacing a not-yet-started pending run. A
 caller therefore observes the exact `begin-review` run complete before treating
 it as a barrier or posting a dependent request.
 
-Agents normally start Codex directly with exact `@codex review` when the check
-is not already passing, avoiding an Actions runner while other checks run.
-`begin-review` remains the coordinated path, especially for a deliberate
-same-head re-review that must establish a newer verifier generation.
+Agents normally make a low-cost provider-side attempt with exact `@codex review`
+when the check is not already passing, avoiding an Actions runner while other
+checks run. The comment does not grant provider capability or guarantee
+delivery; absent official Codex evidence remains pending. `begin-review`
+remains the coordinated path, especially for a deliberate same-head re-review
+that must establish a newer verifier generation.
 
 ### `reconcile`
 
@@ -292,10 +296,21 @@ affect blocking: any qualifying finding blocks.
 
 An authorised generation begins only with an exact, unedited
 `@codex review` request. Its first visible line is exact and there is no other
-visible text. By default, an ordinary request author must have `write`,
-`maintain` or `admin` repository permission. Protected default-branch
-configuration may deliberately set the threshold to `any`. A workflow-authored
-request additionally needs the exact v2 marker binding the full head and run.
+visible text. Under the default `any` policy, an ordinary request author at any
+repository permission is admitted only as an unconfirmed candidate. The
+candidate becomes a generation boundary only after the official Codex Bot adds
+a directly attached, strictly post-revision `eyes` or `+1` receipt to the same
+comment. A terminal or progress carrier that merely appears later elsewhere on
+the PR cannot establish that causal link. This is only gate attribution: it
+does not grant the commenter permission to invoke or control Codex review,
+whose actual provider start remains GitHub/Codex-controlled. An unconfirmed
+candidate cannot reset, preempt, or invalidate an established clean. Canonical workflows fix
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` and do not expose a standard
+strict-policy setting. The stricter `write` threshold (`write`, `maintain`, or
+`admin`) is reserved for a nonstandard future verifier identity allowed to read
+collaborator permissions; the bundled read-only verifier token cannot reliably
+do so. A workflow-authored request additionally needs the exact v2 marker
+binding the full head and run.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
@@ -304,10 +319,12 @@ permission.
 Terminal clean text and a qualifying provider `+1` are equal clean carriers
 only for the first physical generation of a no-base-epoch, single-flight
 lineage. Physical boundary recognition is deliberately separate from positive
-authority. Every provider-triggerable request-shaped comment is one boundary,
-including same-run duplicate markers and edited, malformed, wrong-author, or
-denied requests. Physical-only boundaries are unbound and receive no positive
-authority. Under the default `write` threshold, a syntactically valid ordinary
+authority. An unconfirmed default-`any` ordinary candidate is specifically not
+a physical boundary. Every other provider-triggerable request-shaped comment
+is one boundary, including same-run duplicate markers and edited, malformed,
+wrong-author, or denied requests. Physical-only boundaries are unbound and
+receive no positive authority. Under the nonstandard `write` threshold, a
+syntactically valid ordinary
 request must undergo a permission lookup, cached per author within each
 snapshot, before it can be classified as denied; once denied, it causes no
 reaction or exact-refetch fan-out. Boundaries rejected earlier for invalid
@@ -353,11 +370,13 @@ qualifying `+1` directly attached to the latest strictly post-epoch,
 base-bound canonical workflow request is a positive or superseding carrier.
 An unlineaged terminal clean remains diagnostic evidence and cannot pass or
 clear a finding. This is a deliberate fail-closed exception to carrier parity.
-Ordinary request reactions are provider-liveness signals only; ordinary `+1`
-cannot head-bind clean. Same-time/later official `eyes`/progress from Codex
-vetoes candidate clean evidence. Because reaction changes do not trigger the
-consumer workflow, a later provider event or manual reconcile must observe the
-settled state.
+For an unconfirmed default-`any` ordinary candidate, a direct official
+post-revision `eyes` or `+1` is first a receipt that promotes it into a
+boundary. Afterwards, ordinary request reactions are provider-liveness signals
+only; ordinary `+1` cannot head-bind clean. Same-time/later official
+`eyes`/progress from Codex vetoes candidate clean evidence. Because reaction
+changes do not trigger the consumer workflow, a later provider event or manual
+reconcile must observe the settled state.
 When a terminal carrier includes a reviewed commit, a full or abbreviated SHA
 is accepted only if GitHub resolves it unambiguously to the current bound head.
 For a pull-request review, the resolved commit must also equal native

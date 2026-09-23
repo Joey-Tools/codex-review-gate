@@ -16,7 +16,7 @@ This directory contains the canonical consumer-side assets:
 Copy both workflows unchanged. The verifier runs for pull-request `opened`,
 `reopened`, `synchronize`, and `ready_for_review` events and emits the sole
 required native CheckRun. The controller provides `issue_comment`
-`created`/`edited` bot filtering before runner allocation and the sole manual
+`created` bot filtering before runner allocation and the sole manual
 entry point, `workflow_dispatch`. One manual run targets one PR and exact
 expected head. Neither workflow has cron, `repository_dispatch`, an automatic
 `pull_request_review` job, a runtime GitHub App, or a ledger.
@@ -33,11 +33,19 @@ The default runner is `ubuntu-slim`. Set the repository Actions variable
 may set `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`. There are no numeric limit
 overrides.
 
-Ordinary review-request authors require repository `write`, `maintain`, or
-`admin` permission by default. Protected repository variable
-`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` deliberately relaxes only
-that generation-author boundary; every other value maps to `write`, and
-qualifying Codex findings remain blocking.
+Ordinary review-request authors are admitted as candidates at any repository
+permission by default. This is only the gate's generation-attribution policy:
+an exact ordinary request becomes a boundary only after the official Codex Bot
+directly attaches a strictly post-revision `eyes` or `+1` receipt to that same
+comment. It does not grant the commenter permission to invoke or control Codex
+review; GitHub and Codex still decide whether a provider review starts. An
+unconfirmed candidate cannot preempt or invalidate an existing clean.
+Canonical workflows set
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly and do not expose it
+as a repository variable or Action input. The strict `write`/`maintain`/`admin`
+path is reserved for a nonstandard future verifier identity that can read
+GitHub collaborator permissions; do not add it to an ordinary consumer
+workflow. Qualifying Codex findings remain blocking in either mode.
 
 The ruleset template requires `codex/github-review-gate` from expected source
 GitHub Actions (`integration_id: 15368`), a branch that is up to date, and all

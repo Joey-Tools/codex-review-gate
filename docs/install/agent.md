@@ -43,8 +43,10 @@ Maintain these invariants:
 - `workflow_dispatch` is the sole manual entry point;
 - invoke `gh workflow run` without `--ref`, then read the created run back and
   prove that it used `DEFAULT_BRANCH`;
-- prefer direct `@codex review`; use `begin-review` only when request creation
-  and a newer verifier attempt need controller coordination;
+- prefer a direct `@codex review` provider-side attempt; it does not grant
+  provider capability or guarantee that Codex starts. Use `begin-review` only
+  when request creation and a newer verifier attempt need controller
+  coordination;
 - select exactly one request producer for each exact-head review generation.
   A direct request is preferred only while no controller `begin-review` with
   `request_review=true` is active for that head. Once such a run has been
@@ -53,21 +55,84 @@ Maintain these invariants:
   canonical marker, sticky diagnostic, and provider evidence before mutating;
 - select only `default` and `expanded` through protected repository variable
   `CODEX_REVIEW_GATE_LIMITS_PROFILE`, never dispatch or numeric overrides.
-- treat `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION` as protected wrapper
-  configuration: unset or any value other than exact `any` means `write`;
-  never add it as an Action input.
+- canonical workflows fix `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`.
+  Do not add a repository variable, Action input, or strict policy to an
+  ordinary consumer workflow; `write` is reserved for a future nonstandard
+  verifier identity that can read collaborator permissions.
 - keep `CONTROL_PLANE_OWNER` explicit in every bootstrap invocation. It
   defaults to `@JoeyTeng`, but a non-Joey repository must substitute its own
   eligible GitHub user.
+
+## Narrow source-repository self-hosting exception
+
+Use this path only when `REPO` is exactly `Joey-Tools/codex-review-gate` and
+the task is to migrate that source repository itself. It is not an alternative
+ordinary-consumer or repository-level cohort installation mode: the importable
+template and the bootstrap default `full` profile remain mandatory everywhere
+else.
+
+1. Prepare the source migration PR with the canonical v2 verifier and
+   controller plus the exact temporary legacy bridge. Use `--legacy-bridge` on
+   the source worktree preparation; do not pass `--ruleset-profile status-only`
+   there, because that profile is remote-stage-only.
+2. Merge that PR while the existing source legacy rule remains Active. Record
+   the owner-approved `LEGACY_INVENTORY_SHA256`; do not synthesize or replace
+   its value.
+3. Stage the distinct disabled source rule remotely, preserving the temporary
+   bridge and exact legacy inventory boundary:
+
+   ```bash
+   REPO="Joey-Tools/codex-review-gate"
+   CONTROL_PLANE_OWNER=@JoeyTeng
+   V2_RULESET_NAME="Must Pass Codex Review v2"
+   # Set this from the owner-approved legacy inventory snapshot.
+   LEGACY_INVENTORY_SHA256=OWNER_APPROVED_LEGACY_INVENTORY_SHA256
+
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --apply
+   ```
+
+4. Carry `--ruleset-name "$V2_RULESET_NAME"`, `--ruleset-profile status-only`,
+   and `--legacy-bridge` through every later remote canary activation and
+   read-only cleanup derivation/verification invocation. Do not fall back to
+   the default `full` profile for this source exception. While the legacy
+   required status exists, the CLI rejects this source-only profile without
+   `--legacy-bridge`, so a drifted bridge cannot strand `codex/review-gate`
+   with no producer. Verify that the new
+   rule contains only the strict GitHub-Actions-bound
+   `codex/github-review-gate` requirement. It must be a second rule: the
+   existing source rule keeps deletion, non-fast-forward, pull-request, and
+   associated CODEOWNERS protection. After the separate canary passes and the
+   source-specific rule becomes Active, both the legacy v1 status and v2
+   CheckRun remain required until an owner-approved cleanup action removes
+   only the legacy requirement and the post-cleanup proof succeeds. Do not
+   remove or broaden legacy protection.
+5. Never use an organization schema-2 final-closure receipt to remove this
+   source bridge. Stop until a separately authorized, recorded source-local
+   closure proof exists.
 
 ## Advanced controlled handoff for an active ten-repository v2 cohort
 
 Use this execution path only when the authorized scope is exactly one reviewed
 active ten-repository v2 cohort covered by a shared v1 organization ruleset.
 The old v1 rule retains its original eleven-repository legacy selector. This
-is not a reusable `allow-v1` switch. The ordinary phases below continue to
-reject every v1 caller, and the advanced path must return every active member
-to that same final no-v1 contract.
+is not a reusable `allow-v1` switch. Outside the separately documented source
+self-hosting exception above, the ordinary phases below continue to reject
+every v1 caller, and the advanced path must return every active member to that
+same final no-v1 contract.
 
 `Joey-Tools/codex-waited-delivery` is archived and legacy-only. It stays in the
 old rule's original eleven-repository selector so `deletion` and
@@ -888,8 +953,9 @@ The canonical workflows must have this contract after the merge:
   `synchronize`, `ready_for_review`, and required job
   `codex/github-review-gate` on the exact PR feature-head SHA;
 - controller path `.github/workflows/codex-review-gate-controller.yml`, workflow
-  name `Codex Review Gate Controller`, exact Codex `issue_comment`
-  `created`/`edited`, and default-branch `workflow_dispatch`. It intentionally
+  name `Codex Review Gate Controller`, exact Codex `issue_comment` `created`,
+  and default-branch `workflow_dispatch`. An edited comment does not allocate a
+  runner; use protected manual `reconcile` if it needs evaluation. It intentionally
   excludes `pull_request_review`: GitHub binds review events to the PR merge
   ref, so a controller with narrow write authority must not execute that
   ref. Reconcile review- or reaction-only evidence through the protected
@@ -906,12 +972,19 @@ The canonical workflows must have this contract after the merge:
 - no cron, `repository_dispatch`, `pull_request_target`, writable
   `pull_request_review`, status bridge, runtime App, or ledger.
 
-The wrapper maps protected repository variable
-`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION` into the Action environment.
-Exact `any` accepts an ordinary request author at any repository permission;
-otherwise the runtime requires `write`, `maintain`, or `admin`. This setting
-affects only which ordinary request may establish a generation. It never makes
-a qualifying Codex finding non-blocking.
+Canonical workflows set
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly. This accepts an
+already-observed exact ordinary request author at any repository permission as
+a candidate without a collaborator lookup. It becomes a generation boundary
+only after the official Codex Bot directly adds a strictly post-revision
+`eyes` or `+1` receipt to that same comment. It does not grant the commenter
+permission to invoke Codex or ensure that Codex starts; provider-side
+eligibility and delivery remain independent, and an unconfirmed candidate
+cannot preempt an existing clean. Do not add the nonstandard
+`write`/`maintain`/`admin` policy to an ordinary consumer: it
+needs a verifier identity allowed to read collaborator permissions, which the
+bundled read-only verifier token cannot reliably do. The setting never makes a
+qualifying Codex finding non-blocking.
 
 The controller Action step must use underscore input names:
 `github_token`, `pr_number`, `expected_head_sha`, `operation`,
@@ -1036,9 +1109,12 @@ legacy before v2 is Active and read back.
    request with exactly one terminal LF or CRLF; those two storage forms are
    equivalent to exact `@codex review`. Do not accept or emit any other
    whitespace, visible text, or hidden comment. A qualifying Codex bot `issue_comment`
-   `created` or `edited` event will wake the installed workflow. A review or
-   reaction alone does not have an automatic consumer job; use manual
-   `reconcile` when a later evaluation is needed.
+   `created` event will wake the installed workflow. Editing an existing comment
+   does not; use manual `reconcile` when that carrier needs a later evaluation.
+   A review or reaction alone does not have an automatic consumer job. Treat
+   this direct comment as only a candidate until the official Codex Bot adds a
+   strictly post-revision `eyes` or `+1` reaction directly to it; a terminal
+   elsewhere on the PR is not a substitute for that receipt.
 
    ### Dual-protection legacy-status recovery
 
@@ -1233,25 +1309,30 @@ legacy before v2 is Active and read back.
    `workflow_dispatch`, `pull_request_review`, `pull_request_review_comment`,
    cron, or a new status writer to recover v1.
 
-   Reactions on an authorized ordinary, unmarked request are liveness-only.
-   An ordinary `+1` cannot independently create head-bound clean evidence. An
-   official Codex `eyes` reaction or progress artifact whose timestamp is the
-   same as or later than candidate terminal clean evidence vetoes success. If
-   that liveness change arrives without a later qualifying bot comment event,
-   dispatch a manual exact-head `reconcile` to observe it.
+   On an unconfirmed default-`any` ordinary, unmarked request, an official
+   direct strictly post-revision `eyes` or `+1` reaction is first its receipt:
+   it promotes the candidate into a boundary. Afterwards, reactions are
+   liveness-only. An ordinary `+1` cannot independently create head-bound
+   clean evidence. An official Codex `eyes` reaction or progress artifact
+   whose timestamp is the same as or later than candidate terminal clean
+   evidence vetoes success. If that liveness change arrives without a later
+   qualifying bot comment event, dispatch a manual exact-head `reconcile` to
+   observe it.
 
    For predecessor-to-successor generation closure, liveness whose timestamp
    equals the successor request is also ambiguous and keeps the predecessor
    open. Evidence outside the original gap cannot repair it. A new head is a
    valid reset only when every ambiguous predecessor is explicitly bound to a
-   different full head. If any predecessor is ordinary, deleted, or otherwise
-   unbound, open a replacement PR and run one canonical review generation
-   there.
+   different full head. An unconfirmed default-`any` ordinary candidate is not
+   a predecessor. If any provider-confirmed ordinary, deleted, or otherwise
+   unbound predecessor remains, open a replacement PR and run one canonical
+   review generation there.
 
-   Treat every physical request as a generation boundary. Without a base
-   epoch, unbound provider terminal evidence can close only the first gap; once
-   any predecessor exists, every later gap and positive/superseding authority
-   require a qualifying `+1` directly on the corresponding canonical request.
+   Treat every physical request except an unconfirmed default-`any` ordinary
+   candidate as a generation boundary. Without a base epoch, unbound provider
+   terminal evidence can close only the first gap; once any predecessor exists,
+   every later gap and positive/superseding authority require a qualifying `+1`
+   directly on the corresponding canonical request.
    With a base epoch, every gap requires direct `+1` evidence. Never attribute
    a later terminal to a newer generation merely by timestamp; it may be a
    delayed or duplicate carrier from an older flight. Treat edited unbound
@@ -1297,9 +1378,9 @@ legacy before v2 is Active and read back.
    - If a historical gap exists but every ambiguous predecessor is explicitly
      bound to another full head, create a legitimate new head and run exactly
      one canonical generation there.
-   - If the reason identifies an unclosable historical gap containing an
-     ordinary, edited, malformed, denied, deleted, or otherwise unbound
-     predecessor, do not post another direct or controller request on that
+   - If the reason identifies an unclosable historical gap containing a
+     provider-confirmed ordinary, edited, malformed, denied, deleted, or
+     otherwise unbound predecessor, do not post another direct or controller request on that
      PR/head and do not rely on a commit-only reset. Open a replacement PR from the intended
      branch/commits, run one canonical producer there, validate it, and close
      the ambiguous PR.
@@ -1328,15 +1409,16 @@ legacy before v2 is Active and read back.
    for that controller run to complete before posting a new direct request.
 
    Never overlap the direct and controller producers for the same head. Each
-   request starts a review generation, while terminal Codex text has no
+   provider-confirmed request starts a review generation, while terminal Codex text has no
    originating request ID. If a newer request appears before the previous
    generation is terminally closed, v2 intentionally preserves an unclosed
    lineage gap and keeps the verifier pending; evidence arriving outside the
    original predecessor-to-successor window cannot repair that ordering. If
    every ambiguous predecessor is canonically bound to another full head,
    create a legitimate new head and allow exactly one canonical generation.
-   If any predecessor is ordinary, edited, malformed, denied, deleted, or
-   otherwise unbound, open a replacement PR from the intended branch/commits,
+   An unconfirmed default-`any` ordinary candidate is not a predecessor. If any
+   provider-confirmed ordinary, edited, malformed, denied, deleted, or otherwise
+   unbound predecessor remains, open a replacement PR from the intended branch/commits,
    run one canonical generation there, validate it, and close the ambiguous
    PR.
 
@@ -1364,9 +1446,10 @@ legacy before v2 is Active and read back.
 1. Refresh `CANARY_HEAD`. If it changed, stop and reread the summary plus the
    complete physical lineage; do not automatically start another generation on
    the same PR. Continue on the new head only when every ambiguous predecessor
-   is explicitly bound to a different full head. If an ordinary, edited,
-   malformed, denied, deleted, or otherwise unbound predecessor leaves an
-   unclosable historical gap, use a replacement PR as described above.
+   is explicitly bound to a different full head. An unconfirmed default-`any`
+   ordinary candidate is not a predecessor. If a provider-confirmed ordinary,
+   edited, malformed, denied, deleted, or otherwise unbound predecessor leaves
+   an unclosable historical gap, use a replacement PR as described above.
 2. Dispatch a final exact-head reconcile without `--ref`:
 
    ```bash

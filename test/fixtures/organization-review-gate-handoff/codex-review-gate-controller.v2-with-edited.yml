@@ -2,7 +2,7 @@ name: Codex Review Gate Controller
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
   workflow_dispatch:
     inputs:
       operation:
@@ -53,7 +53,7 @@ jobs:
         ) ||
         (
           github.event_name == 'issue_comment' &&
-          github.event.action == 'created' &&
+          (github.event.action == 'created' || github.event.action == 'edited') &&
           github.event.issue.pull_request &&
           github.event.sender.login == 'chatgpt-codex-connector[bot]' &&
           github.event.sender.type == 'Bot' &&
@@ -68,7 +68,7 @@ jobs:
         id: controller
         uses: JoeyTeng/codex-review-gate-action@v2
         env:
-          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any
+          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}

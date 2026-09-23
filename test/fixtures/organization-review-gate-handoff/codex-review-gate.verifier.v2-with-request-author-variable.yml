@@ -24,7 +24,7 @@ jobs:
         id: gate
         uses: JoeyTeng/codex-review-gate-action@v2
         env:
-          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any
+          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event.pull_request.number }}

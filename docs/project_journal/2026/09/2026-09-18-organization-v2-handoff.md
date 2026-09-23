@@ -804,6 +804,106 @@ evidence that a prior freeze remains in force.
   local ruleset `16410326`, which remains a temporary v1 self-gate until a
   dedicated source bootstrap supplies its v2 replacement.
 
+## Execution Update — 2026-09-23 (source bootstrap)
+
+- `Joey-Tools/codex-review-gate` now carries the canonical v2 verifier and
+  controller, the exact temporary v1 bridge, and canonical workflow
+  CODEOWNERS ownership. The source `State Machine CI` keeps its required
+  `Review gate state machine` check name while using a static non-reserved
+  prefix, so bootstrap admission cannot mistake it for the v2 CheckRun.
+- This change deliberately does not mutate source repository ruleset
+  `16410326`: it continues to require legacy `codex/review-gate` while the
+  bridge preserves that producer. A separately authorized source policy stage
+  must create and activate a status-only v2 rule, then remove only the legacy
+  status rule from `16410326`, retaining its other protections.
+- The explicit remote-only `--ruleset-profile status-only` is reserved in the
+  helper for this exact source repository; all ordinary consumers retain the
+  default `full` profile and importable template. Its selected rule is exactly
+  one strict, GitHub-Actions-bound `codex/github-review-gate` check with no
+  bypass actors or other rules. The profile treats GitHub's
+  `do_not_enforce_on_create: false` readback default as canonical and refuses
+  to repair any extra rule, context, bypass actor, or branch-condition drift.
+- The existing read-only cleanup derivation and verification are profile-aware
+  for this narrow source rule. Their derived state removes only
+  `codex/review-gate` from the old rule and compares every remaining security
+  field across stable snapshots, so deletion, non-fast-forward, and
+  pull-request/CODEOWNERS protections cannot be silently lost.
+- The source controller admits only an exact Codex-bot `issue_comment`
+  `created` event before allocating a runner. An edited comment cannot restart
+  reconciliation automatically; operators use protected manual `reconcile`,
+  and base-retarget recovery remains draft-to-ready followed by a fresh
+  verifier. This implements the final event-cost and race boundary without
+  weakening the comment-author/sender checks.
+- The source-only profile treats an omitted API
+  `do_not_enforce_on_create` field as the documented `false` default only for
+  its otherwise exact status-only shape. Every create, update, activation, and
+  cleanup comparison uses that same semantic normalization; `true`, extra
+  rules/contexts, bypass actors, or branch-condition drift still fail closed.
+- Remote `status-only` now requires `--legacy-bridge` at CLI admission while
+  the source-local v1 requirement exists. It cannot stage a v2 replacement
+  after an unobserved bridge deletion and strand the old required status with
+  no writer. The source self-install test also inventories every
+  `.github/workflows/` file and rejects an additional v1/v2 caller, status
+  writer, or reserved v2 CheckRun producer.
+- The source is not in the fixed active organization cohort. Its later bridge
+  removal requires a source-local closure proof; the organization schema-2
+  receipt cannot authorize it.
+- The completed 10-repository organization receipt intentionally remains bound
+  to all three historical workflow identities: the verifier and controller use
+  the former request-author variable expression, the controller admits
+  `created` and `edited`, and the bridge keeps its deployed v1 envelope. All
+  ten cohort repositories still have those exact manifest-bound bytes; the
+  current created-only, literal-`any` source template must not rewrite or
+  reinterpret that completed receipt.
+- The handoff reader first binds each live verifier, controller, and bridge to
+  its frozen manifest blob SHA and content SHA-256, then applies a dedicated
+  historical structural validator. It does not reuse evolving current-template
+  byte equality or current request-author policy for the historical cohort.
+  Tests likewise use immutable fixtures for all three workflows, preventing a
+  current template from leaking into fake GitHub handoff evidence. Ordinary
+  consumer installation and source bootstrap continue to use the created-only,
+  literal-`any` validator. Runtime compatibility may parse `edited`, but it is
+  not a canonical automatic controller ingress.
+- Live source-bootstrap evidence exposed that the standard read-only verifier
+  token cannot read `GET /repos/{owner}/{repo}/collaborators/{login}/permission`:
+  a direct `@codex review` by `JoeyTeng-Codex` reached that endpoint under the
+  prior default `write` policy and GitHub returned `403 Must have push access to
+  view collaborator permission`. The verifier must remain read-only, so this is
+  not repaired by granting it repository write authority or by introducing a
+  runtime GitHub App.
+- The adopted standard is therefore a fixed `any`. Canonical
+  verifier/controller wrappers set
+  `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly, and the runtime
+  fallback is also `any`; they expose no repository variable or public Action
+  input for strict policy. `write` remains only a nonstandard future runtime
+  mode for a verifier identity that can read collaborator permissions.
+- `any` relaxes only the verifier's collaborator-permission lookup. An
+  already-observed exact, unedited ordinary `@codex review` comment is an
+  unconfirmed candidate, not a generation boundary: it becomes one only after
+  the official Codex Bot directly attaches a strictly post-revision `eyes` or
+  `+1` receipt to that exact comment. A later terminal/progress carrier
+  elsewhere cannot establish this causal receipt. This does not grant the
+  commenter permission to invoke Codex and does not guarantee provider
+  eligibility or delivery. Missing official Codex evidence remains pending,
+  while every qualifying Codex finding remains blocking.
+- This candidate/receipt split repairs a P1 denial-of-service regression in
+  the initial literal-`any` implementation: any commenter able to post the
+  exact text could otherwise create an unbound successor boundary after a
+  legitimate generation, making its clean terminal unlineaged and forcing the
+  required check back to pending even when Codex never accepted the new
+  comment. Candidates remain in the fully paginated snapshot, exact-refetch
+  and reaction inventory so a later receipt is observed through the existing
+  stable-snapshot protocol; only generation/lineage reduction excludes them
+  before that receipt. This preserves fail-closed behavior for findings and
+  genuine provider-confirmed flights without treating arbitrary user comments
+  as provider capability.
+- Existing consumer workflow copies that map an unset variable to `write` must
+  receive the new hard-coded-`any` canonical wrapper before they gain this
+  default; the floating Action alias alone cannot override an environment value
+  already supplied by an old copied workflow. Publish the runtime patch, update
+  those copies, and use fresh canary evidence before treating the change as
+  deployed.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -817,11 +917,12 @@ evidence that a prior freeze remains in force.
    cohort repository. The old organization ruleset intentionally remains Active
    only for deletion and non-fast-forward protection, including the archived
    legacy-only repository.
-3. Bootstrap `Joey-Tools/codex-review-gate` separately, then replace the
-   independent source ruleset `16410326` v1 status requirement through a
-   separate v2 rule; preserve its non-status protections. That source-local
-   exception is outside the frozen 10-member cohort and must not be used to
-   expand the organization closure receipt or bridge-removal scope.
+3. Stage and activate a status-only v2 rule for `Joey-Tools/codex-review-gate`,
+   verify its source-local canary, then remove only the independent source
+   ruleset `16410326` v1 status requirement while preserving its non-status
+   protections. This source-local exception is outside the frozen 10-member
+   cohort and must not be used to expand the organization closure receipt or
+   bridge-removal scope.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.

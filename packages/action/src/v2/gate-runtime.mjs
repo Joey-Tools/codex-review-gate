@@ -2868,7 +2868,7 @@ function readV2Config(environment) {
     throw new Error("GITHUB_RUN_ID must be one canonical positive decimal id");
   }
   const requestAuthorPermission = String(
-    environment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION || "write",
+    environment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION || "any",
   ).trim();
   if (requestAuthorPermission !== "write" && requestAuthorPermission !== "any") {
     throw new Error(
@@ -3397,6 +3397,16 @@ async function loadV2DecisionCarriers(
     requestReactions.set(id, reactions);
   }
 
+  // `any` avoids a collaborator-permission lookup; it does not attest that
+  // Codex accepted a user-authored request. Keep those comments in the
+  // snapshot and reaction inventory, but let only an official direct receipt
+  // promote them into the generation/lineage inputs below.
+  const effectiveRequestAuthority = confirmV2DefaultAnyRequestCandidates({
+    authorized: requestAuthority.authorized,
+    boundaries: requestAuthority.boundaries,
+    requestReactions,
+  });
+
   const providerEvidence = await collectV2ProviderEvidence(
     client,
     config,
@@ -3411,8 +3421,8 @@ async function loadV2DecisionCarriers(
     baseRef: pullRequest.base.ref,
     baseRepositoryId: String(pullRequest.base.repo.id),
     baseEpoch,
-    requests: requestAuthority.authorized,
-    requestBoundaries: requestAuthority.boundaries,
+    requests: effectiveRequestAuthority.authorized,
+    requestBoundaries: effectiveRequestAuthority.boundaries,
     requestErrors: requestAuthority.errors,
     requestReactions,
     artifacts: providerEvidence.artifacts,
@@ -3913,6 +3923,39 @@ function selectV2ReactionInventoryRequests({
     }
     if (request.headBound !== true) return true;
     return request.binding?.headSha === headSha;
+  });
+}
+
+function confirmV2DefaultAnyRequestCandidates({
+  authorized,
+  boundaries,
+  requestReactions,
+}) {
+  const confirmedIds = new Set((authorized ?? [])
+    .filter((request) => isV2ProviderConfirmedRequestCandidate(request, requestReactions))
+    .map((request) => request.id));
+  const include = (request) =>
+    request?.requiresProviderConfirmation !== true || confirmedIds.has(request.id);
+  return {
+    authorized: (authorized ?? []).filter(include),
+    boundaries: (boundaries ?? []).filter(include),
+  };
+}
+
+function isV2ProviderConfirmedRequestCandidate(request, requestReactions) {
+  if (request?.requiresProviderConfirmation !== true) return true;
+  if (!Number.isFinite(request.revisionMs)) return false;
+  return (requestReactions?.get(String(request.id)) ?? []).some((reaction) => {
+    if (
+      (reaction?.content !== "eyes" && reaction?.content !== "+1") ||
+      reaction?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN ||
+      reaction?.user?.type !== "Bot" ||
+      !canonicalPositiveId(reaction?.id) ||
+      !isCanonicalUtcTimestamp(reaction?.created_at)
+    ) {
+      return false;
+    }
+    return Date.parse(reaction.created_at) > request.revisionMs;
   });
 }
 
@@ -4642,6 +4685,7 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
       revisionMs: Date.parse(v2IssueCommentRevisionAt(comment)),
       headBound: false,
       permission,
+      requiresProviderConfirmation: config.requestAuthorPermission === "any",
     };
     boundaries.push({ ...request, authorized: isAuthorized });
     if (isAuthorized) authorized.push(request);

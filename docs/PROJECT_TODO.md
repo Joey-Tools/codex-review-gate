@@ -30,11 +30,11 @@
   organization rule no longer requires `codex/review-gate`, and all eight
   repository-local legacy cleanup surfaces in the fixed active 10-member cohort
   now require only `test`; the scheduler is Active again.
-- [ ] Bootstrap `Joey-Tools/codex-review-gate` separately, then replace its
-  independent local ruleset `16410326` v1 `codex/review-gate` self-gate by
-  staging and activating a separate v2 rule, then removing only the old status
-  rule. This source-local exception is outside the fixed cohort and must not
-  be used to expand organization receipt or bridge-removal scope.
+- [ ] Stage and activate a separate status-only source v2 rule for
+  `Joey-Tools/codex-review-gate`, verify its canary, then remove only the v1
+  `codex/review-gate` status rule from independent local ruleset `16410326`.
+  This source-local exception is outside the fixed cohort and must not be used
+  to expand organization receipt or bridge-removal scope.
 - [ ] Mint the canonical schema-2 final read-only closure receipt for the
   already-cut-over fixed active 10-member cohort, then use it to authorize
   separate cohort temporary-bridge removal work. Keep every cohort bridge

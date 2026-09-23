@@ -11,9 +11,9 @@
 
 Canary 验证完成后关闭、不合并。
 
-活动 v2 10 仓组织级 handoff 是唯一允许 migration PR 暂不移除 v1 的受控例外。旧 v1
-organization ruleset 仍保留原始 11 仓 legacy selector。修改任何活动 cohort member 前，
-必须先阅读下方 advanced section。
+活动 v2 10 仓组织级 handoff 是针对 shared organization ruleset 的受控例外；旧 v1
+organization ruleset 仍保留原始 11 仓 legacy selector。下方另有窄范围的 source repository
+self-hosting 例外，它不属于该 cohort。修改任一例外 scope 前，必须先阅读对应 section。
 
 ## 安装内容
 
@@ -44,7 +44,8 @@ uses: JoeyTeng/codex-review-gate-action@v2
 - read-only verifier 只接受 `pull_request` 的 `opened`、`reopened`、`synchronize`
   与 `ready_for_review`；它在 exact PR feature-head SHA 上的 native
   `codex/github-review-gate` CheckRun 是 required signal；
-- controller 自动 wake-up 只接受 `issue_comment` 的 `created` 与 `edited`。它刻意不订阅
+- controller 自动 wake-up 只接受 `issue_comment` 的 `created`。编辑既有 comment 不会分配 runner；
+  若该 edited carrier 需要重新评估，走受保护 default branch 的手动 `reconcile`。它刻意不订阅
   `pull_request_review`：GitHub 把该 event 绑定到 PR merge ref，而 controller 保留了狭窄的
   write authority。只由 review 或 reaction 携带的 Codex 结果因此必须走受保护 default branch
   的手动 `reconcile`；
@@ -59,22 +60,29 @@ uses: JoeyTeng/codex-review-gate-action@v2
   comment；GitHub 的 issue-comment REST endpoint 对该目标接受 pull-request write。两者都
   没有 `issues: write`、`statuses: write`、`checks: write` 或 `contents: write`。
 
-默认情况下，普通用户发出的 `@codex review` 只有在 author 当前拥有 `write`、
-`maintain` 或 `admin` 权限时，才能建立新的 review generation。若仓库明确接受任意
-commenter 的 request，可以把受保护 repository Actions variable 设置为
-`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；其他任何值都映射为更安全的
-`write` policy。这是 wrapper-owned protected configuration，不是 public Action input。
-它不会削弱 finding authority：任何合格 Codex finding 仍然阻塞。
+默认情况下，普通用户发出的 exact `@codex review` 在 `any` policy 下、任意 repository
+permission 都只会作为 candidate 被纳入，而不是立刻成为 review-generation boundary。只有
+official Codex Bot 在同一条 comment 上直接添加严格晚于当前 revision 的 `eyes` 或 `+1`
+receipt，它才升级为 boundary。这是 gate attribution 决策，不是调用 Codex 的权限，也不保证
+Codex 会启动；provider-side eligibility 与 delivery 独立决定。PR 其他位置后来出现的
+terminal 或 progress carrier 不能建立该因果 receipt，所以未确认 candidate 不能抢占既有
+clean。canonical workflow 直接设定
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；不要给普通 consumer 添加 repository
+variable、public Action input 或 strict policy。`write`/`maintain`/`admin` path 仅保留给将来
+可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only verifier
+token 无法可靠做到。它不会削弱 finding authority：任何合格 Codex finding 仍然阻塞。
 
 Consumer workflows 没有 cron、`repository_dispatch`、`pull_request_target`、自动
 `pull_request_review` writer、runtime GitHub App、status bridge 或 ledger。evidence
 由所选 verifier 从 PR 重建。
 
-合格的普通、无 marker `@codex review` request 上的 reactions 只作为 provider liveness
-evidence 读取。普通 request 上的 `+1` 不能独立产生 head-bound clean evidence。若 official
-Codex `eyes` reaction 或 progress artifact 与候选 terminal clean 同时或更晚，则说明 review
-activity 仍然有效并 veto success。Reaction 变化本身不会启动 consumer job，因此需要等待
-后续合格 bot comment 触发，或手动 dispatch exact-head `reconcile`。
+未确认的普通、无 marker `@codex review` request 上，official Codex 直接添加且严格晚于
+当前 revision 的 `eyes` 或 `+1` reaction 首先充当 receipt，把 candidate 升级为 boundary。
+升级后 reactions 才作为 provider liveness evidence 读取。普通 request 上的 `+1` 仍不能
+独立产生 head-bound clean evidence。若 official Codex `eyes` reaction 或 progress artifact
+与候选 terminal clean 同时或更晚，则说明 review activity 仍然有效并 veto success。Reaction
+变化本身不会启动 consumer job，因此需要等待后续合格 bot comment 触发，或手动 dispatch
+exact-head `reconcile`。
 在 predecessor-to-successor generation closure 中，与 successor request 同一时间戳的
 liveness 也无法排序，必须保持 predecessor open。
 一旦出现第二个物理 request boundary，unbound terminal 就无法证明自己属于新 request，
@@ -84,8 +92,9 @@ liveness 也无法排序，必须保持 predecessor open。
 已经无法在原始窗口内闭合，必须先区分 physical boundary 与 positive authority：edited、
 malformed、wrong-author、denied 或 stale-base request 可以保留为 boundary，但没有
 authority。只有每个歧义 predecessor 都显式绑定另一个 full head 时，新 head 才能恢复。
-若存在 ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，只运行
-一个 canonical producer；验证 replacement 后关闭旧歧义 PR。
+未确认 default-`any` ordinary candidate 不是 predecessor。若仍存在 provider-confirmed
+ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，只运行一个 canonical
+producer；验证 replacement 后关闭旧歧义 PR。
 显式 commit-bound progress 直接归入对应 head；所有 unbound progress 都保留在 current
 inventory，因为邻近 request timestamp 不能证明来源。edited terminal 还会产生从创建到
 terminal revision 的 unbound unknown-activity interval。provider terminal 只有在
@@ -116,6 +125,57 @@ adopted compound boundary。
 variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派生 `limits_profile`；公开 outputs 只有
 `execution_health`、`gate_outcome`、`recovery_code` 与 `retry_safe`。Finding counts
 只出现在 summary 与 sticky diagnostic，不是 outputs。
+
+## 窄范围 source repository self-hosting 例外
+
+此例外只适用于 `Joey-Tools/codex-review-gate` 迁移它自己的 default branch。它不会削弱
+普通 consumer path：importable ruleset 与 bootstrap helper 默认的 `full` profile 仍适用于
+所有普通 consumer 和每个 repository-level cohort installation。不得把此 profile 复制到通用
+installation template。
+
+先合并 source migration PR：它必须同时安装 exact canonical v2 verifier、controller 和
+exact temporary legacy bridge，并保持 source 现有 legacy rule Active。之后才 remote 暂存这个
+source-only v2 rule；`--ruleset-profile status-only` 只允许配合 `--repo`，不能传给
+`--prepare-worktree`：
+
+```bash
+REPO="Joey-Tools/codex-review-gate"
+CONTROL_PLANE_OWNER=@JoeyTeng
+V2_RULESET_NAME="Must Pass Codex Review v2"
+# Use the value recorded in the owner-approved legacy inventory snapshot.
+LEGACY_INVENTORY_SHA256=OWNER_APPROVED_LEGACY_INVENTORY_SHA256
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --apply
+```
+
+在继续执行下方普通的 canary、activation 与 cleanup-proof sections 时，每一条后续 remote
+invocation 都必须继续带上 `--ruleset-name "$V2_RULESET_NAME"`、
+`--ruleset-profile status-only` 和 `--legacy-bridge`。这个 source exception 不能回退到默认
+`full` profile。legacy required status 仍存在时，CLI 会拒绝未带 `--legacy-bridge` 的这个
+source-only profile，避免 bridge 漂移后让 `codex/review-gate` 没有 producer。
+
+新 rule 只包含 strict、GitHub-Actions-bound 的 `codex/github-review-gate` requirement。
+它是第二条 rule：现有 source rule 继续负责 deletion、non-fast-forward、pull-request 与相关
+CODEOWNERS protection。source-specific rule 激活后，legacy v1 status 与新 v2 CheckRun 会
+双重保护 source。此阶段不得移除或扩大任何 legacy protection；只有经过独立 canary 与
+owner-approved cleanup 后，才可以只移除 legacy status requirement。
+
+不得使用 organization schema-2 final-closure receipt 删除 source 的 temporary bridge。
+该 bridge 必须有单独记录的 source-local closure proof 与独立授权。
 
 ## Advanced：活动 v2 10 仓组织 cohort 的受控 handoff
 
@@ -834,9 +894,11 @@ test -n "$CANARY_HEAD_REF"
 
 GitHub 可能把这条单行 direct request 保存为末尾恰好一个 LF 或 CRLF；这两种存储
 形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。
-这条路径不会为了创建 request 消耗 Actions minutes。后续满足条件的 Codex bot
-`issue_comment` `created` 或 `edited` event 会启动 controller，由它建立严格更新的 full
-verifier attempt；若结果只出现在 review 或 reaction，或者需要恢复，再手动 reconcile。
+这条路径不会为了创建 request 消耗 Actions minutes。在 official Codex Bot 直接在同一条
+comment 上添加严格 post-revision 的 `eyes` 或 `+1` receipt 前，它只是 candidate，不能使既有
+clean 失效。后续满足条件的 Codex bot `issue_comment` `created` event 会启动 controller，由它
+建立严格更新的 full verifier attempt；编辑既有 comment 不会启动 controller，若该 carrier 需要
+重新评估则手动 reconcile。若结果只出现在 review 或 reaction，或者需要恢复，也手动 reconcile。
 
 ### Dual-protection legacy-status recovery
 
@@ -1079,8 +1141,9 @@ scoped controller reconcile。manual dispatch 没有 limits-profile 或 numeric 
 
 Head 变化后先停止并重读 summary 与完整 physical lineage；不得接受旧 commit 的 success，
 也不得自动在同一 PR 启动 generation。只有每个歧义 predecessor 都显式绑定不同 full head
-时，才能在 new head 继续。若 ordinary、edited、malformed、denied、deleted 或其他 unbound
-predecessor 留下不可闭合 gap，必须使用 replacement PR。
+时，才能在 new head 继续。若 provider-confirmed ordinary、edited、malformed、denied、deleted
+或其他 unbound predecessor 留下不可闭合 gap，必须使用 replacement PR；未确认 default-`any`
+ordinary candidate 不会单独形成该 gap。
 
 ## 4. 启用 ruleset 并关闭 canary
 
