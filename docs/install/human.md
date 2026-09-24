@@ -217,6 +217,89 @@ Do not use an organization schema-2 final-closure receipt to remove the
 source's temporary bridge. That bridge needs a separately recorded,
 source-local closure proof and its own authorization.
 
+### Source-local legacy cleanup executor
+
+After the source-only v2 rule is exactly Active, derive and review the source
+plan with the same source-only profile and bridge arguments. This executor is
+not available to ordinary consumers. Preserve the resulting raw UTF-8 plan
+bytes unchanged: its SHA-256 is the separately approved input to the executor.
+The plan also records the exact owner-approved legacy-inventory SHA-256, so the
+same digest must be supplied again at execution; a later inventory approval
+cannot be substituted for the approved plan.
+
+```bash
+POST_CLEANUP_PLAN="$(mktemp)"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+jq . "$POST_CLEANUP_PLAN"
+EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+  '.expected_post_cleanup_security_sha256 |
+   select(test("^[0-9a-f]{64}$"))' \
+  "$POST_CLEANUP_PLAN")"
+POST_CLEANUP_PLAN_SHA256="$(shasum -a 256 "$POST_CLEANUP_PLAN" |
+  awk '{print $1}')"
+```
+
+The source plan must have no classic mutation and exactly one
+`remove-legacy-check-only` action for the retained legacy ruleset. Preview the
+approved plan first; then add `--apply` only after the separate authorization:
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+  --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256"
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+  --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256" \
+  --apply
+```
+
+Before its only PUT, the executor first re-derives a final pair of complete
+pre-cleanup closures, requires canonical equality with the admitted plan, then
+reads both the exact legacy target and the selected v2 ruleset immediately
+before comparing their complete writable projections. GitHub does not offer a
+ruleset-update CAS (compare-and-swap, an atomic read-and-write precondition),
+so these reads detect observed drift but cannot exclude an administrator change
+in the final API gap. Run the entire final derivation, exact reads, PUT,
+readback, and closure under a separately authorized external single-writer
+policy freeze; if that freeze cannot be maintained, do not apply the plan. It
+reads the exact after-state and automatically performs the two-round closure.
+If the PUT, readback, or closure fails, it may already have completed: do not
+replay it, change classic protection, remove the bridge, or disable/overwrite
+v2. Preserve v2 Active and use only the following read-only proof plus exact
+ruleset inspection before separately authorizing repair:
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --verify-post-cleanup \
+  --expected-post-cleanup-security-sha256 \
+  "$EXPECTED_POST_CLEANUP_SECURITY_SHA256"
+```
+
 ## Advanced controlled handoff for one active ten-repository v2 cohort
 
 Use this path only for an explicitly approved active ten-repository v2 cohort
@@ -1459,7 +1542,7 @@ EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
   "$POST_CLEANUP_PLAN")"
 ```
 
-Review the plan before authorising cleanup. It may remove only
+Review the plan before authorising legacy cleanup. It may remove only
 `codex/review-gate`. If that removes the final item from classic
 required-status policy, that empty policy and its `strict` field may disappear.
 An emptied ruleset status rule may disappear, and the whole dedicated
@@ -1470,11 +1553,18 @@ including `strict` and `app_id` in a surviving classic policy, and every
 retained ruleset's identity, conditions, bypass actors, and unrelated rules
 must remain exact.
 
-Execute only that reviewed plan as the separately authorised legacy cleanup,
-then perform the read-only post-cleanup closure with the same selected name and
-recorded expected digest. It reads two complete security snapshots and
-requires both rounds to be identical, equal the expected digest, clear on both
-legacy surfaces, and bound to the same exact complete Active v2 policy:
+Execute only that reviewed plan using the applicable separately authorized,
+policy-specific executor. The source-only executor documented in the narrow
+source exception above must not be used by an ordinary consumer. Do not
+re-derive after any write. A cleanup or readback failure is not permission to
+disable or roll back v2: preserve the complete Active v2 gate, run only the
+policy-specific read-only diagnostics, and report the exact remaining or
+indeterminate state.
+
+Then run the dedicated read-only post-cleanup closure with the recorded ruleset
+name and expected digest. It reads two complete security snapshots and requires
+both rounds to be identical, equal the expected digest, clear on both legacy
+surfaces, and bound to the same exact complete Active v2 policy:
 
 ```bash
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
@@ -1485,11 +1575,6 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --expected-post-cleanup-security-sha256 \
   "${EXPECTED_POST_CLEANUP_SECURITY_SHA256}"
 ```
-
-Do not re-derive after cleanup. Any cleanup/readback/verification failure or
-inconclusive result leaves v2 Active. Preserve it, run only read-only
-diagnostics, and report the exact remaining or indeterminate state; never
-disable or roll back v2 to manufacture closure.
 
 Then close the canary without merging it. Do not use `--delete-branch` on the
 close command. Prove that the closed-unmerged PR still carries the recorded

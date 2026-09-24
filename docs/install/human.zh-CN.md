@@ -177,6 +177,82 @@ owner-approved cleanup 后，才可以只移除 legacy status requirement。
 不得使用 organization schema-2 final-closure receipt 删除 source 的 temporary bridge。
 该 bridge 必须有单独记录的 source-local closure proof 与独立授权。
 
+### Source-local legacy cleanup executor
+
+source-only v2 rule 已被精确证明为 Active 后，用同一 source-only profile 与 bridge arguments
+派生并审阅 source plan。该 executor 不对普通 consumer 开放。必须保持生成的 raw UTF-8 plan
+bytes 不变：其 SHA-256 是 executor 的单独批准输入。plan 还记录 exact owner-approved
+legacy-inventory SHA-256，因此执行时必须再次提供同一 digest，不能替换为之后的 inventory
+approval。
+
+```bash
+POST_CLEANUP_PLAN="$(mktemp)"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+jq . "$POST_CLEANUP_PLAN"
+EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+  '.expected_post_cleanup_security_sha256 |
+   select(test("^[0-9a-f]{64}$"))' \
+  "$POST_CLEANUP_PLAN")"
+POST_CLEANUP_PLAN_SHA256="$(shasum -a 256 "$POST_CLEANUP_PLAN" |
+  awk '{print $1}')"
+```
+
+source plan 不得有 classic mutation，且必须仅对 retained legacy ruleset 含一个
+`remove-legacy-check-only` action。先 preview approved plan；只有在单独授权后才添加
+`--apply`：
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+  --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256"
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+  --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+  --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256" \
+  --apply
+```
+
+executor 会在唯一 PUT 前重新派生最终两轮完整 pre-cleanup closure，要求其与 admitted plan
+canonical equality，然后紧贴 PUT 前读取 exact legacy target 与 selected v2 ruleset、比较二者
+完整 writable projection。GitHub 没有 ruleset-update CAS（compare-and-swap，即把读取与写入
+绑定为原子前置条件），所以这些读取只能检测已经观察到的 drift，不能排除最终 API gap 中的
+administrator change。必须在 final derivation、exact reads、PUT、readback 与 closure 的全程
+实施另行授权的外部 single-writer policy freeze；无法维持该 freeze 时不得 apply。它读回 exact
+after-state，且自动执行两轮 closure。PUT、readback 或 closure 失败时可能已经完成：不得 replay、
+不得改变 classic protection、不得移除 bridge、不得 disable/overwrite v2。保持 Active v2；只运行
+下方 read-only proof 与 exact ruleset inspection，之后再单独授权 repair：
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --verify-post-cleanup \
+  --expected-post-cleanup-security-sha256 \
+  "$EXPECTED_POST_CLEANUP_SECURITY_SHA256"
+```
+
 ## Advanced：活动 v2 10 仓组织 cohort 的受控 handoff
 
 只有在一个已明确批准的活动 v2 10 仓 organization cohort 的 default branches 全部受同一条
@@ -1212,10 +1288,15 @@ workflow/CODEOWNERS inventory、owner permission、surviving classic policy 的�
 与 non-legacy checks（包括 `strict`/`app_id`），以及每个 retained ruleset 的 identity、
 conditions、bypass actors 与 unrelated rules 都必须精确保留。
 
-只执行该已审阅 plan 作为另行授权的 legacy cleanup；之后使用相同 selected name 与记录的
-expected digest 运行只读 post-cleanup closure。它读取两轮完整 security snapshot，要求
-两轮完全相同、都等于 expected digest、两个 legacy surfaces 均 clear，并绑定同一 exact
-complete Active v2 policy：
+只使用适用且另行授权的 policy-specific executor 执行该已审阅 plan。上方 narrow source
+exception 所记录的 source-only executor 不得用于 ordinary consumer。任何 write 后均不得
+重新派生。cleanup/readback failure 不能成为 disable/rollback v2 的理由：必须保留 complete
+Active v2 gate，只运行 policy-specific read-only diagnostics，并报告 exact remaining 或
+indeterminate state。
+
+随后使用相同 selected name 与记录的 expected digest 运行专用的只读 post-cleanup closure。
+它读取两轮完整 security snapshot，要求两轮完全相同、都等于 expected digest、两个 legacy
+surfaces 均 clear，并绑定同一 exact complete Active v2 policy：
 
 ```bash
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
@@ -1226,10 +1307,6 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --expected-post-cleanup-security-sha256 \
   "${EXPECTED_POST_CLEANUP_SECURITY_SHA256}"
 ```
-
-Cleanup 后不得重新派生。任何 cleanup/readback/verification failure 或 inconclusive 都必须
-保持 v2 Active，只运行 read-only diagnostics，并报告 exact remaining 或 indeterminate
-state；不得 disable/rollback v2 来制造 closure。
 
 随后关闭 canary，但不 merge，也不在 close 命令使用 `--delete-branch`。先证明
 closed-unmerged PR 仍携带已记录的 head repository、ref 与 OID，再用 Git exact-OID lease

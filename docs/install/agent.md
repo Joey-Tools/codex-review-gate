@@ -123,6 +123,87 @@ else.
 5. Never use an organization schema-2 final-closure receipt to remove this
    source bridge. Stop until a separately authorized, recorded source-local
    closure proof exists.
+6. After the source-only v2 rule is exactly Active, derive and review the
+   source-local cleanup plan with the same `status-only` profile and bridge.
+   Keep the plan's raw UTF-8 bytes unchanged; its SHA-256 is an explicit
+   approval input. The plan also binds the exact owner-approved
+   legacy-inventory SHA-256, so execution must supply that same digest rather
+   than substitute a later inventory approval. This path is unavailable to
+   ordinary consumers:
+
+   ```bash
+   POST_CLEANUP_PLAN="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+   jq . "$POST_CLEANUP_PLAN"
+   EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+     '.expected_post_cleanup_security_sha256 |
+      select(test("^[0-9a-f]{64}$"))' \
+     "$POST_CLEANUP_PLAN")"
+   POST_CLEANUP_PLAN_SHA256="$(shasum -a 256 "$POST_CLEANUP_PLAN" |
+     awk '{print $1}')"
+   ```
+
+7. The source plan must contain no classic mutation and exactly one
+   `remove-legacy-check-only` action for the retained legacy ruleset. Preview
+   it first, then add `--apply` only after the separately recorded
+   authorization:
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+     --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256"
+
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+     --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256" \
+     --apply
+   ```
+
+   Before its single PUT, the executor re-derives a final pair of complete
+   pre-cleanup closures, requires canonical equality with the admitted plan,
+   then reads both the exact legacy target and selected v2 ruleset immediately
+   before comparing their complete writable projections. GitHub does not offer
+   a ruleset-update CAS (compare-and-swap, an atomic read-and-write
+   precondition), so these reads detect observed drift but cannot exclude an
+   administrator change in the final API gap. Run final derivation, exact
+   reads, PUT, readback, and closure under a separately authorized external
+   single-writer policy freeze; if that freeze cannot be maintained, do not
+   apply. It reads the exact after-state and automatically runs the two-round
+   closure. If the PUT, readback, or closure fails, it may already have
+   completed: do not replay it, mutate classic protection, remove the bridge,
+   or disable/overwrite v2. Preserve Active v2 and use only the read-only proof
+   below plus exact ruleset inspection before separately authorizing repair:
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --verify-post-cleanup \
+     --expected-post-cleanup-security-sha256 \
+     "$EXPECTED_POST_CLEANUP_SECURITY_SHA256"
+   ```
 
 ## Advanced controlled handoff for an active ten-repository v2 cohort
 
@@ -1614,7 +1695,7 @@ legacy before v2 is Active and read back.
      "$POST_CLEANUP_PLAN")"
    ```
 
-   The plan may remove only `codex/review-gate`. If that removes the last item
+   This legacy cleanup plan may remove only `codex/review-gate`. If that removes the last item
    from classic required-status policy, that empty policy and its `strict`
    field may disappear. If it empties a ruleset status rule, that rule may
    disappear; the whole dedicated legacy-only ruleset may disappear only when
@@ -1624,17 +1705,19 @@ legacy before v2 is Active and read back.
    (including `strict` and `app_id`) in a surviving classic policy, and every
    retained ruleset's identity, conditions, bypass actors, and unrelated
    rules. Any other delta is not an authorised cleanup plan.
-6. Execute only that reviewed plan as the separately authorised legacy
-   cleanup. Do not re-derive after a write. A cleanup or readback failure is
-   not permission to disable or roll back v2: leave the complete Active v2
-   gate in place, run only read-only diagnostics, and report the exact
-   remaining or indeterminate surface.
-7. Run the dedicated read-only post-cleanup closure with the recorded ruleset
-   name and externally recorded expected-state digest. It takes two complete
-   security snapshots; both rounds must be identical, must equal the expected
-   digest, must show both legacy surfaces clear, and must show the same exact
-   complete v2 ruleset Active. Thus neither an unrelated-policy change nor a
-   cross-surface swap can form a false clear snapshot:
+6. Execute only that reviewed plan with the applicable separately authorized,
+   policy-specific executor. The source-only executor in the narrow source
+   exception above must not be used by an ordinary consumer. Do not re-derive
+   after any write. A cleanup or readback failure is not permission to disable
+   or roll back v2: preserve Active v2, run only policy-specific read-only
+   diagnostics, and report the exact remaining or indeterminate surface.
+7. You may run the dedicated read-only post-cleanup closure for independent
+   evidence or recovery diagnosis with the recorded ruleset name and expected
+   state digest. It takes two complete security snapshots; both rounds must be
+   identical, must equal the expected digest, must show both legacy surfaces
+   clear, and must show the same exact complete v2 ruleset Active. Thus neither
+   an unrelated-policy change nor a cross-surface swap can form a false clear
+   snapshot:
 
    ```bash
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
