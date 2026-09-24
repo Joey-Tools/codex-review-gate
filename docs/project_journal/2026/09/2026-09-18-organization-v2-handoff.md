@@ -3,7 +3,7 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-23
+updated: 2026-09-24
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Stable Action `v2.0.1` and the floating `v2` alias are published from
+- Stable Action `v2.0.2` and the floating `v2` alias are published from
   `JoeyTeng/codex-review-gate-action`. This workstream implements and carries
   out the user-approved organization-wide transition from the inherited v1
   required status to v2.
@@ -909,6 +909,32 @@ evidence that a prior freeze remains in force.
   until the privileged publisher has advanced the stable floating `v2` alias
   to that release.
 
+## Execution Update — 2026-09-24 (v2.0.3 terminal-clean receipt patch)
+
+- `v2.0.2` is published and the floating `v2` alias resolves to it. Source
+  canary `#64` has one exact, unedited ordinary `@codex review` request and an
+  official current-head `issue_comment` terminal-clean result. Its short SHA
+  resolves unambiguously to the canary's exact current head. The v2 verifier
+  nevertheless remained pending: the current default-`any` implementation
+  admits only an official Bot `eyes` or `+1` reaction directly on the request
+  comment, and the observed provider result has no such direct reaction.
+- The `v2.0.3` patch is intentionally narrow. A terminal-clean result may
+  confirm a default-`any` ordinary request only when there is no base epoch,
+  exactly one unedited ordinary request in the single-flight boundary, and an
+  unedited official current-head `issue_comment` terminal-clean result strictly
+  later than that request revision. A short SHA is accepted only when it
+  resolves unambiguously to the current head. Findings remain independently
+  blocking and never become receipts; a base epoch, multiple candidates or
+  request-shaped boundaries, ambiguous resolution, or any relevant edit stays
+  pending.
+- At this checkpoint `v2.0.3` is not yet released. Source v2 ruleset
+  `23927388` remains Disabled, source ruleset `16410326` still requires the v1
+  status, and neither source-policy activation nor v1-status cleanup has been
+  performed. After publication, `#64` must first obtain a fresh verifier run
+  for its then-current base/test-merge scope (using draft-to-ready when needed);
+  an exact-head reconcile is reserved for a recoverable initial result before
+  those separate mutations can proceed.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -922,12 +948,14 @@ evidence that a prior freeze remains in force.
    cohort repository. The old organization ruleset intentionally remains Active
    only for deletion and non-fast-forward protection, including the archived
    legacy-only repository.
-3. Stage and activate a status-only v2 rule for `Joey-Tools/codex-review-gate`,
-   verify its source-local canary, then remove only the independent source
-   ruleset `16410326` v1 status requirement while preserving its non-status
-   protections. This source-local exception is outside the frozen 10-member
-   cohort and must not be used to expand the organization closure receipt or
-   bridge-removal scope.
+3. Publish the narrow `v2.0.3` terminal-clean receipt patch, refresh source
+   canary `#64` for its current base/test-merge scope, reconcile only if its
+   initial result is recoverably pending, then activate the staged status-only
+   v2 rule for `Joey-Tools/codex-review-gate` and remove only the independent
+   source ruleset `16410326` v1 status requirement while preserving its
+   non-status protections. This source-local exception is outside the frozen
+   10-member cohort and must not be used to expand the organization closure
+   receipt or bridge-removal scope.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.

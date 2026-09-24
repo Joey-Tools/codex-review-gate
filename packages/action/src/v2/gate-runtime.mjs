@@ -3397,16 +3397,6 @@ async function loadV2DecisionCarriers(
     requestReactions.set(id, reactions);
   }
 
-  // `any` avoids a collaborator-permission lookup; it does not attest that
-  // Codex accepted a user-authored request. Keep those comments in the
-  // snapshot and reaction inventory, but let only an official direct receipt
-  // promote them into the generation/lineage inputs below.
-  const effectiveRequestAuthority = confirmV2DefaultAnyRequestCandidates({
-    authorized: requestAuthority.authorized,
-    boundaries: requestAuthority.boundaries,
-    requestReactions,
-  });
-
   const providerEvidence = await collectV2ProviderEvidence(
     client,
     config,
@@ -3415,6 +3405,22 @@ async function loadV2DecisionCarriers(
     issueComments,
     reviews,
   );
+  // `any` avoids a collaborator-permission lookup; it does not attest that
+  // Codex accepted a user-authored request. Keep those comments in the
+  // snapshot and reaction inventory, but let only an official direct reaction
+  // or unedited terminal clean receipt promote them into the inputs below.
+  const effectiveRequestAuthority = confirmV2DefaultAnyRequestCandidates({
+    authorized: requestAuthority.authorized,
+    boundaries: requestAuthority.boundaries,
+    physicalBoundaries: [
+      ...requestAuthority.boundaries,
+      ...(deletedCommentEvents ?? []).map(v2DeletedCommentBoundary),
+    ],
+    baseEpoch,
+    requestReactions,
+    providerArtifacts: providerEvidence.artifacts,
+    headSha,
+  });
   const decisionEvidence = reduceV2Evidence({
     headSha,
     baseSha,
@@ -3929,22 +3935,58 @@ function selectV2ReactionInventoryRequests({
 function confirmV2DefaultAnyRequestCandidates({
   authorized,
   boundaries,
+  physicalBoundaries,
+  baseEpoch,
   requestReactions,
+  providerArtifacts,
+  headSha,
 }) {
-  const confirmedIds = new Set((authorized ?? [])
-    .filter((request) => isV2ProviderConfirmedRequestCandidate(request, requestReactions))
-    .map((request) => request.id));
+  const confirmedIds = new Set();
+  const receiptBoundaryIds = new Set();
+  for (const request of authorized ?? []) {
+    if (request?.requiresProviderConfirmation !== true) {
+      confirmedIds.add(request.id);
+      continue;
+    }
+    if (!Number.isFinite(request.revisionMs)) continue;
+    if (hasV2DirectProviderReactionAfterRequest(request, requestReactions)) {
+      confirmedIds.add(request.id);
+      continue;
+    }
+    const receipts = (providerArtifacts ?? []).filter((artifact) =>
+      isV2TerminalCleanReceiptForDefaultAnyRequest(artifact, request, headSha)
+    );
+    if (receipts.length === 0) continue;
+    receiptBoundaryIds.add(request.id);
+    if (receipts.some((receipt) =>
+      isV2UnambiguousTerminalCleanReceiptForDefaultAnyRequest({
+        request,
+        receipt,
+        baseEpoch,
+        physicalBoundaries,
+      })
+    )) {
+      confirmedIds.add(request.id);
+    }
+  }
   const include = (request) =>
     request?.requiresProviderConfirmation !== true || confirmedIds.has(request.id);
   return {
     authorized: (authorized ?? []).filter(include),
-    boundaries: (boundaries ?? []).filter(include),
+    boundaries: (boundaries ?? []).flatMap((request) => {
+      if (include(request)) return [request];
+      if (!receiptBoundaryIds.has(request?.id)) return [];
+      return [{
+        ...request,
+        authorized: false,
+        permission: "physical-only",
+        physicalOnlyReason: "ambiguous-terminal-clean-receipt",
+      }];
+    }),
   };
 }
 
-function isV2ProviderConfirmedRequestCandidate(request, requestReactions) {
-  if (request?.requiresProviderConfirmation !== true) return true;
-  if (!Number.isFinite(request.revisionMs)) return false;
+function hasV2DirectProviderReactionAfterRequest(request, requestReactions) {
   return (requestReactions?.get(String(request.id)) ?? []).some((reaction) => {
     if (
       (reaction?.content !== "eyes" && reaction?.content !== "+1") ||
@@ -3957,6 +3999,51 @@ function isV2ProviderConfirmedRequestCandidate(request, requestReactions) {
     }
     return Date.parse(reaction.created_at) > request.revisionMs;
   });
+}
+
+function isV2TerminalCleanReceiptForDefaultAnyRequest(artifact, request, headSha) {
+  const resolvedHeadSha = String(artifact?.resolvedHeadSha || "").toLowerCase();
+  if (
+    artifact?.kind !== "clean" ||
+    artifact?.source !== "issue-comment" ||
+    artifact?.edited === true ||
+    artifact?.orderingError ||
+    artifact?.resolutionError ||
+    !FULL_SHA.test(resolvedHeadSha) ||
+    resolvedHeadSha !== headSha
+  ) {
+    return false;
+  }
+  const window = v2ProviderActivityWindow(artifact);
+  return window !== null &&
+    window.carrierCreatedMs === window.revisionMs &&
+    window.carrierCreatedMs > request.revisionMs;
+}
+
+function isV2UnambiguousTerminalCleanReceiptForDefaultAnyRequest({
+  request,
+  receipt,
+  baseEpoch,
+  physicalBoundaries,
+}) {
+  if (baseEpoch?.event !== null && baseEpoch?.event !== undefined) return false;
+  const receiptWindow = v2ProviderActivityWindow(receipt);
+  if (receiptWindow === null) return false;
+  const contenders = [];
+  for (const boundary of physicalBoundaries ?? []) {
+    if (
+      typeof boundary?.id !== "string" ||
+      boundary.id.trim() === "" ||
+      !Number.isFinite(boundary.revisionMs)
+    ) {
+      return false;
+    }
+    if (boundary.revisionMs <= receiptWindow.carrierCreatedMs) {
+      contenders.push(boundary);
+    }
+  }
+  return contenders.length === 1 &&
+    contenders[0].id === request.id;
 }
 
 function normalizeV2EvidenceError(value) {

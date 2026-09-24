@@ -41,8 +41,9 @@ push、update-branch operation、base change、close/reopen transition，或 PR 
 
 只有在 PR 没有 base epoch，且这是第一个物理 generation 时，才使用下面的普通 agent
 path。发送前必须确认 current lineage 中没有任何更早、且未显式绑定其他 full head 的
-provider-confirmed 或其他 physical boundary。未确认 default-`any` ordinary candidate
-本身不会形成 lineage gap：
+provider-confirmed 或其他 physical boundary。既没有 direct receipt、也没有 terminal-clean
+contender 的 default-`any` ordinary candidate 本身不会形成 lineage gap；尝试使用但未满足
+狭窄规则的 terminal-clean receipt 会保留为 fail-closed physical-only boundary：
 
 1. 读取 open PR 和 exact current head；
 2. 发送一条 complete visible content 只有 exact `@codex review` 的 comment；
@@ -59,11 +60,19 @@ shell quoting 增加 visible text。不要手工构造 workflow-owned hidden mar
 producer 必须互斥。不确定 ownership 时，应读取 controller run、canonical marker、sticky
 diagnostic 与 provider evidence，不得盲目再发一条 request。
 
-普通 request author 默认在任意 repository permission 下作为 candidate 被纳入。只有
-official Codex Bot 在同一条 comment 上直接留下严格晚于 revision 的 `eyes` 或 `+1`
-receipt，它才成为 gate generation boundary。这既不授予 commenter 启动或控制 Codex
-review 的权限，也不假设 Codex 会接受该 request。未确认 candidate 不能抢占既有 clean。
-canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；不要在普通 consumer
+普通 request author 默认在任意 repository permission 下作为 candidate 被纳入。它可以通过
+official Codex Bot 在同一条 comment 上直接留下严格晚于 revision 的 `eyes` 或 `+1` 获得
+gate receipt；也可以使用刻意收窄的 terminal-clean 方式：没有 base epoch、single-flight
+lineage 中唯一一条 exact、未编辑的 ordinary request，能由严格晚于它的未编辑 official
+current-head 顶层 issue comment（PR 的普通评论，不是 pull-request review body）中的 terminal
+clean 确认。第二条或 ambiguous request/boundary、任何 edit、terminal
+不匹配，或 head/SHA binding 有歧义时，gate 保持 pending。terminal 的 short SHA 只有被
+GitHub 无歧义解析为 current PR head 才接受。同一 comment 上 official `eyes`/`+1` 的
+direct receipt 仍然受支持。这既不授予 commenter 启动或控制 Codex review 的权限，也不会
+使 Codex 启动，更不意味着任何用户都能导致 review；Codex 与 GitHub 仍决定是否接受
+request。符合条件的 finding 独立阻塞，绝不提供此 receipt。没有 terminal-clean contender 的
+未确认 candidate 不能抢占既有 clean；尝试但未满足狭窄规则的 terminal-clean receipt 保持
+fail-closed pending。canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；不要在普通 consumer
 workflow 添加 strict policy。`write`/`maintain`/`admin` 仅保留给将来可以读取 collaborator
 permission 的 nonstandard verifier identity。
 
@@ -100,9 +109,10 @@ gh workflow run "$WORKFLOW" \
 run 完成后，才发送新的 exact `@codex review`。
 
 不得重叠两种 producer。provider-confirmed 或其他 physical request 后出现下一条 boundary，
-会因为 terminal Codex text 没有 originating request ID 而形成 lineage gap；未确认
-default-`any` ordinary candidate 不会形成该 gap。真实 gap 时 V2 会刻意保持 pending；落在
-原 predecessor-to-successor window 之外的 evidence 不能修复该 ordering。只有所有歧义
+会因为 terminal Codex text 没有 originating request ID 而形成 lineage gap；既没有 direct
+receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不会形成该 gap，
+但不满足狭窄规则的 attempted terminal-clean receipt 会形成。真实 gap 时 V2 会刻意保持
+pending；落在原 predecessor-to-successor window 之外的 evidence 不能修复该 ordering。只有所有歧义
 predecessor 都 canonical 绑定到另一个 full head 时，新 head 才足以恢复。如果仍存在
 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor，
 commit 变化不能证明其 provider flight 已结束。应从目标 branch/commits 新开 replacement PR，
@@ -205,7 +215,7 @@ change。
 | `wait_provider` | 等待 Codex 发布 terminal evidence；不要 spam requests。 |
 | `reconcile` | 重读 exact current head 并运行一次 scoped reconcile。 |
 | `fix_findings` | 按 summary reason 操作。通常先修复报告的 current findings，另行解决 inline conversations，取得 later head-bound clean evidence，再 reconcile。若 reason 同时指出不可闭合的 historical lineage，应把修复放到 replacement PR，并在其中只运行一个 canonical generation，不得在原 PR 重发。 |
-| `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。未确认 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
+| `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；或者仅限唯一、没有 base epoch、single-flight、未编辑的 default-`any` ordinary candidate，等待其匹配的未编辑 official current-head 顶层 issue-comment terminal clean。pull-request review clean 不能确认该 candidate。finding 仍独立阻塞，绝不确认它。只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。既没有 direct receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
 | `retry_reconcile` | `retry_safe` 允许时 retry 同一个 exact-head reconcile。 |
 | `wait_then_reconcile` | 等待 GitHub/Codex settle，重读 head，再 reconcile。 |
 | `use_expanded_limits` | 设置受保护 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`，再 reconcile 同一 exact head。 |
@@ -218,9 +228,10 @@ change。
 
 summary 才是该 code category 内具体 reason、lineage 和 object links 的 authority；仅凭
 recovery code 不得另发 request。若已存在的 latest/current canonical request 只缺少可归因
-clean，应取得该 request 上合格的 direct `+1`，不能再增加 generation boundary。若存在不可
-闭合的 historical unbound predecessor gap，必须使用 replacement PR，不能在原 PR 重发或
-仅靠 commit change reset。
+clean，应取得该 request 上合格的 direct `+1`；唯一符合条件的 default-`any` candidate
+也可以等待其匹配 terminal-clean receipt。不得再增加 generation boundary。若存在不可闭合的
+historical unbound predecessor gap，必须使用 replacement PR，不能在原 PR 重发或仅靠 commit
+change reset。
 
 ## Finding 对账和 supersession
 
@@ -248,17 +259,24 @@ finding 已 obsolete 或不适用时，按 `request_clean_generation` 的 summar
 等待 later provider result 后 reconcile；只解决 inline conversation 不会改变 reducer state。
 
 terminal clean text 与合格 provider `+1`，只有在没有 base epoch、single-flight
-lineage 的第一个物理 generation 中才具有相同 clean authority。出现第二个物理
+lineage 的第一个物理 generation 中才具有相同 clean authority。该 lineage 中唯一一条
+exact、未编辑的 default-`any` ordinary request，其匹配的未编辑 official current-head
+顶层 issue-comment terminal clean 还可以提供建立第一个 generation 所需的最小 receipt。
+pull-request review clean 不可以。出现第二个物理
 request 后，provider terminal evidence 只能闭合第一个 gap；之后的每个 gap，以及新
 generation 的 positive/superseding authority，都必须来自直接附着于相关 request 的
-合格 `+1`。延迟或重复、无法归因的 terminal 保持 pending。已经观察到 base epoch 时，
-每个 gap 和 latest generation 都必须使用 request-bound `+1`。
+合格 `+1`。延迟、重复、不匹配、被编辑或 head binding 有歧义的 terminal 都保持 pending。
+已经观察到 base epoch 时，每个 gap 和 latest generation 都必须使用 request-bound `+1`。
 
 未确认 default-`any` ordinary candidate 上，official 直接且严格 post-revision 的 `eyes`
-或 `+1` 先是 receipt，把 candidate 升级为 boundary。升级后 ordinary request reactions
-才仅用于 liveness；ordinary `+1` 不能 head-bind clean。same-time/later official
-`eyes`/progress from Codex 会阻止 candidate clean 完成。reaction-only change 不会启动
-automatic run；通过 later provider event or manual reconcile 观察它。
+或 `+1` 先是 receipt，把 candidate 升级为 boundary。唯一替代方式是匹配的未编辑
+official current-head 顶层 issue-comment terminal clean，且仅适用于唯一、没有 base epoch、single-flight
+的情况。出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的
+identity、order/head binding 有歧义时，该方式不可用。符合条件的 finding 独立阻塞，绝不
+提升 candidate。升级后 ordinary request reactions 才仅用于 liveness；ordinary `+1` 不能
+head-bind clean。same-time/later official `eyes`/progress from Codex 会阻止 candidate clean
+完成。reaction-only change 不会启动 automatic run；通过 later provider event or manual
+reconcile 观察它。
 所有 unbound progress carrier 都保留为 liveness；邻近 request boundary 不能证明其
 head。edited terminal 还会携带从 creation 到 terminal revision 的 unbound unknown
 activity；其 terminal endpoint 只对同一 carrier 构成 self-veto 豁免。
@@ -308,10 +326,11 @@ relevant PR scope 内解析：
 - 多个 matches 属于 indeterminate，不能 pass；
 - PR review 的 native `commit_id` 还必须等于 resolved current head。
 
-不要仅为了展开 prefix 而编辑 provider evidence。若它 ambiguous 或绑定其他 commit，按
-summary reason 与 lineage 分流：已有 current canonical request 时取得其 direct `+1`；
-只有 lineage 可恢复且 summary 明确要求时，才创建恰好一个 generation。不可闭合的
-historical unbound gap 必须使用 replacement PR，不能在原 PR 增加 boundary。
+不要仅为了展开 prefix 而编辑 provider evidence。ambiguous 或不匹配的 terminal 不能提供
+狭窄的 default-`any` terminal-clean receipt，必须保持 pending。按 summary reason 与
+lineage 分流：已有 current canonical request 时取得其 direct `+1`；只有 lineage 可恢复且
+summary 明确要求时，才创建恰好一个 generation。不可闭合的 historical unbound gap 必须
+使用 replacement PR，不能在原 PR 增加 boundary。
 
 ## Sticky diagnostic 恢复
 

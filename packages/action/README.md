@@ -234,14 +234,27 @@ A review generation begins with an exact, unedited `@codex review` request.
 The visible first line is exact and contains no additional visible text. With
 the default `any` policy, an ordinary request is admitted to the snapshot as a
 candidate at any repository permission, not as an immediate generation
-boundary. It becomes a provider-confirmed boundary only when the official
-Codex Bot adds a directly attached, strictly post-revision `eyes` or `+1`
-receipt to that exact comment. A later terminal or progress carrier elsewhere
-on the PR cannot supply that missing causal receipt. This controls only gate
+boundary. It can receive provider confirmation in either of two ways:
+
+1. the official Codex Bot adds a directly attached, strictly post-revision
+   `eyes` or `+1` receipt to that exact comment; or
+2. only for one unique, exact, unedited ordinary request in a no-base-epoch,
+   single-flight lineage, an unedited official top-level issue-comment terminal
+   clean (a normal PR comment, not a pull-request review body) is strictly later
+   than that request and unambiguously binds the current head.
+
+The second form is a deliberately narrow minimal receipt. An additional or
+ambiguous request or physical boundary, an edit to the request or terminal,
+an unmatched terminal carrier, or ambiguous head/SHA binding leaves the gate
+pending. Where that terminal names a reviewed SHA, a short SHA is accepted
+only when GitHub resolves it unambiguously to the current PR head. Direct
+same-comment official `eyes`/`+1` remains supported. This controls only gate
 attribution; it does not grant the commenter permission to invoke or control
-Codex review. GitHub and Codex still decide whether a provider review starts,
-and an unconfirmed candidate cannot reset, preempt, or invalidate an existing
-clean. Canonical workflows set
+Codex review, does not make Codex start, and does not mean that every user can
+cause a review. GitHub and Codex still decide whether a provider review starts.
+An unconfirmed candidate with no terminal-clean contender cannot reset,
+preempt, or invalidate an existing clean; an attempted terminal-clean receipt
+that fails the narrow rule remains fail-closed and pending. Canonical workflows set
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly and do not expose a
 standard strict-policy setting. `write` (`write`, `maintain` or `admin`) is
 reserved for a nonstandard future verifier identity allowed to read collaborator
@@ -259,20 +272,25 @@ uses a deliberately narrower recovery rule: only a qualifying provider `+1`
 attached directly to a strictly post-epoch, base-bound canonical workflow
 request can supply positive clean authority or supersede an older finding.
 Ordinary direct `@codex review` requests remain supported without a workflow
-marker on PRs that have no base epoch once the official Bot directly receipts
-the exact request. Findings remain conservative across the epoch boundary, and
-an unlineaged terminal clean stays pending rather than being guessed into the
-new generation.
+marker on PRs that have no base epoch. They can use either of the two receipt
+forms above, but the terminal form is unavailable after a base epoch. Findings
+remain conservative across the epoch boundary, and an unlineaged terminal clean
+stays pending rather than being guessed into the new generation.
 
 Terminal clean text and a qualifying provider `+1` have equal clean authority
 only for the first physical generation of a no-base-epoch, single-flight
-lineage. This applies after the generation has been established; an
-unconfirmed default-`any` ordinary candidate is an explicit exception and is
-not a physical boundary. Every other provider-triggerable request-shaped
-comment is a physical generation boundary, including duplicate hidden markers,
-edited or malformed requests, and requests that fail authorisation. Boundary
-status records an unknown provider flight; it does not grant positive
-authority. Under the
+lineage. For the one unique default-`any` ordinary request that satisfies the
+minimal receipt rule, the matching official top-level issue-comment terminal
+clean can both confirm that first generation and carry its clean authority. A
+pull-request review clean remains ordinary evidence but cannot confirm a
+default-`any` candidate. A qualifying finding is
+independently blocking and never acts as a receipt. A candidate with no receipt
+contender is not a physical boundary. A terminal-clean contender that fails a
+narrow-condition check remains pending as a fail-closed physical-only boundary.
+Every other provider-triggerable request-shaped comment is a physical
+generation boundary, including duplicate hidden markers, edited or malformed
+requests, and requests that fail authorisation. Boundary status records an
+unknown provider flight; it does not grant positive authority. Under the
 nonstandard `write` threshold, an otherwise valid ordinary request requires a
 permission lookup, cached per author within each snapshot, before it can be
 classified as denied. Once denied, it causes no reaction or exact-refetch fan-
@@ -303,14 +321,18 @@ prove its originating flight or head. An edited terminal carrier additionally
 contributes an unbound unknown-activity interval from `created_at` through its
 terminal revision; only that carrier's own terminal endpoint is exempt from
 self-veto when evaluating the same terminal.
-For an unconfirmed default-`any` ordinary candidate, an official direct
+For an unconfirmed default-`any` ordinary candidate, a direct official
 post-revision `eyes` or `+1` first serves as its receipt and upgrades it into a
-boundary. After that upgrade, ordinary request reactions are provider liveness
-signals only; ordinary `+1` still cannot head-bind clean by itself.
-Same-time/later official `eyes`/progress from Codex vetoes a candidate clean
-because review activity has not been proved terminal. Reaction-only changes
-have no automatic workflow event, so a later provider event or manual
-reconcile must observe them.
+boundary. The only alternative is the matching unedited official top-level
+issue-comment terminal clean strictly after the candidate under the unique
+no-base-epoch, single-flight rule above. It cannot be used after a base epoch,
+after a second or ambiguous request/boundary, after an edit, or when the
+terminal's identity, ordering, or current-head binding is ambiguous. After a direct-reaction
+upgrade, ordinary request reactions are provider liveness signals only;
+ordinary `+1` still cannot head-bind clean by itself. Same-time/later official
+`eyes`/progress from Codex vetoes a candidate clean because review activity has
+not been proved terminal. Reaction-only changes have no automatic workflow
+event, so a later provider event or manual reconcile must observe them.
 When terminal evidence names a reviewed commit, it may use a full or short SHA.
 A short SHA is accepted only when GitHub resolves it unambiguously to the
 current PR head. For a pull-request review, the resolved SHA must also agree
@@ -321,8 +343,9 @@ same head, an older finding can be superseded only by:
 
 1. a strictly newer authorised review generation; and
 2. a later clean result bound to that generation and head under the lineage
-   rule above: an unbound terminal only for the first no-base-epoch generation,
-   otherwise a qualifying request-bound `+1`.
+   rule above: a terminal clean only for the first no-base-epoch generation
+   (and, for a default-`any` ordinary candidate, only when it satisfies the
+   minimal terminal-receipt rule), otherwise a qualifying request-bound `+1`.
 
 An arbitrary later clean does not erase findings. Ambiguous order or binding
 cannot pass. Historical findings remain visible in diagnostics.
