@@ -12,7 +12,7 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "7e565300679f00ebc750a54c0f8fb6e28d4026b7"
+    "tree": "554bd1270757d3e475778c633374bb82a141a02c"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
@@ -144,8 +144,8 @@
       "path": "src/v2/gate-runtime.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 229534,
-      "sha256": "a098138cacf5ad37b7671fe1adf5cbb14d40303884454a9142d280b3e27fb499"
+      "size": 229960,
+      "sha256": "53e54770babbf4323de2af58a09abd6fe01febdbdf68160ecc5ab7d8163b8096"
     }
   ],
   "entrypoint": {

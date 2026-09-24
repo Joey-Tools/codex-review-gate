@@ -3415,7 +3415,7 @@ async function loadV2DecisionCarriers(
     physicalBoundaries: [
       ...requestAuthority.boundaries,
       ...(deletedCommentEvents ?? []).map(v2DeletedCommentBoundary),
-    ],
+    ].filter((boundary) => isV2CurrentHeadPhysicalBoundary(boundary, headSha)),
     baseEpoch,
     requestReactions,
     providerArtifacts: providerEvidence.artifacts,
@@ -3903,10 +3903,17 @@ function selectV2PhysicalRequestBoundaries({
   const currentRequests = (requests ?? []).filter((request) => {
     if (!Number.isFinite(request.revisionMs)) return false;
     if (baseEpochMs !== null && request.revisionMs < baseEpochMs) return false;
-    if (request.headBound !== true) return true;
-    return request.binding?.headSha === headSha;
+    return isV2CurrentHeadPhysicalBoundary(request, headSha);
   });
   return { baseEpochMs, currentRequests };
+}
+
+function isV2CurrentHeadPhysicalBoundary(request, headSha) {
+  // A full canonical head binding establishes scope. Retain every unbound
+  // boundary fail-closed, but a boundary explicitly bound to another full head
+  // cannot compete in current-head lineage or terminal-receipt reduction.
+  if (request?.headBound !== true) return true;
+  return request.binding?.headSha === headSha;
 }
 
 function selectV2ReactionInventoryRequests({

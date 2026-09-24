@@ -927,6 +927,15 @@ evidence that a prior freeze remains in force.
   blocking and never become receipts; a base epoch, multiple candidates or
   request-shaped boundaries, ambiguous resolution, or any relevant edit stays
   pending.
+- GitHub Codex review found and the follow-up patch fixes one current-head
+  scoping gap in that receipt reduction: an explicitly head-bound request for
+  an earlier PR head must not count as a competing physical boundary for a
+  terminal-clean receipt on the current head. The shared current-head predicate
+  now filters only those explicit other-head boundaries at receipt admission;
+  unbound/deleted/malformed physical boundaries and same-head stale-base
+  semantics remain unchanged. A regression fixture combines an ordinary
+  current request, an older canonical request bound to `OLD_HEAD`, and a later
+  current-head clean receipt, and requires a successful decision.
 - At this checkpoint `v2.0.3` is not yet released. Source v2 ruleset
   `23927388` remains Disabled, source ruleset `16410326` still requires the v1
   status, and neither source-policy activation nor v1-status cleanup has been

@@ -3623,6 +3623,30 @@ test("a terminal clean receipt cannot uniquely satisfy multiple default-any requ
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("a previous-head request does not make a current default-any terminal receipt ambiguous", async (context) => {
+  const current = ordinaryRequest({ user: READER });
+  const previousHead = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({ issueComments: [current, previousHead, terminal] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "old-head-does-not-ambiguate-default-any-terminal-receipt",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(result.report.requiresReplacementPr, false);
+});
+
 test("a base epoch rejects a default-any terminal clean receipt", async (context) => {
   const request = ordinaryRequest({ user: READER });
   const terminal = cleanIssueComment(HEAD, {
