@@ -68,6 +68,7 @@ import {
   workflowSingleProducerPolicyViolations,
 } from "../src/bootstrap.mjs";
 
+const BOOTSTRAP_SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SOURCE_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CANONICAL_VERIFIER_WORKFLOW_SOURCE = join(
   SOURCE_ROOT,
@@ -84,6 +85,10 @@ const CANONICAL_LEGACY_BRIDGE_WORKFLOW_SOURCE = join(
 const GH_NOT_FOUND = Symbol("GitHub API not found");
 const GITHUB_PULL_REQUEST_FILES_LIMIT = 3_000;
 const GITHUB_PULL_REQUEST_FILES_PAGE_SIZE = 100;
+const MAX_APPROVED_POST_CLEANUP_PLAN_BYTES = 1_048_576;
+const POST_CLEANUP_WRITE_RECOVERY_TAG = Symbol(
+  "post-cleanup-write-recovery-guidance",
+);
 const SOURCE_SELF_HOSTING_REPOSITORY_SLUG = "Joey-Tools/codex-review-gate";
 
 async function main() {
@@ -109,6 +114,14 @@ async function main() {
 
   if (options.derivePostCleanupPlan) {
     await printDerivedPostCleanupPlan({
+      options,
+      canonicalWorkflows,
+    });
+    return;
+  }
+
+  if (options.applyPostCleanupPlanPath !== null) {
+    await applyApprovedPostCleanupPlan({
       options,
       canonicalWorkflows,
     });
@@ -649,6 +662,8 @@ function readCliOptions() {
       "final-closure-receipt": { type: "string" },
       "expected-final-closure-receipt-sha256": { type: "string" },
       "derive-post-cleanup-plan": { type: "boolean", default: false },
+      "apply-post-cleanup-plan": { type: "string" },
+      "expected-post-cleanup-plan-sha256": { type: "string" },
       "verify-post-cleanup": { type: "boolean", default: false },
       "expected-legacy-inventory-sha256": { type: "string" },
       "expected-post-cleanup-security-sha256": { type: "string" },
@@ -674,6 +689,8 @@ function readCliOptions() {
 
   const hasRepo = values.repo !== undefined;
   const hasPrepareWorktree = values["prepare-worktree"] !== undefined;
+  const hasApplyPostCleanupPlan =
+    values["apply-post-cleanup-plan"] !== undefined;
   const repo = hasRepo ? parseRepoSlug(values.repo) : null;
   const rulesetProfile = normalizeRulesetProfile(values["ruleset-profile"]);
   if (hasRepo === hasPrepareWorktree) {
@@ -746,6 +763,9 @@ function readCliOptions() {
   if (hasPrepareWorktree && values["derive-post-cleanup-plan"]) {
     throw new Error("--derive-post-cleanup-plan is valid only with --repo.");
   }
+  if (hasPrepareWorktree && hasApplyPostCleanupPlan) {
+    throw new Error("--apply-post-cleanup-plan is valid only with --repo.");
+  }
   if (values["derive-post-cleanup-plan"] && values["verify-post-cleanup"]) {
     throw new Error(
       "--derive-post-cleanup-plan and --verify-post-cleanup are separate read-only phases.",
@@ -781,6 +801,45 @@ function readCliOptions() {
   ) {
     throw new Error(
       "--derive-post-cleanup-plan is read-only and cannot be combined with --apply, --activate, or canary inputs.",
+    );
+  }
+  if (
+    hasApplyPostCleanupPlan &&
+    (values["derive-post-cleanup-plan"] ||
+      values["verify-post-cleanup"] ||
+      values.activate ||
+      values["canary-pr"] !== undefined ||
+      values["canary-head"] !== undefined ||
+      values["remove-legacy-bridge"])
+  ) {
+    throw new Error(
+      "--apply-post-cleanup-plan is a separate source-local cleanup phase and cannot be combined with derive, verify, activation, canary, or bridge-removal inputs.",
+    );
+  }
+  if (
+    hasApplyPostCleanupPlan &&
+    (repo?.slug !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+      rulesetProfile !== RULESET_PROFILE_STATUS_ONLY ||
+      !values["legacy-bridge"])
+  ) {
+    throw new Error(
+      `--apply-post-cleanup-plan is restricted to ${SOURCE_SELF_HOSTING_REPOSITORY_SLUG} with --ruleset-profile ${RULESET_PROFILE_STATUS_ONLY} and --legacy-bridge.`,
+    );
+  }
+  if (
+    hasApplyPostCleanupPlan &&
+    values["expected-post-cleanup-plan-sha256"] === undefined
+  ) {
+    throw new Error(
+      "--apply-post-cleanup-plan requires --expected-post-cleanup-plan-sha256 for the exact raw plan bytes approved for this cleanup.",
+    );
+  }
+  if (
+    !hasApplyPostCleanupPlan &&
+    values["expected-post-cleanup-plan-sha256"] !== undefined
+  ) {
+    throw new Error(
+      "--expected-post-cleanup-plan-sha256 is valid only with --apply-post-cleanup-plan.",
     );
   }
   if (
@@ -834,6 +893,15 @@ function readCliOptions() {
         )
       : null,
     derivePostCleanupPlan: values["derive-post-cleanup-plan"],
+    applyPostCleanupPlanPath: hasApplyPostCleanupPlan
+      ? resolve(values["apply-post-cleanup-plan"])
+      : null,
+    expectedPostCleanupPlanSha256: hasApplyPostCleanupPlan
+      ? parseExpectedSecuritySha256(
+          values["expected-post-cleanup-plan-sha256"],
+          "--expected-post-cleanup-plan-sha256",
+        )
+      : null,
     verifyPostCleanup: values["verify-post-cleanup"],
     rulesetName: values["ruleset-name"],
     rulesetProfile,
@@ -891,6 +959,11 @@ Options:
   --context CONTEXT       Required CheckRun name. Must remain "${DEFAULT_STATUS_CONTEXT}".
   --workflow PATH         Verifier path; fixed to "${DEFAULT_WORKFLOW_PATH}" while both workflows are verified.
   -h, --help              Show this help.
+
+The source-self-hosting cleanup executor is intentionally omitted from this
+general help because it is not a consumer-installation capability. Its exact,
+separately authorized invocation is documented only in the source exception in
+docs/install.
 `);
 }
 
@@ -2173,6 +2246,11 @@ async function withPostWriteRecoveryGuidance(
 // to equal that pre-derived state. No original-repository write credential or
 // in-repository ledger is needed.
 async function printDerivedPostCleanupPlan({ options, canonicalWorkflows }) {
+  const { plan } = await derivePostCleanupPlan({ options, canonicalWorkflows });
+  process.stdout.write(canonicalPostCleanupPlanText(plan));
+}
+
+async function derivePostCleanupPlan({ options, canonicalWorkflows }) {
   const first = await loadCleanupSecurityClosure({
     options,
     canonicalWorkflows,
@@ -2212,6 +2290,7 @@ async function printDerivedPostCleanupPlan({ options, canonicalWorkflows }) {
     schema_version: 1,
     repository: first.state.repository,
     authorized_legacy_context: LEGACY_STATUS_CONTEXT,
+    legacy_inventory_sha256: fingerprintText(first.legacyInventoryBytes),
     pre_cleanup_security_sha256: fingerprintText(
       canonicalSecurityBytes(first.state),
     ),
@@ -2226,7 +2305,484 @@ async function printDerivedPostCleanupPlan({ options, canonicalWorkflows }) {
     cleanup_actions: firstDerived.actions,
     expected_post_cleanup_security_state: firstDerived.state,
   };
-  process.stdout.write(`${JSON.stringify(JSON.parse(canonicalSecurityJson(plan)), null, 2)}\n`);
+  return { plan, preCleanupClosure: first };
+}
+
+function canonicalPostCleanupPlanText(plan) {
+  return `${JSON.stringify(JSON.parse(canonicalSecurityJson(plan)), null, 2)}\n`;
+}
+
+async function applyApprovedPostCleanupPlan({ options, canonicalWorkflows }) {
+  const approved = await readApprovedPostCleanupPlan({
+    path: options.applyPostCleanupPlanPath,
+    expectedSha256: options.expectedPostCleanupPlanSha256,
+  });
+  const authorized = assertSourcePostCleanupPlanScope({
+    plan: approved.plan,
+    options,
+  });
+  const derived = await derivePostCleanupPlan({ options, canonicalWorkflows });
+  if (
+    canonicalPostCleanupPlanText(approved.plan) !==
+    canonicalPostCleanupPlanText(derived.plan)
+  ) {
+    throw new Error(
+      "The approved post-cleanup plan no longer equals a fresh two-round complete pre-cleanup derivation. Refusing to write after security-state drift; derive, review, and separately authorize a new raw plan.",
+    );
+  }
+  const plannedAfterRuleset = authorized.plannedAfterLegacyRuleset;
+  console.log(
+    `Approved source-local cleanup plan ${approved.sha256}: remove only ${LEGACY_STATUS_CONTEXT} from ${authorized.legacyRulesetAction.name} (id ${authorized.legacyRulesetAction.id}).`,
+  );
+  if (!options.apply) {
+    console.log("Dry run: the exact approved plan matches a fresh complete closure; no remote write was made.");
+    console.log("Run again with --apply to perform the single plan-bound ruleset PUT.");
+    return;
+  }
+
+  const preWriteDerived = await derivePostCleanupPlan({
+    options,
+    canonicalWorkflows,
+  });
+  if (
+    canonicalPostCleanupPlanText(approved.plan) !==
+    canonicalPostCleanupPlanText(preWriteDerived.plan)
+  ) {
+    throw new Error(
+      "The approved post-cleanup plan no longer equals the final two-round complete pre-write derivation. Refusing to write after security-state drift; derive, review, and separately authorize a new raw plan.",
+    );
+  }
+  const preWriteLegacyRuleset = selectSinglePlanRulesetProjection({
+    state: preWriteDerived.preCleanupClosure.state,
+    rulesetId: authorized.legacyRulesetAction.id,
+    label: "final pre-write cleanup state",
+  });
+  const preWriteSelectedV2Ruleset = selectSinglePlanRulesetProjection({
+    state: preWriteDerived.preCleanupClosure.state,
+    rulesetId: authorized.selectedV2.id,
+    label: "final pre-write selected v2 state",
+  });
+
+  // GitHub's repository-ruleset API has no If-Match/CAS update. The protected
+  // property is the selected legacy ruleset's immutable identity plus complete
+  // writable policy and the independent Active v2 identity/policy; the only
+  // authorized change is removal of the legacy status rule. The final complete
+  // two-round derivation catches all observed closure drift, then exact reads
+  // compare both rulesets immediately before PUT. These reads are not CAS and
+  // cannot exclude a concurrent administrator mutation in the final API gap:
+  // the separately authorized operation must run under an external single-
+  // writer policy freeze, and this executor must never claim otherwise, replay,
+  // or roll back either this PUT or the independent Active v2 ruleset.
+  const currentSelectedV2BeforeWrite = assertSelectedRepositoryRulesetIdentity(
+    await ghJson(
+      `repos/${options.repo.slug}/rulesets/${authorized.selectedV2.id}`,
+    ),
+    {
+      repoSlug: options.repo.slug,
+      rulesetId: authorized.selectedV2.id,
+      rulesetName: authorized.selectedV2.name,
+    },
+  );
+  const currentSelectedV2Projection = rulesetSecurityProjection(
+    currentSelectedV2BeforeWrite,
+    options.rulesetProfile,
+  );
+  if (
+    canonicalSecurityJson(currentSelectedV2Projection.writable) !==
+      canonicalSecurityJson(preWriteSelectedV2Ruleset.writable)
+  ) {
+    throw new Error(
+      `Selected v2 ruleset ${authorized.selectedV2.id} changed after the final complete pre-write closure; refusing to remove ${LEGACY_STATUS_CONTEXT}. Preserve Active v2, derive and separately review a new cleanup plan.`,
+    );
+  }
+  // Read the mutation target last, minimizing the unavoidable no-CAS window
+  // between its exact writable projection comparison and the legacy PUT.
+  const currentBeforeWrite = assertSelectedRepositoryRulesetIdentity(
+    await ghJson(
+      `repos/${options.repo.slug}/rulesets/${authorized.legacyRulesetAction.id}`,
+    ),
+    {
+      repoSlug: options.repo.slug,
+      rulesetId: authorized.legacyRulesetAction.id,
+      rulesetName: authorized.legacyRulesetAction.name,
+    },
+  );
+  const currentBeforeProjection = rulesetSecurityProjection(
+    currentBeforeWrite,
+    DEFAULT_RULESET_PROFILE,
+  );
+  if (
+    canonicalSecurityJson(currentBeforeProjection.writable) !==
+      canonicalSecurityJson(preWriteLegacyRuleset.writable)
+  ) {
+    throw new Error(
+      `Ruleset ${authorized.legacyRulesetAction.id} changed after the final complete pre-write closure; refusing an observed lost-update overwrite. Preserve Active v2, derive and separately review a new cleanup plan.`,
+    );
+  }
+
+  const verifyOptions = {
+    ...options,
+    expectedPostCleanupSecuritySha256:
+      approved.plan.expected_post_cleanup_security_sha256,
+  };
+  await withPostCleanupWriteRecoveryGuidance(
+    {
+      repoSlug: options.repo.slug,
+      rulesetId: authorized.legacyRulesetAction.id,
+      rulesetName: authorized.selectedV2.name,
+      controlPlaneOwner: options.controlPlaneOwner,
+      rulesetProfile: options.rulesetProfile,
+      legacyBridge: options.legacyBridge,
+      expectedPostCleanupSecuritySha256:
+        approved.plan.expected_post_cleanup_security_sha256,
+    },
+    async () => {
+      await ghJson(
+        `repos/${options.repo.slug}/rulesets/${authorized.legacyRulesetAction.id}`,
+        {
+          method: "PUT",
+          body: structuredClone(plannedAfterRuleset.writable),
+        },
+      );
+      const exactReadback = assertSelectedRepositoryRulesetIdentity(
+        await ghJson(
+          `repos/${options.repo.slug}/rulesets/${authorized.legacyRulesetAction.id}`,
+        ),
+        {
+          repoSlug: options.repo.slug,
+          rulesetId: authorized.legacyRulesetAction.id,
+          rulesetName: authorized.legacyRulesetAction.name,
+        },
+      );
+      const readbackProjection = rulesetSecurityProjection(
+        exactReadback,
+        DEFAULT_RULESET_PROFILE,
+      );
+      if (
+        canonicalSecurityJson(readbackProjection.writable) !==
+        canonicalSecurityJson(plannedAfterRuleset.writable)
+      ) {
+        throw new Error(
+          `Ruleset ${authorized.legacyRulesetAction.id} readback does not equal the approved post-cleanup writable projection.`,
+        );
+      }
+      await verifyExpectedPostCleanupState({
+        options: verifyOptions,
+        canonicalWorkflows,
+      });
+    },
+  );
+  console.log(
+    `Applied the approved source-local cleanup plan and verified its post-cleanup closure: ${rulesetLabel(currentBeforeWrite)} retained every planned non-legacy protection while ${LEGACY_STATUS_CONTEXT} was removed.`,
+  );
+}
+
+async function readApprovedPostCleanupPlan({ path, expectedSha256 }) {
+  const noFollow = fileSystemConstants.O_NOFOLLOW ?? 0;
+  let handle;
+  let primaryError = null;
+  try {
+    handle = await open(
+      path,
+      fileSystemConstants.O_RDONLY |
+        noFollow |
+        (fileSystemConstants.O_NONBLOCK ?? 0),
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`Approved post-cleanup plan is missing: ${path}`);
+    }
+    throw new Error(`Unable to open approved post-cleanup plan: ${path}: ${error.message}`);
+  }
+  try {
+    const metadata = await handle.stat({ bigint: true });
+    if (!metadata.isFile()) {
+      throw new Error(
+        `Approved post-cleanup plan must be a regular file: ${path}`,
+      );
+    }
+    if (metadata.size > BigInt(MAX_APPROVED_POST_CLEANUP_PLAN_BYTES)) {
+      throw new Error(
+        `Approved post-cleanup plan exceeds the ${MAX_APPROVED_POST_CLEANUP_PLAN_BYTES}-byte admission limit: ${path}`,
+      );
+    }
+    // O_NOFOLLOW is unavailable on a few platforms. There, bind the opened
+    // descriptor to a same-object non-symlink path witness before reading.
+    // This is only an admission check: the protected property is the raw
+    // content read from the admitted descriptor, not later pathname identity.
+    if (noFollow === 0) {
+      const pathMetadata = await lstat(path, { bigint: true });
+      if (
+        !pathMetadata.isFile() ||
+        pathMetadata.isSymbolicLink() ||
+        pathMetadata.dev !== metadata.dev ||
+        pathMetadata.ino !== metadata.ino
+      ) {
+        throw new Error(
+          `Approved post-cleanup plan changed or is not a regular non-symlink file while opening it: ${path}`,
+        );
+      }
+    }
+    // The protected local property is the admitted plan content. O_NOFOLLOW,
+    // O_NONBLOCK, and descriptor stat reject a symlink, FIFO, device, or
+    // replacement at opening. Read the descriptor with a hard byte ceiling;
+    // a pre-read stat cannot bound concurrent growth or a sparse file by
+    // itself. Bind the admitted bytes' SHA-256 before parsing and retain them
+    // while remote reads occur.
+    const bytes = await readBoundedApprovedPostCleanupPlanBytes(handle);
+    const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(
+        `Approved post-cleanup plan SHA-256 mismatched: expected ${expectedSha256}, read ${actualSha256}. Refusing all remote writes.`,
+      );
+    }
+    const text = bytes.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(bytes)) {
+      throw new Error(
+        `Approved post-cleanup plan is not exact UTF-8 text: ${path}`,
+      );
+    }
+    let plan;
+    try {
+      plan = JSON.parse(text);
+    } catch (error) {
+      throw new Error(
+        `Approved post-cleanup plan is not valid JSON: ${error.message}`,
+      );
+    }
+    if (canonicalPostCleanupPlanText(plan) !== text) {
+      throw new Error(
+        "Approved post-cleanup plan is not the unmodified canonical raw output from --derive-post-cleanup-plan. Refusing all remote writes.",
+      );
+    }
+    return { plan, sha256: actualSha256 };
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      await handle.close();
+    } catch (error) {
+      if (primaryError === null) {
+        throw error;
+      }
+    }
+  }
+}
+
+async function readBoundedApprovedPostCleanupPlanBytes(handle) {
+  const chunks = [];
+  let total = 0;
+  let position = 0;
+  while (true) {
+    const remaining = MAX_APPROVED_POST_CLEANUP_PLAN_BYTES + 1 - total;
+    const chunk = Buffer.allocUnsafe(Math.min(65_536, remaining));
+    const { bytesRead } = await handle.read(
+      chunk,
+      0,
+      chunk.length,
+      position,
+    );
+    if (bytesRead === 0) {
+      return Buffer.concat(chunks, total);
+    }
+    total += bytesRead;
+    if (total > MAX_APPROVED_POST_CLEANUP_PLAN_BYTES) {
+      throw new Error(
+        `Approved post-cleanup plan exceeds the ${MAX_APPROVED_POST_CLEANUP_PLAN_BYTES}-byte admission limit while reading its bound descriptor.`,
+      );
+    }
+    chunks.push(chunk.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+}
+
+function assertSourcePostCleanupPlanScope({ plan, options }) {
+  if (plan === null || typeof plan !== "object" || Array.isArray(plan)) {
+    throw new Error("Approved post-cleanup plan must be a JSON object.");
+  }
+  if (plan.schema_version !== 1) {
+    throw new Error("Approved post-cleanup plan must use schema_version 1.");
+  }
+  if (
+    plan.authorized_legacy_context !== LEGACY_STATUS_CONTEXT ||
+    canonicalSecurityJson(plan.repository) !==
+      canonicalSecurityJson(plan.expected_post_cleanup_security_state?.repository) ||
+    plan.repository?.full_name !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+    plan.repository?.full_name !== options.repo.slug
+  ) {
+    throw new Error(
+      "Approved post-cleanup plan is not bound to the source repository and exact legacy review-gate context.",
+    );
+  }
+  parseExpectedSecuritySha256(
+    plan.pre_cleanup_security_sha256,
+    "approved plan pre_cleanup_security_sha256",
+  );
+  if (plan.legacy_inventory_sha256 !== options.expectedLegacyInventorySha256) {
+    throw new Error(
+      "Approved post-cleanup plan is not bound to the same owner-approved legacy inventory SHA-256 supplied for this cleanup.",
+    );
+  }
+  parseExpectedSecuritySha256(
+    plan.legacy_inventory_sha256,
+    "approved plan legacy_inventory_sha256",
+  );
+  parseExpectedSecuritySha256(
+    plan.expected_post_cleanup_security_sha256,
+    "approved plan expected_post_cleanup_security_sha256",
+  );
+  const selectedV2 = plan.selected_v2_ruleset;
+  if (
+    selectedV2 === null ||
+    typeof selectedV2 !== "object" ||
+    Array.isArray(selectedV2) ||
+    !Number.isSafeInteger(selectedV2.id) ||
+    selectedV2.id <= 0 ||
+    selectedV2.name !== options.rulesetName ||
+    selectedV2.source_type !== "Repository" ||
+    selectedV2.source !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+    selectedV2.target !== "branch"
+  ) {
+    throw new Error(
+      "Approved post-cleanup plan does not bind the selected source status-only v2 ruleset to the requested exact repository ruleset name.",
+    );
+  }
+  const actions = plan.cleanup_actions;
+  if (
+    actions === null ||
+    typeof actions !== "object" ||
+    Array.isArray(actions) ||
+    actions.classic_required_status_check_removed !== false ||
+    !Array.isArray(actions.rulesets) ||
+    actions.rulesets.length !== 1
+  ) {
+    throw new Error(
+      "Source-local cleanup authorizes exactly one retained-ruleset legacy status removal and no classic branch-protection mutation.",
+    );
+  }
+  const [legacyRulesetAction] = actions.rulesets;
+  if (
+    legacyRulesetAction === null ||
+    typeof legacyRulesetAction !== "object" ||
+    Array.isArray(legacyRulesetAction) ||
+    !Number.isSafeInteger(legacyRulesetAction.id) ||
+    legacyRulesetAction.id <= 0 ||
+    typeof legacyRulesetAction.name !== "string" ||
+    legacyRulesetAction.name === "" ||
+    legacyRulesetAction.action !== "remove-legacy-check-only" ||
+    legacyRulesetAction.id === selectedV2.id
+  ) {
+    throw new Error(
+      "Source-local cleanup permits only one distinct legacy ruleset action: remove-legacy-check-only.",
+    );
+  }
+  const plannedAfterLegacyRuleset = selectSinglePlanRulesetProjection({
+    state: plan.expected_post_cleanup_security_state,
+    rulesetId: legacyRulesetAction.id,
+    label: "approved post-cleanup state",
+  });
+  const plannedSelectedV2 = selectSinglePlanRulesetProjection({
+    state: plan.expected_post_cleanup_security_state,
+    rulesetId: selectedV2.id,
+    label: "approved post-cleanup selected v2 ruleset",
+  });
+  if (
+    plannedAfterLegacyRuleset.name !== legacyRulesetAction.name ||
+    plannedAfterLegacyRuleset.source_type !== "Repository" ||
+    plannedAfterLegacyRuleset.source !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+    plannedSelectedV2.name !== selectedV2.name ||
+    plannedSelectedV2.source_type !== selectedV2.source_type ||
+    plannedSelectedV2.source !== selectedV2.source ||
+    plannedSelectedV2.writable?.target !== selectedV2.target ||
+    !Array.isArray(plannedAfterLegacyRuleset.writable?.rules) ||
+    plannedAfterLegacyRuleset.writable.rules.some(
+      (rule) => rule?.type === "required_status_checks",
+    )
+  ) {
+    throw new Error(
+      "Approved source-local cleanup state does not preserve the selected v2 identity or remove only the legacy ruleset status rule.",
+    );
+  }
+  return { legacyRulesetAction, plannedAfterLegacyRuleset, selectedV2 };
+}
+
+function selectSinglePlanRulesetProjection({ state, rulesetId, label }) {
+  if (
+    state === null ||
+    typeof state !== "object" ||
+    Array.isArray(state) ||
+    !Array.isArray(state.rulesets)
+  ) {
+    throw new Error(`${label} lacks a complete ruleset security projection.`);
+  }
+  const matches = state.rulesets.filter((ruleset) => ruleset?.id === rulesetId);
+  if (matches.length !== 1) {
+    throw new Error(
+      `${label} must bind exactly one ruleset projection for id ${rulesetId}.`,
+    );
+  }
+  const [ruleset] = matches;
+  if (
+    typeof ruleset.name !== "string" ||
+    typeof ruleset.source_type !== "string" ||
+    typeof ruleset.source !== "string" ||
+    ruleset.writable === null ||
+    typeof ruleset.writable !== "object" ||
+    Array.isArray(ruleset.writable)
+  ) {
+    throw new Error(`${label} has a malformed ruleset writable projection.`);
+  }
+  return ruleset;
+}
+
+function postCleanupWriteRecoveryGuidance({
+  repoSlug,
+  rulesetId,
+  rulesetName,
+  controlPlaneOwner,
+  rulesetProfile,
+  legacyBridge,
+  expectedPostCleanupSecuritySha256,
+}) {
+  const recoveryScope = [
+    `--repo ${shellQuote(repoSlug)}`,
+    `--control-plane-owner ${shellQuote(controlPlaneOwner)}`,
+    `--ruleset-name ${shellQuote(rulesetName)}`,
+    `--ruleset-profile ${shellQuote(rulesetProfile)}`,
+    ...(legacyBridge ? ["--legacy-bridge"] : []),
+    "--verify-post-cleanup",
+    `--expected-post-cleanup-security-sha256 ${expectedPostCleanupSecuritySha256}`,
+  ].join(" ");
+  return `The plan-bound source cleanup PUT may already have completed. Do not replay the PUT, rollback or overwrite Active v2, remove the bridge, or mutate classic protection. First run the exact read-only closure from this source checkout: node ${shellQuote(BOOTSTRAP_SCRIPT_PATH)} ${recoveryScope}; if it is inconclusive, inspect exact ruleset id ${rulesetId} and the approved plan before separately authorizing any repair.`;
+}
+
+function shellQuote(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("Shell guidance can quote only string arguments.");
+  }
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+async function withPostCleanupWriteRecoveryGuidance(details, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    // Remote API stderr can contain arbitrary text, so only this process-local
+    // symbol—not a recovery sentence in Error.message—proves guidance was
+    // already attached by this wrapper.
+    if (error?.[POST_CLEANUP_WRITE_RECOVERY_TAG] === true) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const wrapped = new Error(
+      `${message} ${postCleanupWriteRecoveryGuidance(details)}`,
+    );
+    Object.defineProperty(wrapped, POST_CLEANUP_WRITE_RECOVERY_TAG, {
+      value: true,
+    });
+    throw wrapped;
+  }
 }
 
 async function verifyExpectedPostCleanupState({ options, canonicalWorkflows }) {

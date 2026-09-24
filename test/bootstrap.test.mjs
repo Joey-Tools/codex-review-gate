@@ -7790,6 +7790,544 @@ test("source status-only cleanup derivation preserves every retained legacy prot
   }
 });
 
+test("general bootstrap help omits the source-only cleanup executor", () => {
+  const help = runBootstrap(["--help"], {
+    addExpectedLegacyInventoryDigest: false,
+  });
+  assert.equal(help.status, 0, help.stderr);
+  assert.doesNotMatch(help.stdout, /--apply-post-cleanup-plan/u);
+  assert.doesNotMatch(help.stdout, /--expected-post-cleanup-plan-sha256/u);
+  assert.match(help.stdout, /not a consumer-installation capability/u);
+});
+
+test("source-local cleanup executor binds the approved raw plan and performs one guarded legacy-ruleset PUT", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-source-cleanup-executor-"));
+  const repoSlug = "Joey-Tools/codex-review-gate";
+  const v2RulesetName = "Must Pass Codex Review v2";
+  const absentClassicProtection = {
+    __fake_http_error: 404,
+    message: "Branch not protected",
+  };
+  try {
+    const retainedLegacy = sourceLegacyRulesetFixture(7, repoSlug);
+    const retainedPostCleanup = structuredClone(retainedLegacy);
+    retainedPostCleanup.rules = retainedPostCleanup.rules.filter(
+      (rule) => rule.type !== "required_status_checks",
+    );
+    const activeV2 = statusOnlyRulesetFixture(8, repoSlug, {
+      name: v2RulesetName,
+      enforcement: "active",
+    });
+    const effectivePre = [[
+      effectiveLegacyRequiredStatusChecksRule(retainedLegacy),
+    ]];
+    const preInventory = legacyInventoryResponseFixtures(repoSlug, {
+      effectiveRulePages: effectivePre,
+      rulesets: [retainedLegacy],
+      classicRequiredStatusChecks: null,
+    });
+    const sourceArguments = [
+      "--repo",
+      repoSlug,
+      "--ruleset-name",
+      v2RulesetName,
+      "--ruleset-profile",
+      RULESET_PROFILE_STATUS_ONLY,
+      "--legacy-bridge",
+    ];
+    const preResponses = {
+      ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+      ...preInventory.responses,
+      [`repos/${repoSlug}/branches/master/protection`]: absentClassicProtection,
+      [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[
+        retainedLegacy,
+        activeV2,
+      ]],
+      [`repos/${repoSlug}/rulesets/7`]: retainedLegacy,
+      [`repos/${repoSlug}/rulesets/8`]: activeV2,
+    };
+    const planBin = join(fixtureRoot, "plan-bin");
+    createFakeGhExecutable(planBin);
+    const planResult = runBootstrap([
+      ...sourceArguments,
+      "--derive-post-cleanup-plan",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: planBin,
+        responses: preResponses,
+        stateDir: join(fixtureRoot, "plan-state"),
+        callLog: join(fixtureRoot, "plan.log"),
+      }),
+    });
+    assert.equal(planResult.status, 0, planResult.stderr);
+    const planPath = join(fixtureRoot, "approved-plan.json");
+    writeFileSync(planPath, planResult.stdout, "utf8");
+    const planSha256 = createHash("sha256")
+      .update(planResult.stdout, "utf8")
+      .digest("hex");
+    const plan = JSON.parse(planResult.stdout);
+    assert.equal(
+      plan.legacy_inventory_sha256,
+      preInventory.approval.sha256,
+      "the approved plan binds the exact owner-approved legacy inventory",
+    );
+    const expectedPutPayload = plan.expected_post_cleanup_security_state.rulesets
+      .find((ruleset) => ruleset.id === retainedLegacy.id).writable;
+    const applyPlanArguments = [
+      ...sourceArguments,
+      "--apply-post-cleanup-plan",
+      planPath,
+      "--expected-post-cleanup-plan-sha256",
+      planSha256,
+    ];
+
+    const symlinkPlanPath = join(fixtureRoot, "approved-plan-link.json");
+    symlinkSync(planPath, symlinkPlanPath);
+    const symlinkBin = join(fixtureRoot, "symlink-bin");
+    const symlinkLog = join(fixtureRoot, "symlink.log");
+    createFakeGhExecutable(symlinkBin);
+    const symlinkPlan = runBootstrap([
+      ...sourceArguments,
+      "--apply-post-cleanup-plan",
+      symlinkPlanPath,
+      "--expected-post-cleanup-plan-sha256",
+      planSha256,
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: symlinkBin,
+        responses: preResponses,
+        stateDir: join(fixtureRoot, "symlink-state"),
+        callLog: symlinkLog,
+      }),
+    });
+    assert.equal(symlinkPlan.status, 1, symlinkPlan.stderr);
+    assert.match(symlinkPlan.stderr, /Unable to open approved post-cleanup plan/u);
+    assert.equal(existsSync(symlinkLog), false);
+
+    const previewBin = join(fixtureRoot, "preview-bin");
+    const previewLog = join(fixtureRoot, "preview.log");
+    createFakeGhExecutable(previewBin);
+    const preview = runBootstrap(applyPlanArguments, {
+      env: fakeGhEnvironment({
+        fakeBin: previewBin,
+        responses: preResponses,
+        stateDir: join(fixtureRoot, "preview-state"),
+        callLog: previewLog,
+      }),
+    });
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.match(preview.stdout, /Dry run:.*no remote write/u);
+    assert.doesNotMatch(readFileSync(previewLog, "utf8"), /^(?:POST|PUT) /mu);
+
+    const alteredPlanPath = join(fixtureRoot, "altered-plan.json");
+    writeFileSync(alteredPlanPath, `${planResult.stdout} `, "utf8");
+    const alteredBin = join(fixtureRoot, "altered-bin");
+    const alteredLog = join(fixtureRoot, "altered.log");
+    createFakeGhExecutable(alteredBin);
+    const altered = runBootstrap([
+      ...sourceArguments,
+      "--apply-post-cleanup-plan",
+      alteredPlanPath,
+      "--expected-post-cleanup-plan-sha256",
+      planSha256,
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: alteredBin,
+        responses: preResponses,
+        stateDir: join(fixtureRoot, "altered-state"),
+        callLog: alteredLog,
+      }),
+    });
+    assert.equal(altered.status, 1, altered.stderr);
+    assert.match(altered.stderr, /plan SHA-256 mismatched/u);
+    assert.equal(existsSync(alteredLog), false);
+
+    const nonCanonicalPlanPath = join(fixtureRoot, "non-canonical-plan.json");
+    const nonCanonicalPlan = `${planResult.stdout} `;
+    writeFileSync(nonCanonicalPlanPath, nonCanonicalPlan, "utf8");
+    const nonCanonicalPlanSha256 = createHash("sha256")
+      .update(nonCanonicalPlan, "utf8")
+      .digest("hex");
+    const nonCanonicalBin = join(fixtureRoot, "non-canonical-bin");
+    const nonCanonicalLog = join(fixtureRoot, "non-canonical.log");
+    createFakeGhExecutable(nonCanonicalBin);
+    const nonCanonical = runBootstrap([
+      ...sourceArguments,
+      "--apply-post-cleanup-plan",
+      nonCanonicalPlanPath,
+      "--expected-post-cleanup-plan-sha256",
+      nonCanonicalPlanSha256,
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: nonCanonicalBin,
+        responses: preResponses,
+        stateDir: join(fixtureRoot, "non-canonical-state"),
+        callLog: nonCanonicalLog,
+      }),
+    });
+    assert.equal(nonCanonical.status, 1, nonCanonical.stderr);
+    assert.match(nonCanonical.stderr, /not the unmodified canonical raw output/u);
+    assert.equal(existsSync(nonCanonicalLog), false);
+
+    const replacedInventoryBin = join(fixtureRoot, "replaced-inventory-bin");
+    const replacedInventoryLog = join(fixtureRoot, "replaced-inventory.log");
+    createFakeGhExecutable(replacedInventoryBin);
+    const replacedInventory = runBootstrap([
+      ...applyPlanArguments,
+      "--expected-legacy-inventory-sha256",
+      "0".repeat(64),
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: replacedInventoryBin,
+        responses: preResponses,
+        stateDir: join(fixtureRoot, "replaced-inventory-state"),
+        callLog: replacedInventoryLog,
+      }),
+    });
+    assert.equal(replacedInventory.status, 1, replacedInventory.stderr);
+    assert.match(
+      replacedInventory.stderr,
+      /same owner-approved legacy inventory SHA-256/u,
+    );
+    assert.equal(existsSync(replacedInventoryLog), false);
+
+    const oversizedPlanPath = join(fixtureRoot, "oversized-plan.json");
+    writeFileSync(oversizedPlanPath, Buffer.alloc(1_048_577, 0x20));
+    const oversizedBin = join(fixtureRoot, "oversized-bin");
+    const oversizedLog = join(fixtureRoot, "oversized.log");
+    createFakeGhExecutable(oversizedBin);
+    const oversized = runBootstrap([
+      ...sourceArguments,
+      "--apply-post-cleanup-plan",
+      oversizedPlanPath,
+      "--expected-post-cleanup-plan-sha256",
+      planSha256,
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: oversizedBin,
+        responses: preResponses,
+        stateDir: join(fixtureRoot, "oversized-state"),
+        callLog: oversizedLog,
+      }),
+    });
+    assert.equal(oversized.status, 1, oversized.stderr);
+    assert.match(oversized.stderr, /admission limit/u);
+    assert.equal(existsSync(oversizedLog), false);
+
+    const driftedLegacy = structuredClone(retainedLegacy);
+    driftedLegacy.conditions.ref_name.include.push("refs/heads/release");
+    const driftBin = join(fixtureRoot, "drift-bin");
+    const driftLog = join(fixtureRoot, "drift.log");
+    createFakeGhExecutable(driftBin);
+    const drift = runBootstrap([
+      ...applyPlanArguments,
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: driftBin,
+        responses: {
+          ...preResponses,
+          [`GET repos/${repoSlug}/rulesets/7`]: {
+            __fake_sequence: [
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              driftedLegacy,
+            ],
+          },
+        },
+        stateDir: join(fixtureRoot, "drift-state"),
+        callLog: driftLog,
+      }),
+    });
+    assert.equal(drift.status, 1, drift.stderr);
+    assert.match(drift.stderr, /changed after the final complete pre-write closure/u);
+    assert.doesNotMatch(readFileSync(driftLog, "utf8"), /^PUT /mu);
+
+    const disabledV2 = structuredClone(activeV2);
+    disabledV2.enforcement = "disabled";
+    const v2DriftBin = join(fixtureRoot, "v2-drift-bin");
+    const v2DriftLog = join(fixtureRoot, "v2-drift.log");
+    createFakeGhExecutable(v2DriftBin);
+    const v2Drift = runBootstrap([
+      ...applyPlanArguments,
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: v2DriftBin,
+        responses: {
+          ...preResponses,
+          [`GET repos/${repoSlug}/rulesets/8`]: {
+            __fake_sequence: [
+              activeV2,
+              activeV2,
+              activeV2,
+              activeV2,
+              disabledV2,
+            ],
+          },
+        },
+        stateDir: join(fixtureRoot, "v2-drift-state"),
+        callLog: v2DriftLog,
+      }),
+    });
+    assert.equal(v2Drift.status, 1, v2Drift.stderr);
+    assert.match(
+      v2Drift.stderr,
+      /Selected v2 ruleset 8 changed after the final complete pre-write closure/u,
+    );
+    assert.doesNotMatch(readFileSync(v2DriftLog, "utf8"), /^PUT /mu);
+
+    const applyBin = join(fixtureRoot, "apply-bin");
+    const applyLog = join(fixtureRoot, "apply.log");
+    const applyBodyLog = join(fixtureRoot, "apply-body.log");
+    createFakeGhExecutable(applyBin);
+    const apply = runBootstrap([
+      ...applyPlanArguments,
+      "--apply",
+    ], {
+      env: {
+        ...fakeGhEnvironment({
+          fakeBin: applyBin,
+          responses: {
+            ...preResponses,
+            [`GET repos/${repoSlug}/rules/branches/master?per_page=100`]: {
+              __fake_sequence: [
+                effectivePre,
+                effectivePre,
+                effectivePre,
+                effectivePre,
+                [[]],
+                [[]],
+              ],
+            },
+            [`GET repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: {
+              __fake_sequence: [
+                [[retainedLegacy, activeV2]],
+                [[retainedLegacy, activeV2]],
+                [[retainedLegacy, activeV2]],
+                [[retainedLegacy, activeV2]],
+                [[retainedPostCleanup, activeV2]],
+                [[retainedPostCleanup, activeV2]],
+              ],
+            },
+            [`GET repos/${repoSlug}/rulesets/7`]: {
+              __fake_sequence: [
+                retainedLegacy,
+                retainedLegacy,
+                retainedLegacy,
+                retainedLegacy,
+                retainedLegacy,
+                retainedLegacy,
+                retainedLegacy,
+                retainedLegacy,
+                retainedLegacy,
+                retainedPostCleanup,
+                retainedPostCleanup,
+                retainedPostCleanup,
+              ],
+            },
+            [`GET repos/${repoSlug}/rulesets/8`]: activeV2,
+            [`PUT repos/${repoSlug}/rulesets/7`]: { id: retainedLegacy.id },
+          },
+          stateDir: join(fixtureRoot, "apply-state"),
+          callLog: applyLog,
+        }),
+        FAKE_GH_BODY_LOG: applyBodyLog,
+      },
+    });
+    assert.equal(apply.status, 0, apply.stderr);
+    assert.match(apply.stdout, /Applied the approved source-local cleanup plan/u);
+    assert.equal(
+      countLines(
+        readFileSync(applyLog, "utf8"),
+        `PUT repos/${repoSlug}/rulesets/7`,
+      ),
+      1,
+    );
+    const applyCalls = readFileSync(applyLog, "utf8").trim().split("\n");
+    const applyPutIndex = applyCalls.indexOf(`PUT repos/${repoSlug}/rulesets/7`);
+    assert.ok(applyPutIndex >= 2, "the guarded legacy PUT was recorded");
+    assert.equal(
+      applyCalls[applyPutIndex - 2],
+      `GET repos/${repoSlug}/rulesets/8`,
+      "the selected v2 ruleset is checked immediately before the mutable target",
+    );
+    assert.equal(
+      applyCalls[applyPutIndex - 1],
+      `GET repos/${repoSlug}/rulesets/7`,
+      "the mutable legacy target is checked last before its PUT",
+    );
+    const [putBody] = readFileSync(applyBodyLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(putBody.requestKey, `PUT repos/${repoSlug}/rulesets/7`);
+    assert.deepEqual(JSON.parse(putBody.requestBody), expectedPutPayload);
+
+    const errorBin = join(fixtureRoot, "error-bin");
+    const errorLog = join(fixtureRoot, "error.log");
+    createFakeGhExecutable(errorBin);
+    const mutationError = runBootstrap([
+      ...applyPlanArguments,
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: errorBin,
+        responses: {
+          ...preResponses,
+          [`PUT repos/${repoSlug}/rulesets/7`]: {
+            __fake_http_error: 500,
+            message: "Ruleset service unavailable. The plan-bound source cleanup PUT may already have completed.",
+          },
+        },
+        stateDir: join(fixtureRoot, "error-state"),
+        callLog: errorLog,
+      }),
+    });
+    assert.equal(mutationError.status, 1, mutationError.stderr);
+    assert.match(
+      mutationError.stderr,
+      /The plan-bound source cleanup PUT may already have completed/u,
+    );
+    assert.match(
+      mutationError.stderr,
+      /First run the exact read-only closure/u,
+    );
+    assert.match(
+      mutationError.stderr,
+      /node '\/.*\/scripts\/bootstrap-codex-review-gate\.mjs' --repo /u,
+      "the recovery command names the exact executable source checkout path",
+    );
+    assert.match(
+      mutationError.stderr,
+      /--control-plane-owner '@[^']+' --ruleset-name 'Must Pass Codex Review v2' --ruleset-profile 'status-only' --legacy-bridge --verify-post-cleanup/u,
+    );
+    assert.equal(
+      countLines(
+        readFileSync(errorLog, "utf8"),
+        `PUT repos/${repoSlug}/rulesets/7`,
+      ),
+      1,
+    );
+
+    const readbackErrorBin = join(fixtureRoot, "readback-error-bin");
+    const readbackErrorLog = join(fixtureRoot, "readback-error.log");
+    createFakeGhExecutable(readbackErrorBin);
+    const readbackError = runBootstrap([
+      ...applyPlanArguments,
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: readbackErrorBin,
+        responses: {
+          ...preResponses,
+          [`GET repos/${repoSlug}/rulesets/7`]: {
+            __fake_sequence: [
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              {
+                __fake_http_error: 500,
+                message: "Readback unavailable after mutation",
+              },
+            ],
+          },
+          [`PUT repos/${repoSlug}/rulesets/7`]: { id: retainedLegacy.id },
+        },
+        stateDir: join(fixtureRoot, "readback-error-state"),
+        callLog: readbackErrorLog,
+      }),
+    });
+    assert.equal(readbackError.status, 1, readbackError.stderr);
+    assert.match(readbackError.stderr, /Readback unavailable after mutation/u);
+    assert.match(
+      readbackError.stderr,
+      /The plan-bound source cleanup PUT may already have completed/u,
+    );
+    assert.match(
+      readbackError.stderr,
+      /First run the exact read-only closure/u,
+    );
+    assert.equal(
+      countLines(
+        readFileSync(readbackErrorLog, "utf8"),
+        `PUT repos/${repoSlug}/rulesets/7`,
+      ),
+      1,
+      "a readback failure must not cause an automatic mutation replay",
+    );
+
+    const mismatchedReadback = structuredClone(retainedPostCleanup);
+    mismatchedReadback.conditions.ref_name.include.push("refs/heads/release");
+    const mismatchedReadbackBin = join(fixtureRoot, "mismatched-readback-bin");
+    const mismatchedReadbackLog = join(fixtureRoot, "mismatched-readback.log");
+    createFakeGhExecutable(mismatchedReadbackBin);
+    const mismatchedReadbackResult = runBootstrap([
+      ...applyPlanArguments,
+      "--apply",
+    ], {
+      env: fakeGhEnvironment({
+        fakeBin: mismatchedReadbackBin,
+        responses: {
+          ...preResponses,
+          [`GET repos/${repoSlug}/rulesets/7`]: {
+            __fake_sequence: [
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              retainedLegacy,
+              mismatchedReadback,
+            ],
+          },
+          [`PUT repos/${repoSlug}/rulesets/7`]: { id: retainedLegacy.id },
+        },
+        stateDir: join(fixtureRoot, "mismatched-readback-state"),
+        callLog: mismatchedReadbackLog,
+      }),
+    });
+    assert.equal(
+      mismatchedReadbackResult.status,
+      1,
+      mismatchedReadbackResult.stderr,
+    );
+    assert.match(
+      mismatchedReadbackResult.stderr,
+      /does not equal the approved post-cleanup writable projection/u,
+    );
+    assert.match(
+      mismatchedReadbackResult.stderr,
+      /The plan-bound source cleanup PUT may already have completed/u,
+    );
+    assert.equal(
+      countLines(
+        readFileSync(mismatchedReadbackLog, "utf8"),
+        `PUT repos/${repoSlug}/rulesets/7`,
+      ),
+      1,
+      "a successful but mismatched readback must not cause an automatic mutation replay",
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("post-cleanup verification rejects legacy residuals and a non-active selected v2 gate", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
@@ -9200,8 +9738,17 @@ const endpoint = process.argv[5];
 const methodIndex = process.argv.indexOf("--method");
 const method = methodIndex === -1 ? "GET" : process.argv[methodIndex + 1];
 const requestKey = \`\${method} \${endpoint}\`;
+const inputIndex = process.argv.indexOf("--input");
+const requestBody = inputIndex === -1 ? null : readFileSync(0, "utf8");
 if (process.env.FAKE_GH_CALL_LOG) {
   appendFileSync(process.env.FAKE_GH_CALL_LOG, \`\${requestKey}\\n\`, "utf8");
+}
+if (process.env.FAKE_GH_BODY_LOG && requestBody !== null) {
+  appendFileSync(
+    process.env.FAKE_GH_BODY_LOG,
+    JSON.stringify({ requestKey, requestBody }) + "\\n",
+    "utf8",
+  );
 }
 const responseKey = Object.prototype.hasOwnProperty.call(responses, requestKey)
   ? requestKey

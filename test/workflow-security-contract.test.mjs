@@ -1919,13 +1919,26 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       guide,
       name,
     );
+    assert.match(
+      sourceSelfHostingGuide,
+      /(?:^|\n)\s*REPO="Joey-Tools\/codex-review-gate"/u,
+      `${name}: source exception remains bound to its one allowed repository`,
+    );
     const sourceCommands = bootstrapRemoteCommands(sourceSelfHostingGuide);
     assert.equal(
       sourceCommands.length,
-      2,
-      `${name}: source self-hosting has only status-only stage preview/apply`,
+      6,
+      `${name}: source self-hosting has stage, approved-plan, and closure commands`,
     );
-    for (const { text } of sourceCommands) {
+    const sourceStageCommands = sourceCommands.filter(({ text }) =>
+      !/--derive-post-cleanup-plan|--apply-post-cleanup-plan|--verify-post-cleanup/u.test(text),
+    );
+    assert.equal(
+      sourceStageCommands.length,
+      2,
+      `${name}: source self-hosting has one status-only stage preview/apply pair`,
+    );
+    for (const { text } of sourceStageCommands) {
       assert.match(text, /--repo "\$REPO"/u, `${name}: ${text}`);
       assert.match(
         text,
@@ -1946,9 +1959,95 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       );
     }
     assert.equal(
-      sourceCommands.filter(({ text }) => text.includes("--apply")).length,
+      sourceStageCommands.filter(({ text }) => /(?:^|\s)--apply(?:\s|$)/u.test(text)).length,
       1,
       `${name}: source self-hosting has one stage apply`,
+    );
+
+    const sourceDeriveCommands = sourceCommands.filter(({ text }) =>
+      text.includes("--derive-post-cleanup-plan"),
+    );
+    assert.equal(sourceDeriveCommands.length, 1, `${name}: one source cleanup-plan derivation`);
+    const [sourceDeriveCommand] = sourceDeriveCommands;
+    assert.match(sourceDeriveCommand.text, /--repo "\$REPO"/u, `${name}: source derivation binds source repo`);
+    assert.match(
+      sourceDeriveCommand.text,
+      /--control-plane-owner "\$CONTROL_PLANE_OWNER"/u,
+      `${name}: source derivation binds the source control-plane owner`,
+    );
+    assert.match(
+      sourceDeriveCommand.text,
+      /--ruleset-name "\$V2_RULESET_NAME"/u,
+      `${name}: source derivation binds the selected v2 ruleset`,
+    );
+    assert.match(sourceDeriveCommand.text, /--ruleset-profile status-only/u, `${name}: source derivation retains the source profile`);
+    assert.match(sourceDeriveCommand.text, /--legacy-bridge/u, `${name}: source derivation retains the temporary bridge`);
+    assert.match(
+      sourceDeriveCommand.text,
+      /--expected-legacy-inventory-sha256/u,
+      `${name}: source derivation remains bound to the approved legacy inventory`,
+    );
+    assert.doesNotMatch(
+      sourceDeriveCommand.text,
+      /--apply-post-cleanup-plan|--verify-post-cleanup|--activate|--canary-pr|--canary-head|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
+      `${name}: source derivation remains read-only`,
+    );
+
+    const sourceExecutorCommands = sourceCommands.filter(({ text }) =>
+      text.includes("--apply-post-cleanup-plan"),
+    );
+    assert.equal(sourceExecutorCommands.length, 2, `${name}: source has preview/apply plan executor pair`);
+    for (const { text } of sourceExecutorCommands) {
+      assert.match(text, /--repo "\$REPO"/u, `${name}: ${text}`);
+      assert.match(text, /--control-plane-owner "\$CONTROL_PLANE_OWNER"/u, `${name}: ${text}`);
+      assert.match(text, /--ruleset-name "\$V2_RULESET_NAME"/u, `${name}: ${text}`);
+      assert.match(text, /--ruleset-profile status-only/u, `${name}: ${text}`);
+      assert.match(text, /--legacy-bridge/u, `${name}: ${text}`);
+      assert.match(text, /--expected-legacy-inventory-sha256/u, `${name}: ${text}`);
+      assert.match(text, /--expected-post-cleanup-plan-sha256/u, `${name}: ${text}`);
+      assert.doesNotMatch(
+        text,
+        /--derive-post-cleanup-plan|--verify-post-cleanup|--activate|--canary-pr|--canary-head|--remove-legacy-bridge/u,
+        `${name}: source plan executor remains an isolated cleanup phase`,
+      );
+    }
+    assert.equal(
+      sourceExecutorCommands.filter(({ text }) => /(?:^|\s)--apply(?:\s|$)/u.test(text)).length,
+      1,
+      `${name}: source plan executor has one write after its preview`,
+    );
+
+    const sourceFinalProbes = sourceCommands.filter(({ text }) =>
+      text.includes("--verify-post-cleanup"),
+    );
+    assert.equal(sourceFinalProbes.length, 1, `${name}: one source post-cleanup closure`);
+    assert.match(sourceFinalProbes[0].text, /--repo "\$REPO"/u, `${name}: source closure binds source repo`);
+    assert.match(
+      sourceFinalProbes[0].text,
+      /--control-plane-owner "\$CONTROL_PLANE_OWNER"/u,
+      `${name}: source closure binds the source control-plane owner`,
+    );
+    assert.match(
+      sourceFinalProbes[0].text,
+      /--ruleset-name "\$V2_RULESET_NAME"/u,
+      `${name}: source closure binds the selected v2 ruleset`,
+    );
+    assert.match(sourceFinalProbes[0].text, /--ruleset-profile status-only/u, `${name}: source closure retains the source profile`);
+    assert.match(sourceFinalProbes[0].text, /--legacy-bridge/u, `${name}: source closure retains the temporary bridge`);
+    assert.match(
+      sourceFinalProbes[0].text,
+      /--expected-post-cleanup-security-sha256/u,
+      `${name}: source closure binds the expected post-cleanup state`,
+    );
+    assert.doesNotMatch(
+      sourceFinalProbes[0].text,
+      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--derive-post-cleanup-plan|--apply-post-cleanup-plan|--activate|--canary-pr|--canary-head|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
+      `${name}: source closure must remain a separate read-only post-cleanup phase`,
+    );
+    assert.doesNotMatch(
+      ordinaryGuide,
+      /--apply-post-cleanup-plan|--expected-post-cleanup-plan-sha256/u,
+      `${name}: ordinary consumer guidance must not expose the source-only executor`,
     );
 
     const remoteCommands = bootstrapRemoteCommands(ordinaryGuide);
@@ -1998,18 +2097,18 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       `${name}: activation preview and apply`,
     );
     assert.equal(
-      preCleanupWrites.filter(({ text }) => text.includes("--apply")).length,
+      preCleanupWrites.filter(({ text }) => /(?:^|\s)--apply(?:\s|$)/u.test(text)).length,
       2,
       `${name}: staging and activation apply`,
     );
     assert.doesNotMatch(
       deriveCommand.text,
-      /--apply|--activate|--verify-post-cleanup/u,
+      /--apply-post-cleanup-plan|--activate|--verify-post-cleanup|(?:^|\s)--apply(?:\s|$)/u,
       `${name}: derivation must remain read-only and pre-cleanup`,
     );
     assert.doesNotMatch(
       finalProbe.text,
-      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--apply|--activate|--derive-post-cleanup-plan/u,
+      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--apply-post-cleanup-plan|--activate|--derive-post-cleanup-plan|(?:^|\s)--apply(?:\s|$)/u,
       `${name}: post-cleanup closure must not replay the stale legacy digest or mutate`,
     );
     assert.match(

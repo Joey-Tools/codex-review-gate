@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Stable Action `v2.0.3` and the floating `v2` alias are published from
+- Stable Action `v2.0.4` and the floating `v2` alias are published from
   `JoeyTeng/codex-review-gate-action`. This workstream implements and carries
   out the user-approved organization-wide transition from the inherited v1
   required status to v2.
@@ -998,6 +998,47 @@ evidence that a prior freeze remains in force.
   lag, confirmed deletion, reappearance, and commit-binding drift without
   allowing an earlier clean to pass.
 
+## Execution Update — 2026-09-24 (source v2 activation and guarded cleanup)
+
+- Stable `v2.0.4` is published from
+  `JoeyTeng/codex-review-gate-action`, and the signed floating `v2` alias now
+  resolves to its target commit. The source repository's separate status-only
+  v2 ruleset `23927388`, `Must Pass Codex Review v2`, is Active. It requires
+  only the strict GitHub-Actions-bound `codex/github-review-gate` CheckRun and
+  has no bypass actors.
+- Source canary `#67` proved the deployed source v2 consumer and the temporary
+  legacy bridge together at exact unique head
+  `b2989023972a8f96d5ab596142672bc3916cb028`; the harmless canary was then
+  closed unmerged. This is source-local evidence only and does not alter the
+  ten-member organization cohort or its outstanding bridge-removal receipt.
+- The retained source ruleset `16410326`, `PR must pass codex review`, still
+  requires legacy `codex/review-gate`. It continues to own deletion,
+  non-fast-forward, pull-request, and associated CODEOWNERS protection. No
+  source v1 requirement has been removed yet, and the temporary bridge remains
+  installed.
+- This delivery adds a narrow source-only cleanup executor, rather than using
+  an ad hoc ruleset PUT. It admits a separately approved raw plan SHA-256 and
+  the same owner-approved legacy-inventory SHA-256 embedded in that plan,
+  requires an initial and final two-round complete pre-cleanup derivation to
+  equal the plan, then validates exact writable projections for both the
+  retained legacy ruleset and selected v2 ruleset immediately before its one
+  PUT. It reads the exact after-state and runs the existing two-round
+  post-cleanup closure. It cannot apply to ordinary consumers, cannot mutate
+  classic protection or v2, and does not automatically replay an ambiguous
+  write.
+- GitHub's ruleset-update API exposes no compare-and-swap precondition. The
+  final reads catch observed drift but cannot prove that no administrator
+  changes policy in the last GET-to-PUT gap. The cleanup therefore requires an
+  externally authorized single-writer policy freeze across final derivation,
+  exact reads, PUT, readback, and closure; without that freeze, it must not
+  apply. Any ambiguous result is read-only diagnosis plus separate human
+  coordination, never an automatic replay or rollback.
+- The executor is implementation evidence only until its PR is merged. After
+  merge, cleanup still requires a newly derived live plan, separate approval,
+  the exact plan-bound apply, and successful readback. A failure may already
+  have written: preserve Active v2 and the bridge, run read-only diagnosis, and
+  authorize any repair separately rather than replaying the request.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -1011,21 +1052,21 @@ evidence that a prior freeze remains in force.
    cohort repository. The old organization ruleset intentionally remains Active
    only for deletion and non-fast-forward protection, including the archived
    legacy-only repository.
-3. Publish the narrow PENDING-review schema tolerance, then reconcile source
-   canary `#64` on its exact current head/test-merge scope. Only after its
-   result is healthy and successful may the staged status-only v2 rule for
-   `Joey-Tools/codex-review-gate` activate; remove only the independent source
-   ruleset `16410326` v1 status requirement in the separately approved cleanup,
-   preserving its non-status protections. This source-local exception is
-   outside the frozen 10-member cohort and must not be used to expand the
-   organization closure receipt or bridge-removal scope.
+3. Merge the source-only plan-bound cleanup executor, then derive a fresh
+   source-local plan and obtain a separate approval before removing only the
+   independent source ruleset `16410326` `codex/review-gate` requirement.
+   Preserve its non-status protections, keep v2 Active, and require the exact
+   post-write readback plus two-round closure before declaring the source
+   transition complete. This source-local exception is outside the frozen
+   10-member cohort and must not be used to expand the organization closure
+   receipt or bridge-removal scope.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.
 
 ## Evidence
 
-- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.0.3`
+- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.0.4`
 - Old organization ruleset: `Joey-Tools` ruleset `16590367`, read through
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:

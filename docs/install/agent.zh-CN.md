@@ -104,6 +104,78 @@ GitHub.com/default-branch PR scope 时停止。
    成功。不得移除或扩大 legacy protection。
 5. 不得用 organization schema-2 final-closure receipt 删除该 source bridge。没有单独授权、
    已记录的 source-local closure proof 时必须停止。
+6. source-only v2 rule 已被精确证明为 Active 后，用同一 `status-only` profile 与 bridge
+   派生并审阅 source-local cleanup plan。必须保持 plan 的 raw UTF-8 bytes 不变；其 SHA-256
+   是显式 approval input。plan 还绑定 exact owner-approved legacy-inventory SHA-256，因此
+   执行时必须再次提供同一 digest，不能替换成之后的 inventory approval。普通 consumer
+   不可使用此路径：
+
+   ```bash
+   POST_CLEANUP_PLAN="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --derive-post-cleanup-plan > "$POST_CLEANUP_PLAN"
+   jq . "$POST_CLEANUP_PLAN"
+   EXPECTED_POST_CLEANUP_SECURITY_SHA256="$(jq -er \
+     '.expected_post_cleanup_security_sha256 |
+     select(test("^[0-9a-f]{64}$"))' \
+     "$POST_CLEANUP_PLAN")"
+   POST_CLEANUP_PLAN_SHA256="$(shasum -a 256 "$POST_CLEANUP_PLAN" |
+     awk '{print $1}')"
+   ```
+
+7. source plan 不得含 classic mutation，且必须只含 retained legacy ruleset 的一个
+   `remove-legacy-check-only` action。先 preview，只有在单独记录授权后才增加 `--apply`：
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+     --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256"
+
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --expected-legacy-inventory-sha256 "$LEGACY_INVENTORY_SHA256" \
+     --apply-post-cleanup-plan "$POST_CLEANUP_PLAN" \
+     --expected-post-cleanup-plan-sha256 "$POST_CLEANUP_PLAN_SHA256" \
+     --apply
+   ```
+
+   executor 会在唯一 PUT 前重新派生最终两轮完整 pre-cleanup closure、要求其与 admitted plan
+   canonical equality，然后紧贴 PUT 前读取 exact legacy target 与 selected v2 ruleset、比较二者
+   完整 writable projection。GitHub 没有 ruleset-update CAS（compare-and-swap，即把读取与写入
+   绑定为原子前置条件），所以这些读取只能检测已经观察到的 drift，不能排除最终 API gap 中的
+   administrator change。必须在 final derivation、exact reads、PUT、readback 与 closure 的全程
+   实施另行授权的外部 single-writer policy freeze；无法维持该 freeze 时不得 apply。它读回 exact
+   after-state，并自动运行两轮 closure。PUT/readback/closure 失败时可能已经完成：不得 replay、
+   不得 mutation classic protection、不得移除 bridge、不得 disable/overwrite v2。保留 Active v2；
+   只使用下面的 read-only proof 与 exact ruleset inspection，再单独授权 repair：
+
+   ```bash
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --verify-post-cleanup \
+     --expected-post-cleanup-security-sha256 \
+     "$EXPECTED_POST_CLEANUP_SECURITY_SHA256"
+   ```
 
 ## Advanced：活动 v2 10 仓 organization handoff
 
@@ -1368,7 +1440,7 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
      "$POST_CLEANUP_PLAN")"
    ```
 
-   Plan 只能删除 `codex/review-gate`。如果这移除了 classic required-status policy 的最后
+   这个 legacy cleanup plan 只能删除 `codex/review-gate`。如果这移除了 classic required-status policy 的最后
    item，则该 empty policy 及其 `strict` field 可消失；如果 ruleset status rule 因而变空，
    该 rule 可消失，而 dedicated legacy-only ruleset 只有在不剩其他 rule 时才可整体消失。
    这些是唯一 structural exceptions。必须精确保留 repository/default-head identity、
@@ -1376,13 +1448,15 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    与 non-legacy checks（包括 `strict`/`app_id`），以及每个 retained ruleset 的 identity、
    conditions、bypass actors 与 unrelated rules。任何其他 delta 都不是获授权的 cleanup
    plan。
-5. 只执行该已审阅 plan，作为另行授权的 legacy cleanup；write 后不得重新派生。
-   Cleanup 或 readback 失败不能成为 disable/rollback v2 的理由；保留 complete Active v2
-   gate，只运行 read-only diagnostics，并报告 exact remaining 或 indeterminate surface。
-6. 使用已记录 ruleset name 与 externally recorded expected-state digest 运行专用只读
-   post-cleanup closure。它读取两轮完整 security snapshot；两轮必须相同、都等于 expected
-   digest、两个 legacy surfaces 均 clear，并且同一 exact complete v2 ruleset 仍 Active。
-   因此 unrelated-policy change 与 cross-surface swap 都不能伪造 clear snapshot：
+5. 只可通过适用于该 policy 的、另行授权的 executor 执行已审阅 plan。上方窄范围 source
+   exception 中的 source-only executor 不得用于普通 consumer。任何 write 后不得重新派生。
+   cleanup 或 readback 失败不构成 disable/rollback v2 的授权：保留 Active v2，只运行
+   policy-specific read-only diagnostics，并报告 exact remaining 或 indeterminate surface。
+6. 可以使用已记录 ruleset name 与 externally recorded expected-state digest 运行专用只读
+   post-cleanup closure，作为 independent evidence 或 recovery diagnosis。它读取两轮完整
+   security snapshot；两轮必须相同、都等于 expected digest、两个 legacy surfaces 均 clear，
+   并且同一 exact complete v2 ruleset 仍 Active。因此 unrelated-policy change 与
+   cross-surface swap 都不能伪造 clear snapshot：
 
    ```bash
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
