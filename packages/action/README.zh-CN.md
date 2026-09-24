@@ -199,12 +199,24 @@ resolved” 要求才是其 authority。
 review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
 line 必须 exact，且不得有其他 visible text。默认 `any` policy 会把 ordinary request
 author（任意 repository permission）纳入 snapshot 作为 candidate，而不是立刻视作
-generation boundary。只有 official Codex Bot 在同一条 comment 上留下严格晚于当前
-revision 的 `eyes` 或 `+1` receipt，它才升级为 provider-confirmed boundary。PR 其他位置
-后来出现的 terminal 或 progress carrier 不能补足这个因果 receipt。这只决定 gate 如何
-归因；不授予 commenter 调用或控制 Codex review 的权限。是否真的启动 provider review
-仍由 GitHub 与 Codex 决定；未确认 candidate 不能 reset、抢占或使既有 clean 失效。
-canonical workflow 直接固定 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不会把它暴露成
+generation boundary。它有两种获得 provider confirmation 的方式：
+
+1. official Codex Bot 在同一条 comment 上留下严格晚于当前 revision 的直接 `eyes` 或
+   `+1` receipt；或
+2. 仅限没有 base epoch、single-flight lineage 中唯一一条 exact、未编辑的 ordinary
+   request：严格晚于该 request 的未编辑 official 顶层 issue comment（PR 的普通评论，
+   不是 pull-request review body）中的 terminal clean 可以在无歧义绑定 current head 时
+   充当 receipt。
+
+第二种是刻意收窄的最小 receipt。额外或 ambiguous request/physical boundary、request 或
+terminal 被编辑、terminal carrier 不匹配，或 head/SHA binding 有歧义时，gate 都保持
+pending。terminal 指定 reviewed SHA 时，short SHA 只有被 GitHub 无歧义解析为 current PR
+head 才接受。同一 comment 上 official `eyes`/`+1` 的直接 receipt 仍然受支持。这只决定
+gate 如何归因；不授予 commenter 调用或控制 Codex review 的权限，不会使 Codex 必然启动，
+也不意味着任何用户都能让 review 启动。是否真的启动 provider review 仍由 GitHub 与 Codex
+决定；没有 terminal-clean contender 的未确认 candidate 不能 reset、抢占或使既有 clean
+失效；尝试但未满足狭窄规则的 terminal-clean receipt 保持 fail-closed pending。canonical workflow 直接固定
+`CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不会把它暴露成
 standard strict-policy setting。`write` threshold（`write`、`maintain` 或 `admin`）仅保留给
 将来具有 collaborator permission 读取能力的 nonstandard verifier identity；bundled
 read-only verifier token 无法可靠完成这个读取。workflow-authored request 还必须带
@@ -218,16 +230,20 @@ epoch；timestamp 相同属于歧义，保持 pending。provider terminal payloa
 recovery rule：只有直接附着在 epoch 后、绑定当前 base 的 canonical workflow request
 上的合格 provider `+1`，才能提供 positive clean authority 或 supersede 旧 finding。
 没有 base epoch 的 PR 仍支持无需 workflow marker 的 ordinary direct
-`@codex review`，但 official Bot 必须直接 receipt 该 exact request。findings 在 epoch
-boundary 两侧始终保守阻塞；无法归因的 terminal clean 保持 pending，runtime 不会猜测它
-属于新 generation。
+`@codex review`，可使用上述两种 receipt 方式；一旦出现 base epoch，terminal receipt
+不再可用。findings 在 epoch boundary 两侧始终保守阻塞；无法归因的 terminal clean 保持
+pending，runtime 不会猜测它属于新 generation。
 
 terminal clean 文本和符合条件的 provider `+1`，只有在没有 base epoch、single-flight
-lineage 的第一个物理 generation 中才具有相同 clean authority；前提是该 generation
-已经建立。未确认的 default-`any` ordinary candidate 是明确例外，不是 physical boundary。
-其他每条可能触发 provider 的 request-shaped comment 都是物理 generation boundary，
-包括 duplicate hidden marker、edited/malformed request 和 authorisation 失败的 request。
-boundary 只表示可能存在未知 provider flight，不授予 positive authority。在 nonstandard
+lineage 的第一个物理 generation 中才具有相同 clean authority。唯一符合最小 receipt rule
+的 default-`any` ordinary request，其匹配的 official 顶层 issue-comment terminal clean
+可以同时确认这个第一个 generation，并携带该 clean authority。pull-request review clean
+仍是普通 evidence，但不能确认 default-`any` candidate。符合条件的 finding 独立阻塞，绝不充当 receipt。
+没有 receipt contender 的 candidate 不是 physical boundary。存在 terminal-clean contender
+但未满足狭窄条件时，它以 fail-closed physical-only boundary 保持 pending。其他每条可能触发
+provider 的 request-shaped comment 都是物理 generation boundary，包括 duplicate hidden
+marker、edited/malformed request 和 authorisation 失败的 request。boundary 只表示可能存在
+未知 provider flight，不授予 positive authority。在 nonstandard
 `write` threshold 下，其他条件均合法的
 ordinary request 必须先查询 permission（同一 snapshot 内按 author 缓存），才能判定为
 denied；判定后不再触发 reaction 或 exact-refetch fan-out。更早因 shape、author 或 binding
@@ -255,11 +271,14 @@ endpoint，不能豁免其他 carrier。provider terminal 只有在 predecessor 
 完整，且从该 terminal 到 successor 没有当前 `eyes` 或 provider activity 时，才能闭合
 第一个 gap。
 未确认的 default-`any` ordinary candidate 上，official 直接且 post-revision 的 `eyes` 或
-`+1` 先充当 receipt，把它升级为 boundary。升级后 ordinary request reactions 才只用于
-provider liveness；ordinary `+1` 本身仍不能 head-bind clean。same-time/later official
-`eyes`/progress from Codex 会 veto candidate clean，因为 review activity 尚未被证明
-terminal。reaction-only change 没有 automatic workflow event，必须由 later provider event
-或 manual reconcile 重新观察。
+`+1` 先充当 receipt，把它升级为 boundary。唯一替代方式是上述唯一、没有 base epoch、
+single-flight rule 下严格晚于 candidate 的匹配未编辑 official 顶层 issue-comment terminal clean。
+出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的 identity、
+ordering/current-head binding 有歧义时，都不能使用该方式。direct-reaction upgrade 后，
+ordinary request reactions 才只用于 provider liveness；ordinary `+1` 本身仍不能
+head-bind clean。same-time/later official `eyes`/progress from Codex 会 veto candidate
+clean，因为 review activity 尚未被证明 terminal。reaction-only change 没有 automatic
+workflow event，必须由 later provider event 或 manual reconcile 重新观察。
 terminal evidence 指定 reviewed commit 时，可以使用 full 或 short SHA。只有
 GitHub 能把 short SHA 无歧义解析为 current PR head 时才接受；对于 PR review，
 resolved SHA 还必须与 review 原生 `commit_id` 一致。
@@ -269,8 +288,9 @@ resolved SHA 还必须与 review 原生 `commit_id` 一致。
 
 1. 存在严格更新的 authorised review generation；
 2. 随后出现符合上述 lineage rule、绑定该 generation 和 head 的 clean result：只有
-   no-base-epoch 的第一个 generation 可以使用 unbound terminal，其他情况必须使用
-   合格的 request-bound `+1`。
+   no-base-epoch 的第一个 generation 可以使用 terminal clean（对于 default-`any`
+   ordinary candidate 还必须满足最小 terminal-receipt rule），其他情况必须使用合格的
+   request-bound `+1`。
 
 任意更晚的 clean 不能抹掉 findings。ordering 或 binding 有歧义时不能 pass。
 historical findings 仍保留在 diagnostics 中。
