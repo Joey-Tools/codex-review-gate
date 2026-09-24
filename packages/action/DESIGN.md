@@ -292,6 +292,38 @@ Provider carriers must bind exact bot identity. Similar names, copied text or
 user-authored claims have no authority. A finding's severity label does not
 affect blocking: any qualifying finding blocks.
 
+GitHub REST may omit `submitted_at` entirely for a `PENDING` pull-request
+review. It remains in identity, exact-refetch, and snapshot-stability
+observation, but it is an unsubmitted draft and its body is not reduced into
+provider finding or clean evidence. Its presence is nevertheless liveness
+evidence: it blocks pass, including a clean that predates the draft, until the
+review reaches a stable terminal state. A later submitted terminal review is
+observed normally; inline conversations remain a ruleset condition. Every
+terminal review state still needs a canonical `submitted_at` timestamp, so a
+malformed terminal review remains fail-closed.
+
+The protected property of an untimestamped `PENDING` draft is its review ID,
+provider actor/App provenance, and commit binding; its draft body may change
+before submission. A body update restarts snapshot stability and an update
+observed only by exact refetch abandons that snapshot for a later retry. It
+never becomes terminal evidence. The only draft-to-terminal lifecycle admitted
+by the stability latch has that same immutable binding and becomes a
+canonical-timestamped `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED` review.
+The exact response is not retained as the terminal value, because the list
+endpoint may still show `PENDING`; a later complete snapshot must first see
+the terminal state through its normal list read. A terminal review must then
+be observed consistently before it can affect the decision.
+
+A `PENDING` review missing from a complete list is not presumed deleted. The
+verifier exact-fetches it: a still-pending result retains the liveness lock and
+a permitted terminal result waits for normal-list convergence. Only two exact
+`404` observations in separate complete-snapshot attempts confirm deletion;
+that confirmation itself forces another fresh complete snapshot before the
+draft can cease blocking. If the draft reappears, it becomes live again only
+when the same ID, actor/App and commit binding still match. Reversions,
+`DISMISSED` transitions, terminal-to-terminal drift, or any identity, App or
+commit-binding change remain fail-closed.
+
 ### Review generations
 
 An authorised generation begins only with an exact, unedited
