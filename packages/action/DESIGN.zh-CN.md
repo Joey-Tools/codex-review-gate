@@ -255,6 +255,31 @@ provider carriers 必须绑定 exact bot identity。相似 name、复制的文�
 claim 都没有 authority。finding severity label 不影响 blocking：任何符合条件的
 finding 都会阻塞。
 
+GitHub REST 对 `PENDING` pull-request review 可能完全省略 `submitted_at`。这种 shape
+仍会进入 identity、exact-refetch 和 snapshot-stability observation，但它是尚未提交的
+draft，其 body 不会被 reducer 变成 provider finding 或 clean evidence。但它的存在本身是
+liveness evidence：在 review 达到 stable terminal state 前，它会阻止 pass，甚至会阻止早于
+该 draft 的 clean。之后提交的 terminal review 会按正常路径观察；inline conversations 仍是
+ruleset condition。每个 terminal review state 仍必须有 canonical `submitted_at` timestamp，故
+malformed terminal review 仍然 fail-closed。
+
+raw `submitted_at` 缺失或为 `null` 的 `PENDING` draft，其 protected property 是 review ID、
+provider actor/App provenance 与 commit binding；提交前 draft body 可以变化。body update 会
+重新开始 snapshot stability；若仅在 exact refetch 中看到 update，则放弃该 snapshot，之后再
+retry。它绝不成为 terminal evidence。stability latch 唯一允许的 draft-to-terminal lifecycle
+必须保持上述 immutable binding，并变为带 canonical timestamp 的 `COMMENTED`、`APPROVED` 或
+`CHANGES_REQUESTED` review。exact response 不会立即被保留为 terminal value，因为 list
+endpoint 可能仍显示 `PENDING`；之后一个完整 snapshot 必须先从正常 list read 观察到 terminal
+state。terminal review 之后仍须被一致观察，才能影响 decision。
+
+完整 list 中缺少 `PENDING` review 不能直接当作 deletion。verifier 会 exact-fetch：仍为
+pending 时继续保留 liveness lock；允许的 terminal state 则等待 normal-list convergence。只有
+两次位于不同 complete-snapshot attempts 的 exact `404` 才确认 deletion；确认本身还会强制再读
+一个完整 fresh snapshot，之后该 draft 才可能不再阻塞。draft 随后重新出现时，只有相同 ID、
+actor/App 与 commit binding 仍匹配才重新进入 live 状态。任何 reversal、到 `DISMISSED` 的
+transition、terminal-to-terminal drift，或 identity、App、commit-binding 的变化都继续
+fail-closed。
+
 ### Review generations
 
 authorised generation 只能由一条 exact、未编辑的 `@codex review` request 建立。

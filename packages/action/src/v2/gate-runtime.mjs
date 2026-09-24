@@ -128,6 +128,12 @@ const V2_OBSERVED_BASE_EPOCH_LATEST = Symbol(
 const V2_OBSERVED_CARRIER_FINGERPRINTS = Symbol(
   "v2-observed-carrier-fingerprints",
 );
+const V2_PENDING_REVIEW_DELETION_CONFIRMATIONS = Symbol(
+  "v2-pending-review-deletion-confirmations",
+);
+const V2_CONFIRMED_DELETED_PENDING_REVIEW_FINGERPRINTS = Symbol(
+  "v2-confirmed-deleted-pending-review-fingerprints",
+);
 const V2_DELETED_COMMENTS_QUERY = `query CodexReviewGateDeletedComments(
   $owner: String!
   $repo: String!
@@ -3207,11 +3213,10 @@ async function loadV2DecisionCarriers(
         seenReviewIds.add(id);
         if (!providerRelevant) return;
         providerReviewIds.add(id);
-        rememberV2ObservedCarrierFingerprint(
+        rememberV2ObservedReviewFingerprint(
           observedIssueCommentEdits,
-          "review-rest",
           id,
-          canonicalJson(fingerprintReview(review)),
+          review,
         );
       },
     }),
@@ -3227,6 +3232,7 @@ async function loadV2DecisionCarriers(
   const [issueCommentRead, reviewRead, baseEpochRead, commentHistoryRead] =
     carrierReads;
   let latchError = null;
+  let missingPendingReviews = [];
   if (issueCommentRead.status === "fulfilled") {
     try {
       retainV2ObservedCarrierFingerprints(
@@ -3243,14 +3249,13 @@ async function loadV2DecisionCarriers(
   }
   if (reviewRead.status === "fulfilled") {
     try {
-      retainV2ObservedCarrierFingerprints(
+      missingPendingReviews = retainV2ObservedReviewFingerprints(
         observedIssueCommentEdits,
-        "review-rest",
         reviewRead.value
           .filter(hasAnyV2ProviderIdentitySignal)
           .map((review) => [
             canonicalPositiveId(review.id),
-            canonicalJson(fingerprintReview(review)),
+            review,
           ]),
       );
     } catch (error) {
@@ -3319,6 +3324,13 @@ async function loadV2DecisionCarriers(
     issueComments,
     reviews,
     requestAuthority.authorized,
+    observedIssueCommentEdits,
+  );
+  await exactRefetchV2MissingPendingReviews(
+    client,
+    config,
+    budget,
+    missingPendingReviews,
     observedIssueCommentEdits,
   );
   const reactionRequests = selectV2ReactionInventoryRequests({
@@ -3682,6 +3694,11 @@ function reduceV2Evidence({
     headSha,
     progressArtifacts,
   });
+  const hasPendingProviderReview = scopedProgressArtifacts.some((artifact) =>
+    artifact.source === "pull-request-review" &&
+    artifact.kind === "pending" &&
+    artifact.pendingKind === "progress"
+  );
   const providerActivityArtifacts = [
     ...scopedProgressArtifacts,
     ...unboundProviderActivities,
@@ -3843,7 +3860,9 @@ function reduceV2Evidence({
   } else if (cleanBlockedByLiveness) {
     decision = {
       gateOutcome: "pending",
-      reason: "Codex activity at or after the latest clean evidence indicates review is still in progress",
+      reason: hasPendingProviderReview
+        ? "An official Codex pull-request review remains pending"
+        : "Codex activity at or after the latest clean evidence indicates review is still in progress",
       recoveryCode: "wait_provider",
     };
   } else if (hasUnattributableEpochTerminalClean) {
@@ -4642,19 +4661,122 @@ async function exactRefetchV2RelevantObjects(
     );
     budget.consumeObjects(1, `exact review refetch ${id}`);
     requireV2ReviewShape(data, `exact review refetch ${id}`);
+    const listedFingerprint = fingerprintReview(review);
+    const refetchedFingerprint = fingerprintReview(data);
+    // The review's actor/App provenance is immutable across list and exact
+    // reads, including the permitted draft lifecycle transitions. Check it
+    // before the lifecycle branch so a PENDING change cannot conceal identity
+    // drift.
     rememberV2ObservedCarrierFingerprint(
       observedIssueCommentEdits,
-      "review-rest",
+      "review-identity",
       id,
-      canonicalJson(fingerprintReview(data)),
+      canonicalJson(fingerprintReviewIdentity(data)),
     );
-    if (canonicalJson(fingerprintReview(data)) !== canonicalJson(fingerprintReview(review))) {
+    if (canonicalJson(refetchedFingerprint) !== canonicalJson(listedFingerprint)) {
+      if (isV2AdmittedPendingReviewTransition(listedFingerprint, refetchedFingerprint)) {
+        // Do not persist an exact-only draft update or terminal value yet.
+        // GitHub's list and exact-object endpoints can converge at different
+        // times; retaining it would turn a later list response into a false
+        // lifecycle conflict. The next complete snapshot must observe the
+        // changed review through the normal list path.
+        const transition = refetchedFingerprint.state === "PENDING"
+          ? "changed while pending"
+          : "submitted";
+        throw new V2RuntimeFailure(
+          `Pull-request review ${id} ${transition} during exact refetch`,
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      rememberV2ObservedReviewFingerprint(
+        observedIssueCommentEdits,
+        id,
+        data,
+      );
       throw poisonV2ObservedHistory(
         observedIssueCommentEdits,
         `Pull-request review ${id} changed during exact refetch`,
       );
     }
+    rememberV2ObservedReviewFingerprint(
+      observedIssueCommentEdits,
+      id,
+      data,
+    );
   });
+}
+
+async function exactRefetchV2MissingPendingReviews(
+  client,
+  config,
+  budget,
+  missingPendingReviews,
+  observedIssueCommentEdits,
+) {
+  for (const { id, fingerprint: listedFingerprint } of missingPendingReviews ?? []) {
+    let data;
+    try {
+      ({ data } = await client.request(
+        "GET",
+        `${config.repoPath}/pulls/${config.prNumber}/reviews/${id}`,
+        undefined,
+        { budget, safeRead: true },
+      ));
+    } catch (error) {
+      if (error?.httpStatus !== 404) throw error;
+      // A missing list entry can be endpoint lag, not deletion. Require two
+      // exact 404 observations on separate complete-snapshot attempts before
+      // allowing a deleted unsubmitted draft to stop vetoing a prior clean.
+      // Submitted reviews cannot be deleted. If the draft subsequently
+      // reappears, its immutable identity/App/commit binding must still match
+      // and it resumes its ordinary PENDING liveness lock.
+      if (!recordV2PendingReviewDeletionConfirmation(
+        observedIssueCommentEdits,
+        id,
+      )) {
+        throw new V2RuntimeFailure(
+          `Pull-request review ${id} is absent from the list and awaiting a second exact deletion confirmation`,
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      confirmV2PendingReviewDeletion(
+        observedIssueCommentEdits,
+        id,
+        listedFingerprint,
+      );
+      throw new V2RuntimeFailure(
+        `Pull-request review ${id} deletion was confirmed; retry from a fresh complete snapshot`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    budget.consumeObjects(1, `exact missing pending review ${id}`);
+    requireV2ReviewShape(data, `exact missing pending review ${id}`);
+    const refetchedFingerprint = fingerprintReview(data);
+    rememberV2ObservedCarrierFingerprint(
+      observedIssueCommentEdits,
+      "review-identity",
+      id,
+      canonicalJson(fingerprintReviewIdentity(data)),
+    );
+    clearV2PendingReviewDeletionConfirmation(observedIssueCommentEdits, id);
+    if (isV2PendingReviewDraftTransition(listedFingerprint, refetchedFingerprint)) {
+      throw new V2RuntimeFailure(
+        `Pull-request review ${id} remains pending but is absent from the review list`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    if (isV2PendingReviewSubmissionTransition(listedFingerprint, refetchedFingerprint)) {
+      throw new V2RuntimeFailure(
+        `Pull-request review ${id} submitted while absent from the review list`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    rememberV2ObservedReviewFingerprint(observedIssueCommentEdits, id, data);
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      `Previously observed pending pull-request review ${id} changed while absent from the review list`,
+    );
+  }
 }
 
 async function collectAuthorizedV2Requests(client, config, budget, issueComments) {
@@ -4944,6 +5066,21 @@ async function collectV2ProviderEvidence(
           revisionAt,
           activityKind: "invalid-provider-provenance",
         },
+      });
+      continue;
+    }
+    // GitHub exposes PENDING reviews as unsubmitted drafts. Keep their identity
+    // and exact-refetch observations, and treat their presence as liveness that
+    // blocks a prior clean, but never reduce a draft body into a terminal
+    // finding or clean before GitHub publishes its terminal review state.
+    if (review.state === "PENDING") {
+      artifacts.push({
+        source: "pull-request-review",
+        id: String(review.id),
+        kind: "pending",
+        pendingKind: "progress",
+        auditOnly: true,
+        reason: "Codex pull-request review is still pending",
       });
       continue;
     }
@@ -5423,6 +5560,207 @@ function rememberV2ObservedCarrierFingerprint(
     );
   }
   fingerprints.set(key, fingerprint);
+}
+
+function isV2PendingReviewSubmissionTransition(previous, current) {
+  const terminalStates = new Set([
+    "COMMENTED",
+    "APPROVED",
+    "CHANGES_REQUESTED",
+  ]);
+  return isPlainRecord(previous) &&
+    isPlainRecord(current) &&
+    previous.state === "PENDING" &&
+    previous.submittedAtAbsent === true &&
+    terminalStates.has(current.state) &&
+    current.submittedAtAbsent === false &&
+    isCanonicalUtcTimestamp(current.submittedAt) &&
+    hasV2SamePendingReviewBinding(previous, current);
+}
+
+function isV2PendingReviewDraftTransition(previous, current) {
+  return isPlainRecord(previous) &&
+    isPlainRecord(current) &&
+    previous.state === "PENDING" &&
+    current.state === "PENDING" &&
+    previous.submittedAtAbsent === true &&
+    current.submittedAtAbsent === true &&
+    hasV2SamePendingReviewBinding(previous, current);
+}
+
+function isV2AdmittedPendingReviewTransition(previous, current) {
+  return isV2PendingReviewDraftTransition(previous, current) ||
+    isV2PendingReviewSubmissionTransition(previous, current);
+}
+
+function hasV2SameReviewIdentityAndProvenance(previous, current) {
+  return previous.id === current.id &&
+    canonicalJson(previous.author) === canonicalJson(current.author) &&
+    canonicalJson(previous.appSlugs) === canonicalJson(current.appSlugs);
+}
+
+function hasV2SamePendingReviewBinding(previous, current) {
+  return hasV2SameReviewIdentityAndProvenance(previous, current) &&
+    previous.commitId === current.commitId;
+}
+
+function rememberV2ObservedReviewFingerprint(observed, id, review) {
+  const current = fingerprintReview(review);
+  const fingerprint = canonicalJson(current);
+  if (!(observed instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  restoreV2PendingReviewAfterConfirmedDeletion(observed, id, current);
+  let fingerprints = observed.get(V2_OBSERVED_CARRIER_FINGERPRINTS);
+  if (!(fingerprints instanceof Map)) {
+    fingerprints = new Map();
+    observed.set(V2_OBSERVED_CARRIER_FINGERPRINTS, fingerprints);
+  }
+  const key = `review-rest:${id}`;
+  const previous = fingerprints.get(key);
+  if (previous !== undefined && previous !== fingerprint) {
+    let parsedPrevious;
+    try {
+      parsedPrevious = JSON.parse(previous);
+    } catch {
+      throw poisonV2ObservedHistory(
+        observed,
+        `Previously observed review-rest issue-comment ${id} changed`,
+      );
+    }
+    // The protected property is the provider review's immutable identity and
+    // provenance. An untimestamped PENDING review is an unsubmitted draft, so
+    // GitHub can update its body before submission, then add terminal state,
+    // body, commit binding, and submission time together. Those monotonic
+    // draft transitions are snapshot churn; every terminal value remains
+    // immutable and any identity/provenance drift still fails closed.
+    if (!isV2AdmittedPendingReviewTransition(parsedPrevious, current)) {
+      throw poisonV2ObservedHistory(
+        observed,
+        `Previously observed review-rest issue-comment ${id} changed`,
+      );
+    }
+  }
+  clearV2PendingReviewDeletionConfirmation(observed, id);
+  fingerprints.set(key, fingerprint);
+}
+
+function retainV2ObservedReviewFingerprints(observed, entries) {
+  if (!(observed instanceof Map)) return [];
+  assertV2ObservedHistoryNotPoisoned(observed);
+  const current = new Map(entries ?? []);
+  let fingerprints = observed.get(V2_OBSERVED_CARRIER_FINGERPRINTS);
+  if (!(fingerprints instanceof Map)) {
+    fingerprints = new Map();
+    observed.set(V2_OBSERVED_CARRIER_FINGERPRINTS, fingerprints);
+  }
+  const prefix = "review-rest:";
+  const missingPendingReviews = [];
+  for (const key of fingerprints.keys()) {
+    if (!key.startsWith(prefix)) continue;
+    const id = key.slice(prefix.length);
+    if (!current.has(id)) {
+      const previous = parseV2ObservedReviewFingerprint(
+        fingerprints.get(key),
+        observed,
+        id,
+      );
+      if (previous.state === "PENDING" && previous.submittedAtAbsent === true) {
+        missingPendingReviews.push({ id, fingerprint: previous });
+        continue;
+      }
+      throw poisonV2ObservedHistory(
+        observed,
+        `Previously observed review-rest issue-comment ${id} disappeared`,
+      );
+    }
+  }
+  for (const [id, review] of current) {
+    rememberV2ObservedReviewFingerprint(observed, id, review);
+  }
+  return missingPendingReviews;
+}
+
+function parseV2ObservedReviewFingerprint(value, observed, id) {
+  try {
+    const parsed = JSON.parse(value);
+    if (
+      !isPlainRecord(parsed) ||
+      parsed.id !== String(id) ||
+      typeof parsed.state !== "string" ||
+      typeof parsed.submittedAtAbsent !== "boolean" ||
+      !Array.isArray(parsed.appSlugs)
+    ) {
+      throw new Error("invalid review fingerprint");
+    }
+    return parsed;
+  } catch {
+    throw poisonV2ObservedHistory(
+      observed,
+      `Previously observed review-rest issue-comment ${id} has an invalid fingerprint`,
+    );
+  }
+}
+
+function recordV2PendingReviewDeletionConfirmation(observed, id) {
+  if (!(observed instanceof Map)) return false;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  let confirmations = observed.get(V2_PENDING_REVIEW_DELETION_CONFIRMATIONS);
+  if (!(confirmations instanceof Map)) {
+    confirmations = new Map();
+    observed.set(V2_PENDING_REVIEW_DELETION_CONFIRMATIONS, confirmations);
+  }
+  const next = (confirmations.get(String(id)) || 0) + 1;
+  confirmations.set(String(id), next);
+  return next >= 2;
+}
+
+function clearV2PendingReviewDeletionConfirmation(observed, id) {
+  if (!(observed instanceof Map)) return;
+  const confirmations = observed.get(V2_PENDING_REVIEW_DELETION_CONFIRMATIONS);
+  confirmations?.delete(String(id));
+}
+
+function confirmV2PendingReviewDeletion(observed, id, fingerprint) {
+  if (!(observed instanceof Map)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  const fingerprints = observed.get(V2_OBSERVED_CARRIER_FINGERPRINTS);
+  if (!(fingerprints instanceof Map)) {
+    throw poisonV2ObservedHistory(
+      observed,
+      `Previously observed pending pull-request review ${id} lost its fingerprint before deletion confirmation`,
+    );
+  }
+  const key = `review-rest:${id}`;
+  if (fingerprints.get(key) !== canonicalJson(fingerprint)) {
+    throw poisonV2ObservedHistory(
+      observed,
+      `Previously observed pending pull-request review ${id} changed before deletion confirmation`,
+    );
+  }
+  let deleted = observed.get(V2_CONFIRMED_DELETED_PENDING_REVIEW_FINGERPRINTS);
+  if (!(deleted instanceof Map)) {
+    deleted = new Map();
+    observed.set(V2_CONFIRMED_DELETED_PENDING_REVIEW_FINGERPRINTS, deleted);
+  }
+  deleted.set(String(id), canonicalJson(fingerprint));
+  fingerprints.delete(key);
+  clearV2PendingReviewDeletionConfirmation(observed, id);
+}
+
+function restoreV2PendingReviewAfterConfirmedDeletion(observed, id, current) {
+  if (!(observed instanceof Map)) return;
+  const deleted = observed.get(V2_CONFIRMED_DELETED_PENDING_REVIEW_FINGERPRINTS);
+  if (!(deleted instanceof Map)) return;
+  const previous = deleted.get(String(id));
+  if (previous === undefined) return;
+  const parsedPrevious = parseV2ObservedReviewFingerprint(previous, observed, id);
+  if (!isV2PendingReviewDraftTransition(parsedPrevious, current)) {
+    throw poisonV2ObservedHistory(
+      observed,
+      `Confirmed-deleted pending pull-request review ${id} reappeared with a changed binding`,
+    );
+  }
+  deleted.delete(String(id));
 }
 
 function retainV2ObservedCarrierFingerprints(observed, source, entries) {
@@ -6311,9 +6649,13 @@ function requireV2ReviewShape(review, label) {
     "CHANGES_REQUESTED",
     "DISMISSED",
   ]);
-  const submittedAtIsValid = review?.submitted_at === null
-    ? review?.state === "PENDING"
-    : isCanonicalUtcTimestamp(review?.submitted_at);
+  // GitHub's REST API can represent an in-progress review by omitting
+  // `submitted_at` rather than returning null. Preserve the existing handling
+  // of a present timestamp, but recognize either absent form only for PENDING.
+  const submittedAtIsValid =
+    review?.submitted_at === null || review?.submitted_at === undefined
+      ? review?.state === "PENDING"
+      : isCanonicalUtcTimestamp(review?.submitted_at);
   if (
     !isPlainRecord(review) ||
     !canonicalPositiveId(review.id) ||
@@ -6658,6 +7000,7 @@ function fingerprintReview(review) {
     body: review?.body ?? null,
     state: review?.state ?? null,
     commitId: review?.commit_id ?? null,
+    submittedAtAbsent: review?.submitted_at === null || review?.submitted_at === undefined,
     submittedAt: review?.submitted_at ?? review?.created_at ?? null,
     author: fingerprintActor(review?.user),
     appSlugs: [review?.app?.slug ?? null, review?.performed_via_github_app?.slug ?? null],

@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Stable Action `v2.0.2` and the floating `v2` alias are published from
+- Stable Action `v2.0.3` and the floating `v2` alias are published from
   `JoeyTeng/codex-review-gate-action`. This workstream implements and carries
   out the user-approved organization-wide transition from the inherited v1
   required status to v2.
@@ -936,13 +936,67 @@ evidence that a prior freeze remains in force.
   semantics remain unchanged. A regression fixture combines an ordinary
   current request, an older canonical request bound to `OLD_HEAD`, and a later
   current-head clean receipt, and requires a successful decision.
-- At this checkpoint `v2.0.3` is not yet released. Source v2 ruleset
-  `23927388` remains Disabled, source ruleset `16410326` still requires the v1
-  status, and neither source-policy activation nor v1-status cleanup has been
-  performed. After publication, `#64` must first obtain a fresh verifier run
-  for its then-current base/test-merge scope (using draft-to-ready when needed);
-  an exact-head reconcile is reserved for a recoverable initial result before
-  those separate mutations can proceed.
+- `v2.0.3` published successfully on 2026-09-24, and the signed floating `v2`
+  alias resolves to its release commit. Source v2 ruleset `23927388` remains
+  Disabled and source ruleset `16410326` still requires the v1 status; neither
+  source-policy activation nor v1-status cleanup has been performed.
+- Refreshing `#64` exposed a separate GitHub REST compatibility detail: a
+  normal human `PENDING` pull-request review can omit `submitted_at` entirely.
+  The verifier treated that documented non-terminal shape as malformed and
+  returned `wait_then_reconcile`, even though the current canonical request and
+  official current-head terminal-clean receipt were otherwise valid. The next
+  narrow runtime release accepts missing or null `submitted_at` only for
+  `PENDING`, while preserving the existing canonical-timestamp requirement for
+  every present terminal-review submission. This preserves terminal-evidence
+  integrity while avoiding a permanent fail-closed state on an ordinary
+  in-progress review.
+- The `v2.0.4` release intent freezes that narrow compatibility repair against
+  the published `v2.0.3` wrapper head. Regression coverage uses the actual REST
+  absence shape (no `submitted_at` or surrogate `created_at`) for both an
+  ordinary human review and a provider-identifiable review that goes through
+  exact REST refetch. It also proves that an `APPROVED` review with the same
+  absent field stays unhealthy/pending. The Action design documents the
+  resulting invariant: only `PENDING` may be an untimestamped non-terminal
+  snapshot carrier; it cannot contribute clean, ordering, or supersession
+  authority, and all terminal review states still fail closed without a
+  canonical submission timestamp.
+- Independent fixed-range review found that a provider-identifiable `PENDING`
+  review with a finding-shaped draft body and a `created_at` could otherwise
+  enter the terminal reducer, close a lineage gap, and indirectly participate
+  in finding supersession. The release therefore keeps every PENDING review in
+  pagination, identity, fingerprint, and exact-refetch observation, but drops
+  its body before provider-artifact reduction. This does not discard a
+  published finding: PENDING is an unsubmitted draft, so its body has no
+  finding/clean authority, but the official pending review is retained as
+  timestamp-independent liveness evidence that blocks every pass until a
+  terminal result is stably observed. Its terminal submission is picked up by
+  the normal exact-head reconcile path, while inline conversations remain
+  enforced by the ruleset. A regression gives such a draft a canonical finding
+  body and timestamp, then proves it contributes no finding counts while still
+  preventing a pre-existing clean from passing.
+- The same review can legitimately transition from `PENDING` to a submitted
+  terminal state while one reconciliation is reading GitHub. The generic
+  immutable-carrier latch would have treated that lifecycle transition as a
+  permanent conflict, so v2.0.4 admits only a monotonic transition from a
+  raw-untimestamped (`submitted_at` absent or null) `PENDING` review to a
+  canonical-timestamped `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`
+  terminal with the same review ID, actor/App provenance, and commit binding.
+  An unsubmitted draft body may change, so a draft-body update restarts
+  stability rather than poisoning history; an exact-only update abandons that
+  snapshot until the normal list converges. This preserves the protected
+  identity/binding property while avoiding a permanent block on a GitHub
+  operation that is legal before review submission.
+- A provider `PENDING` draft can also be deleted before submission. A missing
+  list entry is therefore not treated as proof of deletion: v2.0.4 requires
+  two exact `404` reads in separate complete-snapshot attempts, then forces a
+  fresh full snapshot before releasing that draft's liveness lock. A missing
+  review that exact-fetches as still `PENDING` remains live; an allowed
+  terminal waits for ordinary-list convergence. If it reappears after confirmed
+  deletion, it becomes live again only with the same ID, actor/App provenance,
+  and commit binding; all other reappearance or lifecycle drift remains
+  fail-closed. Regression coverage exercises draft-update churn, exact/list
+  lag, confirmed deletion, reappearance, and commit-binding drift without
+  allowing an earlier clean to pass.
 
 ## Next Steps
 
@@ -957,21 +1011,21 @@ evidence that a prior freeze remains in force.
    cohort repository. The old organization ruleset intentionally remains Active
    only for deletion and non-fast-forward protection, including the archived
    legacy-only repository.
-3. Publish the narrow `v2.0.3` terminal-clean receipt patch, refresh source
-   canary `#64` for its current base/test-merge scope, reconcile only if its
-   initial result is recoverably pending, then activate the staged status-only
-   v2 rule for `Joey-Tools/codex-review-gate` and remove only the independent
-   source ruleset `16410326` v1 status requirement while preserving its
-   non-status protections. This source-local exception is outside the frozen
-   10-member cohort and must not be used to expand the organization closure
-   receipt or bridge-removal scope.
+3. Publish the narrow PENDING-review schema tolerance, then reconcile source
+   canary `#64` on its exact current head/test-merge scope. Only after its
+   result is healthy and successful may the staged status-only v2 rule for
+   `Joey-Tools/codex-review-gate` activate; remove only the independent source
+   ruleset `16410326` v1 status requirement in the separately approved cleanup,
+   preserving its non-status protections. This source-local exception is
+   outside the frozen 10-member cohort and must not be used to expand the
+   organization closure receipt or bridge-removal scope.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.
 
 ## Evidence
 
-- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.0.1`
+- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.0.3`
 - Old organization ruleset: `Joey-Tools` ruleset `16590367`, read through
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:

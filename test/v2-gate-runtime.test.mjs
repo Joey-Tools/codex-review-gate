@@ -172,6 +172,396 @@ test("canonical workflow request binds repository, PR, head, base epoch, and run
   assert.equal(canonicalV2RequestComments([workflowRequest()]).length, 1);
 });
 
+test("REST PENDING reviews with omitted submitted_at block pass without reducing draft findings", async (context) => {
+  const pendingReview = {
+    id: 403,
+    state: "PENDING",
+    body: "",
+    commit_id: HEAD,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#pullrequestreview-403`,
+    user: HUMAN,
+    app: null,
+    performed_via_github_app: null,
+  };
+  const providerPendingReview = {
+    id: 405,
+    state: "PENDING",
+    body: [
+      "### 💡 Codex Review",
+      "",
+      `https://github.com/${REPOSITORY}/blob/${HEAD}/src/pending-finding.mjs#L1`,
+    ].join("\n"),
+    commit_id: HEAD,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#pullrequestreview-405`,
+    user: CODEX_BOT,
+    app: null,
+    performed_via_github_app: CODEX_APP,
+  };
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviews: [pendingReview, providerPendingReview],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-omitted-submitted-at",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(Object.hasOwn(providerPendingReview, "submitted_at"), false);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.match(result.report.reason, /official Codex pull-request review remains pending/iu);
+  assert.deepEqual(result.report.counts, {
+    unresolved: 0,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  assert.ok(github.calls.some((call) =>
+    call.method === "GET" &&
+    call.path === `/repos/${REPOSITORY}/pulls/${PR}/reviews/${providerPendingReview.id}`
+  ));
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a provider PENDING submission restarts stability before a terminal clean can pass", async (context) => {
+  const request = ordinaryRequest();
+  const terminal = approvedReview(HEAD, {
+    id: 405,
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const pending = pendingReviewFrom(terminal);
+  const github = createGitHubMock({
+    issueComments: [request],
+    reviewSnapshots: [[pending], [terminal], [terminal], [terminal]],
+    reactionsByCommentId: new Map([[String(request.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:01:00Z",
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-submission-stability",
+  });
+  const { result, sleeps } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(sleeps.length, 2);
+});
+
+test("a provider PENDING submission during exact refetch retries before evaluating a terminal finding", async (context) => {
+  const terminal = findingReview(HEAD, {
+    id: 406,
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const pending = pendingReviewFrom(terminal);
+  let exactReads = 0;
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reviewSnapshots: [[pending], [terminal], [terminal]],
+    reviewRefetchMutator: (review) => {
+      exactReads += 1;
+      return exactReads === 1 ? terminal : review;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-submission-exact-refetch",
+  });
+  const { result, sleeps } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.deepEqual(result.report.counts, {
+    unresolved: 1,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  assert.equal(sleeps.length, 1);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an exact pending-to-terminal transition does not poison a lagging review list", async (context) => {
+  const terminal = findingReview(HEAD, {
+    id: 409,
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const pending = pendingReviewFrom(terminal);
+  let exactReads = 0;
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reviewSnapshots: [[pending], [pending], [terminal], [terminal]],
+    reviewRefetchMutator: (review) => {
+      exactReads += 1;
+      return exactReads === 1 ? terminal : review;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-lagging-list-after-exact-submission",
+  });
+  const { result, sleeps } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.deepEqual(result.report.counts, {
+    unresolved: 1,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  assert.equal(sleeps.length, 2);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a provider PENDING draft update restarts stability before a terminal finding is evaluated", async (context) => {
+  const terminal = findingReview(HEAD, {
+    id: 410,
+    submitted_at: "2026-08-25T08:03:00Z",
+  });
+  const pending = pendingReviewFrom(terminal, {
+    body: "Initial Codex draft body.",
+  });
+  const editedPending = {
+    ...pending,
+    body: "Updated Codex draft body.",
+  };
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewSnapshots: [[pending], [editedPending], [terminal], [terminal]],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-draft-update",
+  });
+  const { result, sleeps } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.deepEqual(result.report.counts, {
+    unresolved: 1,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  assert.equal(sleeps.length, 1);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an exact provider PENDING draft update retries until the review list converges", async (context) => {
+  const terminal = findingReview(HEAD, {
+    id: 414,
+    submitted_at: "2026-08-25T08:03:00Z",
+  });
+  const pending = pendingReviewFrom(terminal, {
+    body: "Initial Codex draft body.",
+  });
+  const editedPending = {
+    ...pending,
+    body: "Updated Codex draft body.",
+  };
+  let exactReads = 0;
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewSnapshots: [[pending], [editedPending], [terminal], [terminal]],
+    reviewRefetchMutator: (review) => {
+      exactReads += 1;
+      return exactReads === 1 ? editedPending : review;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-draft-update-exact-refetch",
+  });
+  const { result, sleeps } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.deepEqual(result.report.counts, {
+    unresolved: 1,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  assert.equal(sleeps.length, 2);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a disappearing provider PENDING review remains blocking until exact deletion is confirmed twice", async (context) => {
+  const pending = pendingReviewFrom(approvedReview(HEAD, {
+    id: 411,
+    submitted_at: "2026-08-25T08:03:00Z",
+  }));
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviews: [],
+    reviewSnapshots: [[pending], [], [], [], [], []],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-exact-deletion-confirmation",
+  });
+  const { result, sleeps } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(sleeps.length, 3);
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" &&
+      path === `/repos/${REPOSITORY}/pulls/${PR}/reviews/${pending.id}`
+    ).length,
+    3,
+  );
+});
+
+test("a temporarily omitted provider PENDING review cannot release an earlier clean", async (context) => {
+  const pending = pendingReviewFrom(approvedReview(HEAD, {
+    id: 412,
+    submitted_at: "2026-08-25T08:03:00Z",
+  }));
+  let exactReads = 0;
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviews: [],
+    reviewSnapshots: [[pending], [], [], []],
+    requestInterceptor: ({ method, path }) => {
+      if (
+        method === "GET" &&
+        path === `/repos/${REPOSITORY}/pulls/${PR}/reviews/${pending.id}` &&
+        exactReads++ > 0
+      ) {
+        return jsonResponse(pending);
+      }
+      return undefined;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-list-omission",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a provider PENDING review that reappears after confirmed deletion becomes live again", async (context) => {
+  const pending = pendingReviewFrom(approvedReview(HEAD, {
+    id: 413,
+    submitted_at: "2026-08-25T08:03:00Z",
+  }));
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviews: [],
+    reviewSnapshots: [[pending], [], [], [pending], [pending]],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "pending-review-reappearance-after-deletion",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 4,
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.match(result.report.reason, /official Codex pull-request review remains pending/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("only an untimestamped PENDING review can move to a submitted terminal state", async (context) => {
+  for (const {
+    suffix,
+    terminalState,
+    pendingFrom,
+  } of [
+    {
+      suffix: "pending-with-submitted-at",
+      terminalState: "APPROVED",
+      pendingFrom: (terminal) => ({
+        ...terminal,
+        state: "PENDING",
+        submitted_at: "2026-08-25T08:01:00Z",
+      }),
+    },
+    {
+      suffix: "pending-to-dismissed",
+      terminalState: "DISMISSED",
+      pendingFrom: pendingReviewFrom,
+    },
+    {
+      suffix: "pending-commit-drift",
+      terminalState: "APPROVED",
+      pendingFrom: (terminal) => pendingReviewFrom(terminal, { commit_id: BASE }),
+    },
+  ]) {
+    const request = ordinaryRequest();
+    const terminal = approvedReview(HEAD, {
+      id: suffix === "pending-with-submitted-at" ? 407 : 408,
+      state: terminalState,
+      submitted_at: "2026-08-25T08:02:00Z",
+    });
+    const pending = pendingFrom(terminal);
+    const github = createGitHubMock({
+      issueComments: [request],
+      reviewSnapshots: [[pending], [terminal], [terminal]],
+      reactionsByCommentId: new Map([[String(request.id), [reaction({
+        content: "eyes",
+        created_at: "2026-08-25T08:01:00Z",
+      })]]]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `pending-review-invalid-transition-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.report.executionHealth, "unhealthy");
+    assert.equal(result.report.gateOutcome, "pending");
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  }
+});
+
+test("a terminal review with omitted submitted_at remains fail-closed", async (context) => {
+  const malformedTerminalReview = {
+    id: 404,
+    state: "APPROVED",
+    body: "",
+    commit_id: HEAD,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#pullrequestreview-404`,
+    user: HUMAN,
+    app: null,
+    performed_via_github_app: null,
+  };
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviews: [malformedTerminalReview],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "terminal-review-omitted-submitted-at",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+});
+
 test("qualifying +1 is strict, head-bound, and vetoed by same-or-later eyes", () => {
   const request = workflowRequest();
   const requests = canonicalV2RequestComments([request]);
@@ -8520,6 +8910,16 @@ function approvedReview(commitRef = HEAD, overrides = {}) {
     performed_via_github_app: null,
     ...overrides,
   };
+}
+
+function pendingReviewFrom(review, overrides = {}) {
+  const pending = {
+    ...review,
+    ...overrides,
+    state: "PENDING",
+  };
+  delete pending.submitted_at;
+  return pending;
 }
 
 function progressIssueComment(overrides = {}) {
