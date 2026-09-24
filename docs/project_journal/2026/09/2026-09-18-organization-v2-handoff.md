@@ -27,11 +27,11 @@ superseded_by:
   removal work.
 - The source repository `Joey-Tools/codex-review-gate` is deliberately outside
   that active 10-member cohort. Its separate repository ruleset `16410326`
-  still requires `codex/review-gate` as a temporary v1 self-gate; it was not
-  selected by either organization ruleset or by the eight repository-local
-  cleanup surfaces. A dedicated source bootstrap must stage and activate a
-  separate v2 rule, then remove only that independent v1 status requirement
-  before v1 can be retired from the source repository.
+  no longer requires `codex/review-gate`: a dedicated source-local cleanup
+  removed only that independent v1 status requirement after status-only v2
+  activation and a separately approved plan. The source remains outside both
+  organization rulesets and the eight repository-local cleanup surfaces; its
+  temporary bridge remains a separate future closure-proof concern.
 - This is not a broad relaxation of the ordinary installer. It adds a separate,
   auditable temporary-bridge profile and a manifest-bound organization handoff
   transaction. The normal completed-installation contract continues to reject
@@ -1039,6 +1039,30 @@ evidence that a prior freeze remains in force.
   have written: preserve Active v2 and the bridge, run read-only diagnosis, and
   authorize any repair separately rather than replaying the request.
 
+## Execution Update — 2026-09-24 (source v1 required-status cleanup)
+
+- Source PR `#68` merged the plan-bound source executor as
+  `master@3bdcac7852b8a0ed8ffd152fabda62def094a548`. The post-merge live
+  derivation was bound to owner-approved legacy inventory
+  `6f45529bcd98362f6bc7bad9b5253859d363d811a29c647ccaf98a804b574288` and
+  separately approved raw plan
+  `d56a3da4d119c8b20083596173cb1c626c0eeb2ed4ae887ac951e6e9f105f5a7`.
+- The plan's pre-cleanup security digest was
+  `9314a6094eeac720785db76ba227d17bbfc3fa47e3b352980112b4ce084204f2`; its
+  expected post-cleanup security digest was
+  `c09f18dbb19e46f235d669697fac6575168fe3d780c8cda92522cfedf4dfdb2e`.
+  Its only authorized mutation was one PUT to repository ruleset `16410326`,
+  `PR must pass codex review`, removing only `codex/review-gate`.
+- The executor's exact readback and two complete stable post-cleanup snapshots
+  succeeded. Both legacy required-status surfaces are clear; ruleset `16410326`
+  retains deletion, non-fast-forward, and pull-request/conversation policy;
+  Active status-only v2 ruleset `23927388`, `Must Pass Codex Review v2`, still
+  strictly requires the GitHub-Actions-bound `codex/github-review-gate` check
+  with no bypass actors.
+- The temporary source legacy bridge remains installed. This operation did not
+  mutate the fixed organization cohort, its organization ruleset, or archived
+  `codex-waited-delivery`; it does not authorize any bridge removal.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -1052,14 +1076,11 @@ evidence that a prior freeze remains in force.
    cohort repository. The old organization ruleset intentionally remains Active
    only for deletion and non-fast-forward protection, including the archived
    legacy-only repository.
-3. Merge the source-only plan-bound cleanup executor, then derive a fresh
-   source-local plan and obtain a separate approval before removing only the
-   independent source ruleset `16410326` `codex/review-gate` requirement.
-   Preserve its non-status protections, keep v2 Active, and require the exact
-   post-write readback plus two-round closure before declaring the source
-   transition complete. This source-local exception is outside the frozen
-   10-member cohort and must not be used to expand the organization closure
-   receipt or bridge-removal scope.
+3. Treat the source required-status transition as complete: `16410326` no
+   longer requires `codex/review-gate`, while v2 is Active and its non-status
+   protections remain. Keep the source bridge installed until a distinct,
+   separately authorized source-local closure proof exists; the organization
+   closure receipt cannot authorize it.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.

@@ -10,12 +10,12 @@
 - The source repository `Joey-Tools/codex-review-gate` is not part of that
   cohort. Its canonical v2 verifier and controller are installed alongside an
   exact temporary v1 bridge, and separate status-only v2 ruleset `23927388`
-  is Active after source canary `#67`. Independent repository ruleset
-  `16410326` remains a temporary v1 `codex/review-gate` self-gate until the
-  merged source-only plan-bound executor applies a freshly approved cleanup
-  plan and verifies its exact post-state. The controller admits only exact
-  Codex-bot `issue_comment` `created` events; edited carriers use protected
-  manual reconciliation.
+  is Active after source canary `#67`. The separately approved source-local
+  cleanup has removed the v1 `codex/review-gate` required status from
+  independent repository ruleset `16410326` while retaining its non-status
+  protections; the temporary bridge remains intentionally installed. The
+  controller admits only exact Codex-bot `issue_comment` `created` events;
+  edited carriers use protected manual reconciliation.
 - Per-workstream details live under `docs/project_journal/`; keep this file as a short repo-wide recovery entrypoint.
 
 ## Recovery Pointers
@@ -31,14 +31,12 @@
   The receipt must still bind equal manifest-derived and observed identity
   lists; it cannot authorize removal of a source-local bridge outside that
   cohort.
-- The source repository's local ruleset `16410326` still requires
-  `codex/review-gate`. It is an independent temporary v1 self-gate, not a
-  member of the fixed organization cohort or a repository-cleanup surface. Its
-  canonical v2 verifier/controller, temporary bridge, and Active status-only
-  v2 ruleset are installed. The remaining source-local cleanup needs a merged
-  plan-bound executor, a freshly derived and separately approved plan, and its
-  exact readback/closure proof; this must not broaden the organization receipt
-  scope.
+- The source repository's v1 required-status transition is complete: its
+  independent local ruleset `16410326` no longer requires
+  `codex/review-gate`, while Active status-only v2 ruleset `23927388` and every
+  unrelated protection remain intact. Its temporary bridge is intentionally
+  retained. Any later source-local bridge removal needs its own separately
+  authorized closure proof and must not broaden the organization receipt scope.
 - The old rule's original 11-repository legacy selector remains intact,
   including archived `Joey-Tools/codex-waited-delivery`. The completed final
   cutover removed only the v1 required-status rule; it retains `deletion` and
