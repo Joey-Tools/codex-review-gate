@@ -306,7 +306,19 @@ identity/default-branch drift 或 `archived: false` 都是 inconclusive，绝不
    前停止。记录所有 bound IDs，并让 canary 保持 open、non-draft、same-repository、
    current-base，直到 shared organization activation 被证明。旧 organization v1 rule 与
    所有 repository legacy requirements 必须仍然存在。
-3. 完成并独立审阅 `HANDOFF_MANIFEST`，运行只读 organization plan：
+3. 完成并独立审阅 `HANDOFF_MANIFEST`。运行任何 manifest-bound ruleset detail GET 或只读
+   organization plan 前，选择对每个绑定 ruleset 都有 write access 的 credential：两个
+   organization ruleset、全部十个 repository v2 ruleset，以及每个 repository-local cleanup
+   surface。调用者缺少相应 access 时，GitHub 会省略 `bypass_actors`；这表示被脱敏，而不是
+   证明它是 `[]`。可见的 `null` 或其他非数组值均为 malformed。此时停止，切换到合格
+   credential，并在适用 freeze 下重新开始受影响的只读 preview；不得复用不完整 receipt，也
+   不得推断 bypass list 为空。
+
+   Manifest 中 materialized 的 repository-v2 parameters 是 exact policy：完整
+   merge-method 集合、空 reviewer/dismissal-actor lists、启用的 unattributed-change approval，
+   以及 `do_not_enforce_on_create: false` 都必须按绑定值读回；缺失、额外或变化的值都是 drift。
+
+   然后运行只读 organization plan：
 
    ```bash
    node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \

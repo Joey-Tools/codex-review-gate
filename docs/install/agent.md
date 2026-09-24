@@ -378,7 +378,21 @@ Execute the following state machine in order.
    organization v1 rule and all repository legacy requirements must still be
    present.
 3. Complete and independently review `HANDOFF_MANIFEST`. Run the read-only
-   organization plan:
+   organization plan. Before any manifest-bound ruleset detail GET, select a
+   credential with write access to every bound ruleset: the two organization
+   rulesets, all ten repository v2 rulesets, and every repository-local cleanup
+   surface. GitHub omits `bypass_actors` for a caller that lacks that access;
+   omission is redaction rather than proof of `[]`, while `null` or another
+   non-array value is malformed. Stop, switch to an eligible credential, and
+   restart the affected read-only preview under the applicable freeze. Do not
+   reuse an incomplete receipt or infer an empty bypass list.
+
+   The manifest's materialized repository-v2 parameters are exact policy:
+   full merge methods, empty reviewer/dismissal-actor lists, enabled
+   unattributed-change approval, and `do_not_enforce_on_create: false` must
+   read back as bound. Missing, extra, or changed values are drift.
+
+   Then run the organization plan:
 
    ```bash
    node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \

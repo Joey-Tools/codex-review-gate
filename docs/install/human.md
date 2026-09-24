@@ -362,6 +362,22 @@ source blob/SHA-256, required initial `active` state, and drain budget. Missing,
 extra or reordered members, or any scheduler descriptor on another repository,
 are hard failures.
 
+Before completing that manifest or minting a final receipt, use a credential
+with write access to **every** manifest-bound ruleset detail: both organization
+rulesets, every active repository v2 ruleset, and every repository-local
+cleanup surface. GitHub deliberately omits `bypass_actors` for callers without
+write access to that ruleset. An omitted property is redacted, not `[]`; a
+visible `null` or non-array is malformed. Stop, obtain an eligible credential,
+and restart the affected read-only preview under the applicable freeze. Do not
+infer an empty bypass list or reuse a receipt from an incompletely disclosed
+read.
+
+The v3 manifest binds the observed, materialized repository-v2 parameters
+exactly. Its full merge-method set, empty reviewer/dismissal-actor lists,
+unattributed-change approval, and `do_not_enforce_on_create: false` are frozen
+policy values; a missing, additional, or different value is drift rather than
+a harmless API default.
+
 The exact `activation` fields are
 `legacy_evidence_stability_timeout_ms`, `repository_evidence_timeout_ms`,
 `scheduler_snapshot_timeout_ms`, `organization_evidence_timeout_ms`,

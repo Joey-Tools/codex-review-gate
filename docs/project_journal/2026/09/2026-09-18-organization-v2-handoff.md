@@ -1066,14 +1066,39 @@ evidence that a prior freeze remains in force.
   mutate the fixed organization cohort, its organization ruleset, or archived
   `codex-waited-delivery`; it does not authorize any bridge removal.
 
+## Execution Update — 2026-09-24 (final-closure reader disclosure boundary)
+
+- A read-only 10/10 repository-v2 audit found one identical visible policy
+  shape across the active cohort. GitHub now materializes the complete
+  merge-method set, empty reviewer and dismissal-actor lists, the enabled
+  unattributed-change approval, and `do_not_enforce_on_create: false` in each
+  detail response. The v3 template and validator bind those exact values;
+  they are not accepted as permissive reader defaults. The Copilot
+  unattributed-change approval is documented as enabled by default, while the
+  remaining fields are recorded as observed frozen policy values.
+- The same audit also established that the current read credential does not
+  disclose `bypass_actors` on repository-ruleset detail reads. GitHub documents
+  that omission as a write-access visibility boundary, so it is redaction—not
+  proof of an empty list. The helper now rejects an omitted property with an
+  actionable credential-recovery error and rejects visible `null`/non-array
+  values as malformed. It never converts either form to `[]`.
+- This requirement applies to every manifest-bound ruleset detail read: both
+  organization rulesets, the ten repository v2 rulesets, and all eight local
+  cleanup surfaces. No organization or repository policy was changed and no
+  schema-2 receipt was minted by this audit. A final read must use a credential
+  that GitHub recognizes as having ruleset write access, then establish a fresh
+  applicable policy-mutation freeze and produce a new complete read-only
+  receipt; an inherited effective-rule projection cannot replace the direct
+  organization detail proof.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
-   bridge-removal PR, obtain a fresh applicable policy-mutation freeze and
-   repair or extend the post-activation stable-reader path enough to mint the
-   canonical schema-2 final read-only closure receipt against the now-cut-over
-   state. That receipt cannot authorize a source-local bridge outside the
-   frozen cohort.
+   bridge-removal PR, use a ruleset-write-capable credential for every
+   manifest-bound detail read, obtain a fresh applicable policy-mutation freeze,
+   and mint the canonical schema-2 final read-only closure receipt against the
+   now-cut-over state. That receipt cannot authorize a source-local bridge
+   outside the frozen cohort.
 2. Treat the cohort v1 status transition as complete: do not restore
    `codex/review-gate` in the old organization rule or on any fixed active
    cohort repository. The old organization ruleset intentionally remains Active
@@ -1095,9 +1120,13 @@ evidence that a prior freeze remains in force.
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:
   `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`.
-- Current delivery validation: after the current-head review follow-up,
-  `npm run check` passed and the complete
-  `test/organization-review-gate-handoff.test.mjs` suite completed
-  successfully. Earlier dedicated v2 workflow-contract and workflow-security
-  validation remain recorded above. `git diff --check` and project-journal
-  validation passed after this checkpoint was updated.
+- Current delivery validation: `npm run check`, `git diff --check`, and
+  project-journal validation passed. The complete
+  `test/organization-review-gate-handoff.test.mjs` suite passed before the
+  final bilingual documentation and omitted-materialized-field regression
+  correction; that new regression passed in its targeted suite along with
+  syntax and template validation. A subsequent repository-wide `npm test`
+  reached the unrelated serial `v2-release-pipeline` suite but remained idle
+  without a terminal result for 15 minutes, so it was interrupted and is not
+  recorded as passing. Earlier dedicated v2 workflow-contract and
+  workflow-security validation remain recorded above.

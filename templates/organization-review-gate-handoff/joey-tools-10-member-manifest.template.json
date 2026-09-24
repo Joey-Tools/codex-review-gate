@@ -120,11 +120,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -136,7 +147,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -291,11 +303,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -307,7 +330,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -462,11 +486,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -478,7 +513,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -642,11 +678,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -658,7 +705,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -734,11 +782,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -750,7 +809,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -905,11 +965,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -921,7 +992,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -1076,11 +1148,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -1092,7 +1175,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -1247,11 +1331,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -1263,7 +1358,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -1418,11 +1514,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -1434,7 +1541,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
@@ -1589,11 +1697,22 @@
             {
               "type": "pull_request",
               "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
                 "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
                 "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
                 "require_last_push_approval": false,
                 "required_approving_review_count": 0,
-                "required_review_thread_resolution": true
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
               }
             },
             {
@@ -1605,7 +1724,8 @@
                     "integration_id": 15368
                   }
                 ],
-                "strict_required_status_checks_policy": true
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
               }
             },
             {
