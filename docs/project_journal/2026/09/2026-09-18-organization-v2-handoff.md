@@ -827,7 +827,9 @@ evidence that a prior freeze remains in force.
   for this narrow source rule. Their derived state removes only
   `codex/review-gate` from the old rule and compares every remaining security
   field across stable snapshots, so deletion, non-fast-forward, and
-  pull-request/CODEOWNERS protections cannot be silently lost.
+  pull-request/conversation policy cannot be silently lost. Canonical workflow
+  CODEOWNERS ownership is a distinct control-plane artifact, not a ruleset
+  Code Owner review requirement.
 - The source controller admits only an exact Codex-bot `issue_comment`
   `created` event before allocating a runner. An edited comment cannot restart
   reconciliation automatically; operators use protected manual `reconcile`,
@@ -1013,9 +1015,10 @@ evidence that a prior freeze remains in force.
   ten-member organization cohort or its outstanding bridge-removal receipt.
 - The retained source ruleset `16410326`, `PR must pass codex review`, still
   requires legacy `codex/review-gate`. It continues to own deletion,
-  non-fast-forward, pull-request, and associated CODEOWNERS protection. No
-  source v1 requirement has been removed yet, and the temporary bridge remains
-  installed.
+  non-fast-forward, and pull-request/conversation policy. Its canonical
+  workflow CODEOWNERS ownership is distinct and does not make Code Owner review
+  required by this ruleset. No source v1 requirement has been removed yet, and
+  the temporary bridge remains installed.
 - This delivery adds a narrow source-only cleanup executor, rather than using
   an ad hoc ruleset PUT. It admits a separately approved raw plan SHA-256 and
   the same owner-approved legacy-inventory SHA-256 embedded in that plan,
