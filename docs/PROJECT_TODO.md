@@ -30,19 +30,22 @@
   organization rule no longer requires `codex/review-gate`, and all eight
   repository-local legacy cleanup surfaces in the fixed active 10-member cohort
   now require only `test`; the scheduler is Active again.
-- [ ] Merge the source-only plan-bound cleanup executor, then derive and
-  separately approve a fresh source-local plan to remove only the v1
+- [x] Merge the source-only plan-bound cleanup executor, derive and separately
+  approve a fresh source-local plan, and remove only the v1
   `codex/review-gate` status rule from independent local ruleset `16410326`.
-  Source status-only v2 ruleset `23927388` is Active and canary `#67` passed;
-  preserve the bridge and every non-status protection until exact readback and
-  the two-round closure pass. This source-local exception is outside the fixed
-  cohort and must not be used to expand organization receipt or bridge-removal
-  scope.
+  Source status-only v2 ruleset `23927388` remains Active; exact readback and
+  the two-round closure passed while preserving the bridge and every non-status
+  protection. This source-local exception did not expand organization receipt
+  or bridge-removal scope.
 - [ ] Mint the canonical schema-2 final read-only closure receipt for the
   already-cut-over fixed active 10-member cohort, then use it to authorize
   separate cohort temporary-bridge removal work. Keep every cohort bridge
   installed until the receipt exists and validates; a source-local bridge
   requires its own later removal proof.
+- [ ] Define and authorize a separate source-local closure proof before
+  removing `.github/workflows/codex-review-gate-legacy-bridge.yml` from
+  `Joey-Tools/codex-review-gate`. The organization schema-2 receipt cannot
+  authorize this source-local bridge removal.
 
 ## Later
 
