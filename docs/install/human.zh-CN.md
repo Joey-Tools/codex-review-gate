@@ -359,6 +359,17 @@ repository rule。Shared organization rule 完成 activation 且 dual-enforcemen
 之前，canary 必须保持 open。把 current bound evidence 写入 manifest；10 个活动 entries
 全部满足条件前不得开始 organization activation。
 
+完成 manifest 或生成 final receipt 前，对每一个 manifest-bound ruleset detail GET 都必须使用
+具备 write access 的 credential：两个 organization ruleset、全部十个 repository v2 ruleset，
+以及每个 repository-local cleanup surface。调用者缺少相应 access 时，GitHub 会省略
+`bypass_actors`；这表示被脱敏，而不是证明它是 `[]`。可见的 `null` 或其他非数组值均为
+malformed。此时停止，切换到合格 credential，并在适用 freeze 下重新开始受影响的只读 preview；
+不得复用不完整 receipt，也不得推断 bypass list 为空。
+
+Manifest 中 materialized 的 repository-v2 parameters 是 exact policy：完整 merge-method
+集合、空 reviewer/dismissal-actor lists、启用的 unattributed-change approval，以及
+`do_not_enforce_on_create: false` 都必须按绑定值读回；缺失、额外或变化的值都是 drift。
+
 Organization helper 总是 preview-first；每个有写入的 apply 都必须使用对应 live preview
 输出的 exact `plan_sha256`。因为失败的 stage POST 可能需要 no-receipt recovery，从 stage
 preview 开始就必须建立外部 organization-admin policy-mutation freeze，并保持到 apply、

@@ -38,10 +38,11 @@
   protection. This source-local exception did not expand organization receipt
   or bridge-removal scope.
 - [ ] Mint the canonical schema-2 final read-only closure receipt for the
-  already-cut-over fixed active 10-member cohort, then use it to authorize
-  separate cohort temporary-bridge removal work. Keep every cohort bridge
-  installed until the receipt exists and validates; a source-local bridge
-  requires its own later removal proof.
+  already-cut-over fixed active 10-member cohort with a credential that
+  discloses explicit bypass arrays for every manifest-bound ruleset, then use
+  it to authorize separate cohort temporary-bridge removal work. Keep every
+  cohort bridge installed until the receipt exists and validates; a source-local
+  bridge requires its own later removal proof.
 - [ ] Define and authorize a separate source-local closure proof before
   removing `.github/workflows/codex-review-gate-legacy-bridge.yml` from
   `Joey-Tools/codex-review-gate`. The organization schema-2 receipt cannot

@@ -45,6 +45,28 @@ other unsupported entry types make the inventory inconclusive. Each
 repository must also expose a complete Actions policy with default workflow
 permissions set to `read`; that policy is included in every cohort snapshot.
 
+### Ruleset-detail visibility and materialized policy
+
+Every manifest-bound ruleset detail read must use a credential that GitHub
+recognizes as having write access to that exact ruleset: both organization
+rulesets, all ten repository v2 rulesets, and every repository-local cleanup
+surface. GitHub intentionally omits `bypass_actors` from a detail response for
+an identity without that access. An omitted property is redacted evidence, not
+an empty list; `null` or any non-array value is malformed. Stop without a
+receipt, change to an eligible credential, and restart the read-only preview
+under the applicable freeze. Never infer an empty bypass list from a redacted
+response.
+
+The ten checked-in repository-v2 snapshots also explicitly bind GitHub's
+currently materialized pull-request and status parameters. They are frozen
+observed policy values, not permissive reader defaults: a different, missing,
+or additional parameter is drift and fails closed. In particular, the template
+records the full merge-method set, empty reviewer and dismissal-actor lists,
+the enabled unattributed-change approval, and
+`do_not_enforce_on_create: false`. GitHub documents the unattributed-change
+approval as enabled by default; the other fields are intentionally recorded as
+the exact current readback rather than generalized as defaults.
+
 Version 3 also binds timing and the one scheduler that can create fresh
 legacy-writer work during the organization handoff:
 

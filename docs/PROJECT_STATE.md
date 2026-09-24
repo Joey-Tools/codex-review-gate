@@ -29,8 +29,10 @@
 - Temporary bridge removal for the frozen active 10-member cohort remains
   blocked until a canonical schema-2 final read-only closure receipt is minted.
   The receipt must still bind equal manifest-derived and observed identity
-  lists; it cannot authorize removal of a source-local bridge outside that
-  cohort.
+  lists and explicit `bypass_actors` arrays from every manifest-bound ruleset
+  detail read; a redacted/malformed bypass field requires a ruleset-write-capable
+  credential and a fresh read under the applicable freeze. It cannot authorize
+  removal of a source-local bridge outside that cohort.
 - The source repository's v1 required-status transition is complete: its
   independent local ruleset `16410326` no longer requires
   `codex/review-gate`, while Active status-only v2 ruleset `23927388` and every

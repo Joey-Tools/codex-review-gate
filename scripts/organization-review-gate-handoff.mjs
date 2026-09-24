@@ -26,6 +26,34 @@ export const V2_RULESET_NAME = "Must Pass Codex Review v2";
 export const V2_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
 export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
+// GitHub materializes these values on the repository-v2 ruleset detail
+// response. They are part of the frozen policy, rather than permissive
+// readback extras: every value below is either the observed no-additional-
+// restriction shape or an explicit required gate property.
+const V2_REPOSITORY_PULL_REQUEST_PARAMETERS = Object.freeze({
+  allowed_merge_methods: Object.freeze(["merge", "squash", "rebase"]),
+  dismiss_stale_reviews_on_push: true,
+  dismissal_restriction: Object.freeze({
+    enabled: false,
+    allowed_actors: Object.freeze([]),
+  }),
+  require_code_owner_review: true,
+  require_extra_approval_for_unattributed_changes: true,
+  require_last_push_approval: false,
+  required_approving_review_count: 0,
+  required_review_thread_resolution: true,
+  required_reviewers: Object.freeze([]),
+});
+const V2_REPOSITORY_STATUS_PARAMETERS = Object.freeze({
+  required_status_checks: Object.freeze([
+    Object.freeze({
+      context: V2_STATUS_CONTEXT,
+      integration_id: GITHUB_ACTIONS_INTEGRATION_ID,
+    }),
+  ]),
+  strict_required_status_checks_policy: true,
+  do_not_enforce_on_create: false,
+});
 export const REQUIRED_REPOSITORY_COUNT = 10;
 // The current v2 handoff migrates ten active repositories. The inherited
 // organization rule intentionally retains one archived repository so its
@@ -513,30 +541,26 @@ function assertV2RepositoryRulesetPolicy(ruleset, defaultBranch, label) {
     throw new Error(`${label} must contain exactly one required_status_checks rule.`);
   }
   const statusRule = statusRules[0];
-  const checks = statusChecks(statusRule, `${label}.v2_status_rule`);
-  if (
-    checks.length !== 1 ||
-    checks[0].context !== V2_STATUS_CONTEXT ||
-    checks[0].integration_id !== GITHUB_ACTIONS_INTEGRATION_ID ||
-    statusRule.parameters.strict_required_status_checks_policy !== true ||
-    checks.some((check) => check.context === LEGACY_STATUS_CONTEXT)
-  ) {
-    throw new Error(`${label} must require only the strict, source-bound v2 status.`);
-  }
+  assertPlainObject(
+    statusRule.parameters,
+    `${label}.v2_status_rule.parameters`,
+  );
+  assertExactSnapshot(
+    statusRule.parameters,
+    V2_REPOSITORY_STATUS_PARAMETERS,
+    `${label}.v2_status_rule.parameters`,
+  );
   const pullRequestRules = ruleset.rules.filter((rule) => rule.type === "pull_request");
   if (pullRequestRules.length !== 1) {
     throw new Error(`${label} must contain exactly one pull_request rule.`);
   }
   const parameters = pullRequestRules[0].parameters;
-  for (const key of [
-    "require_code_owner_review",
-    "dismiss_stale_reviews_on_push",
-    "required_review_thread_resolution",
-  ]) {
-    if (parameters?.[key] !== true) {
-      throw new Error(`${label}.pull_request.${key} must be true.`);
-    }
-  }
+  assertPlainObject(parameters, `${label}.pull_request.parameters`);
+  assertExactSnapshot(
+    parameters,
+    V2_REPOSITORY_PULL_REQUEST_PARAMETERS,
+    `${label}.pull_request.parameters`,
+  );
   if (ruleset.rules.filter((rule) => rule.type === "non_fast_forward").length !== 1) {
     throw new Error(`${label} must contain exactly one non_fast_forward rule.`);
   }
@@ -1207,6 +1231,24 @@ export function deriveRepositoryCleanupAction(action) {
   return { operation: "update", expected_after: cloneJson(derived) };
 }
 
+function disclosedBypassActorsFromApi(value, label) {
+  // GitHub intentionally redacts this property from a ruleset-detail response
+  // when the calling identity cannot write that ruleset. A receipt must prove
+  // the absence of bypass actors, so neither an omitted property nor a
+  // malformed visible value can be interpreted as an empty list.
+  if (!Object.hasOwn(value, "bypass_actors")) {
+    throw new Error(
+      `${label} cannot prove its bypass policy because GitHub omitted bypass_actors; rerun with an identity that has write access to this ruleset.`,
+    );
+  }
+  if (!Array.isArray(value.bypass_actors)) {
+    throw new Error(
+      `${label} returned a malformed bypass_actors value; rerun with an identity that has write access to this ruleset and require an explicit array.`,
+    );
+  }
+  return cloneJson(value.bypass_actors);
+}
+
 function writableRulesetFromApi(value, expectedSourceType, expectedSource, label) {
   assertPlainObject(value, label);
   assertJsonData(value, label);
@@ -1220,7 +1262,7 @@ function writableRulesetFromApi(value, expectedSourceType, expectedSource, label
     name: value.name,
     target: value.target,
     enforcement: value.enforcement,
-    bypass_actors: cloneJson(value.bypass_actors),
+    bypass_actors: disclosedBypassActorsFromApi(value, label),
     conditions: cloneJson(value.conditions),
     rules: cloneJson(value.rules),
   };

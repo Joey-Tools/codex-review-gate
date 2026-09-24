@@ -270,9 +270,18 @@ function repositoryV2Ruleset(index) {
       {
         type: "pull_request",
         parameters: {
+          allowed_merge_methods: ["merge", "squash", "rebase"],
           dismiss_stale_reviews_on_push: true,
+          dismissal_restriction: {
+            enabled: false,
+            allowed_actors: [],
+          },
           require_code_owner_review: true,
+          require_extra_approval_for_unattributed_changes: true,
+          require_last_push_approval: false,
+          required_approving_review_count: 0,
           required_review_thread_resolution: true,
+          required_reviewers: [],
         },
       },
       {
@@ -285,7 +294,7 @@ function repositoryV2Ruleset(index) {
             },
           ],
           strict_required_status_checks_policy: true,
-          do_not_enforce_on_create: true,
+          do_not_enforce_on_create: false,
         },
       },
       { type: "non_fast_forward" },
@@ -697,6 +706,7 @@ function createFakeGhHarness(
     organizationRulesetInventoryFailure = false,
     organizationRulesetInventoryFailureDelaySeconds = null,
     apiSortRepositoryCleanupRulesetArrays = false,
+    mutateRepositoryV2RulesetReadback = null,
     mutateRepositoryCleanupRulesetReadback = null,
   } = {},
 ) {
@@ -1052,6 +1062,13 @@ function createFakeGhHarness(
 
     const v2RulesetEndpoint =
       `repos/${encodedSlug}/rulesets/${repository.v2_ruleset.id}?includes_parents=false`;
+    let v2RulesetReadback = clone(repository.v2_ruleset.expected);
+    if (mutateRepositoryV2RulesetReadback !== null) {
+      v2RulesetReadback = mutateRepositoryV2RulesetReadback(v2RulesetReadback, {
+        repository,
+        repositoryIndex,
+      });
+    }
     addFakeResponse(
       responses,
       v2RulesetEndpoint,
@@ -1059,7 +1076,7 @@ function createFakeGhHarness(
         repository.v2_ruleset.id,
         "Repository",
         repository.slug,
-        repository.v2_ruleset.expected,
+        v2RulesetReadback,
       ),
     );
     const localRulesetSummaries = [{
@@ -3194,6 +3211,94 @@ function configureDetailedCleanupHandoff(harness) {
   }
 }
 
+function configureFinalVerifiedHandoff(harness) {
+  writeFileSync(
+    harness.manifestPath,
+    `${JSON.stringify(harness.manifest, null, 2)}\n`,
+  );
+  writeFileSync(harness.v2StatePath, "active\n");
+  writeFileSync(harness.legacyStatePath, "after\n");
+  writeFileSync(harness.cleanupStatePath, "after\n");
+  writeFileSync(harness.schedulerStatePath, "active\n");
+  for (const action of harness.cleanupActionStatePaths) {
+    writeFileSync(action.path, "after\n");
+  }
+}
+
+test("repository v2 readback requires disclosed bypass actors and exact materialized policy", async (t) => {
+  const cases = [
+    {
+      name: "redacted bypass actors",
+      mutate: (ruleset) => {
+        delete ruleset.bypass_actors;
+      },
+      error: /cannot prove its bypass policy because GitHub omitted bypass_actors/u,
+    },
+    {
+      name: "malformed visible bypass actors",
+      mutate: (ruleset) => {
+        ruleset.bypass_actors = null;
+      },
+      error: /returned a malformed bypass_actors value/u,
+    },
+    {
+      name: "new-reference status exemption",
+      mutate: (ruleset) => {
+        ruleset.rules
+          .find(({ type }) => type === "required_status_checks")
+          .parameters.do_not_enforce_on_create = true;
+      },
+      error: /v2 repository ruleset drifted from the manifest-bound snapshot/u,
+    },
+    {
+      name: "missing materialized status parameter",
+      mutate: (ruleset) => {
+        delete ruleset.rules
+          .find(({ type }) => type === "required_status_checks")
+          .parameters.do_not_enforce_on_create;
+      },
+      error: /v2 repository ruleset drifted from the manifest-bound snapshot/u,
+    },
+    {
+      name: "reduced merge method set",
+      mutate: (ruleset) => {
+        ruleset.rules
+          .find(({ type }) => type === "pull_request")
+          .parameters.allowed_merge_methods.pop();
+      },
+      error: /v2 repository ruleset drifted from the manifest-bound snapshot/u,
+    },
+    {
+      name: "additional required reviewer",
+      mutate: (ruleset) => {
+        ruleset.rules
+          .find(({ type }) => type === "pull_request")
+          .parameters.required_reviewers.push(12524680);
+      },
+      error: /v2 repository ruleset drifted from the manifest-bound snapshot/u,
+    },
+  ];
+
+  for (const readbackCase of cases) {
+    await t.test(readbackCase.name, async (t) => {
+      const harness = createFakeGhHarness(t, {
+        mutateRepositoryV2RulesetReadback: (ruleset, { repositoryIndex }) => {
+          if (repositoryIndex === 0) readbackCase.mutate(ruleset);
+          return ruleset;
+        },
+      });
+      configureFinalVerifiedHandoff(harness);
+
+      await assert.rejects(runFakeCli(harness, "verify"), readbackCase.error);
+      assert.deepEqual(
+        mutationRequests(fakeGhRequests(harness.logPath)),
+        [],
+        "a redacted, malformed, or drifted repository-v2 readback must remain read-only",
+      );
+    });
+  }
+});
+
 test("repository cleanup ruleset readback normalization rejects nonordering drift", async (t) => {
   const cases = [
     {
@@ -5207,6 +5312,47 @@ test("the checked-in Joey manifest template fixes the approved identities and cl
       node_id: "MDQ6VXNlcjEyNTI0Njgw",
     });
   }
+  const expectedRepositoryV2Ruleset = {
+    name: V2_RULESET_NAME,
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [],
+    conditions: defaultBranchConditions(),
+    rules: [
+      {
+        type: "pull_request",
+        parameters: {
+          allowed_merge_methods: ["merge", "squash", "rebase"],
+          dismiss_stale_reviews_on_push: true,
+          dismissal_restriction: {
+            enabled: false,
+            allowed_actors: [],
+          },
+          require_code_owner_review: true,
+          require_extra_approval_for_unattributed_changes: true,
+          require_last_push_approval: false,
+          required_approving_review_count: 0,
+          required_review_thread_resolution: true,
+          required_reviewers: [],
+        },
+      },
+      {
+        type: "required_status_checks",
+        parameters: {
+          required_status_checks: [{
+            context: V2_STATUS_CONTEXT,
+            integration_id: GITHUB_ACTIONS_INTEGRATION_ID,
+          }],
+          strict_required_status_checks_policy: true,
+          do_not_enforce_on_create: false,
+        },
+      },
+      { type: "non_fast_forward" },
+    ],
+  };
+  for (const repository of JOEY_TEMPLATE.repositories) {
+    assert.deepEqual(repository.v2_ruleset.expected, expectedRepositoryV2Ruleset);
+  }
   for (const [key, identity] of Object.entries(CANONICAL_WORKFLOW_IDENTITIES)) {
     const bytes = historicalHandoffWorkflowBytes(key, identity);
     const gitBlobHeader = Buffer.from(`blob ${bytes.length}\0`, "utf8");
@@ -5723,7 +5869,7 @@ test("manifest validation requires exact workflow, canary, and repository-v2 pro
         );
         rule.parameters.required_status_checks[0].integration_id = 1;
       },
-      error: /strict, source-bound v2 status/u,
+      error: /v2_status_rule\.parameters drifted/u,
     },
     {
       name: "repository v2 proof keeps control-plane review policy",
@@ -5733,7 +5879,67 @@ test("manifest validation requires exact workflow, canary, and repository-v2 pro
         );
         rule.parameters.require_code_owner_review = false;
       },
-      error: /require_code_owner_review must be true/u,
+      error: /pull_request\.parameters drifted/u,
+    },
+    {
+      name: "repository v2 proof enforces checks for newly created references",
+      mutate: (manifest) => {
+        const rule = manifest.repositories[0].v2_ruleset.expected.rules.find(
+          ({ type }) => type === "required_status_checks",
+        );
+        rule.parameters.do_not_enforce_on_create = true;
+      },
+      error: /v2_status_rule\.parameters drifted/u,
+    },
+    {
+      name: "repository v2 proof retains unattributed-change approval",
+      mutate: (manifest) => {
+        const rule = manifest.repositories[0].v2_ruleset.expected.rules.find(
+          ({ type }) => type === "pull_request",
+        );
+        rule.parameters.require_extra_approval_for_unattributed_changes = false;
+      },
+      error: /pull_request\.parameters drifted/u,
+    },
+    {
+      name: "repository v2 proof retains every merge method",
+      mutate: (manifest) => {
+        const rule = manifest.repositories[0].v2_ruleset.expected.rules.find(
+          ({ type }) => type === "pull_request",
+        );
+        rule.parameters.allowed_merge_methods.pop();
+      },
+      error: /pull_request\.parameters drifted/u,
+    },
+    {
+      name: "repository v2 proof has no additional required reviewer",
+      mutate: (manifest) => {
+        const rule = manifest.repositories[0].v2_ruleset.expected.rules.find(
+          ({ type }) => type === "pull_request",
+        );
+        rule.parameters.required_reviewers = [12524680];
+      },
+      error: /pull_request\.parameters drifted/u,
+    },
+    {
+      name: "repository v2 proof keeps dismissal unrestricted",
+      mutate: (manifest) => {
+        const rule = manifest.repositories[0].v2_ruleset.expected.rules.find(
+          ({ type }) => type === "pull_request",
+        );
+        rule.parameters.dismissal_restriction.enabled = true;
+      },
+      error: /pull_request\.parameters drifted/u,
+    },
+    {
+      name: "repository v2 proof keeps its zero approval-count setting",
+      mutate: (manifest) => {
+        const rule = manifest.repositories[0].v2_ruleset.expected.rules.find(
+          ({ type }) => type === "pull_request",
+        );
+        rule.parameters.required_approving_review_count = 1;
+      },
+      error: /pull_request\.parameters drifted/u,
     },
   ];
 
