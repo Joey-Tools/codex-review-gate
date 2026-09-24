@@ -259,12 +259,19 @@ finding 都会阻塞。
 
 authorised generation 只能由一条 exact、未编辑的 `@codex review` request 建立。
 其 first visible line 必须 exact，且没有其他 visible text。默认 `any` policy 下，任意
-repository permission 的 ordinary request author 只会作为未确认 candidate 被纳入。
-只有 official Codex Bot 在同一 comment 上添加严格晚于当前 revision 的直接 `eyes` 或
-`+1` receipt，它才成为 generation boundary。仅仅在 PR 其他位置后来出现 terminal 或
-progress carrier 不能建立这个因果链接。这只是 gate attribution：不授予 commenter 调用或
-控制 Codex review 的权限，provider 是否真正启动仍由 GitHub/Codex 决定。未确认 candidate
-不能 reset、抢占或使已建立的 clean 失效。canonical workflow 固定
+repository permission 的 ordinary request author 只会作为未确认 candidate 被纳入。它有两种
+provider confirmation 方式：official Codex Bot 在同一 comment 上留下严格晚于 revision 的
+直接 `eyes` 或 `+1` reaction；或者严格晚于 candidate 的未编辑 official 顶层 issue comment
+（PR 的普通评论，不是 pull-request review body）中的 terminal clean。后者仅适用于没有
+base epoch、single-flight lineage 中唯一一条 exact、未编辑的 ordinary request，且 terminal
+必须无歧义绑定 current head。额外或 ambiguous request/physical
+boundary、任一 carrier 被编辑、terminal 不匹配，或 head/SHA binding 有歧义时都保持
+pending。terminal 的 short SHA 只有被 GitHub 无歧义解析为 current PR head 才接受。
+同一 comment 上 official `eyes`/`+1` 的直接 receipt 仍然受支持。这只是 gate attribution：
+不授予 commenter 调用或控制 Codex review 的权限，不会使 Codex 启动，也不意味着每个用户
+都能导致 review；provider 是否真正启动仍由 GitHub/Codex 决定。没有 terminal-clean contender
+的未确认 candidate 不能 reset、抢占或使已建立的 clean 失效；尝试但未满足狭窄规则的
+terminal-clean receipt 保持 fail-closed pending。canonical workflow 固定
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`，不暴露 standard
 strict-policy setting。更严格的 `write` threshold（`write`、`maintain` 或 `admin`）仅保留给
 将来可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only
@@ -272,14 +279,18 @@ verifier token 无法可靠做到。workflow-authored request 还需要 exact v2
 head 和 run。
 
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
-provider findings 不受 request-author permission 影响，始终阻塞。
+provider findings 不受 request-author permission 影响，始终阻塞。finding 绝不充当最小
+terminal receipt。pull-request review clean 仍是普通 evidence，但不能充当该 receipt。
 
 terminal clean text 与符合条件的 provider `+1`，只有在没有 base epoch、single-flight
 lineage 的第一个物理 generation 中才是同等 clean carriers。物理 boundary 识别与
-positive authority 必须分开。未确认 default-`any` ordinary candidate 明确不是 physical
-boundary。其他每条可能触发 provider 的 request-shaped comment 都恰好是一个 boundary，
-包括 duplicate marker，以及 edited、malformed、wrong-author 或 denied request。
-physical-only boundary 没有 binding 或 positive authority。在 nonstandard `write` threshold
+positive authority 必须分开；唯一例外是狭窄的 default-`any` terminal-clean receipt，可以
+同时建立该第一个 generation 并携带其 clean authority；它必须是顶层 issue-comment terminal
+clean。没有 terminal-clean contender 的未确认 default-`any` ordinary candidate 才不是 physical boundary。存在 terminal-clean contender 但未
+满足狭窄 receipt 条件时，仍是 unresolved、fail-closed physical-only boundary。其他每条可能触发
+provider 的 request-shaped comment 都恰好是一个 boundary，包括 duplicate marker，以及
+edited、malformed、wrong-author 或 denied request。physical-only boundary 没有 binding 或
+positive authority。在 nonstandard `write` threshold
 下，形状合法的 ordinary request 必须先查询 author permission（同一 snapshot
 内按 author 缓存），才能判定为 denied；判定后不再触发 reaction 或 exact-refetch
 fan-out。更早因 shape、author 或 binding 无效而拒绝的 boundary，不触发 permission、
@@ -290,11 +301,13 @@ provider-triggering request。该事件进入 stable fingerprint 与本次运行
 replacement PR。绑定 current full head 的 canonical request 即使 base SHA/ref/repository
 tuple 已旧，也仍是 boundary；exact current scope 只决定 authority，不能擦除物理
 boundary。没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider
-terminal evidence 只能闭合第一个 gap。之后的每个 predecessor-to-successor gap，以及任何前面
-已有物理 request 的 generation 所需 positive/superseding authority，都必须来自直接
-附着于该 request 的合格 `+1`。provider terminal payload 没有 originating request ID；
-后到的 carrier 可能来自任一旧 generation，两个 stable snapshots 也无法使该归属唯一。
-出现 base epoch 后，provider terminal 连第一个 gap 也不能闭合。
+terminal evidence 只能闭合第一个 gap。对于 default-`any` ordinary candidate，它也只能在
+满足上述唯一 single-flight rule 时作为第一个 request 的最小 receipt。之后的每个
+predecessor-to-successor gap，以及任何前面已有物理 request 的 generation 所需
+positive/superseding authority，都必须来自直接附着于该 request 的合格 `+1`。provider
+terminal payload 没有 originating request ID；后到的 carrier 可能来自任一旧 generation，
+两个 stable snapshots 也无法使该归属唯一。出现 base epoch 后，provider terminal 连第一
+个 gap 或 ordinary candidate 的 receipt 都不能闭合。
 
 如果 official `eyes` 或 provider activity 不早于 candidate closure 且不晚于后继
 boundary，前一个 generation 仍保持 open。GitHub timestamp 精度下与任一端点同时都属于
@@ -317,8 +330,11 @@ base 的 canonical workflow request 上的合格 `+1`，才能作为 positive �
 superseding carrier。无法归因的 terminal clean 只保留为 diagnostic evidence，不能
 pass 或清除 finding。这是 carrier parity 的明确 fail-closed 例外。
 未确认 default-`any` ordinary candidate 上，official 直接且严格 post-revision 的 `eyes`
-或 `+1` 先是 receipt，用于把它升级为 boundary。升级后 ordinary request reactions 才
-仅用于 provider liveness；ordinary `+1` 不能 head-bind clean。same-time/later official
+或 `+1` 先是 receipt，用于把它升级为 boundary。唯一替代方式是在唯一、没有 base epoch、
+single-flight rule 下，严格晚于 candidate 的匹配未编辑 official current-head 顶层
+issue-comment terminal clean。出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的
+identity、ordering/head binding 有歧义时，该方式不可用。升级后 ordinary request reactions
+才仅用于 provider liveness；ordinary `+1` 不能 head-bind clean。same-time/later official
 `eyes`/progress from Codex 会 veto candidate clean evidence。由于 reaction change 不触发
 consumer workflow，必须由 later provider event or manual reconcile 观察 settled state。
 terminal carrier 包含 reviewed commit
@@ -334,8 +350,9 @@ non-inline finding 只有同时证明以下两项时才被 supersede：
 
 1. 存在严格更新的 authorised review generation；
 2. 之后出现符合上述 lineage rule、属于该新 generation 且绑定该 head 的 clean：只有
-   no-base-epoch 的第一个物理 generation 可以使用 unbound terminal，其他情况必须
-   使用合格的 request-bound `+1`。
+   no-base-epoch 的第一个物理 generation 可以使用 terminal clean（对于 default-`any`
+   ordinary candidate 还必须满足最小 terminal-receipt rule），其他情况必须使用合格的
+   request-bound `+1`。
 
 无关 later clean 不能清除 finding。temporal order、generation binding 或 head
 binding 有歧义时，仍为 failure 或 inconclusive。superseded finding 会作为

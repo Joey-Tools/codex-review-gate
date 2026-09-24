@@ -3459,7 +3459,7 @@ test("terminal clean without an authorized request generation cannot pass", asyn
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("default-any ordinary requests need an official direct receipt before becoming generations", async (context) => {
+test("default-any ordinary requests accept an official terminal clean receipt", async (context) => {
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
     updated_at: "2026-08-25T08:02:00Z",
@@ -3473,8 +3473,9 @@ test("default-any ordinary requests need an official direct receipt before becom
     const terminalGitHub = createGitHubMock({ issueComments: [ordinary, terminal] });
     const terminalEnvironment = runtimeEnvironment(context, { suffix });
     const { result: terminalResult } = await runGate(terminalEnvironment, terminalGitHub);
-    assert.equal(terminalResult.report.gateOutcome, "pending", suffix);
-    assert.equal(terminalResult.report.recoveryCode, "wait_provider", suffix);
+    assert.equal(terminalResult.exitCode, 0, suffix);
+    assert.equal(terminalResult.report.gateOutcome, "success", suffix);
+    assert.equal(terminalResult.report.recoveryCode, "none", suffix);
     assert.equal(
       terminalGitHub.calls.some((call) => call.path.endsWith(`/commits/${HEAD}`)),
       false,
@@ -3486,6 +3487,32 @@ test("default-any ordinary requests need an official direct receipt before becom
       suffix,
     );
   }
+
+  const shortReceiptRequest = ordinaryRequest({ id: 102, user: READER });
+  const shortReceipt = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 202,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const shortReceiptGitHub = createGitHubMock({
+    issueComments: [shortReceiptRequest, shortReceipt],
+  });
+  const shortReceiptEnvironment = runtimeEnvironment(context, {
+    suffix: "ordinary-terminal-short-sha-receipt",
+  });
+  const { result: shortReceiptResult } = await runGate(
+    shortReceiptEnvironment,
+    shortReceiptGitHub,
+  );
+  assert.equal(shortReceiptResult.exitCode, 0);
+  assert.equal(shortReceiptResult.report.gateOutcome, "success");
+  assert.equal(shortReceiptResult.report.recoveryCode, "none");
+  assert.equal(
+    shortReceiptGitHub.calls.some((call) =>
+      call.path.endsWith(`/commits/${HEAD.slice(0, 10)}`)
+    ),
+    true,
+  );
 
   const ordinary = ordinaryRequest();
 
@@ -3554,8 +3581,9 @@ test("default-any ordinary requests need an official direct receipt before becom
     untrustedEyesEnvironment,
     untrustedEyesGitHub,
   );
-  assert.equal(untrustedEyesResult.report.gateOutcome, "pending");
-  assert.equal(untrustedEyesResult.report.recoveryCode, "wait_provider");
+  assert.equal(untrustedEyesResult.exitCode, 0);
+  assert.equal(untrustedEyesResult.report.gateOutcome, "success");
+  assert.equal(untrustedEyesResult.report.recoveryCode, "none");
 
   const reactionGitHub = createGitHubMock({
     issueComments: [ordinary],
@@ -3570,7 +3598,114 @@ test("default-any ordinary requests need an official direct receipt before becom
   );
 });
 
-test("an unacknowledged default-any request cannot preempt an established generation", async (context) => {
+test("a terminal clean receipt cannot uniquely satisfy multiple default-any requests", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: READER });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({ issueComments: [first, second, terminal] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "multiple-default-any-terminal-receipt",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a previous-head request does not make a current default-any terminal receipt ambiguous", async (context) => {
+  const current = ordinaryRequest({ user: READER });
+  const previousHead = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(OLD_HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({ issueComments: [current, previousHead, terminal] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "old-head-does-not-ambiguate-default-any-terminal-receipt",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(result.report.requiresReplacementPr, false);
+});
+
+test("a base epoch rejects a default-any terminal clean receipt", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:59:00Z" }),
+    issueComments: [request, terminal],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "default-any-terminal-receipt-base-epoch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a pull-request review clean cannot promote a default-any request", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const review = approvedReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [request],
+    reviews: [review],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "default-any-review-clean-is-not-receipt",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a terminal finding still blocks a default-any request", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const finding = findingIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({ issueComments: [request, finding] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "default-any-terminal-finding",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.equal(result.report.counts.unresolved, 1);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a terminal clean receipt preempts an established generation only fail-closed", async (context) => {
   const generation = workflowRequest({
     created_at: "2026-08-25T08:00:00Z",
     updated_at: "2026-08-25T08:00:00Z",
@@ -3593,8 +3728,11 @@ test("an unacknowledged default-any request cannot preempt an established genera
     suffix: "unacknowledged-default-any-cannot-preempt",
   });
   const { result } = await runGate(environment, github);
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.match(result.report.reason, /request 101.*request 102/u);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
   assert.equal(
     github.calls.some((call) => /\/collaborators\/[^/]+\/permission$/u.test(call.path)),
     false,

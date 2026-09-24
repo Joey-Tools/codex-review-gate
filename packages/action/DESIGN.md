@@ -297,14 +297,24 @@ affect blocking: any qualifying finding blocks.
 An authorised generation begins only with an exact, unedited
 `@codex review` request. Its first visible line is exact and there is no other
 visible text. Under the default `any` policy, an ordinary request author at any
-repository permission is admitted only as an unconfirmed candidate. The
-candidate becomes a generation boundary only after the official Codex Bot adds
-a directly attached, strictly post-revision `eyes` or `+1` receipt to the same
-comment. A terminal or progress carrier that merely appears later elsewhere on
-the PR cannot establish that causal link. This is only gate attribution: it
-does not grant the commenter permission to invoke or control Codex review,
-whose actual provider start remains GitHub/Codex-controlled. An unconfirmed
-candidate cannot reset, preempt, or invalidate an established clean. Canonical workflows fix
+repository permission is admitted only as an unconfirmed candidate. It can
+receive provider confirmation either from an official Codex Bot `eyes` or `+1`
+reaction directly attached strictly after that comment's revision, or from an
+unedited official top-level issue-comment terminal clean (a normal PR comment,
+not a pull-request review body) strictly after the candidate. The terminal form
+is allowed only for the one unique, exact, unedited ordinary request in a
+no-base-epoch, single-flight lineage, and only when the terminal unambiguously
+binds the current head. An additional or ambiguous request or physical
+boundary, an edit to either carrier, an unmatched terminal, or ambiguous
+head/SHA binding leaves the state pending. A terminal short SHA is accepted
+only when GitHub resolves it unambiguously to the current PR head. Direct
+same-comment official `eyes`/`+1` remains supported. This is only gate
+attribution: it does not grant the commenter permission to invoke or control
+Codex review, does not make Codex start, and does not mean every user can cause
+a review; actual provider start remains GitHub/Codex-controlled. An
+unconfirmed candidate with no terminal-clean contender cannot reset, preempt,
+or invalidate an established clean; an attempted terminal-clean receipt that
+fails the narrow rule remains fail-closed and pending. Canonical workflows fix
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` and do not expose a standard
 strict-policy setting. The stricter `write` threshold (`write`, `maintain`, or
 `admin`) is reserved for a nonstandard future verifier identity allowed to read
@@ -314,16 +324,23 @@ binding the full head and run.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
-permission.
+permission. A finding never serves as the minimal terminal receipt. A
+pull-request review clean remains ordinary evidence but cannot be that receipt.
 
 Terminal clean text and a qualifying provider `+1` are equal clean carriers
 only for the first physical generation of a no-base-epoch, single-flight
 lineage. Physical boundary recognition is deliberately separate from positive
-authority. An unconfirmed default-`any` ordinary candidate is specifically not
-a physical boundary. Every other provider-triggerable request-shaped comment
-is one boundary, including same-run duplicate markers and edited, malformed,
-wrong-author, or denied requests. Physical-only boundaries are unbound and
-receive no positive authority. Under the nonstandard `write` threshold, a
+authority, except that the narrow default-`any` top-level issue-comment
+terminal-clean receipt can establish that first generation and carry its clean
+authority at the same time.
+An unconfirmed default-`any` ordinary candidate without a terminal-clean
+contender is otherwise not a physical boundary. A terminal-clean contender
+that cannot meet the narrow receipt conditions remains an unresolved,
+fail-closed physical-only boundary. Every other provider-triggerable
+request-shaped comment is one boundary, including same-run duplicate markers
+and edited, malformed, wrong-author, or denied requests. Physical-only
+boundaries are unbound and receive no positive authority. Under the
+nonstandard `write` threshold, a
 syntactically valid ordinary
 request must undergo a permission lookup, cached per author within each
 snapshot, before it can be classified as denied; once denied, it causes no
@@ -338,12 +355,15 @@ A canonical request bound to the current full head remains a boundary when its
 base SHA, ref, or repository tuple is stale; exact current scope is an
 authority requirement, not a boundary-erasure rule. Without a base epoch,
 provider terminal evidence strictly between the first request and its
-successor may close only that first gap. Every later predecessor-to-successor gap, and positive or
-superseding authority for any generation with a physical predecessor, requires
-a qualifying `+1` directly on that request. Provider terminal payloads have no
-originating request ID, so a later carrier could be delayed or duplicated from
-any older generation; stable snapshots cannot make that attribution unique.
-After a base epoch, provider terminal evidence cannot close even the first gap.
+successor may close only that first gap. For an ordinary default-`any`
+candidate, it can also serve as that first request's minimal receipt only under
+the unique single-flight rule above. Every later predecessor-to-successor gap,
+and positive or superseding authority for any generation with a physical
+predecessor, requires a qualifying `+1` directly on that request. Provider
+terminal payloads have no originating request ID, so a later carrier could be
+delayed or duplicated from any older generation; stable snapshots cannot make
+that attribution unique. After a base epoch, provider terminal evidence cannot
+close even the first gap or receipt an ordinary candidate.
 
 Official `eyes` or provider activity at or after a candidate closure and no
 later than the successor keeps the predecessor open. Equality with either
@@ -372,11 +392,15 @@ An unlineaged terminal clean remains diagnostic evidence and cannot pass or
 clear a finding. This is a deliberate fail-closed exception to carrier parity.
 For an unconfirmed default-`any` ordinary candidate, a direct official
 post-revision `eyes` or `+1` is first a receipt that promotes it into a
-boundary. Afterwards, ordinary request reactions are provider-liveness signals
-only; ordinary `+1` cannot head-bind clean. Same-time/later official
-`eyes`/progress from Codex vetoes candidate clean evidence. Because reaction
-changes do not trigger the consumer workflow, a later provider event or manual
-reconcile must observe the settled state.
+boundary. The only alternative is a matching unedited official current-head
+top-level issue-comment terminal clean strictly after that candidate under the
+unique no-base-epoch, single-flight rule. It is unavailable after a base epoch,
+after a second or ambiguous request/boundary, after an edit, or when terminal
+identity, ordering, or head binding is ambiguous. Afterwards, ordinary request reactions are
+provider-liveness signals only; ordinary `+1` cannot head-bind clean. Same-time/later
+official `eyes`/progress from Codex vetoes candidate clean evidence. Because
+reaction changes do not trigger the consumer workflow, a later provider event
+or manual reconcile must observe the settled state.
 When a terminal carrier includes a reviewed commit, a full or abbreviated SHA
 is accepted only if GitHub resolves it unambiguously to the current bound head.
 For a pull-request review, the resolved commit must also equal native
@@ -391,8 +415,9 @@ proved:
 
 1. a strictly newer authorised review generation exists; and
 2. a later clean belongs to that newer generation under the lineage rule
-   above: an unbound terminal only when it is the first no-base-epoch physical
-   generation, otherwise a qualifying request-bound `+1`.
+   above: a terminal clean only when it is the first no-base-epoch physical
+   generation (and, for a default-`any` ordinary candidate, meets the minimal
+   terminal-receipt rule), otherwise a qualifying request-bound `+1`.
 
 An unrelated later clean cannot clear the finding. Ambiguous temporal order,
 generation binding or head binding remains failure or inconclusive. A
