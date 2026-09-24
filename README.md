@@ -141,9 +141,10 @@ with `--legacy-bridge` and the distinct `Must Pass Codex Review v2` rule. That
 new rule adds only the strict v2 status context while the existing source rule
 retains deletion, non-fast-forward, pull-request, and CODEOWNERS protection.
 It is not a general consumer or cohort template. The source repository uses
-the canonical v2 verifier and controller while its repository-local v1
-requirement remains active through the exact temporary legacy bridge. Its later
-physical bridge removal needs a separately recorded source-local closure proof;
-an organization schema-2 cohort receipt cannot authorize it. See
+the canonical v2 verifier and controller; its repository-local v1 required
+status is retired while the exact temporary legacy bridge intentionally
+remains. Its later physical bridge removal needs a separately recorded
+source-local closure proof; an organization schema-2 cohort receipt cannot
+authorize it. See
 [docs/RELEASING.md](docs/RELEASING.md) for the complete staged flow, recovery
 states and protection baseline.

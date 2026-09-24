@@ -125,8 +125,8 @@ contract。只有 `Joey-Tools/codex-review-gate` 自身迁移可以显式在 rem
 `Must Pass Codex Review v2` rule。该新 rule 只增加 strict v2 status context；现有
 source rule 继续保留 deletion、non-fast-forward、pull-request 与 CODEOWNERS 保护。
 它不是通用 consumer 或 cohort template。source repository 使用 canonical v2 verifier 和
-controller；在其 repository-local v1 requirement 仍然 Active 的期间，仅通过精确的
-temporary legacy bridge 保持 v1 producer。之后物理删除该 bridge 必须有单独记录的
-source-local closure proof，organization schema-2 cohort receipt 不能授权此操作。
+controller；其 repository-local v1 required status 已退休，精确的 temporary legacy
+bridge 则有意保留。之后物理删除该 bridge 必须有单独记录的 source-local closure proof，
+organization schema-2 cohort receipt 不能授权此操作。
 完整 staged flow、recovery states 与 protection baseline 见
 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。
