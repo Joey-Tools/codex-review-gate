@@ -139,7 +139,7 @@ the ordinary consumer contract. Only the `Joey-Tools/codex-review-gate` source
 self-migration may explicitly stage remote `--ruleset-profile status-only`
 with `--legacy-bridge` and the distinct `Must Pass Codex Review v2` rule. That
 new rule adds only the strict v2 status context while the existing source rule
-retains deletion, non-fast-forward, pull-request, and CODEOWNERS protection.
+retains deletion, non-fast-forward, and pull-request/conversation policy.
 It is not a general consumer or cohort template. The source repository uses
 the canonical v2 verifier and controller; its repository-local v1 required
 status is retired while the exact temporary legacy bridge intentionally
