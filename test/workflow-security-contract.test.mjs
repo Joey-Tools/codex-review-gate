@@ -2059,11 +2059,31 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       /--ruleset-name "\$V2_RULESET_NAME"/u,
       /--ruleset-profile status-only/u,
       /--legacy-bridge/u,
-      /--canary-pr 74/u,
-      /--canary-head fb40b3c4152f288fdde810d5f4cd32c273ff061e/u,
     ]) {
       assert.match(sourceProofDerivation.text, required, `${name}: ${required}`);
     }
+    assert.equal(
+      (sourceProofDerivation.text.match(/(?:^|\s)--canary-pr(?=\s|=|$)/gu) ?? [])
+        .length,
+      1,
+      `${name}: source proof derivation has one canary-pr option`,
+    );
+    assert.match(
+      sourceProofDerivation.text,
+      /(?:^|\s)--canary-pr\s+74(?=\s|$)/u,
+      `${name}: source proof derivation pins historical canary PR 74`,
+    );
+    assert.equal(
+      (sourceProofDerivation.text.match(/(?:^|\s)--canary-head(?=\s|=|$)/gu) ?? [])
+        .length,
+      1,
+      `${name}: source proof derivation has one canary-head option`,
+    );
+    assert.match(
+      sourceProofDerivation.text,
+      /(?:^|\s)--canary-head\s+fb40b3c4152f288fdde810d5f4cd32c273ff061e(?=\s|$)/u,
+      `${name}: source proof derivation pins the historical canary head`,
+    );
     assert.doesNotMatch(
       sourceProofDerivation.text,
       /--expected-legacy-inventory-sha256|--expected-post-cleanup-security-sha256|--apply-post-cleanup-plan|--verify-post-cleanup|--rebind-source-bridge-removal-proof|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
@@ -2079,6 +2099,10 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       `${name}: one source-only approved-proof rebind`,
     );
     const [sourceProofRebind] = sourceProofRebinds;
+    assert.ok(
+      sourceProofDerivation.end < sourceProofRebind.start,
+      `${name}: source proof derivation must precede the approved-proof rebind`,
+    );
     for (const required of [
       /--repo "\$REPO"/u,
       /--control-plane-owner "\$CONTROL_PLANE_OWNER"/u,
@@ -2086,16 +2110,88 @@ test("installation runbooks derive and verify one explicit post-cleanup security
       /--ruleset-profile status-only/u,
       /--legacy-bridge/u,
       /--rebind-source-bridge-removal-proof "\$SOURCE_BRIDGE_REMOVAL_PROOF"/u,
-      /--expected-source-bridge-removal-proof-sha256/u,
-      /"\$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"/u,
     ]) {
       assert.match(sourceProofRebind.text, required, `${name}: ${required}`);
     }
+    assert.equal(
+      (sourceProofRebind.text.match(
+        /(?:^|\s)--expected-source-bridge-removal-proof-sha256(?=\s|=|$)/gu,
+      ) ?? []).length,
+      1,
+      `${name}: source proof rebind has one approved-proof digest flag`,
+    );
+    assert.match(
+      sourceProofRebind.text,
+      /(?:^|\s)--expected-source-bridge-removal-proof-sha256\s+(?:\\\s*)?"\$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"(?=\s|$)/u,
+      `${name}: source proof rebind binds its approved-proof digest as the adjacent value`,
+    );
     assert.doesNotMatch(
       sourceProofRebind.text,
       /--expected-legacy-inventory-sha256|--expected-post-cleanup-security-sha256|--derive-post-cleanup-plan|--apply-post-cleanup-plan|--verify-post-cleanup|--derive-source-bridge-removal-proof|--canary-pr|--canary-head|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
       `${name}: source proof rebind is read-only and only accepts the independently approved receipt`,
     );
+
+    const sourceBridgeDeleteCommands = shellInvocations(
+      sourceSelfHostingGuide,
+      /^node "\$SOURCE_ROOT\/scripts\/bootstrap-codex-review-gate\.mjs"(?=\s|$)/u,
+    ).filter((text) =>
+      /(?:^|\s)--prepare-worktree(?=\s|=|$)/u.test(text),
+    );
+    assert.equal(
+      sourceBridgeDeleteCommands.length,
+      2,
+      `${name}: source self-hosting has one local bridge-delete preview/apply pair`,
+    );
+    const sourceBridgeDeletePreviews = sourceBridgeDeleteCommands.filter((text) =>
+      !/(?:^|\s)--apply(?=\s|$)/u.test(text),
+    );
+    const sourceBridgeDeleteApplies = sourceBridgeDeleteCommands.filter((text) =>
+      /(?:^|\s)--apply(?=\s|$)/u.test(text),
+    );
+    assert.equal(
+      sourceBridgeDeletePreviews.length,
+      1,
+      `${name}: source bridge deletion has one preview`,
+    );
+    assert.equal(
+      sourceBridgeDeleteApplies.length,
+      1,
+      `${name}: source bridge deletion has one apply`,
+    );
+    const [sourceBridgeDeletePreview] = sourceBridgeDeletePreviews;
+    const [sourceBridgeDeleteApply] = sourceBridgeDeleteApplies;
+    const sourceBridgeDeletePreviewWords = shellCommandSegments(
+      sourceBridgeDeletePreview,
+    ).flat().map(({ value }) => value);
+    assert.deepEqual(
+      sourceBridgeDeletePreviewWords,
+      [
+        "node",
+        "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs",
+        "--prepare-worktree",
+        "$DEFAULT_BRANCH_WORKTREE",
+        "--control-plane-owner",
+        "$CONTROL_PLANE_OWNER",
+        "--remove-source-legacy-bridge",
+        "--source-bridge-removal-proof",
+        "$SOURCE_BRIDGE_REMOVAL_PROOF",
+        "--expected-source-bridge-removal-proof-sha256",
+        "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256",
+      ],
+      `${name}: source bridge-delete preview uses the exact local-only argument shape`,
+    );
+    assert.deepEqual(
+      shellCommandSegments(sourceBridgeDeleteApply).flat().map(({ value }) => value),
+      [...sourceBridgeDeletePreviewWords, "--apply"],
+      `${name}: source bridge-delete apply differs from its preview only by --apply`,
+    );
+    for (const text of sourceBridgeDeleteCommands) {
+      assert.doesNotMatch(
+        text,
+        /--repo|--ruleset-profile|--legacy-bridge|--derive-source-bridge-removal-proof|--rebind-source-bridge-removal-proof|--canary-pr|--canary-head|--remove-legacy-bridge|--final-closure-receipt|--expected-final-closure-receipt-sha256/u,
+        `${name}: source bridge deletion must not mix remote or organization receipt phases`,
+      );
+    }
     assert.doesNotMatch(
       ordinaryGuide,
       /--apply-post-cleanup-plan|--expected-post-cleanup-plan-sha256|--derive-source-bridge-removal-proof|--rebind-source-bridge-removal-proof|--expected-source-bridge-removal-proof-sha256/u,

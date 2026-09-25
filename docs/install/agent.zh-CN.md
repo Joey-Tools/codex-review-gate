@@ -223,11 +223,16 @@ closure evidence，而不是 source 的 Code Owner approval 或 stale-review pro
    base 必须是 current default branch 的 ancestor，但 proof-machinery PR 合入后不必等于 current
    default-branch head。workflow/CODEOWNERS/owner projection 用于检测 source control-plane drift，
    不是 retained source ruleset 强制 Code Owner approval 或 stale-review dismissal 的证据。Derive
-   需要两份 complete live snapshot、间隔五秒、stability ceiling 为
-   60 秒，且只有两份 snapshot 比较相等才输出 receipt。Rebind 必须将 fresh two-round live
-   evidence 与**同一份已独立批准**的 receipt 及精确 SHA-256 比较；它不是重新派生 replacement
-   后继续的许可。任何 live identity、policy、workflow、ancestry 或 canary evidence drift 都必须
-   停止，直到 fresh receipt 被审阅并取得新的 approval。
+   每次 closure read 都按固定的 `source_type: Repository` 加名称 `Must Pass Codex Review v2`
+   重新选出唯一 v2 ruleset，而不是全局 hard-pin 历史 numeric ID。candidate receipt 与每次 rebind
+   绑定的是该轮观察到的 ID 和完整 writable-projection SHA-256 fingerprint。Derive 需要两份
+   complete live snapshot 及中间五秒等待，且只有两份 snapshot 比较相等才输出 receipt。一次稳定
+   尝试的 60 秒总 cap 同时覆盖两份 snapshot 和中间等待；无法在预算内完成时不输出 receipt，保持
+   pending/inconclusive 并 fail closed。该 per-attempt cap 同时适用于 derive、read-only rebind 与
+   mutation-bound local executor rebind。Rebind 必须将 fresh two-round live evidence 与**同一份已独立
+   批准**的 receipt 及精确 SHA-256 比较；它不是重新派生 replacement 后继续的许可。任何 live
+   identity、policy、workflow、ancestry 或 canary evidence drift 都必须停止，直到 fresh receipt 被
+   审阅并取得新的 approval。
 10. 创建 local bridge-delete worktree 前，必须 rebind 完全相同、独立批准的 receipt。此步骤
     read-only，会完成 fresh two-round live comparison；它不能替代之后 deletion boundary 的
     rebind：
@@ -249,6 +254,40 @@ closure evidence，而不是 source 的 Code Owner approval 或 stale-review pro
     quarantine/delete boundary 前再次执行同一比较。receipt、source identity、current security
     projection、bridge bytes 或 canary binding 任一 drift 都必须拒绝。它仅限 source
     self-hosting repository；不得调用 ordinary consumer 或 organization bridge-removal executor。
+
+11. 只能在用于准备新 bridge-delete PR 的 clean、已 checkout default branch 的 source worktree 中
+    运行这条受约束的本地删除 executor；其 HEAD 必须仍等于 approved receipt 记录的
+    default-branch head。先执行 dry run；取得单独的 deletion authorization 后，用同一命令加上
+    `--apply`：
+
+    ```bash
+    DEFAULT_BRANCH_WORKTREE=/absolute/path/to/clean-source-default-branch-worktree
+
+    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+      --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+      --control-plane-owner "$CONTROL_PLANE_OWNER" \
+      --remove-source-legacy-bridge \
+      --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+      --expected-source-bridge-removal-proof-sha256 \
+      "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+
+    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+      --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+      --control-plane-owner "$CONTROL_PLANE_OWNER" \
+      --remove-source-legacy-bridge \
+      --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+      --expected-source-bridge-removal-proof-sha256 \
+      "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256" \
+      --apply
+    ```
+
+    所要求的 option shape 是
+    `--prepare-worktree <default-branch-worktree> --remove-source-legacy-bridge --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" --expected-source-bridge-removal-proof-sha256 "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"`。
+    其中没有 `--repo`、`--ruleset-profile`、`--legacy-bridge`、
+    `--derive-source-bridge-removal-proof`、
+    `--rebind-source-bridge-removal-proof`、`--canary-pr` 或 `--canary-head` parameter。不得把它与
+    remote phase 混用，也不得在任意 checkout 中运行；它是产生并检查该 PR 的 one-file deletion diff
+    的受约束路径，不构成临时手工删除授权。
 
     删除 tracked bridge YAML 会阻止普通的新 dispatch，但不承诺历史 Actions run 不能被 rerun。
     绝不能把它表述成永久移除所有 v1 side effect。安全边界更窄：fresh live proof 证明 current

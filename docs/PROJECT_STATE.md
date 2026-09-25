@@ -47,10 +47,14 @@
   retained. A later source-local bridge deletion must use a separately derived
   source-only closure receipt whose exact SHA-256 receives independent approval;
   the helper re-derives the live closure before local mutation, so a receipt is
-  not trusted as a standalone file. Its admission pins the fixed source v2 and
-  retained-policy identities rather than accepting a same-shaped policy
-  snapshot, and source and organization receipts are not interchangeable. This
-  source proof must not broaden the organization receipt scope.
+  not trusted as a standalone file. Each closure read selects the unique
+  `source_type: Repository` source v2 ruleset named `Must Pass Codex Review v2`;
+  it does not globally hard-pin historical ID `23927388`. The receipt and
+  rebind instead bind that round's observed ID and full writable-projection
+  fingerprint, together with retained-policy identities, rather than accepting
+  a same-shaped policy snapshot. Source and organization receipts are not
+  interchangeable. This source proof must not broaden the organization receipt
+  scope.
 - The old rule's original 11-repository legacy selector remains intact,
   including archived `Joey-Tools/codex-waited-delivery`. The completed final
   cutover removed only the v1 required-status rule; it retains `deletion` and

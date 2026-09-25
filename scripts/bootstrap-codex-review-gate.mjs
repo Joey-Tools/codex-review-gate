@@ -2921,6 +2921,11 @@ async function deriveStableSourceBridgeRemovalProof({
       options,
       canonicalWorkflows,
     });
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Source bridge-removal closure exceeded the ${SOURCE_CLOSURE_STABILITY_TIMEOUT_MS / 1000}-second stability budget after its second complete read. Fail closed: no receipt was emitted; wait for repository state to settle and derive a new proof.`,
+      );
+    }
     const firstCanonical = canonicalSourceBridgeRemovalProof(first);
     const secondCanonical = canonicalSourceBridgeRemovalProof(second);
     if (firstCanonical === secondCanonical) {
@@ -4611,15 +4616,14 @@ async function removeSourceLegacyBridgeFromWorktree({
     receipt: proof.receipt,
   });
   const currentBridge = await readOptionalRegularFile(bridgePath);
-  const initialDiffState = await classifySourceBridgeRemovalWorktreeDiff({
-    targetRoot,
-  });
-
   await assertSourceBridgeRemovalProofBindingStable({
     targetRoot,
     proof,
     canonicalWorkflows,
     phase: "source bridge-removal receipt admission",
+  });
+  const initialDiffState = await classifySourceBridgeRemovalWorktreeDiff({
+    targetRoot,
   });
 
   if (currentBridge === null) {
@@ -4671,11 +4675,16 @@ async function removeSourceLegacyBridgeFromWorktree({
     return;
   }
 
-  const rebindAtBoundary = async (phase) => {
+  const rebindAtBoundary = async (phase, expectedDiffState) => {
     await assertSourceBridgeRemovalProofBindingStable({
       targetRoot,
       proof,
       canonicalWorkflows,
+      phase,
+    });
+    await assertSourceBridgeRemovalWorktreeDiffState({
+      targetRoot,
+      expectedDiffState,
       phase,
     });
   };
@@ -4687,21 +4696,25 @@ async function removeSourceLegacyBridgeFromWorktree({
     beforeRemove: async () => {
       await rebindAtBoundary(
         "immediately before source legacy bridge removal",
+        "clean",
       );
     },
     beforeQuarantineRename: async () => {
       await rebindAtBoundary(
         "immediately before source legacy bridge quarantine rename",
+        "clean",
       );
     },
     beforeFinalQuarantineRename: async () => {
       await rebindAtBoundary(
         "immediately before final source legacy bridge quarantine rename",
+        "clean",
       );
     },
     beforeQuarantineUnlink: async () => {
       await rebindAtBoundary(
         "after source legacy bridge quarantine rename and before unlink",
+        "already-removed",
       );
     },
   });
@@ -4961,10 +4974,22 @@ async function classifySourceBridgeRemovalWorktreeDiff({ targetRoot }) {
 }
 
 async function assertExactSourceBridgeRemovalDiff({ targetRoot, phase }) {
+  await assertSourceBridgeRemovalWorktreeDiffState({
+    targetRoot,
+    expectedDiffState: "already-removed",
+    phase,
+  });
+}
+
+async function assertSourceBridgeRemovalWorktreeDiffState({
+  targetRoot,
+  expectedDiffState,
+  phase,
+}) {
   const state = await classifySourceBridgeRemovalWorktreeDiff({ targetRoot });
-  if (state !== "already-removed") {
+  if (state !== expectedDiffState) {
     throw new Error(
-      `Expected exactly one unstaged deletion of ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} during ${phase}; refusing source bridge-removal success.`,
+      `Expected source bridge-removal worktree diff state ${expectedDiffState} during ${phase}; found ${state}.`,
     );
   }
 }

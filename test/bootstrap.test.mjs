@@ -8508,6 +8508,41 @@ test("source proof keeps pending when complete source snapshots do not stabilize
   }
 });
 
+test("source proof fails closed when its second complete read reaches the stability deadline", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-closure-second-read-deadline-"),
+  );
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const preloadPath = join(fixtureRoot, "second-read-deadline-source-closure.cjs");
+  try {
+    createFakeGhExecutable(fakeBin);
+    writeFileSync(preloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    const { responses } = sourceBridgeRemovalFixtureResponses();
+    const result = runBootstrap(sourceBridgeRemovalArguments(), {
+      addExpectedLegacyInventoryDigest: false,
+      env: {
+        ...fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+        CODEX_SOURCE_CLOSURE_TEST_CLOCK: "second-read-over-deadline",
+        NODE_OPTIONS: `--require=${preloadPath}`,
+      },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /exceeded the 60-second stability budget after its second complete read.*Fail closed: no receipt was emitted/u,
+    );
+    assert.equal(result.stdout, "");
+    assert.doesNotMatch(
+      readFileSync(callLog, "utf8"),
+      /^(?:PUT|PATCH|DELETE) /mu,
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("source bridge deletion CLI admits only its isolated local authority", () => {
   const nonWorktree = join(tmpdir(), "codex-review-gate-no-source-worktree");
   const placeholderProof = join(tmpdir(), "codex-review-gate-unread-proof.json");
@@ -8779,6 +8814,161 @@ test("source bridge deletion restores the canonical bridge when source closure d
     );
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source bridge deletion rejects unrelated worktree changes at every mutation rebind boundary", () => {
+  for (const [phase, expectsRestoration] of [
+    ["before-quarantine-rename", false],
+    ["after-quarantine-rename-before-unlink", true],
+  ]) {
+    const fixtureRoot = mkdtempSync(
+      join(tmpdir(), `codex-review-gate-source-delete-worktree-diff-${phase}-`),
+    );
+    const targetRoot = join(fixtureRoot, "source-worktree");
+    const timingPreloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+    const diffPreloadPath = join(fixtureRoot, "source-worktree-diff-race.cjs");
+    const bridgePath = join(
+      targetRoot,
+      ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+    );
+    try {
+      initializeGitRepository(targetRoot);
+      runGit(["-C", targetRoot, "symbolic-ref", "HEAD", "refs/heads/master"]);
+      runGit(["-C", targetRoot, "config", "user.name", "Codex Test"]);
+      runGit([
+        "-C",
+        targetRoot,
+        "config",
+        "user.email",
+        "codex-test@example.invalid",
+      ]);
+      mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+        CANONICAL_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+        CANONICAL_CONTROLLER_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+      writeFileSync(
+        join(targetRoot, ".github", "CODEOWNERS"),
+        ensureControlPlaneCodeownersContent(null).content,
+        "utf8",
+      );
+      writeFileSync(join(targetRoot, "README.md"), "fixture base\n", "utf8");
+      runGit(["-C", targetRoot, "add", ".github", "README.md"]);
+      runGit(["-C", targetRoot, "commit", "-qm", "source bridge fixture"]);
+      const sourceHead = runGit(["-C", targetRoot, "rev-parse", "HEAD"]).trim();
+      const admittedBridge = lstatSync(bridgePath, { bigint: true });
+      runGit([
+        "-C",
+        targetRoot,
+        "remote",
+        "add",
+        "origin",
+        `https://github.com/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}.git`,
+      ]);
+      writeFileSync(timingPreloadPath, sourceClosureTimingPreloadSource(), "utf8");
+      writeFileSync(
+        diffPreloadPath,
+        sourceBridgeRemovalWorktreeDiffRacePreloadSource(),
+        "utf8",
+      );
+
+      const deriveBin = join(fixtureRoot, "derive-bin");
+      createFakeGhExecutable(deriveBin);
+      const deriveFixture = sourceBridgeRemovalFixtureResponses({
+        currentDefaultBranchHeadSha: sourceHead,
+      });
+      const derive = runBootstrap(sourceBridgeRemovalArguments({
+        includeRulesetName: false,
+      }), {
+        addExpectedLegacyInventoryDigest: false,
+        env: {
+          ...fakeGhEnvironment({
+            fakeBin: deriveBin,
+            responses: deriveFixture.responses,
+            stateDir: join(fixtureRoot, "derive-state"),
+            callLog: join(fixtureRoot, "derive.log"),
+          }),
+          NODE_OPTIONS: `--require=${timingPreloadPath}`,
+        },
+      });
+      assert.equal(derive.status, 0, `${phase}: ${derive.stderr}`);
+      const proofPath = join(fixtureRoot, "approved-source-proof.json");
+      writeFileSync(proofPath, derive.stdout, "utf8");
+      const approvedSha256 = JSON.parse(
+        derive.stdout,
+      ).source_bridge_removal_receipt_sha256;
+
+      const applyBin = join(fixtureRoot, "apply-bin");
+      const applyLog = join(fixtureRoot, "apply.log");
+      createFakeGhExecutable(applyBin);
+      const applyFixture = sourceBridgeRemovalFixtureResponses({
+        currentDefaultBranchHeadSha: sourceHead,
+      });
+      const apply = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--remove-source-legacy-bridge",
+        "--source-bridge-removal-proof",
+        proofPath,
+        "--expected-source-bridge-removal-proof-sha256",
+        approvedSha256,
+        "--apply",
+      ], {
+        env: {
+          ...fakeGhEnvironment({
+            fakeBin: applyBin,
+            responses: applyFixture.responses,
+            stateDir: join(fixtureRoot, "apply-state"),
+            callLog: applyLog,
+          }),
+          CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT: targetRoot,
+          CODEX_SOURCE_CLOSURE_TEST_WORKTREE_DIFF_RACE_PHASE: phase,
+          NODE_OPTIONS: `--require=${timingPreloadPath} --require=${diffPreloadPath}`,
+        },
+      });
+      assert.equal(apply.status, 1, `${phase}: ${apply.stderr}`);
+      assert.match(
+        apply.stderr,
+        /Source bridge removal requires a clean worktree/u,
+        phase,
+      );
+      if (expectsRestoration) {
+        assert.match(
+          apply.stderr,
+          /admitted exact bridge remains installed.*atomically restored/u,
+          phase,
+        );
+      }
+      assert.equal(
+        readFileSync(bridgePath, "utf8"),
+        CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+        phase,
+      );
+      const restoredBridge = lstatSync(bridgePath, { bigint: true });
+      assert.equal(restoredBridge.dev, admittedBridge.dev, phase);
+      assert.equal(restoredBridge.ino, admittedBridge.ino, phase);
+      assert.equal(
+        runGit(["-C", targetRoot, "status", "--porcelain"]),
+        " M README.md\n",
+        phase,
+      );
+      assert.doesNotMatch(apply.stdout, /Applied: removed only/u, phase);
+      assert.doesNotMatch(
+        readFileSync(applyLog, "utf8"),
+        /^(?:PUT|PATCH|DELETE) /mu,
+        phase,
+      );
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   }
 });
 
@@ -10893,6 +11083,11 @@ global.setTimeout = (callback, delay, ...args) => {
   return nativeSetTimeout(callback, delay, ...args);
 };
 if (process.env.CODEX_SOURCE_CLOSURE_TEST_CLOCK === "unstable") {
+  const values = [0, 0, 0, 60000];
+  let index = 0;
+  Date.now = () => values[Math.min(index++, values.length - 1)];
+}
+if (process.env.CODEX_SOURCE_CLOSURE_TEST_CLOCK === "second-read-over-deadline") {
   const values = [0, 0, 60000];
   let index = 0;
   Date.now = () => values[Math.min(index++, values.length - 1)];
@@ -10936,6 +11131,64 @@ fs.promises.rename = async function patchedRename(from, to) {
   }
   return result;
 };
+
+syncBuiltinESMExports();
+`;
+}
+
+function sourceBridgeRemovalWorktreeDiffRacePreloadSource() {
+  return `
+const fs = require("node:fs");
+const { join } = require("node:path");
+const { syncBuiltinESMExports } = require("node:module");
+
+const originalMkdtemp = fs.promises.mkdtemp.bind(fs.promises);
+const originalRename = fs.promises.rename.bind(fs.promises);
+const targetRoot = process.env.CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT;
+const phase = process.env.CODEX_SOURCE_CLOSURE_TEST_WORKTREE_DIFF_RACE_PHASE;
+const bridgePath = join(
+  targetRoot,
+  ".github",
+  "workflows",
+  "codex-review-gate-legacy-bridge.yml",
+);
+const quarantinePrefix = join(
+  targetRoot,
+  ".github",
+  "workflows",
+  ".codex-review-gate-removal-",
+);
+let injected = false;
+
+function injectUnrelatedTrackedDiff() {
+  fs.appendFileSync(
+    join(targetRoot, "README.md"),
+    "unrelated worktree change\\n",
+    "utf8",
+  );
+}
+
+if (phase === "before-quarantine-rename") {
+  fs.promises.mkdtemp = async function patchedMkdtemp(prefix, ...args) {
+    const directory = await originalMkdtemp(prefix, ...args);
+    if (!injected && String(prefix) === quarantinePrefix) {
+      injected = true;
+      injectUnrelatedTrackedDiff();
+    }
+    return directory;
+  };
+} else if (phase === "after-quarantine-rename-before-unlink") {
+  fs.promises.rename = async function patchedRename(from, to) {
+    const result = await originalRename(from, to);
+    if (!injected && String(from) === bridgePath) {
+      injected = true;
+      injectUnrelatedTrackedDiff();
+    }
+    return result;
+  };
+} else {
+  throw new Error(\`Unknown source worktree-diff race phase: \${phase}\`);
+}
 
 syncBuiltinESMExports();
 `;

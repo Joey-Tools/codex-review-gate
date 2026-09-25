@@ -1148,8 +1148,11 @@ evidence that a prior freeze remains in force.
   this bridge.
 - The next source-only phase is deliberately two PRs. First, proof machinery
   derives a canonical source bridge-removal receipt from two stable, complete
-  live snapshots five seconds apart (with a 60-second stability ceiling) and
-  requires full ruleset/bypass-actor visibility. The
+  live snapshots five seconds apart. One 60-second attempt budget covers both
+  complete snapshots and the intervening wait; expiry, an incomplete snapshot,
+  or inequality remains pending/inconclusive and fails closed. This same
+  per-attempt budget applies to derive, rebind, and the mutation-bound local
+  executor rebind. It requires full ruleset/bypass-actor visibility. The
   historical canary base must be an ancestor of the current default branch,
   while the current live control plane and v2 policy are independently bound;
   the proof-machinery merge does not need to recreate the old canary base.
@@ -1173,8 +1176,8 @@ evidence that a prior freeze remains in force.
 
 ### Source proof-machinery admission hardening
 
-- The first source closure PR installs proof machinery (and, if included, a
-  source-only local deletion executor) but leaves
+- The first source closure PR installs proof machinery and the constrained
+  source-only local deletion executor but leaves
   `.github/workflows/codex-review-gate-legacy-bridge.yml` intact. The later
   bridge-delete PR is a separate review and authorization boundary.
 - Release `v2.1.0` and closed canary `#74` are historical evidence only. They
@@ -1183,10 +1186,13 @@ evidence that a prior freeze remains in force.
   receipt's exact SHA-256, and the executor must rebind it immediately before
   local mutation.
 - Source proof admission treats the current source rules as hard conditions,
-  not as a best-effort snapshot. Ruleset `23927388`, `Must Pass Codex Review
-  v2`, must be Active with the strict `codex/github-review-gate` required
-  status and an explicit empty bypass-actor list. Retained ruleset `16410326`,
-  `PR must pass codex review`, must retain `deletion`, parameterless
+  not as a best-effort snapshot. Each closure read finds the unique
+  `source_type: Repository` ruleset named `Must Pass Codex Review v2`; it does
+  not globally hard-pin historical ID `23927388`. The current observed ruleset
+  `23927388` must be Active with the strict `codex/github-review-gate` required
+  status and an explicit empty bypass-actor list. The receipt and each rebind
+  bind that round's observed ID and full writable-projection fingerprint.
+  Retained ruleset `16410326`, `PR must pass codex review`, must retain `deletion`, parameterless
   `non_fast_forward`, and its actual `pull_request` projection: review-thread
   resolution remains required while code-owner review and stale-review
   dismissal remain false. The v1 required status must remain absent.
@@ -1196,11 +1202,25 @@ evidence that a prior freeze remains in force.
   ordinary directory churn as mutation. Replacing the marker with another
   otherwise valid linked worktree must fail closed before bridge rename or
   unlink.
+- Review hardening makes the stability budget and local mutation boundary
+  operational rather than documentary. The 60-second monotonic budget is
+  checked again after the second complete snapshot before an equal pair can
+  emit a receipt; a slow second read cannot turn an expired attempt into
+  success. After every remote rebind, the local executor reclassifies the
+  whole worktree: it requires `clean` before either bridge-rename boundary and
+  only the exact admitted bridge deletion after quarantine rename. The latter
+  check remains inside the restoration path, so an unrelated concurrent
+  tracked, staged, or untracked change before unlink restores the same
+  admitted bridge object instead of leaving a mixed worktree with an already
+  deleted bridge.
 - Source proof derive/rebind modes are fixed to
-  `Joey-Tools/codex-review-gate`, `Must Pass Codex Review v2`, and the source
-  control-plane owner; same-shaped owner or ruleset overrides are rejected.
-  Source-only and organization-handoff receipt schemas are mutually isolated,
-  so neither receipt type can authorize the other's deletion path.
+  `Joey-Tools/codex-review-gate`, repository source type, `Must Pass Codex
+  Review v2`, and the source control-plane owner; same-shaped owner or ruleset
+  overrides are rejected. That fixed selector is not a global numeric-ID pin:
+  receipt/rebind binds the observed ID and full writable-projection fingerprint
+  for its closure round. Source-only and organization-handoff receipt schemas
+  are mutually isolated, so neither receipt type can authorize the other's
+  deletion path.
 - Before this proof-machinery PR is merged, a ruleset-admin read-only live
   derive succeeded against the current source control plane. Its output was
   deliberately not retained or approved: a pre-merge helper receipt cannot

@@ -346,20 +346,27 @@ The derive result is a candidate receipt, not a portable authority token. It
 binds the source repository identity, current default-branch control plane,
 both source ruleset projections, all legacy required-status surfaces, canonical
 workflow/CODEOWNERS inventory, and the historical `#74` PR/head/base/test-merge
-and v2 CheckRun/run/job tuple. `#74`'s base need only be a confirmed ancestor of
-the current default branch: the receipt separately verifies the current live
-control plane and v2 policy, so merging proof machinery need not recreate the
-old canary base. The workflow/CODEOWNERS/owner projection detects source
-control-plane drift; it is not evidence that this retained source ruleset
-requires Code Owner approval or stale-review dismissal. The helper emits the
-candidate only after two complete live
-snapshots, five seconds apart, canonically compare equal; it gives that
-stability attempt at most 60 seconds. A later rebind performs the same fresh
-two-round read and requires equality with the **same independently approved**
-receipt and SHA-256. Do not derive a replacement receipt and continue silently:
-any identity, policy, workflow, ancestry, or canary-evidence drift stops the
-flow until a newly derived receipt is reviewed and receives new independent
-approval.
+and v2 CheckRun/run/job tuple. At each closure read, the v2 rule is selected
+afresh as the unique `source_type: Repository` ruleset named `Must Pass Codex
+Review v2`; a historical numeric ruleset ID is not globally hard-pinned. The
+candidate receipt and every rebind instead bind that round's observed ruleset
+ID and complete writable-projection SHA-256 fingerprint. `#74`'s base need only
+be a confirmed ancestor of the current default branch: the receipt separately
+verifies the current live control plane and v2 policy, so merging proof
+machinery need not recreate the old canary base. The workflow/CODEOWNERS/owner
+projection detects source control-plane drift; it is not evidence that this
+retained source ruleset requires Code Owner approval or stale-review dismissal.
+The helper emits the candidate only after two complete live snapshots, with a
+five-second wait between them, canonically compare equal. One stability attempt
+includes both complete snapshots and that wait under one 60-second total cap;
+if it cannot finish within that budget, no receipt is emitted: the attempt
+remains pending/inconclusive and fails closed. The same per-attempt cap applies
+to derive, the read-only rebind, and the mutation-bound local executor rebind.
+A later rebind performs the same fresh two-round read and requires equality
+with the **same independently approved** receipt and SHA-256. Do not derive a
+replacement receipt and continue silently: any identity, policy, workflow,
+ancestry, or canary-evidence drift stops the flow until a newly derived receipt
+is reviewed and receives new independent approval.
 
 ```bash
 SOURCE_BRIDGE_REMOVAL_PROOF="$(mktemp)"
@@ -405,6 +412,42 @@ security projection, canonical bridge bytes, or historical-canary binding. This
 executor is limited to the source self-hosting repository; do not use the
 organization receipt executor, the ordinary consumer cleanup executor, or an
 ad hoc file deletion for this source-only operation.
+
+Run the only permitted local deletion executor in the clean, checked-out
+default-branch source worktree used to prepare the new bridge-delete PR. Its
+HEAD must still equal the approved receipt's default-branch head. First make a
+dry run; after the separate deletion authorization, repeat the exact command
+with `--apply`:
+
+```bash
+DEFAULT_BRANCH_WORKTREE=/absolute/path/to/clean-source-default-branch-worktree
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --remove-source-legacy-bridge \
+  --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --remove-source-legacy-bridge \
+  --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256" \
+  --apply
+```
+
+The required option shape is
+`--prepare-worktree <default-branch-worktree> --remove-source-legacy-bridge --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" --expected-source-bridge-removal-proof-sha256 "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"`.
+It has no `--repo`, `--ruleset-profile`, `--legacy-bridge`,
+`--derive-source-bridge-removal-proof`,
+`--rebind-source-bridge-removal-proof`, `--canary-pr`, or `--canary-head`
+parameter. Do not combine it with any remote phase or use it from an arbitrary
+checkout; it is the constrained way to produce and inspect the one-file bridge
+deletion diff before opening that PR, not permission for an ad hoc deletion.
 
 Deleting the tracked bridge YAML blocks ordinary new dispatches, but GitHub
 does not promise that a historical Actions run cannot be rerun. This flow makes

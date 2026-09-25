@@ -257,14 +257,21 @@ protection.
    default-branch head after the proof-machinery PR has merged. Its
    workflow/CODEOWNERS/owner projection detects source control-plane drift; it
    is not evidence that the retained source ruleset requires Code Owner approval
-   or stale-review dismissal. Derive requires
-   two complete live snapshots five seconds apart, with a 60-second stability
-   ceiling, and emits a receipt only when those snapshots compare equal.
-   A rebind must compare fresh two-round live evidence with the **same
-   independently approved** receipt and exact SHA-256; it is not permission to
-   derive a replacement and continue. Any live identity, policy, workflow,
-   ancestry, or canary-evidence drift stops the flow until a fresh receipt is
-   reviewed and receives new approval.
+   or stale-review dismissal. Each closure read selects v2 afresh as the unique
+   `source_type: Repository` ruleset named `Must Pass Codex Review v2`, rather
+   than globally hard-pinning a historical numeric ID. The candidate receipt and
+   each rebind bind that round's observed ID and complete writable-projection
+   SHA-256 fingerprint. Derive requires two complete live snapshots with a
+   five-second wait between them and emits a receipt only when they compare
+   equal. One stability attempt includes both snapshots and that wait under one
+   60-second total cap; if it cannot finish in budget, it emits no receipt and
+   remains pending/inconclusive and fails closed. The same per-attempt cap
+   applies to derive, the read-only rebind, and the mutation-bound local
+   executor rebind. A rebind must compare fresh two-round live evidence with
+   the **same independently approved** receipt and exact SHA-256; it is not
+   permission to derive a replacement and continue. Any live identity, policy,
+   workflow, ancestry, or canary-evidence drift stops the flow until a fresh
+   receipt is reviewed and receives new approval.
 10. Before creating the local bridge-delete worktree, rebind exactly the
     independently approved receipt. This is read-only and performs the fresh
     two-round live comparison; it is not a replacement for the later deletion
@@ -289,6 +296,42 @@ protection.
     current security projection, bridge-byte, and canary-binding drift. It is
     limited to the source self-hosting repository: do not invoke the ordinary
     consumer or organization bridge-removal executor.
+
+11. Run the constrained local deletion executor only in the clean, checked-out
+    default-branch source worktree used to prepare the new bridge-delete PR. Its
+    HEAD must still equal the approved receipt's default-branch head. First run
+    the dry run; after the separate deletion authorization, repeat it with
+    `--apply`:
+
+    ```bash
+    DEFAULT_BRANCH_WORKTREE=/absolute/path/to/clean-source-default-branch-worktree
+
+    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+      --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+      --control-plane-owner "$CONTROL_PLANE_OWNER" \
+      --remove-source-legacy-bridge \
+      --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+      --expected-source-bridge-removal-proof-sha256 \
+      "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+
+    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+      --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+      --control-plane-owner "$CONTROL_PLANE_OWNER" \
+      --remove-source-legacy-bridge \
+      --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+      --expected-source-bridge-removal-proof-sha256 \
+      "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256" \
+      --apply
+    ```
+
+    The required option shape is
+    `--prepare-worktree <default-branch-worktree> --remove-source-legacy-bridge --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" --expected-source-bridge-removal-proof-sha256 "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"`.
+    It has no `--repo`, `--ruleset-profile`, `--legacy-bridge`,
+    `--derive-source-bridge-removal-proof`,
+    `--rebind-source-bridge-removal-proof`, `--canary-pr`, or `--canary-head`
+    parameter. Do not combine it with a remote phase or run it from an arbitrary
+    checkout: it is the constrained route to produce and inspect the one-file
+    deletion diff before opening that PR, not an ad hoc deletion authorization.
 
     Deleting the tracked bridge YAML blocks ordinary new dispatches; it does
     not promise that a historical Actions run cannot be rerun. Never represent
