@@ -1185,12 +1185,29 @@ evidence that a prior freeze remains in force.
   uses that same predicate when producing its exact after-state, so a
   case-variant legacy requirement is removed by the reviewed, plan-bound PUT
   rather than being recognized but retained indefinitely.
-- The code and protocol record were validated with `npm run check`, the full
-  `test/bootstrap.test.mjs` and
-  `test/organization-review-gate-handoff.test.mjs` suites, `git diff --check`,
-  and project-journal validation. The changes remain pending review and merge
-  in source PR `#71`; they do not yet authorize a live organization audit or
-  any v1 bridge removal.
+- A later current-head review found that the post-cutover boundary still did
+  not re-read the deployed default-branch v2 control plane. A stale removal
+  worktree could otherwise pass the organization/no-v1 checks and then merge
+  while a later default-branch verifier, controller, or CODEOWNERS change was
+  broken or malicious. The post-cutover-only consumer path now takes Q1, a
+  single GraphQL repository observation that binds `nameWithOwner`, numeric
+  database ID, node ID, unarchived state, default-branch name, and target OID
+  together against the receipt. It reads the complete remote workflow tree/
+  blobs and CODEOWNERS at Q1's target OID, validates canonical
+  verifier/controller bytes and CODEOWNERS diagnostics, then takes Q2 through
+  the same GraphQL response shape. Q2 must bind the same receipt identity and
+  default branch and retain Q1's target OID; this rejects a same-slug object
+  replacement even if its new default branch reuses the same commit SHA. It
+  accepts only either the exact temporary bridge or no bridge at all; the latter
+  preserves an already-completed removal as an idempotent no-op, while a
+  noncanonical file at the legacy bridge path remains a blocker. This is a
+  point-in-time fail-closed boundary rather than a claim of a continuous remote
+  lock. Focused regressions cover verifier drift, head advance, same-SHA
+  same-slug replacement, bridge-path occupation, and bridge-free idempotence.
+  Historical handoff-v2 remains identity-only compatible.
+- This source-side boundary is only a precondition for the later live
+  organization audit: it does not itself authorize a live audit or any v1
+  bridge removal.
 
 ## Next Steps
 

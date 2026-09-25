@@ -91,6 +91,22 @@ const POST_CLEANUP_WRITE_RECOVERY_TAG = Symbol(
   "post-cleanup-write-recovery-guidance",
 );
 const SOURCE_SELF_HOSTING_REPOSITORY_SLUG = "Joey-Tools/codex-review-gate";
+const POST_CUTOVER_AUDIT_REPOSITORY_OBSERVATION_QUERY = `
+  query PostCutoverAuditRepositoryObservation($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {
+      nameWithOwner
+      databaseId
+      id
+      isArchived
+      defaultBranchRef {
+        name
+        target {
+          oid
+        }
+      }
+    }
+  }
+`;
 
 async function main() {
   const options = readCliOptions();
@@ -3548,12 +3564,19 @@ function assertPostCutoverAuditOrganizationRulesetBinding({
 // before every local mutation boundary, so the consumer never treats the
 // audit as a perpetual authorization after a later v1 restoration or policy
 // rewrite. The receipt deliberately does not contain a replayable complete
-// repository-local policy snapshot. The separate live repository check below
-// therefore proves only the security property actually bound by this receipt:
-// no legacy status remains effective through either classic protection or an
-// effective ruleset. It must not invent an unbound repository-policy hash.
-// The existing origin -> live repository identity/default-branch -> origin
-// binding remains the independent consumer object-selection proof. Historical
+// repository-local policy snapshot. The separate live repository checks below
+// therefore prove only the security properties needed at this boundary: no
+// legacy status remains effective through either classic protection or an
+// effective ruleset, and the current default branch still has a canonical v2
+// control plane. The latter permits only two complete inventories: the exact
+// temporary bridge or no bridge at all. That keeps an already-completed
+// cutover idempotent without accepting a drifted, displaced, or additional v1
+// caller. Q1 and Q2 each bind the live repository identity, default branch,
+// and target OID in one GraphQL response: Q1 anchors the tree inventory and
+// Q2 is the final remote read. Unrelated commits are benign only when they did
+// not race this inventory read. It must not invent an unbound repository-policy
+// hash. The existing origin -> live repository identity/default-branch ->
+// origin binding remains the independent consumer object-selection proof. Historical
 // handoff-v2 proofs also retain their published identity-only compatibility
 // because they contain no policy fingerprints.
 async function assertPostCutoverAuditOrganizationPolicyStable(proof, phase) {
@@ -3628,6 +3651,166 @@ async function assertPostCutoverAuditRepositoryLegacyPolicyClear(proof, phase) {
   }
 }
 
+async function assertPostCutoverAuditRepositoryControlPlaneStable(
+  proof,
+  canonicalWorkflows,
+  controlPlaneOwner,
+  phase,
+) {
+  if (proof.proofKind !== "post-cutover-audit-v1") return;
+
+  const repository = proof.repository;
+  try {
+    const initialObservation =
+      await loadPostCutoverAuditRepositoryObservation(
+        proof.originRepository,
+        repository,
+      );
+    const defaultBranchHeadSha = initialObservation.targetOid;
+    const { workflowFiles, codeownersContent } =
+      await loadDefaultBranchControlPlaneInventory({
+        repoSlug: repository.full_name,
+        treeRef: defaultBranchHeadSha,
+      });
+    assertPostCutoverAuditCanonicalWorkflowInventory(
+      workflowFiles,
+      canonicalWorkflows,
+    );
+    validateControlPlaneCodeownersContent(codeownersContent, controlPlaneOwner);
+    const codeownersErrors = await ghJson(
+      `repos/${repository.full_name}/codeowners/errors?ref=${encodeURIComponent(defaultBranchHeadSha)}`,
+    );
+    if (
+      !Array.isArray(codeownersErrors?.errors) ||
+      codeownersErrors.errors.length !== 0
+    ) {
+      throw new Error(
+        "GitHub reports CODEOWNERS syntax or ownership errors at the exact default-branch head.",
+      );
+    }
+    const finalObservation = await loadPostCutoverAuditRepositoryObservation(
+      proof.originRepository,
+      repository,
+    );
+    if (finalObservation.targetOid !== defaultBranchHeadSha) {
+      throw new Error(
+        "Default branch head changed while reading the canonical control-plane inventory.",
+      );
+    }
+  } catch (error) {
+    throw new Error(
+      `Post-cutover audit repository default-branch control plane is unreadable or drifted during ${phase}; refusing bridge removal success.\n${error.message}`,
+    );
+  }
+}
+
+async function loadPostCutoverAuditRepositoryObservation(
+  originRepository,
+  expectedRepository,
+) {
+  if (
+    typeof originRepository?.owner !== "string" ||
+    originRepository.owner === "" ||
+    typeof originRepository?.repo !== "string" ||
+    originRepository.repo === ""
+  ) {
+    throw new Error("Git origin repository is malformed for GraphQL observation.");
+  }
+  const response = await ghJson("graphql", {
+    method: "POST",
+    body: {
+      query: POST_CUTOVER_AUDIT_REPOSITORY_OBSERVATION_QUERY,
+      variables: {
+        owner: originRepository.owner,
+        name: originRepository.repo,
+      },
+    },
+  });
+  if (
+    response === null ||
+    typeof response !== "object" ||
+    Array.isArray(response) ||
+    (response.errors !== undefined &&
+      (!Array.isArray(response.errors) || response.errors.length !== 0))
+  ) {
+    throw new Error("GitHub GraphQL repository observation returned errors or malformed data.");
+  }
+  const observed = response.data?.repository;
+  const defaultBranchRef = observed?.defaultBranchRef;
+  const target = defaultBranchRef?.target;
+  const targetOid = target?.oid;
+  if (
+    observed === null ||
+    typeof observed !== "object" ||
+    Array.isArray(observed) ||
+    typeof observed.nameWithOwner !== "string" ||
+    observed.nameWithOwner === "" ||
+    !Number.isSafeInteger(observed.databaseId) ||
+    observed.databaseId <= 0 ||
+    typeof observed.id !== "string" ||
+    observed.id === "" ||
+    observed.isArchived !== false ||
+    defaultBranchRef === null ||
+    typeof defaultBranchRef !== "object" ||
+    Array.isArray(defaultBranchRef) ||
+    typeof defaultBranchRef.name !== "string" ||
+    defaultBranchRef.name === "" ||
+    target === null ||
+    typeof target !== "object" ||
+    Array.isArray(target) ||
+    typeof targetOid !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(targetOid)
+  ) {
+    throw new Error(
+      "GitHub GraphQL repository observation is incomplete, archived, or malformed.",
+    );
+  }
+  if (
+    observed.nameWithOwner !== expectedRepository.full_name ||
+    observed.databaseId !== expectedRepository.id ||
+    observed.id !== expectedRepository.node_id ||
+    defaultBranchRef.name !== expectedRepository.default_branch
+  ) {
+    throw new Error(
+      "GitHub GraphQL repository observation does not match the receipt-bound repository identity or default branch.",
+    );
+  }
+  return { targetOid };
+}
+
+function assertPostCutoverAuditCanonicalWorkflowInventory(
+  workflowFiles,
+  canonicalWorkflows,
+) {
+  let exactBridgeError;
+  try {
+    validateCanonicalV2WorkflowInventory(workflowFiles, canonicalWorkflows, {
+      legacyBridge: true,
+    });
+    return;
+  } catch (error) {
+    exactBridgeError = error;
+  }
+  if (
+    workflowFiles.some(
+      (file) => file?.path === DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+    )
+  ) {
+    throw new Error(
+      `Default-branch workflow inventory must retain the exact temporary bridge or contain no bridge. Exact-bridge validation failed: ${exactBridgeError.message}\n${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} remains occupied by a non-canonical workflow.`,
+    );
+  }
+  try {
+    validateCanonicalV2WorkflowInventory(workflowFiles, canonicalWorkflows, {
+      legacyBridge: false,
+    });
+  } catch (error) {
+    throw new Error(
+      `Default-branch workflow inventory must retain the exact temporary bridge or contain no bridge. Exact-bridge validation failed: ${exactBridgeError.message}\nBridge-absent validation failed: ${error.message}`,
+    );
+  }
+}
+
 async function loadCurrentOrganizationFinalClosureRepository(
   originRepository,
   phase,
@@ -3642,6 +3825,8 @@ async function loadCurrentOrganizationFinalClosureRepository(
 async function assertOrganizationFinalClosureBindingStable(
   targetRoot,
   proof,
+  canonicalWorkflows,
+  controlPlaneOwner,
   phase,
 ) {
   const current = await loadGitHubOriginRepository(targetRoot);
@@ -3662,6 +3847,12 @@ async function assertOrganizationFinalClosureBindingStable(
   }
   await assertPostCutoverAuditOrganizationPolicyStable(proof, phase);
   await assertPostCutoverAuditRepositoryLegacyPolicyClear(proof, phase);
+  await assertPostCutoverAuditRepositoryControlPlaneStable(
+    proof,
+    canonicalWorkflows,
+    controlPlaneOwner,
+    phase,
+  );
   const afterMetadataRead = await loadGitHubOriginRepository(targetRoot);
   assertOrganizationFinalClosureOriginMatchesProof(
     afterMetadataRead,
@@ -3762,6 +3953,8 @@ async function prepareConsumerWorktree({
     await assertOrganizationFinalClosureBindingStable(
       targetRoot,
       bridgeRemovalProof,
+      canonicalWorkflows,
+      controlPlaneOwner,
       "bridge-removal proof admission",
     );
   }
@@ -3825,6 +4018,8 @@ async function prepareConsumerWorktree({
       await assertOrganizationFinalClosureBindingStable(
         targetRoot,
         bridgeRemovalProof,
+        canonicalWorkflows,
+        controlPlaneOwner,
         "no-op success readback",
       );
     }
@@ -3951,6 +4146,8 @@ async function prepareConsumerWorktree({
       await assertOrganizationFinalClosureBindingStable(
         targetRoot,
         bridgeRemovalProof,
+        canonicalWorkflows,
+        controlPlaneOwner,
         phase,
       );
     }
@@ -4082,6 +4279,8 @@ async function prepareConsumerWorktree({
       await assertOrganizationFinalClosureBindingStable(
         targetRoot,
         bridgeRemovalProof,
+        canonicalWorkflows,
+        controlPlaneOwner,
         "immediately before local apply success",
       );
     }

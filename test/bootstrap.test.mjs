@@ -2382,6 +2382,143 @@ test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
   }
 });
 
+test("post-cutover bridge-removal no-op accepts a canonical default branch without the bridge", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-bridge-free-noop-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      repositoryControlPlaneLegacyBridge: false,
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], { env: auditProofEnv });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Admitted bridge-removal proof/u);
+    assert.match(result.stdout, /legacy bridge is already absent/u);
+    assert.equal(existsSync(bridgePath), false);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("post-cutover bridge-free no-op rejects a non-canonical workflow at the bridge path", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-bridge-path-occupant-"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const repository = auditFixture.output.post_cutover_audit_receipt
+      .manifest_repositories[0];
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      repositoryControlPlaneLegacyBridge: false,
+      repositoryControlPlaneResponseOverrides: {
+        [`repos/${repository.full_name}/git/trees/workflows-tree`]: {
+          truncated: false,
+          tree: [
+            {
+              path: "codex-review-gate.yml",
+              sha: "canonical-blob",
+              type: "blob",
+              mode: "100644",
+            },
+            {
+              path: "codex-review-gate-controller.yml",
+              sha: "canonical-controller-blob",
+              type: "blob",
+              mode: "100644",
+            },
+            {
+              path: "codex-review-gate-legacy-bridge.yml",
+              sha: "inert-bridge-path-blob",
+              type: "blob",
+              mode: "100644",
+            },
+          ],
+        },
+        [`repos/${repository.full_name}/git/blobs/inert-bridge-path-blob`]: {
+          encoding: "base64",
+          content: Buffer.from(
+            "name: Inert bridge-path occupant\non: workflow_dispatch\npermissions: {}\njobs:\n  inert:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
+            "utf8",
+          ).toString("base64"),
+        },
+      },
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], { env: auditProofEnv });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Post-cutover audit repository default-branch control plane is unreadable or drifted during bridge-removal proof admission/u,
+    );
+    assert.match(result.stderr, /remains occupied by a non-canonical workflow/u);
+    assert.doesNotMatch(result.stdout, /Admitted bridge-removal proof|Applied: remove/u);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
 test("post-cutover audit rejects self-consistent forged receipt hashes for disabled or weak live v2", () => {
   for (const [name, weakenLiveV2] of [
     [
@@ -2657,6 +2794,199 @@ test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable
       }),
       /v2 ruleset readback is unavailable/u,
       /Post-cutover audit organization policy is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "default-branch-verifier-drift",
+      (fixture) => {
+        const repository = fixture.output.post_cutover_audit_receipt
+          .manifest_repositories[0];
+        const driftedHeadSha = "b".repeat(40);
+        return {
+          repositoryGraphqlResponse: {
+            __fake_sequence: [
+              // Admission and the preceding CODEOWNERS boundary each consume
+              // Q1/Q2. The bridge-removal boundary's Q1 then selects the
+              // drifted tree before any local bridge mutation can begin.
+              ...Array.from({ length: 4 }, () =>
+                postCutoverAuditGraphqlRepositoryResponse(repository),
+              ),
+              postCutoverAuditGraphqlRepositoryResponse(repository, {
+                targetOid: driftedHeadSha,
+              }),
+            ],
+          },
+          repositoryControlPlaneResponseOverrides: {
+            [`repos/${repository.full_name}/git/trees/${driftedHeadSha}`]: {
+              truncated: false,
+              tree: [{
+                path: ".github",
+                sha: "drifted-github-tree",
+                type: "tree",
+              }],
+            },
+            [`repos/${repository.full_name}/git/trees/drifted-github-tree`]: {
+              truncated: false,
+              tree: [
+                {
+                  path: "CODEOWNERS",
+                  sha: "codeowners-blob",
+                  type: "blob",
+                  mode: "100644",
+                },
+                {
+                  path: "workflows",
+                  sha: "drifted-workflows-tree",
+                  type: "tree",
+                },
+              ],
+            },
+            [`repos/${repository.full_name}/git/trees/drifted-workflows-tree`]: {
+              truncated: false,
+              tree: [
+                {
+                  path: "codex-review-gate.yml",
+                  sha: "drifted-verifier-blob",
+                  type: "blob",
+                  mode: "100644",
+                },
+                {
+                  path: "codex-review-gate-controller.yml",
+                  sha: "canonical-controller-blob",
+                  type: "blob",
+                  mode: "100644",
+                },
+                {
+                  path: "codex-review-gate-legacy-bridge.yml",
+                  sha: "canonical-legacy-bridge-blob",
+                  type: "blob",
+                  mode: "100644",
+                },
+              ],
+            },
+            [`repos/${repository.full_name}/git/blobs/drifted-verifier-blob`]: {
+              encoding: "base64",
+              content: Buffer.from(
+                CANONICAL_WORKFLOW.replace(
+                  "name: Codex Review Gate Verifier",
+                  "name: Drifted Codex Review Gate Verifier",
+                ),
+                "utf8",
+              ).toString("base64"),
+            },
+          },
+        };
+      },
+      /canonical v2 verifier workflow bytes|Canonical v2 verifier workflow/u,
+      /Post-cutover audit repository default-branch control plane is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "graphql-default-branch-head-churn",
+      (fixture) => {
+        const repository = fixture.output.post_cutover_audit_receipt
+          .manifest_repositories[0];
+        return {
+          repositoryGraphqlResponse: {
+            __fake_sequence: [
+              // Admission and the preceding CODEOWNERS boundary each consume
+              // Q1/Q2. The third boundary sees Q1 at A and Q2 at B.
+              ...Array.from({ length: 5 }, () =>
+                postCutoverAuditGraphqlRepositoryResponse(repository),
+              ),
+              postCutoverAuditGraphqlRepositoryResponse(repository, {
+                targetOid: "c".repeat(40),
+              }),
+            ],
+          },
+        };
+      },
+      /Default branch head changed while reading the canonical control-plane inventory/u,
+      /Post-cutover audit repository default-branch control plane is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "graphql-same-sha-repository-replacement-after-q1",
+      (fixture) => {
+        const repository = fixture.output.post_cutover_audit_receipt
+          .manifest_repositories[0];
+        return {
+          repositoryGraphqlResponse: {
+            __fake_sequence: [
+              // The first two boundaries consume Q1/Q2. At the bridge-removal
+              // boundary Q1 reads the receipt-bound repository at A, then Q2
+              // observes a same-slug replacement that preserves A's OID.
+              ...Array.from({ length: 5 }, () =>
+                postCutoverAuditGraphqlRepositoryResponse(repository),
+              ),
+              postCutoverAuditGraphqlRepositoryResponse(repository, {
+                databaseId: repository.id + 1,
+                nodeId: `${repository.node_id}-replacement`,
+              }),
+            ],
+          },
+        };
+      },
+      /GraphQL repository observation does not match the receipt-bound repository identity or default branch/u,
+      /Post-cutover audit repository default-branch control plane is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "graphql-errors-after-q1",
+      (fixture) => {
+        const repository = fixture.output.post_cutover_audit_receipt
+          .manifest_repositories[0];
+        return {
+          repositoryGraphqlResponse: {
+            __fake_sequence: [
+              ...Array.from({ length: 5 }, () =>
+                postCutoverAuditGraphqlRepositoryResponse(repository),
+              ),
+              {
+                errors: [{ message: "repository observation is unavailable" }],
+              },
+            ],
+          },
+        };
+      },
+      /GraphQL repository observation returned errors or malformed data/u,
+      /Post-cutover audit repository default-branch control plane is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "graphql-null-repository-after-q1",
+      (fixture) => {
+        const repository = fixture.output.post_cutover_audit_receipt
+          .manifest_repositories[0];
+        return {
+          repositoryGraphqlResponse: {
+            __fake_sequence: [
+              ...Array.from({ length: 5 }, () =>
+                postCutoverAuditGraphqlRepositoryResponse(repository),
+              ),
+              { data: { repository: null } },
+            ],
+          },
+        };
+      },
+      /GraphQL repository observation is incomplete, archived, or malformed/u,
+      /Post-cutover audit repository default-branch control plane is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "graphql-archived-repository-after-q1",
+      (fixture) => {
+        const repository = fixture.output.post_cutover_audit_receipt
+          .manifest_repositories[0];
+        return {
+          repositoryGraphqlResponse: {
+            __fake_sequence: [
+              ...Array.from({ length: 5 }, () =>
+                postCutoverAuditGraphqlRepositoryResponse(repository),
+              ),
+              postCutoverAuditGraphqlRepositoryResponse(repository, {
+                isArchived: true,
+              }),
+            ],
+          },
+        };
+      },
+      /GraphQL repository observation is incomplete, archived, or malformed/u,
+      /Post-cutover audit repository default-branch control plane is unreadable or drifted during immediately before legacy bridge removal/u,
     ],
   ]) {
     const targetRoot = mkdtempSync(
@@ -10867,6 +11197,9 @@ function postCutoverAuditGhEnvironment(
     },
     repositoryRulesetResponses = {},
     repositoryMetadataResponse = undefined,
+    repositoryGraphqlResponse = undefined,
+    repositoryControlPlaneLegacyBridge = true,
+    repositoryControlPlaneResponseOverrides = {},
   },
 ) {
   const receipt = output.post_cutover_audit_receipt;
@@ -10881,7 +11214,15 @@ function postCutoverAuditGhEnvironment(
     stateDir,
     callLog,
     responses: {
-      [`repos/${repository.full_name}`]: repositoryMetadataResponse ?? repository,
+      ...canonicalRemoteWorkflowResponses(repository.full_name, {
+        legacyBridge: repositoryControlPlaneLegacyBridge,
+      }),
+      [`repos/${repository.full_name}`]: repositoryMetadataResponse ?? {
+        ...repository,
+        archived: false,
+      },
+      "POST graphql": repositoryGraphqlResponse ??
+        postCutoverAuditGraphqlRepositoryResponse(repository),
       [`orgs/${receipt.organization.login}`]: receipt.organization,
       [`orgs/${receipt.organization.login}/rulesets/${receipt.legacy.id}`]:
         legacyRulesetResponse,
@@ -10893,6 +11234,7 @@ function postCutoverAuditGhEnvironment(
         classicRequiredStatusChecksResponse,
       [`repos/${repository.full_name}/branches/${branch}`]: {
         name: repository.default_branch,
+        commit: { sha: DEFAULT_BRANCH_SHA },
       },
       ...Object.fromEntries(
         Object.entries(repositoryRulesetResponses).map(([id, response]) => [
@@ -10900,8 +11242,34 @@ function postCutoverAuditGhEnvironment(
           response,
         ]),
       ),
+      ...repositoryControlPlaneResponseOverrides,
     },
   });
+}
+
+function postCutoverAuditGraphqlRepositoryResponse(
+  repository,
+  {
+    databaseId = repository.id,
+    nodeId = repository.node_id,
+    targetOid = DEFAULT_BRANCH_SHA,
+    isArchived = false,
+  } = {},
+) {
+  return {
+    data: {
+      repository: {
+        nameWithOwner: repository.full_name,
+        databaseId,
+        id: nodeId,
+        isArchived,
+        defaultBranchRef: {
+          name: repository.default_branch,
+          target: { oid: targetOid },
+        },
+      },
+    },
+  };
 }
 
 function runGit(args) {

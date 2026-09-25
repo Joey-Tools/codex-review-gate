@@ -207,10 +207,23 @@ unreadable detail, restored `codex/review-gate`, disabled or weakened v2, or
 any legacy/v2 policy drift leaves the bridge installed. The receipt does not
 carry a replayable repository-local ruleset-policy snapshot, so the consumer
 does not invent an unbound complete repository-policy hash comparison. It does
-re-read the target default branch's classic required-status and effective-
-ruleset surfaces and requires that neither still requires
-`codex/review-gate`; the separate origin/live-repository identity/default-
-branch rebind continues to select the exact repository object. These are
-point-in-time checks at the listed boundaries, not a claim of a continuous
-remote lock. Historical handoff-v2 proofs remain identity-only compatible
-because they contain no writable-policy fingerprints.
+  re-read the target default branch's classic required-status and effective-
+  ruleset surfaces and requires that neither still requires
+  `codex/review-gate`; the separate origin/live-repository identity/default-
+  branch rebind continues to select the exact repository object. These are
+  point-in-time checks at the listed boundaries, not a claim of a continuous
+  remote lock. At those same post-cutover-only boundaries, Q1 is one GitHub
+  GraphQL repository observation that binds `nameWithOwner`, numeric database
+  ID, node ID, unarchived state, default-branch name, and target OID together
+  against the receipt. The consumer reads the complete remote workflow
+  tree/blobs and `.github/CODEOWNERS` at Q1's exact target OID and validates
+  GitHub's CODEOWNERS diagnostics. Q2 repeats that same one-response
+  identity/default-branch/head observation after those reads and requires the
+  exact identity/default branch plus the same target OID. It accepts only the
+  exact canonical v2 verifier/controller plus either the exact temporary
+  bridge or no bridge at all (the latter keeps an already-merged removal
+  idempotent); an arbitrary file occupying the bridge path is rejected. A
+  changed head during the observation, same-slug repository replacement,
+  archived/malformed/unreadable GraphQL object, or any workflow/CODEOWNERS
+  mismatch leaves the bridge installed. Historical handoff-v2 proofs remain
+  identity-only compatible because they contain no writable-policy fingerprints.
