@@ -167,8 +167,8 @@ required for every ordinary consumer and every repository-level cohort
 installation. Do not copy this profile into a general installation template.
 
 > **Completed source exception.** The current source default branch has
-> completed this two-PR lifecycle and no longer contains the temporary legacy
-> bridge. The commands below are retained as an audited historical procedure;
+> completed its source-only proof-and-removal lifecycle and no longer contains
+> the temporary legacy bridge. The commands below are retained as an audited historical procedure;
 > do not rerun them against `Joey-Tools/codex-review-gate` unless a future
 > authorized migration deliberately recreates a bridge. This does not alter the
 > canonical bridge template or ordinary consumer/cohort cleanup procedures.

@@ -133,7 +133,7 @@ review-thread resolution。其 CODEOWNERS/owner projection 是 source control-pl
 policy。
 它不是通用 consumer 或 cohort template。source repository 使用 canonical v2 verifier 和
 controller；其 repository-local v1 required status 和 temporary legacy bridge 均已退休。
-该 bridge 只会在独立的 source-only executor 使用已明确批准的 closure receipt SHA-256
+该 bridge 已由独立的 source-only executor 使用已明确批准的 closure receipt SHA-256
 `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`，并在每个本地 mutation
 boundary 对 fresh two-round GitHub evidence 重新绑定成功后删除。已发布的 `v2.1.0` payload
 与 closed-unmerged 历史 canary `#74` 仍只是证据输入，绝不是可独立使用的删除授权。source-only
