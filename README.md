@@ -134,17 +134,36 @@ major (beginning with `v2.0.0`); minor and patch releases advance `@v2` without
 another Marketplace operation. Existing v1 tags and consumers remain valid and
 frozen until each consumer is deliberately migrated.
 
+The published `v2.1.0` payload declares `runs.using: node24`, and the floating
+`v2` alias resolves to that immutable release. It does not retroactively change
+the frozen v2.0 release contract or make a v1 bridge removable by itself.
+
 The importable template and the helper's default `full` ruleset profile remain
 the ordinary consumer contract. Only the `Joey-Tools/codex-review-gate` source
 self-migration may explicitly stage remote `--ruleset-profile status-only`
 with `--legacy-bridge` and the distinct `Must Pass Codex Review v2` rule. That
 new rule adds only the strict v2 status context while the existing source rule
-retains deletion, non-fast-forward, and pull-request/conversation policy.
+retains deletion, non-fast-forward, pull-request conditions, and required
+review-thread resolution. Its CODEOWNERS/owner projection is receipt material
+for source control-plane ownership and drift detection, not an enforced Code
+Owner-approval or stale-review policy.
 It is not a general consumer or cohort template. The source repository uses
 the canonical v2 verifier and controller; its repository-local v1 required
 status is retired while the exact temporary legacy bridge intentionally
-remains. Its later physical bridge removal needs a separately recorded
-source-local closure proof; an organization schema-2 cohort receipt cannot
-authorize it. See
-[docs/RELEASING.md](docs/RELEASING.md) for the complete staged flow, recovery
-states and protection baseline.
+remains. Its later physical bridge removal needs a separately derived,
+source-only closure receipt whose exact SHA-256 receives independent approval.
+The published `v2.1.0` payload and closed-unmerged historical canary `#74` are
+evidence inputs only, never bridge-deletion authority; `#74` contributes its
+exact PR/head/base/test-merge/CheckRun/run/job tuple. The receipt also binds a
+fresh two-round live source closure. Before local deletion, the **same**
+independently approved receipt (and exact SHA-256) must rebind equal to fresh
+GitHub evidence. Drift stops the flow: derive a new receipt, review it, and
+obtain a new independent approval before any later deletion attempt. The
+source-only executor is unavailable to ordinary consumers. Deleting the YAML
+stops ordinary new dispatches, but does not promise that GitHub cannot rerun a
+historical Actions run. The receipt cannot be trusted as a standalone file, and
+the organization schema-2 cohort receipt cannot authorize it. A proof-machinery
+PR and the later bridge-delete PR remain deliberately separate. See the
+[human installation guide](docs/install/human.md) for that source-only closure
+flow, and [docs/RELEASING.md](docs/RELEASING.md) for publisher recovery states
+and the release-protection baseline.

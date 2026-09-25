@@ -19,11 +19,93 @@ export const RULESET_PROFILE_STATUS_ONLY = "status-only";
 export const DEFAULT_RULESET_PROFILE = RULESET_PROFILE_FULL;
 export const DEFAULT_CONTROL_PLANE_OWNER = "@JoeyTeng";
 export const DEFAULT_CODEOWNERS_PATH = ".github/CODEOWNERS";
+// This source repository is deliberately outside the organization handoff
+// cohort. Its temporary v1 bridge has a separate, source-local closure
+// lifecycle and must never be admitted through an organization receipt.
+export const SOURCE_SELF_HOSTING_REPOSITORY_SLUG =
+  "Joey-Tools/codex-review-gate";
+export const SOURCE_SELF_HOSTING_RULESET_NAME = "Must Pass Codex Review v2";
+export const SOURCE_SELF_HOSTING_RETAINED_RULESET_ID = 16_410_326;
+export const SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME =
+  "PR must pass codex review";
+export const SOURCE_BRIDGE_REMOVAL_PROOF_SCHEMA_VERSION = 1;
+export const SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION =
+  "source-bridge-removal-proof-output/v1";
 export const CANONICAL_V2_WORKFLOW_USES =
   "JoeyTeng/codex-review-gate-action@v2";
 export const LEGACY_V1_WORKFLOW_USES =
   "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1";
 const LEGACY_V1_DIRECT_ACTION_USES = "JoeyTeng/codex-review-gate-action@v1";
+
+// This source repository retains its pre-v2 non-status protections in a
+// separate ruleset while the v2 status-only policy evolves independently.
+// These are intentionally the observed source policy values, not the generic
+// consumer full-profile defaults: source does not require CODEOWNERS review or
+// stale-review dismissal, but it does require conversation resolution and the
+// unattributed-change extra approval. Source bridge deletion must not silently
+// weaken or substitute this retained policy.
+const SOURCE_SELF_HOSTING_RETAINED_RULESET_WRITABLE_POLICY = Object.freeze({
+  name: SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME,
+  target: "branch",
+  enforcement: "active",
+  bypass_actors: [],
+  conditions: {
+    ref_name: {
+      include: ["~DEFAULT_BRANCH"],
+      exclude: [],
+    },
+  },
+  rules: [
+    { type: "deletion" },
+    { type: "non_fast_forward" },
+    {
+      type: "pull_request",
+      parameters: {
+        allowed_merge_methods: ["squash"],
+        dismiss_stale_reviews_on_push: false,
+        dismissal_restriction: { allowed_actors: [], enabled: false },
+        require_code_owner_review: false,
+        require_extra_approval_for_unattributed_changes: true,
+        require_last_push_approval: false,
+        required_approving_review_count: 0,
+        required_review_thread_resolution: true,
+        required_reviewers: [],
+      },
+    },
+  ],
+});
+
+// GitHub status-context matching is case-insensitive for this legacy surface.
+// Keep the comparison explicitly ASCII-only: the reserved context is ASCII and
+// accepting Unicode case folds would blur a security identity rather than
+// normalize it.
+export function statusContextEqualsAsciiCaseInsensitive(value, expected) {
+  if (
+    typeof value !== "string" ||
+    typeof expected !== "string" ||
+    value.length !== expected.length
+  ) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const valueCode = value.charCodeAt(index);
+    const expectedCode = expected.charCodeAt(index);
+    const normalizedValue =
+      valueCode >= 0x41 && valueCode <= 0x5a ? valueCode + 0x20 : valueCode;
+    const normalizedExpected =
+      expectedCode >= 0x41 && expectedCode <= 0x5a
+        ? expectedCode + 0x20
+        : expectedCode;
+    if (normalizedValue !== normalizedExpected || normalizedValue > 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function isLegacyStatusContext(value) {
+  return statusContextEqualsAsciiCaseInsensitive(value, LEGACY_STATUS_CONTEXT);
+}
 const CANONICAL_LEGACY_BRIDGE_WORKFLOW_CONTENT = [
   "name: Codex Review Gate Legacy Bridge",
   "",
@@ -486,6 +568,972 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
     canonical.manifest_repositories = manifestRepositories;
   }
   return canonical;
+}
+
+// A source bridge-removal proof is deliberately evidence, not authority. A
+// later local mutation must re-derive the complete live closure and require
+// byte-for-byte equality with this canonical receipt. Keeping this separate
+// from organization receipts prevents the organization cohort from extending
+// deletion authority to the source repository.
+export function canonicalSourceBridgeRemovalProof(receipt) {
+  return canonicalJson(validateSourceBridgeRemovalProof(receipt));
+}
+
+export function sourceBridgeRemovalProofSha256(receipt) {
+  return createHash("sha256")
+    .update(canonicalSourceBridgeRemovalProof(receipt), "utf8")
+    .digest("hex");
+}
+
+export function sourceBridgeRemovalSecurityStateSha256(securityState) {
+  const canonical = validateReceiptJsonValue(
+    securityState,
+    "Source bridge-removal security state",
+  );
+  if (canonical === null || typeof canonical !== "object" || Array.isArray(canonical)) {
+    throw new Error("Source bridge-removal security state must be an object.");
+  }
+  return createHash("sha256")
+    .update(canonicalJson(canonical), "utf8")
+    .digest("hex");
+}
+
+export function sourceBridgeRemovalLegacyInventorySha256(inventory) {
+  const canonical = validateReceiptJsonValue(
+    inventory,
+    "Source bridge-removal legacy inventory",
+  );
+  if (canonical === null || typeof canonical !== "object" || Array.isArray(canonical)) {
+    throw new Error("Source bridge-removal legacy inventory must be an object.");
+  }
+  return createHash("sha256")
+    .update(`${canonicalJson(canonical)}\n`, "utf8")
+    .digest("hex");
+}
+
+export function sourceBridgeRemovalRulesetWritableSha256(writable) {
+  const canonical = validateReceiptJsonValue(
+    writable,
+    "Source bridge-removal v2 ruleset writable policy",
+  );
+  if (canonical === null || typeof canonical !== "object" || Array.isArray(canonical)) {
+    throw new Error(
+      "Source bridge-removal v2 ruleset writable policy must be an object.",
+    );
+  }
+  return createHash("sha256")
+    .update(canonicalJson(canonical), "utf8")
+    .digest("hex");
+}
+
+export function canonicalSourceBridgeRemovalProofOutput(output) {
+  return canonicalJson(validateSourceBridgeRemovalProofOutput(output));
+}
+
+export function validateSourceBridgeRemovalProofOutput(output) {
+  assertPlainReceiptObject(output, "Source bridge-removal proof output");
+  assertExactReceiptKeys(
+    output,
+    [
+      "schema_version",
+      "mode",
+      "status",
+      "applied",
+      "source_bridge_removal_receipt",
+      "source_bridge_removal_receipt_sha256",
+    ],
+    "Source bridge-removal proof output",
+  );
+  if (
+    output.schema_version !== SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION ||
+    output.mode !== "derive" ||
+    output.status !== "candidate" ||
+    output.applied !== false
+  ) {
+    throw new Error(
+      "Source bridge-removal proof output must be the read-only candidate result from derive mode.",
+    );
+  }
+  const receipt = validateSourceBridgeRemovalProof(
+    output.source_bridge_removal_receipt,
+  );
+  assertReceiptSha256(
+    output.source_bridge_removal_receipt_sha256,
+    "source_bridge_removal_receipt_sha256",
+  );
+  if (
+    output.source_bridge_removal_receipt_sha256 !==
+    sourceBridgeRemovalProofSha256(receipt)
+  ) {
+    throw new Error(
+      "Source bridge-removal proof output SHA-256 does not bind its canonical receipt.",
+    );
+  }
+  return {
+    schema_version: SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION,
+    mode: "derive",
+    status: "candidate",
+    applied: false,
+    source_bridge_removal_receipt: receipt,
+    source_bridge_removal_receipt_sha256:
+      output.source_bridge_removal_receipt_sha256,
+  };
+}
+
+export function validateSourceBridgeRemovalProof(receipt) {
+  assertPlainReceiptObject(receipt, "Source bridge-removal receipt");
+  assertExactReceiptKeys(
+    receipt,
+    [
+      "schema_version",
+      "scope",
+      "repository",
+      "control_plane_owner",
+      "v2_ruleset",
+      "retained_source_ruleset",
+      "canary",
+      "live_closure",
+    ],
+    "Source bridge-removal receipt",
+  );
+  if (
+    receipt.schema_version !== SOURCE_BRIDGE_REMOVAL_PROOF_SCHEMA_VERSION ||
+    receipt.scope !== "source-bridge-removal"
+  ) {
+    throw new Error(
+      "Source bridge-removal receipt must use the admitted source-only schema and scope.",
+    );
+  }
+  const repository = validateSourceBridgeRemovalRepository(receipt.repository);
+  const controlPlaneOwner = validateSourceBridgeRemovalControlPlaneOwner(
+    receipt.control_plane_owner,
+  );
+  const v2Ruleset = validateSourceBridgeRemovalV2Ruleset(receipt.v2_ruleset);
+  const retainedSourceRuleset = validateSourceBridgeRemovalRetainedRuleset(
+    receipt.retained_source_ruleset,
+  );
+  const canary = validateSourceBridgeRemovalCanary({
+    canary: receipt.canary,
+    repository,
+  });
+  const liveClosure = validateSourceBridgeRemovalLiveClosure({
+    value: receipt.live_closure,
+    repository,
+    controlPlaneOwner,
+    v2Ruleset,
+    retainedSourceRuleset,
+  });
+  return {
+    schema_version: SOURCE_BRIDGE_REMOVAL_PROOF_SCHEMA_VERSION,
+    scope: "source-bridge-removal",
+    repository,
+    control_plane_owner: controlPlaneOwner,
+    v2_ruleset: v2Ruleset,
+    retained_source_ruleset: retainedSourceRuleset,
+    canary,
+    live_closure: liveClosure,
+  };
+}
+
+function validateSourceBridgeRemovalControlPlaneOwner(value) {
+  if (value !== DEFAULT_CONTROL_PLANE_OWNER) {
+    throw new Error(
+      `Source bridge-removal receipt must bind the fixed control-plane owner ${DEFAULT_CONTROL_PLANE_OWNER}.`,
+    );
+  }
+  return DEFAULT_CONTROL_PLANE_OWNER;
+}
+
+function validateSourceBridgeRemovalRepository(value) {
+  assertPlainReceiptObject(value, "Source bridge-removal repository");
+  assertExactReceiptKeys(
+    value,
+    ["full_name", "id", "node_id", "default_branch", "default_branch_head_sha"],
+    "Source bridge-removal repository",
+  );
+  if (value.full_name !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG) {
+    throw new Error(
+      "Source bridge-removal receipt is not bound to the source self-hosting repository.",
+    );
+  }
+  assertPositiveReceiptId(value.id, "Source bridge-removal repository id");
+  assertReceiptText(value.node_id, "Source bridge-removal repository node_id");
+  assertReceiptText(
+    value.default_branch,
+    "Source bridge-removal repository default_branch",
+  );
+  if (
+    value.default_branch.startsWith("refs/") ||
+    value.default_branch.includes("..")
+  ) {
+    throw new Error(
+      "Source bridge-removal repository default_branch is malformed.",
+    );
+  }
+  assertReceiptCommitSha(
+    value.default_branch_head_sha,
+    "Source bridge-removal repository default_branch_head_sha",
+  );
+  return {
+    full_name: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    id: value.id,
+    node_id: value.node_id,
+    default_branch: value.default_branch,
+    default_branch_head_sha: value.default_branch_head_sha,
+  };
+}
+
+function validateSourceBridgeRemovalV2Ruleset(value) {
+  assertPlainReceiptObject(value, "Source bridge-removal v2_ruleset");
+  assertExactReceiptKeys(
+    value,
+    [
+      "id",
+      "name",
+      "state",
+      "profile",
+      "context",
+      "integration_id",
+      "strict_required_status_checks",
+      "writable_sha256",
+    ],
+    "Source bridge-removal v2_ruleset",
+  );
+  assertPositiveReceiptId(value.id, "Source bridge-removal v2_ruleset id");
+  assertReceiptText(value.name, "Source bridge-removal v2_ruleset name");
+  if (
+    value.name !== SOURCE_SELF_HOSTING_RULESET_NAME ||
+    value.state !== "active" ||
+    value.profile !== RULESET_PROFILE_STATUS_ONLY ||
+    value.context !== DEFAULT_STATUS_CONTEXT ||
+    value.integration_id !== DEFAULT_STATUS_INTEGRATION_ID ||
+    value.strict_required_status_checks !== true
+  ) {
+    throw new Error(
+      `Source bridge-removal receipt v2_ruleset is not the fixed ${SOURCE_SELF_HOSTING_RULESET_NAME} active strict status-only GitHub Actions v2 policy.`,
+    );
+  }
+  assertReceiptSha256(
+    value.writable_sha256,
+    "Source bridge-removal v2_ruleset writable_sha256",
+  );
+  return {
+    id: value.id,
+    name: value.name,
+    state: "active",
+    profile: RULESET_PROFILE_STATUS_ONLY,
+    context: DEFAULT_STATUS_CONTEXT,
+    integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+    strict_required_status_checks: true,
+    writable_sha256: value.writable_sha256,
+  };
+}
+
+function validateSourceBridgeRemovalRetainedRuleset(value) {
+  assertPlainReceiptObject(value, "Source bridge-removal retained_source_ruleset");
+  assertExactReceiptKeys(
+    value,
+    ["id", "name", "source_type", "source", "target", "writable_sha256"],
+    "Source bridge-removal retained_source_ruleset",
+  );
+  if (
+    value.id !== SOURCE_SELF_HOSTING_RETAINED_RULESET_ID ||
+    value.name !== SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME ||
+    value.source_type !== "Repository" ||
+    value.source !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+    value.target !== "branch"
+  ) {
+    throw new Error(
+      "Source bridge-removal retained_source_ruleset is not the fixed source non-status protection ruleset.",
+    );
+  }
+  assertReceiptSha256(
+    value.writable_sha256,
+    "Source bridge-removal retained_source_ruleset writable_sha256",
+  );
+  const expectedWritableSha256 = sourceBridgeRemovalRulesetWritableSha256(
+    sourceSelfHostingRetainedRulesetWritableProjection(
+      SOURCE_SELF_HOSTING_RETAINED_RULESET_WRITABLE_POLICY,
+    ),
+  );
+  if (value.writable_sha256 !== expectedWritableSha256) {
+    throw new Error(
+      "Source bridge-removal retained_source_ruleset writable_sha256 does not bind the admitted exact non-status protection policy.",
+    );
+  }
+  return {
+    id: SOURCE_SELF_HOSTING_RETAINED_RULESET_ID,
+    name: SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME,
+    source_type: "Repository",
+    source: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    target: "branch",
+    writable_sha256: expectedWritableSha256,
+  };
+}
+
+// GitHub represents rules as an unordered ruleset. Normalize only that outer
+// rule collection before comparing it with the security-state projection.
+// Parameter arrays such as allowed_merge_methods and required_status_checks
+// remain verbatim because their order may carry API semantics.
+function sourceSelfHostingRetainedRulesetWritableProjection(writable) {
+  if (!Array.isArray(writable?.rules)) {
+    throw new Error(
+      "Source retained ruleset writable policy must contain a complete rules array.",
+    );
+  }
+  return {
+    ...writable,
+    rules: [...writable.rules].sort((left, right) =>
+      canonicalJson(left).localeCompare(canonicalJson(right))
+    ),
+  };
+}
+
+function validateSourceBridgeRemovalCanary({ canary, repository }) {
+  assertPlainReceiptObject(canary, "Source bridge-removal canary");
+  assertExactReceiptKeys(
+    canary,
+    [
+      "number",
+      "state",
+      "merged",
+      "closed_at",
+      "base",
+      "base_ancestry",
+      "head_sha",
+      "test_merge_sha",
+      "check_run",
+      "run",
+      "job",
+    ],
+    "Source bridge-removal canary",
+  );
+  assertPositiveReceiptId(canary.number, "Source bridge-removal canary number");
+  if (canary.state !== "closed" || canary.merged !== false) {
+    throw new Error(
+      "Source bridge-removal canary must be a closed, unmerged historical pull request.",
+    );
+  }
+  const closedAt = assertReceiptTimestamp(
+    canary.closed_at,
+    "Source bridge-removal canary closed_at",
+  );
+  assertPlainReceiptObject(canary.base, "Source bridge-removal canary base");
+  assertExactReceiptKeys(
+    canary.base,
+    ["ref", "sha"],
+    "Source bridge-removal canary base",
+  );
+  if (canary.base.ref !== repository.default_branch) {
+    throw new Error(
+      "Source bridge-removal canary base must use the source default branch.",
+    );
+  }
+  assertReceiptCommitSha(canary.base.sha, "Source bridge-removal canary base sha");
+  assertReceiptCommitSha(canary.head_sha, "Source bridge-removal canary head_sha");
+  assertReceiptCommitSha(
+    canary.test_merge_sha,
+    "Source bridge-removal canary test_merge_sha",
+  );
+  const baseAncestry = validateSourceBridgeRemovalCanaryBaseAncestry({
+    value: canary.base_ancestry,
+    baseSha: canary.base.sha,
+    defaultBranchHeadSha: repository.default_branch_head_sha,
+  });
+  const checkRun = validateSourceBridgeRemovalCanaryCheckRun(
+    canary.check_run,
+    canary.head_sha,
+  );
+  if (Date.parse(checkRun.completed_at) > closedAt) {
+    throw new Error(
+      "Source bridge-removal canary CheckRun completed after the pull request was closed.",
+    );
+  }
+  const run = validateSourceBridgeRemovalCanaryRun({
+    run: canary.run,
+    canary,
+  });
+  const job = validateSourceBridgeRemovalCanaryJob({
+    job: canary.job,
+    headSha: canary.head_sha,
+    checkRunId: checkRun.id,
+    runId: run.id,
+  });
+  return {
+    number: canary.number,
+    state: "closed",
+    merged: false,
+    closed_at: canary.closed_at,
+    base: { ref: repository.default_branch, sha: canary.base.sha },
+    base_ancestry: baseAncestry,
+    head_sha: canary.head_sha,
+    test_merge_sha: canary.test_merge_sha,
+    check_run: checkRun,
+    run,
+    job,
+  };
+}
+
+function validateSourceBridgeRemovalCanaryBaseAncestry({
+  value,
+  baseSha,
+  defaultBranchHeadSha,
+}) {
+  assertPlainReceiptObject(
+    value,
+    "Source bridge-removal canary base_ancestry",
+  );
+  assertExactReceiptKeys(
+    value,
+    [
+      "base_sha",
+      "current_default_branch_head_sha",
+      "merge_base_sha",
+      "status",
+    ],
+    "Source bridge-removal canary base_ancestry",
+  );
+  if (
+    value.base_sha !== baseSha ||
+    value.current_default_branch_head_sha !== defaultBranchHeadSha ||
+    value.merge_base_sha !== baseSha ||
+    !new Set(["identical", "ahead"]).has(value.status)
+  ) {
+    throw new Error(
+      "Source bridge-removal canary base_ancestry does not prove that the historical base remains an ancestor of the current default-branch head.",
+    );
+  }
+  return {
+    base_sha: baseSha,
+    current_default_branch_head_sha: defaultBranchHeadSha,
+    merge_base_sha: baseSha,
+    status: value.status,
+  };
+}
+
+function validateSourceBridgeRemovalCanaryCheckRun(value, headSha) {
+  assertPlainReceiptObject(value, "Source bridge-removal canary check_run");
+  assertExactReceiptKeys(
+    value,
+    [
+      "id",
+      "name",
+      "head_sha",
+      "status",
+      "conclusion",
+      "completed_at",
+      "app_id",
+      "app_slug",
+    ],
+    "Source bridge-removal canary check_run",
+  );
+  assertPositiveReceiptId(value.id, "Source bridge-removal canary check_run id");
+  if (
+    value.name !== DEFAULT_STATUS_CONTEXT ||
+    value.head_sha !== headSha ||
+    value.status !== "completed" ||
+    value.conclusion !== "success" ||
+    value.app_id !== DEFAULT_STATUS_INTEGRATION_ID ||
+    value.app_slug !== "github-actions"
+  ) {
+    throw new Error(
+      "Source bridge-removal canary check_run is not the successful native GitHub Actions v2 check on its exact head.",
+    );
+  }
+  assertReceiptTimestamp(
+    value.completed_at,
+    "Source bridge-removal canary check_run completed_at",
+  );
+  return {
+    id: value.id,
+    name: DEFAULT_STATUS_CONTEXT,
+    head_sha: headSha,
+    status: "completed",
+    conclusion: "success",
+    completed_at: value.completed_at,
+    app_id: DEFAULT_STATUS_INTEGRATION_ID,
+    app_slug: "github-actions",
+  };
+}
+
+function validateSourceBridgeRemovalCanaryRun({ run, canary }) {
+  assertPlainReceiptObject(run, "Source bridge-removal canary run");
+  assertExactReceiptKeys(
+    run,
+    [
+      "id",
+      "attempt",
+      "workflow_id",
+      "workflow_path",
+      "event",
+      "head_sha",
+      "status",
+      "conclusion",
+      "display_title",
+    ],
+    "Source bridge-removal canary run",
+  );
+  assertPositiveReceiptId(run.id, "Source bridge-removal canary run id");
+  assertPositiveReceiptId(
+    run.attempt,
+    "Source bridge-removal canary run attempt",
+  );
+  assertPositiveReceiptId(
+    run.workflow_id,
+    "Source bridge-removal canary run workflow_id",
+  );
+  const expectedDisplayTitle =
+    `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/${canary.number}/${canary.test_merge_sha}`;
+  if (
+    run.workflow_path !== DEFAULT_WORKFLOW_PATH ||
+    run.event !== "pull_request" ||
+    run.head_sha !== canary.head_sha ||
+    run.status !== "completed" ||
+    run.conclusion !== "success" ||
+    run.display_title !== expectedDisplayTitle
+  ) {
+    throw new Error(
+      "Source bridge-removal canary run does not bind the successful v2 verifier pull_request execution to the exact historical test merge.",
+    );
+  }
+  return {
+    id: run.id,
+    attempt: run.attempt,
+    workflow_id: run.workflow_id,
+    workflow_path: DEFAULT_WORKFLOW_PATH,
+    event: "pull_request",
+    head_sha: canary.head_sha,
+    status: "completed",
+    conclusion: "success",
+    display_title: expectedDisplayTitle,
+  };
+}
+
+function validateSourceBridgeRemovalCanaryJob({
+  job,
+  headSha,
+  checkRunId,
+  runId,
+}) {
+  assertPlainReceiptObject(job, "Source bridge-removal canary job");
+  assertExactReceiptKeys(
+    job,
+    ["id", "run_id", "name", "head_sha", "status", "conclusion", "check_run_id"],
+    "Source bridge-removal canary job",
+  );
+  assertPositiveReceiptId(job.id, "Source bridge-removal canary job id");
+  if (
+    job.run_id !== runId ||
+    job.name !== DEFAULT_STATUS_CONTEXT ||
+    job.head_sha !== headSha ||
+    job.status !== "completed" ||
+    job.conclusion !== "success" ||
+    job.check_run_id !== checkRunId
+  ) {
+    throw new Error(
+      "Source bridge-removal canary job does not bind the exact successful v2 CheckRun and run.",
+    );
+  }
+  return {
+    id: job.id,
+    run_id: runId,
+    name: DEFAULT_STATUS_CONTEXT,
+    head_sha: headSha,
+    status: "completed",
+    conclusion: "success",
+    check_run_id: checkRunId,
+  };
+}
+
+function validateSourceBridgeRemovalLiveClosure({
+  value,
+  repository,
+  controlPlaneOwner,
+  v2Ruleset,
+  retainedSourceRuleset,
+}) {
+  assertPlainReceiptObject(value, "Source bridge-removal live_closure");
+  assertExactReceiptKeys(
+    value,
+    [
+      "security_sha256",
+      "legacy_inventory_sha256",
+      "legacy_inventory",
+      "legacy_status_required",
+      "canonical_workflows",
+      "canonical_workflow_api",
+      "security_state",
+    ],
+    "Source bridge-removal live_closure",
+  );
+  assertReceiptSha256(
+    value.security_sha256,
+    "Source bridge-removal live_closure security_sha256",
+  );
+  assertReceiptSha256(
+    value.legacy_inventory_sha256,
+    "Source bridge-removal live_closure legacy_inventory_sha256",
+  );
+  if (value.legacy_status_required !== false) {
+    throw new Error(
+      "Source bridge-removal live closure must prove that the legacy status is not required.",
+    );
+  }
+  const legacyInventory = validateSourceBridgeRemovalLegacyInventory({
+    value: value.legacy_inventory,
+    repository,
+  });
+  if (
+    value.legacy_inventory_sha256 !==
+    sourceBridgeRemovalLegacyInventorySha256(legacyInventory)
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure legacy_inventory_sha256 does not bind its complete legacy inventory.",
+    );
+  }
+  if (!Array.isArray(value.canonical_workflows) || value.canonical_workflows.length !== 3) {
+    throw new Error(
+      "Source bridge-removal live closure must bind the three canonical v2/legacy workflow objects.",
+    );
+  }
+  const expectedPaths = [
+    DEFAULT_CONTROLLER_WORKFLOW_PATH,
+    DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+    DEFAULT_WORKFLOW_PATH,
+  ].sort(compareCanonicalText);
+  const workflows = value.canonical_workflows.map((workflow, index) => {
+    assertPlainReceiptObject(
+      workflow,
+      `Source bridge-removal canonical_workflows ${index + 1}`,
+    );
+    assertExactReceiptKeys(
+      workflow,
+      ["path", "mode", "content_sha256"],
+      `Source bridge-removal canonical_workflows ${index + 1}`,
+    );
+    if (workflow.path !== expectedPaths[index]) {
+      throw new Error(
+        "Source bridge-removal canonical_workflows must use exact canonical path order.",
+      );
+    }
+    if (!new Set(["100644", "100755"]).has(workflow.mode)) {
+      throw new Error(
+        "Source bridge-removal canonical workflow mode is not a regular Git blob mode.",
+      );
+    }
+    assertReceiptSha256(
+      workflow.content_sha256,
+      `Source bridge-removal canonical workflow ${workflow.path} content_sha256`,
+    );
+    return {
+      path: workflow.path,
+      mode: workflow.mode,
+      content_sha256: workflow.content_sha256,
+    };
+  });
+  const securityState = validateSourceBridgeRemovalSecurityState({
+    value: value.security_state,
+    repository,
+    controlPlaneOwner,
+    v2Ruleset,
+    retainedSourceRuleset,
+    workflows,
+  });
+  const workflowApi = validateSourceBridgeRemovalWorkflowApi({
+    value: value.canonical_workflow_api,
+    workflows,
+  });
+  if (
+    value.security_sha256 !==
+    sourceBridgeRemovalSecurityStateSha256(securityState)
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure security_sha256 does not bind its complete security_state.",
+    );
+  }
+  return {
+    security_sha256: value.security_sha256,
+    legacy_inventory_sha256: value.legacy_inventory_sha256,
+    legacy_inventory: legacyInventory,
+    legacy_status_required: false,
+    canonical_workflows: workflows,
+    canonical_workflow_api: workflowApi,
+    security_state: securityState,
+  };
+}
+
+function validateSourceBridgeRemovalLegacyInventory({ value, repository }) {
+  const inventory = validateReceiptJsonValue(
+    value,
+    "Source bridge-removal live_closure legacy_inventory",
+  );
+  if (
+    inventory === null ||
+    typeof inventory !== "object" ||
+    Array.isArray(inventory) ||
+    inventory.repository !== repository.full_name ||
+    inventory.repository_id !== repository.id ||
+    inventory.repository_node_id !== repository.node_id ||
+    inventory.default_branch !== repository.default_branch ||
+    !Array.isArray(inventory.rulesets) ||
+    inventory.rulesets.length !== 0
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure legacy_inventory is not a complete clear inventory bound to the source repository.",
+    );
+  }
+  const classic = inventory.classic_required_status_checks;
+  if (
+    classic !== null &&
+    (typeof classic !== "object" ||
+      Array.isArray(classic) ||
+      !Array.isArray(classic.contexts) ||
+      !Array.isArray(classic.checks) ||
+      classic.contexts.some((context) => isLegacyStatusContext(context)) ||
+      classic.checks.some((check) => isLegacyStatusContext(check?.context)))
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure legacy_inventory still contains the legacy status context.",
+    );
+  }
+  return inventory;
+}
+
+function validateSourceBridgeRemovalWorkflowApi({ value, workflows }) {
+  if (!Array.isArray(value) || value.length !== workflows.length) {
+    throw new Error(
+      "Source bridge-removal live_closure must bind active workflow API identities for each canonical workflow.",
+    );
+  }
+  const expectedPaths = workflows.map((workflow) => workflow.path);
+  return value.map((workflow, index) => {
+    assertPlainReceiptObject(
+      workflow,
+      `Source bridge-removal canonical_workflow_api ${index + 1}`,
+    );
+    assertExactReceiptKeys(
+      workflow,
+      ["id", "path", "state"],
+      `Source bridge-removal canonical_workflow_api ${index + 1}`,
+    );
+    assertPositiveReceiptId(
+      workflow.id,
+      `Source bridge-removal canonical workflow ${workflow.path} id`,
+    );
+    if (workflow.path !== expectedPaths[index] || workflow.state !== "active") {
+      throw new Error(
+        "Source bridge-removal canonical_workflow_api must use exact canonical path order and active states.",
+      );
+    }
+    return { id: workflow.id, path: workflow.path, state: "active" };
+  });
+}
+
+function validateSourceBridgeRemovalSecurityState({
+  value,
+  repository,
+  controlPlaneOwner,
+  v2Ruleset,
+  retainedSourceRuleset,
+  workflows,
+}) {
+  const securityState = validateReceiptJsonValue(
+    value,
+    "Source bridge-removal live_closure security_state",
+  );
+  if (
+    securityState === null ||
+    typeof securityState !== "object" ||
+    Array.isArray(securityState)
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure security_state must be a complete object.",
+    );
+  }
+  const boundControlPlaneOwner =
+    validateSourceBridgeRemovalControlPlaneOwnerSecurityBinding(
+      securityState.control_plane_owner,
+      controlPlaneOwner,
+    );
+  assertExactReceiptKeys(
+    securityState,
+    [
+      "schema_version",
+      "repository",
+      "actions_workflow_permissions",
+      "control_plane_owner",
+      "workflow_inventory",
+      "codeowners",
+      "classic_branch_protection",
+      "rulesets",
+    ],
+    "Source bridge-removal live_closure security_state",
+  );
+  if (
+    securityState.schema_version !== 1 ||
+    securityState.repository === null ||
+    typeof securityState.repository !== "object" ||
+    Array.isArray(securityState.repository) ||
+    securityState.repository.full_name !== repository.full_name ||
+    securityState.repository.id !== repository.id ||
+    securityState.repository.node_id !== repository.node_id ||
+    securityState.repository.default_branch !== repository.default_branch ||
+    securityState.repository.default_branch_head_sha !==
+      repository.default_branch_head_sha ||
+    !Array.isArray(securityState.rulesets) ||
+    !Array.isArray(securityState.workflow_inventory)
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure security_state is not bound to the receipt repository, complete rulesets, and workflow inventory.",
+    );
+  }
+  const matchedRetainedSourceRulesets = securityState.rulesets.filter(
+    (ruleset) => ruleset?.id === retainedSourceRuleset.id,
+  );
+  if (
+    matchedRetainedSourceRulesets.length !== 1 ||
+    matchedRetainedSourceRulesets[0]?.name !== retainedSourceRuleset.name ||
+    matchedRetainedSourceRulesets[0]?.source_type !==
+      retainedSourceRuleset.source_type ||
+    matchedRetainedSourceRulesets[0]?.source !== retainedSourceRuleset.source ||
+    matchedRetainedSourceRulesets[0]?.writable === null ||
+    typeof matchedRetainedSourceRulesets[0]?.writable !== "object" ||
+    Array.isArray(matchedRetainedSourceRulesets[0]?.writable) ||
+    sourceBridgeRemovalRulesetWritableSha256(
+      matchedRetainedSourceRulesets[0].writable,
+    ) !== retainedSourceRuleset.writable_sha256
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure security_state does not bind the fixed retained source non-status protection policy.",
+    );
+  }
+  const matchedRulesets = securityState.rulesets.filter(
+    (ruleset) => ruleset?.id === v2Ruleset.id,
+  );
+  if (
+    matchedRulesets.length !== 1 ||
+    matchedRulesets[0]?.name !== v2Ruleset.name ||
+    matchedRulesets[0]?.source_type !== "Repository" ||
+    matchedRulesets[0]?.source !== repository.full_name ||
+    matchedRulesets[0]?.writable === null ||
+    typeof matchedRulesets[0]?.writable !== "object" ||
+    Array.isArray(matchedRulesets[0]?.writable) ||
+    sourceBridgeRemovalRulesetWritableSha256(matchedRulesets[0].writable) !==
+      v2Ruleset.writable_sha256
+  ) {
+    throw new Error(
+      "Source bridge-removal live_closure security_state does not bind the selected v2 ruleset writable policy.",
+    );
+  }
+  for (const workflow of workflows) {
+    const matches = securityState.workflow_inventory.filter(
+      (entry) =>
+        entry?.path === workflow.path &&
+        entry?.mode === workflow.mode &&
+        entry?.content_sha256 === workflow.content_sha256,
+    );
+    if (matches.length !== 1) {
+      throw new Error(
+        "Source bridge-removal live_closure security_state does not bind each canonical workflow object.",
+      );
+    }
+  }
+  return {
+    ...securityState,
+    control_plane_owner: boundControlPlaneOwner,
+  };
+}
+
+function validateSourceBridgeRemovalControlPlaneOwnerSecurityBinding(
+  value,
+  controlPlaneOwner,
+) {
+  assertPlainReceiptObject(
+    value,
+    "Source bridge-removal control_plane_owner security binding",
+  );
+  assertExactReceiptKeys(
+    value,
+    ["login", "type", "id", "node_id", "permission"],
+    "Source bridge-removal control_plane_owner security binding",
+  );
+  const expectedLogin = controlPlaneOwner.slice(1).toLowerCase();
+  if (
+    value.login !== expectedLogin ||
+    value.type !== "User" ||
+    !["write", "maintain", "admin"].includes(value.permission)
+  ) {
+    throw new Error(
+      `Source bridge-removal control_plane_owner security binding must prove ${controlPlaneOwner} as a writable GitHub User.`,
+    );
+  }
+  assertPositiveReceiptId(
+    value.id,
+    "Source bridge-removal control_plane_owner security binding id",
+  );
+  assertReceiptText(
+    value.node_id,
+    "Source bridge-removal control_plane_owner security binding node_id",
+  );
+  return {
+    login: expectedLogin,
+    type: "User",
+    id: value.id,
+    node_id: value.node_id,
+    permission: value.permission,
+  };
+}
+
+function validateReceiptJsonValue(value, label) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`${label} contains a non-safe-integer number.`);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) =>
+      validateReceiptJsonValue(item, `${label}[${index}]`),
+    );
+  }
+  if (value === undefined || typeof value !== "object") {
+    throw new Error(`${label} contains an unsupported value.`);
+  }
+  const result = {};
+  for (const key of Object.keys(value)) {
+    if (
+      typeof key !== "string" ||
+      /[\0\r\n]/u.test(key) ||
+      ["__proto__", "constructor", "prototype"].includes(key)
+    ) {
+      throw new Error(`${label} contains an invalid object key.`);
+    }
+    result[key] = validateReceiptJsonValue(value[key], `${label}.${key}`);
+  }
+  return result;
+}
+
+function assertReceiptCommitSha(value, label) {
+  if (typeof value !== "string" || !/^[0-9a-f]{40}$/u.test(value)) {
+    throw new Error(`${label} must be an exact lowercase 40-hex commit SHA.`);
+  }
+}
+
+function assertReceiptTimestamp(value, label) {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(value)
+  ) {
+    throw new Error(`${label} must be an exact UTC ISO-8601 timestamp.`);
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isSafeInteger(timestamp)) {
+    throw new Error(`${label} is not a valid UTC ISO-8601 timestamp.`);
+  }
+  return timestamp;
 }
 
 function assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
@@ -1100,7 +2148,7 @@ export function buildCanonicalLegacyReviewGateInventory({
     if (
       rule.type === "required_status_checks" &&
       rule.parameters.required_status_checks.some(
-        (check) => check.context === LEGACY_STATUS_CONTEXT,
+        (check) => isLegacyStatusContext(check.context),
       )
     ) {
       effectiveLegacyRules.push(rule);
@@ -1137,7 +2185,7 @@ export function buildCanonicalLegacyReviewGateInventory({
         (rule) =>
           rule.type === "required_status_checks" &&
           rule.parameters.required_status_checks.some(
-            (check) => check.context === LEGACY_STATUS_CONTEXT,
+            (check) => isLegacyStatusContext(check.context),
           ),
       )
     ) {
@@ -1241,8 +2289,15 @@ export function ensureStatusContextInRules(
   const rule = rules[index];
   const parameters = structuredCloneSafe(rule.parameters ?? {});
   const originalChecks = [...(parameters.required_status_checks ?? [])];
-  const removableContexts = new Set(removeContexts.filter((item) => item !== context));
-  const checks = originalChecks.filter((check) => !removableContexts.has(check?.context));
+  const removableContexts = removeContexts.filter(
+    (item) => !statusContextEqualsAsciiCaseInsensitive(item, context),
+  );
+  const checks = originalChecks.filter(
+    (check) =>
+      !removableContexts.some((item) =>
+        statusContextEqualsAsciiCaseInsensitive(check?.context, item),
+      ),
+  );
   const statusIndex = checks.findIndex((check) => check?.context === context);
   let changed = checks.length !== originalChecks.length;
   if (statusIndex === -1) {
@@ -1561,6 +2616,44 @@ export function rulesetWritableFingerprint(
       ? rules.map(normalizeStatusOnlyRequiredStatusRuleForComparison)
       : rules,
   });
+}
+
+export function assertSourceSelfHostingRetainedRulesetPolicy(ruleset) {
+  const fullRuleset = assertCompleteRulesetApiObject(ruleset);
+  if (
+    fullRuleset.id !== SOURCE_SELF_HOSTING_RETAINED_RULESET_ID ||
+    fullRuleset.name !== SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME ||
+    fullRuleset.source_type !== "Repository" ||
+    fullRuleset.source !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+    fullRuleset.target !== "branch"
+  ) {
+    throw new Error(
+      `Source retained ruleset must remain ${SOURCE_SELF_HOSTING_RETAINED_RULESET_ID} (${SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME}) with the exact source repository branch identity.`,
+    );
+  }
+  const writable = sourceSelfHostingRetainedRulesetWritableProjection(
+    JSON.parse(rulesetWritableFingerprint(fullRuleset)),
+  );
+  if (
+    canonicalJson(writable) !==
+    canonicalJson(
+      sourceSelfHostingRetainedRulesetWritableProjection(
+        SOURCE_SELF_HOSTING_RETAINED_RULESET_WRITABLE_POLICY,
+      ),
+    )
+  ) {
+    throw new Error(
+      "Source retained ruleset no longer matches the admitted exact non-status protection policy.",
+    );
+  }
+  return {
+    id: SOURCE_SELF_HOSTING_RETAINED_RULESET_ID,
+    name: SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME,
+    source_type: "Repository",
+    source: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    target: "branch",
+    writable,
+  };
 }
 
 export function validateCanonicalV2WorkflowContent(value) {

@@ -133,6 +133,11 @@ variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派生 `limits_profile`；公开 out
 所有普通 consumer 和每个 repository-level cohort installation。不得把此 profile 复制到通用
 installation template。
 
+与普通 `full` profile 不同，retained source ruleset 的
+`require_code_owner_review: false` 和 `dismiss_stale_reviews_on_push: false`。
+其 CODEOWNERS 与 named-owner projection 是 control-plane ownership 与 drift detection 的
+closure evidence，而不是 source 的 Code Owner approval 或 stale-review protection。
+
 先合并 source migration PR：它必须同时安装 exact canonical v2 verifier、controller 和
 exact temporary legacy bridge，并保持 source 现有 legacy rule Active。之后才 remote 暂存这个
 source-only v2 rule；`--ruleset-profile status-only` 只允许配合 `--repo`，不能传给
@@ -169,10 +174,12 @@ invocation 都必须继续带上 `--ruleset-name "$V2_RULESET_NAME"`、
 source-only profile，避免 bridge 漂移后让 `codex/review-gate` 没有 producer。
 
 新 rule 只包含 strict、GitHub-Actions-bound 的 `codex/github-review-gate` requirement。
-它是第二条 rule：现有 source rule 继续负责 deletion、non-fast-forward、pull-request 与相关
-CODEOWNERS protection。source-specific rule 激活后，legacy v1 status 与新 v2 CheckRun 会
-双重保护 source。此阶段不得移除或扩大任何 legacy protection；只有经过独立 canary 与
-owner-approved cleanup 后，才可以只移除 legacy status requirement。
+它是第二条 rule：现有 source rule 继续保留 deletion、non-fast-forward、pull-request conditions
+与 required review-thread resolution。它**不**强制 Code Owner approval 或 stale-review dismissal；
+其 CODEOWNERS/owner projection 仍只是 closure 所需的 control-plane ownership 与 drift-detection
+input。source-specific rule 激活后，legacy v1 status 与新 v2 CheckRun 会双重保护 source。此阶段
+不得移除或扩大任何 legacy protection；只有经过独立 canary 与 owner-approved cleanup 后，才可以
+只移除 legacy status requirement。
 
 不得使用 organization schema-2 final-closure receipt 删除 source 的 temporary bridge。
 该 bridge 必须有单独记录的 source-local closure proof 与独立授权。
@@ -252,6 +259,131 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --expected-post-cleanup-security-sha256 \
   "$EXPECTED_POST_CLEANUP_SECURITY_SHA256"
 ```
+
+### Source-only closure receipt 与后续 bridge-delete PR
+
+完成 source status cleanup 并**不会**授权删除
+`.github/workflows/codex-review-gate-legacy-bridge.yml`。已发布的 Node 24 `v2.1.0` Action
+与 closed-unmerged source canary `#74` 都只是证据输入，绝不构成 bridge 删除授权；immutable
+release 或历史 successful check 都不能替代新近批准的 receipt。`#74` 贡献的是精确绑定 tuple：它在
+head `fb40b3c4152f288fdde810d5f4cd32c273ff061e`、base
+`1d598106b5ce206ecd75e05a79d42964ec954a91`、test merge
+`7e0db2f05a785bc2a88b4e0f2844911315c646c1` 上通过 v2 CheckRun，receipt 还绑定其
+CheckRun/run/job identities。organization schema-2 receipt 同样不能替代它。
+
+必须使用能读取 source 完整 ruleset detail（包括显式 `bypass_actors` arrays）的 credential。
+GitHub 对没有足够 ruleset access 的调用者可能 redact 该字段；missing、`null` 或 non-array
+都只是 inconclusive，不是 empty list。停止并取得合格的 administrator credential，不能从
+partial proof 派生或批准。
+
+这个 source-only flow 有意使用两个 PR：
+
+1. 先合并 proof-machinery PR，bridge 保持不变。
+2. 再派生并独立批准一个 source closure receipt，用它准备单独的 bridge-delete PR；该 PR 的
+   唯一预期 production change 是删除 canonical bridge，且合并前要取得自己的 fresh v2 gate
+   result。
+
+合并 proof-machinery PR 会推进 default-branch head。因此不得在该 PR 合并前就派生或批准
+bridge-delete receipt。必须在当前 default branch 上使用已合并的 helper 执行 derive，再审阅并
+独立批准这份新派生 receipt 的 SHA-256，之后才可准备 bridge-delete PR。针对 pre-merge default
+branch 生成的 receipt 不能复用。
+
+derive result 是 candidate receipt，不是可携带的 authority token。它绑定 source repository
+identity、current default-branch control plane、两个 source ruleset projection、所有 legacy
+required-status surfaces、canonical workflow/CODEOWNERS inventory，以及历史 `#74` 的
+PR/head/base/test-merge 与 v2 CheckRun/run/job tuple。每次 closure read 都会按固定的
+`source_type: Repository` 加名称 `Must Pass Codex Review v2` 重新选出唯一 v2 ruleset；历史
+numeric ruleset ID 不是全局 hard pin。candidate receipt 与每次 rebind 绑定的，是该轮观察到的
+ruleset ID 及完整 writable-projection SHA-256 fingerprint。`#74` 的 base 只需被确认是 current
+default branch 的 ancestor：receipt 会独立验证 current live control plane 与 v2 policy，所以合并
+proof machinery 不需要重建旧 canary base。workflow/CODEOWNERS/owner projection 用于检测 source
+control-plane drift，不是该 retained source ruleset 强制 Code Owner approval 或 stale-review
+dismissal 的证据。Helper 只有在两份 complete live snapshot 及其中间五秒等待后，二者
+canonical 比较相等时才输出 candidate。一次稳定尝试的 60 秒总 cap 同时覆盖两份完整 snapshot 和
+中间等待；无法在该预算内完成时不输出 receipt，尝试保持 pending/inconclusive 并 fail closed。该
+per-attempt cap 同时适用于 derive、read-only rebind 及 mutation-bound local executor rebind。之后的
+rebind 会做同样的 fresh two-round read，并要求它与**同一份已独立批准**的 receipt 和 SHA-256 相等。
+不得重新派生一个 replacement receipt 后静默继续：identity、policy、workflow、ancestry 或 canary
+evidence 任一 drift 都必须停止，重新派生、审阅并独立批准新的 receipt。
+
+```bash
+SOURCE_BRIDGE_REMOVAL_PROOF="$(mktemp)"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --derive-source-bridge-removal-proof \
+  --canary-pr 74 \
+  --canary-head fb40b3c4152f288fdde810d5f4cd32c273ff061e \
+  > "$SOURCE_BRIDGE_REMOVAL_PROOF"
+jq . "$SOURCE_BRIDGE_REMOVAL_PROOF"
+SOURCE_BRIDGE_REMOVAL_PROOF_SHA256="$(jq -er \
+  '.source_bridge_removal_receipt_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF")"
+```
+
+必须审阅完整 canonical JSON，并独立批准 `$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256`；只批准
+filename、canary number 或旧 terminal message 都不够。准备独立的 local deletion worktree 前，
+必须对完全相同的 approved proof 做一次 fresh read-only rebind：
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --rebind-source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+```
+
+这次 rebind 不会生成 replacement receipt 或刷新 approval；它要求 fresh two-round live closure
+与精确批准的 canonical receipt 相等。之后的 local deletion command 会在 mutation boundary 再次
+执行同一比较。只要 receipt、source identity、current security projection、canonical bridge bytes
+或 historical-canary binding 有变化，它就必须拒绝。该 executor 仅限 source self-hosting
+repository；不得为此 source-only operation 使用 organization receipt executor、ordinary consumer
+cleanup executor，或临时手工删除文件。
+
+只能在用于准备新 bridge-delete PR 的 clean、已 checkout default branch 的 source worktree 中运行这条
+受约束的本地删除 executor；其 HEAD 必须仍等于 approved receipt 记录的 default-branch head。先执行
+dry run；取得单独的 deletion authorization 后，使用完全相同的命令加上 `--apply`：
+
+```bash
+DEFAULT_BRANCH_WORKTREE=/absolute/path/to/clean-source-default-branch-worktree
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --remove-source-legacy-bridge \
+  --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --remove-source-legacy-bridge \
+  --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256" \
+  --apply
+```
+
+它所要求的 option shape 是
+`--prepare-worktree <default-branch-worktree> --remove-source-legacy-bridge --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" --expected-source-bridge-removal-proof-sha256 "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"`。
+其中没有 `--repo`、`--ruleset-profile`、`--legacy-bridge`、
+`--derive-source-bridge-removal-proof`、`--rebind-source-bridge-removal-proof`、`--canary-pr` 或
+`--canary-head` parameter。不得将它与任何 remote phase 混用，也不得在任意 checkout 中运行；它是
+产生并检查这个 PR 的 one-file bridge deletion diff 的受约束路径，不构成临时手工删除的许可。
+
+删除 tracked bridge YAML 会阻止普通的新 dispatch，但 GitHub 不承诺历史 Actions run 不能被 rerun。
+本流程不声称 v1 side effect 会永久不存在。之所以仍可继续，仅因为 live proof 已证明 current
+default-branch control plane 和 effective merge policy 不再在 ruleset 或 classic surfaces 要求
+legacy context，且 bridge-delete PR 自身必须在合并前取得 fresh strict v2 exact-head gate success。
+不要为此流程加入 history purge 或按时间等待。
 
 ## Advanced：活动 v2 10 仓组织 cohort 的受控 handoff
 

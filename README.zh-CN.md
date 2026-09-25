@@ -119,14 +119,29 @@ major 的第一个 stable release 手工 out-of-band 执行一次（从 `v2.0.0`
 patch release 只推进 `@v2`，不再操作 Marketplace。现有 v1 tags 与 consumers 保持有效且
 冻结，直到各 consumer 主动 migration。
 
+已发布的 `v2.1.0` payload 声明 `runs.using: node24`，floating `v2` alias 也解析到这份
+immutable release。它不会追溯改变冻结的 v2.0 release contract，也不会自行授权删除 v1
+bridge。
+
 Importable template 与 helper 默认的 `full` ruleset profile 仍是普通 consumer 的
 contract。只有 `Joey-Tools/codex-review-gate` 自身迁移可以显式在 remote 阶段使用
 `--ruleset-profile status-only`，并搭配 `--legacy-bridge` 与独立的
 `Must Pass Codex Review v2` rule。该新 rule 只增加 strict v2 status context；现有
-source rule 继续保留 deletion、non-fast-forward 与 pull-request/conversation policy。
+source rule 继续保留 deletion、non-fast-forward、pull-request conditions 与 required
+review-thread resolution。其 CODEOWNERS/owner projection 是 source control-plane ownership
+与 drift detection 的 receipt material，不是实际强制的 Code Owner approval 或 stale-review
+policy。
 它不是通用 consumer 或 cohort template。source repository 使用 canonical v2 verifier 和
 controller；其 repository-local v1 required status 已退休，精确的 temporary legacy
-bridge 则有意保留。之后物理删除该 bridge 必须有单独记录的 source-local closure proof，
-organization schema-2 cohort receipt 不能授权此操作。
-完整 staged flow、recovery states 与 protection baseline 见
-[docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。
+bridge 则有意保留。之后物理删除该 bridge 必须先有单独派生的 source-only closure receipt，
+并由人独立批准其精确 SHA-256。已发布的 `v2.1.0` payload 与 closed-unmerged 历史 canary
+`#74` 都只是证据输入，绝不构成 bridge 删除授权；`#74` 贡献的是精确的
+PR/head/base/test-merge/CheckRun/run/job tuple。receipt 还绑定 fresh two-round live source
+closure。本地删除前必须让**同一份**已独立批准的 receipt（及其精确 SHA-256）与 fresh GitHub
+evidence rebind 后完全相等；若发生 drift，必须停止，重新派生、审阅并独立批准新的 receipt，
+之后才可再次尝试删除。source-only executor 不可用于普通 consumer。删除 YAML 只能阻止普通的
+新 dispatch，不能承诺 GitHub 无法 rerun 历史 Actions run。receipt file 不能单独作为可信授权，
+organization schema-2 cohort receipt 也不能授权此操作。proof-machinery PR 与之后的
+bridge-delete PR 有意保持为两个独立阶段。source-only closure flow 见
+[人类安装指南](docs/install/human.zh-CN.md)；publisher recovery states 与 release-protection
+baseline 见 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。

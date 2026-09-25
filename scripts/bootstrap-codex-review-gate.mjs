@@ -16,7 +16,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 
@@ -28,6 +28,10 @@ import {
   DEFAULT_RULESET_ENFORCEMENT,
   DEFAULT_RULESET_NAME,
   DEFAULT_RULESET_PROFILE,
+  SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION,
+  SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+  SOURCE_SELF_HOSTING_RULESET_NAME,
+  SOURCE_SELF_HOSTING_RETAINED_RULESET_ID,
   RULESET_PROFILE_STATUS_ONLY,
   DEFAULT_STATUS_CONTEXT,
   DEFAULT_STATUS_INTEGRATION_ID,
@@ -35,9 +39,12 @@ import {
   DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
   assertCompleteRulesetApiObject,
+  assertSourceSelfHostingRetainedRulesetPolicy,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
   canonicalOrganizationFinalClosureReceipt,
+  canonicalSourceBridgeRemovalProof,
+  canonicalSourceBridgeRemovalProofOutput,
   canonicalClassicRequiredStatusChecks,
   canonicalLegacyReviewGateInventoryBytes,
   buildUpdateRulesetPayload,
@@ -47,6 +54,7 @@ import {
   ensureControlPlaneCodeownersContent,
   findEffectiveRulesetWithProfilePolicy,
   installedWorkflowMatchesCanonical,
+  isLegacyStatusContext,
   normalizeControlPlaneOwner,
   normalizeRulesetProfile,
   normalizeWorkflowPath,
@@ -54,9 +62,13 @@ import {
   parseRepoSlug,
   rulesetCoversDefaultBranch,
   rulesetHasPolicyForProfile,
-  rulesetHasRequiredStatusContext,
   rulesetHasStatusOnlyProfile,
   rulesetWritableFingerprint,
+  sourceBridgeRemovalProofSha256,
+  sourceBridgeRemovalLegacyInventorySha256,
+  sourceBridgeRemovalRulesetWritableSha256,
+  sourceBridgeRemovalSecurityStateSha256,
+  validateSourceBridgeRemovalProofOutput,
   validateCanonicalV2ControllerWorkflowContent,
   validateCanonicalLegacyBridgeWorkflowContent,
   validateCanonicalV2VerifierWorkflowContent,
@@ -89,15 +101,33 @@ const MAX_APPROVED_POST_CLEANUP_PLAN_BYTES = 1_048_576;
 const POST_CLEANUP_WRITE_RECOVERY_TAG = Symbol(
   "post-cleanup-write-recovery-guidance",
 );
-const SOURCE_SELF_HOSTING_REPOSITORY_SLUG = "Joey-Tools/codex-review-gate";
+const SOURCE_CLOSURE_STABILITY_INTERVAL_MS = 5_000;
+const SOURCE_CLOSURE_STABILITY_TIMEOUT_MS = 60_000;
+const MAX_SOURCE_BRIDGE_REMOVAL_PROOF_BYTES = 1_048_576;
 
 async function main() {
   const options = readCliOptions();
   const canonicalWorkflows = await loadCanonicalWorkflows({
-    includeLegacyBridge: options.legacyBridge || options.removeLegacyBridge,
+    includeLegacyBridge:
+      options.legacyBridge ||
+      options.removeLegacyBridge ||
+      options.removeSourceLegacyBridge ||
+      options.deriveSourceBridgeRemovalProof ||
+      options.sourceBridgeRemovalProofPath !== null,
   });
 
   if (options.prepareWorktree !== null) {
+    if (options.removeSourceLegacyBridge) {
+      await removeSourceLegacyBridgeFromWorktree({
+        targetRoot: options.prepareWorktree,
+        canonicalWorkflows,
+        sourceBridgeRemovalProofPath: options.sourceBridgeRemovalReceiptPath,
+        expectedSourceBridgeRemovalProofSha256:
+          options.expectedSourceBridgeRemovalProofSha256,
+        apply: options.apply,
+      });
+      return;
+    }
     await prepareConsumerWorktree({
       targetRoot: options.prepareWorktree,
       canonicalWorkflows,
@@ -114,6 +144,22 @@ async function main() {
 
   if (options.derivePostCleanupPlan) {
     await printDerivedPostCleanupPlan({
+      options,
+      canonicalWorkflows,
+    });
+    return;
+  }
+
+  if (options.deriveSourceBridgeRemovalProof) {
+    await printDerivedSourceBridgeRemovalProof({
+      options,
+      canonicalWorkflows,
+    });
+    return;
+  }
+
+  if (options.sourceBridgeRemovalProofPath !== null) {
+    await rebindSourceBridgeRemovalProof({
       options,
       canonicalWorkflows,
     });
@@ -194,9 +240,7 @@ async function main() {
     (ruleset) =>
       ruleset.enforcement === "active" &&
       rulesetCoversDefaultBranch(ruleset, defaultBranch) &&
-      rulesetHasRequiredStatusContext(ruleset, LEGACY_STATUS_CONTEXT, {
-        integrationId: undefined,
-      }) &&
+      rulesetHasLegacyStatusContext(ruleset) &&
       ruleset.id !== repoRuleset?.id,
   );
   if (overlappingLegacyRulesets.length > 0) {
@@ -393,9 +437,7 @@ async function main() {
     })
   ) {
     if (
-      rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
-        integrationId: undefined,
-      })
+      rulesetHasLegacyStatusContext(fullRuleset)
     ) {
       console.log(
         `No cleanup: ${LEGACY_STATUS_CONTEXT} remains required by the active v2 ruleset until a separately authorised legacy cleanup removes it.`,
@@ -431,9 +473,7 @@ async function main() {
         context: options.context,
         integrationId: options.integrationId,
       }) ||
-      rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
-        integrationId: undefined,
-      }) ||
+      rulesetHasLegacyStatusContext(fullRuleset) ||
       rulesetWritableFingerprint(payload, {
         profile: options.rulesetProfile,
       }) !==
@@ -456,9 +496,7 @@ async function main() {
   }
   if (!changed) {
     if (
-      rulesetHasRequiredStatusContext(fullRuleset, LEGACY_STATUS_CONTEXT, {
-        integrationId: undefined,
-      })
+      rulesetHasLegacyStatusContext(fullRuleset)
     ) {
       console.log(
         `No cleanup: ${LEGACY_STATUS_CONTEXT} remains required by the active v2 ruleset until a separately authorised legacy cleanup removes it.`,
@@ -651,7 +689,7 @@ async function main() {
 }
 
 function readCliOptions() {
-  const { values } = parseArgs({
+  const { values, tokens } = parseArgs({
     options: {
       repo: { type: "string" },
       "prepare-worktree": { type: "string" },
@@ -659,12 +697,20 @@ function readCliOptions() {
       activate: { type: "boolean", default: false },
       "legacy-bridge": { type: "boolean", default: false },
       "remove-legacy-bridge": { type: "boolean", default: false },
+      "remove-source-legacy-bridge": { type: "boolean", default: false },
       "final-closure-receipt": { type: "string" },
       "expected-final-closure-receipt-sha256": { type: "string" },
       "derive-post-cleanup-plan": { type: "boolean", default: false },
       "apply-post-cleanup-plan": { type: "string" },
       "expected-post-cleanup-plan-sha256": { type: "string" },
       "verify-post-cleanup": { type: "boolean", default: false },
+      "derive-source-bridge-removal-proof": {
+        type: "boolean",
+        default: false,
+      },
+      "rebind-source-bridge-removal-proof": { type: "string" },
+      "source-bridge-removal-proof": { type: "string" },
+      "expected-source-bridge-removal-proof-sha256": { type: "string" },
       "expected-legacy-inventory-sha256": { type: "string" },
       "expected-post-cleanup-security-sha256": { type: "string" },
       "ruleset-name": { type: "string", default: DEFAULT_RULESET_NAME },
@@ -680,6 +726,7 @@ function readCliOptions() {
       help: { type: "boolean", short: "h", default: false },
     },
     strict: true,
+    tokens: true,
   });
 
   if (values.help) {
@@ -691,6 +738,43 @@ function readCliOptions() {
   const hasPrepareWorktree = values["prepare-worktree"] !== undefined;
   const hasApplyPostCleanupPlan =
     values["apply-post-cleanup-plan"] !== undefined;
+  const hasRebindSourceBridgeRemovalProof =
+    values["rebind-source-bridge-removal-proof"] !== undefined;
+  const hasSourceBridgeRemovalReceipt =
+    values["source-bridge-removal-proof"] !== undefined;
+  const removeSourceLegacyBridge = values["remove-source-legacy-bridge"];
+  const hasSourceBridgeRemovalProofMode =
+    values["derive-source-bridge-removal-proof"] ||
+    hasRebindSourceBridgeRemovalProof;
+  const hasSourceBridgeRemovalLifecycleMode =
+    removeSourceLegacyBridge || hasSourceBridgeRemovalProofMode;
+  const hasExplicitRulesetName = tokens.some(
+    (token) => token.kind === "option" && token.name === "ruleset-name",
+  );
+  const hasExplicitControlPlaneOwner = tokens.some(
+    (token) =>
+      token.kind === "option" && token.name === "control-plane-owner",
+  );
+  // The ordinary CLI defaults intentionally describe the consumer policy.
+  // Source-self-hosting proof/deletion modes instead own a distinct fixed
+  // policy, so only an explicit conflicting input is invalid.  Force the
+  // effective values before any mode can carry the generic default into a
+  // source proof, receipt, or deletion rebind.
+  if (
+    hasSourceBridgeRemovalLifecycleMode &&
+    ((hasExplicitRulesetName &&
+      values["ruleset-name"] !== SOURCE_SELF_HOSTING_RULESET_NAME) ||
+      (hasExplicitControlPlaneOwner &&
+        values["control-plane-owner"] !== DEFAULT_CONTROL_PLANE_OWNER))
+  ) {
+    throw new Error(
+      `Source bridge-removal proof and deletion modes are fixed to ruleset "${SOURCE_SELF_HOSTING_RULESET_NAME}" and control-plane owner ${DEFAULT_CONTROL_PLANE_OWNER}; they do not admit migration-policy overrides.`,
+    );
+  }
+  if (hasSourceBridgeRemovalLifecycleMode) {
+    values["ruleset-name"] = SOURCE_SELF_HOSTING_RULESET_NAME;
+    values["control-plane-owner"] = DEFAULT_CONTROL_PLANE_OWNER;
+  }
   const repo = hasRepo ? parseRepoSlug(values.repo) : null;
   const rulesetProfile = normalizeRulesetProfile(values["ruleset-profile"]);
   if (hasRepo === hasPrepareWorktree) {
@@ -726,6 +810,16 @@ function readCliOptions() {
       "--legacy-bridge and --remove-legacy-bridge are mutually exclusive lifecycle phases.",
     );
   }
+  if (values["legacy-bridge"] && removeSourceLegacyBridge) {
+    throw new Error(
+      "--legacy-bridge and --remove-source-legacy-bridge are mutually exclusive lifecycle phases.",
+    );
+  }
+  if (values["remove-legacy-bridge"] && removeSourceLegacyBridge) {
+    throw new Error(
+      "--remove-legacy-bridge and --remove-source-legacy-bridge select different authorization domains and are mutually exclusive.",
+    );
+  }
   if (hasRepo && values["remove-legacy-bridge"]) {
     throw new Error(
       "--remove-legacy-bridge is local-only and requires --prepare-worktree after legacy requirements have been removed and verified.",
@@ -749,6 +843,26 @@ function readCliOptions() {
       "--final-closure-receipt and --expected-final-closure-receipt-sha256 are valid only with --remove-legacy-bridge.",
     );
   }
+  if (removeSourceLegacyBridge && !hasPrepareWorktree) {
+    throw new Error(
+      "--remove-source-legacy-bridge is a local source-only operation and requires --prepare-worktree.",
+    );
+  }
+  if (
+    removeSourceLegacyBridge &&
+    (typeof values["source-bridge-removal-proof"] !== "string" ||
+      values["source-bridge-removal-proof"].trim() === "" ||
+      values["expected-source-bridge-removal-proof-sha256"] === undefined)
+  ) {
+    throw new Error(
+      "--remove-source-legacy-bridge requires --source-bridge-removal-proof and --expected-source-bridge-removal-proof-sha256 from an explicitly approved canonical source proof.",
+    );
+  }
+  if (!removeSourceLegacyBridge && hasSourceBridgeRemovalReceipt) {
+    throw new Error(
+      "--source-bridge-removal-proof is valid only with --remove-source-legacy-bridge.",
+    );
+  }
   if (
     hasPrepareWorktree &&
     values["expected-legacy-inventory-sha256"] !== undefined
@@ -766,6 +880,90 @@ function readCliOptions() {
   if (hasPrepareWorktree && hasApplyPostCleanupPlan) {
     throw new Error("--apply-post-cleanup-plan is valid only with --repo.");
   }
+  if (hasPrepareWorktree && hasSourceBridgeRemovalProofMode) {
+    throw new Error(
+      "Source bridge-removal proof derive and rebind modes are remote read-only modes and require --repo.",
+    );
+  }
+  if (
+    removeSourceLegacyBridge &&
+    (values.activate ||
+      values["derive-post-cleanup-plan"] ||
+      values["verify-post-cleanup"] ||
+      hasApplyPostCleanupPlan ||
+      values["remove-legacy-bridge"] ||
+      values["final-closure-receipt"] !== undefined ||
+      values["expected-final-closure-receipt-sha256"] !== undefined ||
+      hasSourceBridgeRemovalProofMode ||
+      values["expected-legacy-inventory-sha256"] !== undefined ||
+      values["expected-post-cleanup-security-sha256"] !== undefined ||
+      values["expected-post-cleanup-plan-sha256"] !== undefined ||
+      values["canary-pr"] !== undefined ||
+      values["canary-head"] !== undefined)
+  ) {
+    throw new Error(
+      "--remove-source-legacy-bridge is a separate local source-only operation and cannot be combined with remote, organization-receipt, canary, or source legacy-status cleanup modes.",
+    );
+  }
+  if (
+    values["derive-source-bridge-removal-proof"] &&
+    hasRebindSourceBridgeRemovalProof
+  ) {
+    throw new Error(
+      "--derive-source-bridge-removal-proof and --rebind-source-bridge-removal-proof are separate source-only read-only phases.",
+    );
+  }
+  if (
+    hasSourceBridgeRemovalProofMode &&
+    (repo?.slug !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+      rulesetProfile !== RULESET_PROFILE_STATUS_ONLY ||
+      !values["legacy-bridge"])
+  ) {
+    throw new Error(
+      `Source bridge-removal proof modes are restricted to ${SOURCE_SELF_HOSTING_REPOSITORY_SLUG} with --ruleset-profile ${RULESET_PROFILE_STATUS_ONLY} and --legacy-bridge.`,
+    );
+  }
+  if (
+    hasSourceBridgeRemovalProofMode &&
+    (values.apply ||
+      values.activate ||
+      values["remove-legacy-bridge"] ||
+      values["remove-source-legacy-bridge"] ||
+      values["derive-post-cleanup-plan"] ||
+      values["verify-post-cleanup"] ||
+      hasApplyPostCleanupPlan ||
+      values["expected-legacy-inventory-sha256"] !== undefined ||
+      values["expected-post-cleanup-security-sha256"] !== undefined ||
+      values["expected-post-cleanup-plan-sha256"] !== undefined)
+  ) {
+    throw new Error(
+      "Source bridge-removal proof modes are read-only and cannot be combined with apply, activation, organization bridge removal, or source legacy-status cleanup phases.",
+    );
+  }
+  if (
+    !hasRebindSourceBridgeRemovalProof &&
+    !removeSourceLegacyBridge &&
+    values["expected-source-bridge-removal-proof-sha256"] !== undefined
+  ) {
+    throw new Error(
+      "--expected-source-bridge-removal-proof-sha256 is valid only with --rebind-source-bridge-removal-proof or --remove-source-legacy-bridge.",
+    );
+  }
+  if (
+    hasRebindSourceBridgeRemovalProof &&
+    (typeof values["rebind-source-bridge-removal-proof"] !== "string" ||
+      values["rebind-source-bridge-removal-proof"].trim() === "" ||
+      values["expected-source-bridge-removal-proof-sha256"] === undefined)
+  ) {
+    throw new Error(
+      "--rebind-source-bridge-removal-proof requires a non-empty proof-output path and --expected-source-bridge-removal-proof-sha256.",
+    );
+  }
+  if (hasRebindSourceBridgeRemovalProof && hasSourceBridgeRemovalReceipt) {
+    throw new Error(
+      "--rebind-source-bridge-removal-proof and --source-bridge-removal-proof are separate receipt inputs and cannot be combined.",
+    );
+  }
   if (values["derive-post-cleanup-plan"] && values["verify-post-cleanup"]) {
     throw new Error(
       "--derive-post-cleanup-plan and --verify-post-cleanup are separate read-only phases.",
@@ -774,6 +972,7 @@ function readCliOptions() {
   if (
     hasRepo &&
     !values["verify-post-cleanup"] &&
+    !hasSourceBridgeRemovalProofMode &&
     values["expected-legacy-inventory-sha256"] === undefined
   ) {
     throw new Error(
@@ -784,6 +983,7 @@ function readCliOptions() {
     values["verify-post-cleanup"] &&
     (values.apply ||
       values.activate ||
+      hasSourceBridgeRemovalProofMode ||
       values["canary-pr"] !== undefined ||
       values["canary-head"] !== undefined ||
       values["expected-legacy-inventory-sha256"] !== undefined)
@@ -796,6 +996,7 @@ function readCliOptions() {
     values["derive-post-cleanup-plan"] &&
     (values.apply ||
       values.activate ||
+      hasSourceBridgeRemovalProofMode ||
       values["canary-pr"] !== undefined ||
       values["canary-head"] !== undefined)
   ) {
@@ -808,6 +1009,7 @@ function readCliOptions() {
     (values["derive-post-cleanup-plan"] ||
       values["verify-post-cleanup"] ||
       values.activate ||
+      hasSourceBridgeRemovalProofMode ||
       values["canary-pr"] !== undefined ||
       values["canary-head"] !== undefined ||
       values["remove-legacy-bridge"])
@@ -858,11 +1060,23 @@ function readCliOptions() {
       "--expected-post-cleanup-security-sha256 is valid only with --verify-post-cleanup.",
     );
   }
-  if (values.activate && (values["canary-pr"] === undefined || values["canary-head"] === undefined)) {
-    throw new Error("--activate requires both --canary-pr and --canary-head for source readback.");
+  const requiresCanaryInputs =
+    values.activate || values["derive-source-bridge-removal-proof"];
+  if (
+    requiresCanaryInputs &&
+    (values["canary-pr"] === undefined || values["canary-head"] === undefined)
+  ) {
+    throw new Error(
+      "--activate and --derive-source-bridge-removal-proof each require both --canary-pr and --canary-head for exact source readback.",
+    );
   }
-  if (!values.activate && (values["canary-pr"] !== undefined || values["canary-head"] !== undefined)) {
-    throw new Error("--canary-pr and --canary-head are valid only with --activate.");
+  if (
+    !requiresCanaryInputs &&
+    (values["canary-pr"] !== undefined || values["canary-head"] !== undefined)
+  ) {
+    throw new Error(
+      "--canary-pr and --canary-head are valid only with --activate or --derive-source-bridge-removal-proof.",
+    );
   }
   if (values.context !== DEFAULT_STATUS_CONTEXT) {
     throw new Error(
@@ -883,6 +1097,7 @@ function readCliOptions() {
     activate: values.activate,
     legacyBridge: values["legacy-bridge"],
     removeLegacyBridge: values["remove-legacy-bridge"],
+    removeSourceLegacyBridge,
     finalClosureReceiptPath: values["remove-legacy-bridge"]
       ? resolve(values["final-closure-receipt"])
       : null,
@@ -893,6 +1108,21 @@ function readCliOptions() {
         )
       : null,
     derivePostCleanupPlan: values["derive-post-cleanup-plan"],
+    deriveSourceBridgeRemovalProof:
+      values["derive-source-bridge-removal-proof"],
+    sourceBridgeRemovalProofPath: hasRebindSourceBridgeRemovalProof
+      ? resolve(values["rebind-source-bridge-removal-proof"])
+      : null,
+    sourceBridgeRemovalReceiptPath: removeSourceLegacyBridge
+      ? resolve(values["source-bridge-removal-proof"])
+      : null,
+    expectedSourceBridgeRemovalProofSha256:
+      hasRebindSourceBridgeRemovalProof || removeSourceLegacyBridge
+        ? parseExpectedSecuritySha256(
+            values["expected-source-bridge-removal-proof-sha256"],
+            "--expected-source-bridge-removal-proof-sha256",
+          )
+        : null,
     applyPostCleanupPlanPath: hasApplyPostCleanupPlan
       ? resolve(values["apply-post-cleanup-plan"])
       : null,
@@ -908,7 +1138,10 @@ function readCliOptions() {
     controlPlaneOwner: normalizeControlPlaneOwner(values["control-plane-owner"]),
     context: values.context,
     integrationId: DEFAULT_STATUS_INTEGRATION_ID,
-    expectedLegacyInventorySha256: hasRepo && !values["verify-post-cleanup"]
+    expectedLegacyInventorySha256:
+      hasRepo &&
+      !values["verify-post-cleanup"] &&
+      !hasSourceBridgeRemovalProofMode
       ? parseExpectedLegacyInventorySha256(
           values["expected-legacy-inventory-sha256"],
         )
@@ -919,8 +1152,10 @@ function readCliOptions() {
           "--expected-post-cleanup-security-sha256",
         )
       : null,
-    canaryPr: values.activate ? parseCanaryPr(values["canary-pr"]) : null,
-    canaryHead: values.activate ? parseCanaryHead(values["canary-head"]) : null,
+    canaryPr: requiresCanaryInputs ? parseCanaryPr(values["canary-pr"]) : null,
+    canaryHead: requiresCanaryInputs
+      ? parseCanaryHead(values["canary-head"])
+      : null,
   };
 }
 
@@ -1190,6 +1425,386 @@ async function assertCanaryCheckRunSource({
   console.log(
     `Canary: #${prNumber} has one successful native ${DEFAULT_STATUS_CONTEXT} CheckRun on feature head ${headSha}; the current verifier execution scope is test-merge ${mergeCommitSha}.`,
   );
+}
+
+// This is intentionally separate from assertCanaryCheckRunSource. Activation
+// needs an open canary with run.pull_requests still populated; GitHub clears
+// that run field after a PR closes, so historical source proof uses the
+// durable GraphQL PR tuple as its primary binding. The REST state/base/head
+// read remains an independent cross-check; its merge_commit_sha is optional
+// archival metadata and, when present, must agree with GraphQL.
+async function loadHistoricalSourceCanaryEvidence({
+  repoSlug,
+  repoId,
+  defaultBranch,
+  defaultBranchHeadSha,
+  prNumber,
+  headSha,
+  canonicalWorkflows,
+  controlPlaneOwner,
+}) {
+  const pullRequest = await ghJson(`repos/${repoSlug}/pulls/${prNumber}`);
+  const baseSha = pullRequest?.base?.sha;
+  const restTestMergeSha = pullRequest?.merge_commit_sha;
+  const closedAt = pullRequest?.closed_at;
+  if (
+    pullRequest?.state !== "closed" ||
+    pullRequest?.merged !== false ||
+    pullRequest?.merged_at !== null ||
+    pullRequest?.draft === true ||
+    pullRequest?.base?.ref !== defaultBranch ||
+    pullRequest?.base?.repo?.full_name !== repoSlug ||
+    pullRequest?.head?.repo?.full_name !== repoSlug ||
+    pullRequest?.head?.sha !== headSha ||
+    typeof baseSha !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(baseSha) ||
+    (restTestMergeSha !== undefined &&
+      restTestMergeSha !== null &&
+      (typeof restTestMergeSha !== "string" ||
+        !/^[0-9a-f]{40}$/u.test(restTestMergeSha)))
+  ) {
+    throw new Error(
+      `Historical source canary PR #${prNumber} is not a closed, unmerged, non-draft, same-repository default-branch PR at exact head ${headSha}.`,
+    );
+  }
+  const graphPullRequest = await loadHistoricalSourceCanaryGraphPullRequest({
+    repoSlug,
+    prNumber,
+  });
+  const testMergeSha = graphPullRequest?.potentialMergeCommit?.oid;
+  if (
+    graphPullRequest?.number !== prNumber ||
+    graphPullRequest?.state !== "CLOSED" ||
+    graphPullRequest?.isDraft !== false ||
+    graphPullRequest?.merged !== false ||
+    graphPullRequest?.mergedAt !== null ||
+    graphPullRequest?.closedAt !== closedAt ||
+    graphPullRequest?.baseRefName !== defaultBranch ||
+    graphPullRequest?.baseRefOid !== baseSha ||
+    graphPullRequest?.headRefOid !== headSha ||
+    typeof testMergeSha !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(testMergeSha) ||
+    (restTestMergeSha !== undefined &&
+      restTestMergeSha !== null &&
+      restTestMergeSha !== testMergeSha) ||
+    graphPullRequest?.baseRepository?.nameWithOwner !== repoSlug ||
+    graphPullRequest?.headRepository?.nameWithOwner !== repoSlug
+  ) {
+    throw new Error(
+      `Historical source canary PR #${prNumber} GraphQL tuple disagrees with the exact closed REST PR/head/base identity or lacks a durable potential test merge.`,
+    );
+  }
+  const closedAtEpoch = parseGitHubUtcTimestamp(
+    closedAt,
+    `Historical source canary PR #${prNumber} closed_at`,
+  );
+
+  await assertCanaryControlPlaneUnchanged({
+    repoSlug,
+    prNumber,
+    changedFiles: pullRequest.changed_files,
+  });
+  const historicalControlPlane = await loadDefaultBranchControlPlaneInventory({
+    repoSlug,
+    treeRef: baseSha,
+  });
+  validateCanonicalV2WorkflowInventory(
+    historicalControlPlane.workflowFiles,
+    canonicalWorkflows,
+    { legacyBridge: true },
+  );
+  validateControlPlaneCodeownersContent(
+    historicalControlPlane.codeownersContent,
+    controlPlaneOwner,
+  );
+  const historicalCodeownersErrors = await ghJson(
+    `repos/${repoSlug}/codeowners/errors?ref=${encodeURIComponent(baseSha)}`,
+  );
+  if (
+    !Array.isArray(historicalCodeownersErrors?.errors) ||
+    historicalCodeownersErrors.errors.length !== 0
+  ) {
+    throw new Error(
+      `Historical source canary PR #${prNumber} base has CODEOWNERS errors or an incomplete readback.`,
+    );
+  }
+
+  const historicalMerge = await ghJson(
+    `repos/${repoSlug}/git/commits/${encodeURIComponent(testMergeSha)}`,
+  );
+  if (
+    historicalMerge?.sha !== testMergeSha ||
+    !Array.isArray(historicalMerge?.parents) ||
+    historicalMerge.parents.length !== 2 ||
+    historicalMerge.parents[0]?.sha !== baseSha ||
+    historicalMerge.parents[1]?.sha !== headSha
+  ) {
+    throw new Error(
+      `Historical source canary PR #${prNumber} test-merge ${testMergeSha} does not bind exact ordered base/head parents.`,
+    );
+  }
+  const baseAncestry = await assertHistoricalCanaryBaseAncestor({
+    repoSlug,
+    baseSha,
+    currentDefaultBranchHeadSha: defaultBranchHeadSha,
+  });
+
+  const checkRuns = await loadCompleteCheckRuns({
+    repoSlug,
+    sha: headSha,
+    checkName: DEFAULT_STATUS_CONTEXT,
+  });
+  if (checkRuns.length !== 1) {
+    throw new Error(
+      `Historical source canary feature head ${headSha} must have exactly one latest CheckRun named ${DEFAULT_STATUS_CONTEXT}; found ${checkRuns.length}.`,
+    );
+  }
+  const checkRun = checkRuns[0];
+  const completedAtEpoch = parseGitHubUtcTimestamp(
+    checkRun?.completed_at,
+    `Historical source canary ${DEFAULT_STATUS_CONTEXT} completed_at`,
+  );
+  if (
+    checkRun.name !== DEFAULT_STATUS_CONTEXT ||
+    checkRun.head_sha !== headSha ||
+    checkRun.status !== "completed" ||
+    checkRun.conclusion !== "success" ||
+    Number(checkRun?.app?.id) !== DEFAULT_STATUS_INTEGRATION_ID ||
+    checkRun?.app?.slug !== "github-actions" ||
+    completedAtEpoch > closedAtEpoch
+  ) {
+    throw new Error(
+      `Historical source canary ${DEFAULT_STATUS_CONTEXT} is not a successful native GitHub Actions CheckRun completed before the closed PR boundary.`,
+    );
+  }
+
+  const { runId, jobId } = parseCanonicalActionsJobDetailsUrl(
+    checkRun.details_url,
+    repoSlug,
+  );
+  const run = await ghJson(`repos/${repoSlug}/actions/runs/${runId}`);
+  const expectedDisplayTitle =
+    `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/${prNumber}/${testMergeSha}`;
+  if (
+    run?.display_title !== expectedDisplayTitle ||
+    Number(run?.id) !== runId ||
+    run?.repository?.full_name !== repoSlug ||
+    run?.repository?.id !== repoId ||
+    run?.head_repository?.full_name !== repoSlug ||
+    run?.head_repository?.id !== repoId ||
+    run?.path !== DEFAULT_WORKFLOW_PATH ||
+    run?.head_sha !== headSha ||
+    run?.event !== "pull_request" ||
+    run?.status !== "completed" ||
+    run?.conclusion !== "success" ||
+    !Number.isSafeInteger(run?.workflow_id) ||
+    run.workflow_id <= 0 ||
+    !Number.isSafeInteger(run?.run_attempt) ||
+    run.run_attempt <= 0
+  ) {
+    throw new Error(
+      `Historical source canary CheckRun does not resolve to the exact successful canonical ${DEFAULT_WORKFLOW_PATH} pull_request run at feature head ${headSha}.`,
+    );
+  }
+  // Do not require run.pull_requests here. GitHub clears that array after
+  // closing an unmerged PR; the PR REST tuple, merge parents, exact run-name,
+  // and job-to-CheckRun reverse link are the retained historical binding.
+  const workflow = await ghJson(
+    `repos/${repoSlug}/actions/workflows/${run.workflow_id}`,
+  );
+  if (
+    workflow?.id !== run.workflow_id ||
+    workflow?.path !== DEFAULT_WORKFLOW_PATH ||
+    workflow?.state !== "active"
+  ) {
+    throw new Error(
+      `Historical source canary run ${runId} is not bound to an active canonical workflow identity.`,
+    );
+  }
+
+  const jobPages = await ghJson(
+    `repos/${repoSlug}/actions/runs/${runId}/attempts/${run.run_attempt}/jobs?per_page=100`,
+    { paginate: true },
+  );
+  if (
+    !Array.isArray(jobPages) ||
+    jobPages.length === 0 ||
+    jobPages.some(
+      (page) =>
+        page === null ||
+        typeof page !== "object" ||
+        Array.isArray(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.jobs),
+    )
+  ) {
+    throw new Error(
+      "Historical source canary Actions job readback did not return complete paginated job objects.",
+    );
+  }
+  const jobs = jobPages.flatMap((page) => page.jobs);
+  const jobTotalCount = jobPages[0].total_count;
+  if (
+    jobPages.some((page) => page.total_count !== jobTotalCount) ||
+    jobs.length !== jobTotalCount ||
+    jobs.some(
+      (job) =>
+        job === null ||
+        typeof job !== "object" ||
+        Array.isArray(job) ||
+        !Number.isSafeInteger(job.id) ||
+        job.id <= 0 ||
+        Number(job.run_id) !== runId ||
+        typeof job.head_sha !== "string" ||
+        !/^[0-9a-f]{40}$/u.test(job.head_sha) ||
+        typeof job.name !== "string" ||
+        job.name === "" ||
+        typeof job.status !== "string" ||
+        (job.conclusion !== null && typeof job.conclusion !== "string") ||
+        typeof job.check_run_url !== "string" ||
+        job.check_run_url === "",
+    )
+  ) {
+    throw new Error(
+      "Historical source canary Actions job inventory is incomplete, malformed, or inconsistent with the verified run.",
+    );
+  }
+  const canonicalJobs = jobs.filter(
+    (job) => job.name === DEFAULT_STATUS_CONTEXT,
+  );
+  if (
+    canonicalJobs.length !== 1 ||
+    canonicalJobs[0].id !== jobId ||
+    canonicalJobs[0].head_sha !== headSha ||
+    canonicalJobs[0].status !== "completed" ||
+    canonicalJobs[0].conclusion !== "success"
+  ) {
+    throw new Error(
+      `Historical source canary run ${runId} must contain exactly one successful ${DEFAULT_STATUS_CONTEXT} job bound to its exact head.`,
+    );
+  }
+  const canonicalJob = canonicalJobs[0];
+  const checkRunId = parseCanonicalCheckRunApiUrl(
+    canonicalJob.check_run_url,
+    repoSlug,
+  );
+  if (checkRunId !== checkRun.id) {
+    throw new Error(
+      "Historical source canary verifier job does not resolve to the unique CheckRun.",
+    );
+  }
+
+  return {
+    number: prNumber,
+    state: "closed",
+    merged: false,
+    closed_at: closedAt,
+    base: { ref: defaultBranch, sha: baseSha },
+    base_ancestry: baseAncestry,
+    head_sha: headSha,
+    test_merge_sha: testMergeSha,
+    check_run: {
+      id: checkRun.id,
+      name: checkRun.name,
+      head_sha: checkRun.head_sha,
+      status: checkRun.status,
+      conclusion: checkRun.conclusion,
+      completed_at: checkRun.completed_at,
+      app_id: checkRun.app.id,
+      app_slug: checkRun.app.slug,
+    },
+    run: {
+      id: run.id,
+      attempt: run.run_attempt,
+      workflow_id: run.workflow_id,
+      workflow_path: run.path,
+      event: run.event,
+      head_sha: run.head_sha,
+      status: run.status,
+      conclusion: run.conclusion,
+      display_title: run.display_title,
+    },
+    job: {
+      id: canonicalJob.id,
+      run_id: canonicalJob.run_id,
+      name: canonicalJob.name,
+      head_sha: canonicalJob.head_sha,
+      status: canonicalJob.status,
+      conclusion: canonicalJob.conclusion,
+      check_run_id: checkRunId,
+    },
+  };
+}
+
+async function loadHistoricalSourceCanaryGraphPullRequest({ repoSlug, prNumber }) {
+  const { owner, repo } = parseRepoSlug(repoSlug);
+  const response = await ghJson("graphql", {
+    method: "POST",
+    body: {
+      query: `query SourceBridgeRemovalHistoricalCanary($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      closedAt
+      baseRefName
+      baseRefOid
+      headRefOid
+      potentialMergeCommit { oid }
+      baseRepository { nameWithOwner }
+      headRepository { nameWithOwner }
+    }
+  }
+}`,
+      variables: { owner, name: repo, number: prNumber },
+    },
+  });
+  return response?.data?.repository?.pullRequest;
+}
+
+async function assertHistoricalCanaryBaseAncestor({
+  repoSlug,
+  baseSha,
+  currentDefaultBranchHeadSha,
+}) {
+  const comparison = await ghJson(
+    `repos/${repoSlug}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(currentDefaultBranchHeadSha)}`,
+  );
+  if (
+    comparison?.base_commit?.sha !== baseSha ||
+    comparison?.merge_base_commit?.sha !== baseSha ||
+    comparison?.status !== "identical" && comparison?.status !== "ahead" ||
+    !Number.isSafeInteger(comparison?.ahead_by) ||
+    comparison.ahead_by < 0
+  ) {
+    throw new Error(
+      `Historical source canary base ${baseSha} is not a proven ancestor of current default-branch head ${currentDefaultBranchHeadSha}.`,
+    );
+  }
+  return {
+    base_sha: baseSha,
+    current_default_branch_head_sha: currentDefaultBranchHeadSha,
+    merge_base_sha: baseSha,
+    status: comparison.status,
+  };
+}
+
+function parseGitHubUtcTimestamp(value, label) {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(value)
+  ) {
+    throw new Error(`${label} must be an exact UTC ISO-8601 timestamp.`);
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isSafeInteger(timestamp)) {
+    throw new Error(`${label} is not a valid UTC ISO-8601 timestamp.`);
+  }
+  return timestamp;
 }
 
 function parseCanonicalActionsJobDetailsUrl(value, repoSlug) {
@@ -1767,11 +2382,11 @@ async function loadConsumerSecuritySnapshot({
     const classicLegacyStatusRequired =
       classicBranchProtection.requiredStatusChecks !== null &&
       (
-        classicBranchProtection.requiredStatusChecks.contexts.includes(
-          LEGACY_STATUS_CONTEXT,
+        classicBranchProtection.requiredStatusChecks.contexts.some(
+          (context) => isLegacyStatusContext(context),
         ) ||
         classicBranchProtection.requiredStatusChecks.checks.some(
-          (check) => check.context === LEGACY_STATUS_CONTEXT,
+          (check) => isLegacyStatusContext(check.context),
         )
       );
     return {
@@ -2245,6 +2860,428 @@ async function withPostWriteRecoveryGuidance(
 // The read-only verify phase then requires two complete post-cleanup closures
 // to equal that pre-derived state. No original-repository write credential or
 // in-repository ledger is needed.
+async function printDerivedSourceBridgeRemovalProof({
+  options,
+  canonicalWorkflows,
+}) {
+  const receipt = await deriveStableSourceBridgeRemovalProof({
+    options,
+    canonicalWorkflows,
+  });
+  process.stdout.write(canonicalSourceBridgeRemovalProofOutputText(
+    sourceBridgeRemovalProofOutput(receipt),
+  ));
+}
+
+async function rebindSourceBridgeRemovalProof({ options, canonicalWorkflows }) {
+  const approved = await readApprovedSourceBridgeRemovalProof({
+    path: options.sourceBridgeRemovalProofPath,
+    expectedSha256: options.expectedSourceBridgeRemovalProofSha256,
+  });
+  const receipt = await deriveStableSourceBridgeRemovalProof({
+    options: {
+      ...options,
+      canaryPr: approved.receipt.canary.number,
+      canaryHead: approved.receipt.canary.head_sha,
+    },
+    canonicalWorkflows,
+  });
+  if (
+    canonicalSourceBridgeRemovalProof(receipt) !==
+    canonicalSourceBridgeRemovalProof(approved.receipt)
+  ) {
+    throw new Error(
+      "The admitted source bridge-removal proof no longer equals a fresh two-round live source closure. It is evidence only, not deletion authority: derive, review, and explicitly approve a new receipt SHA-256.",
+    );
+  }
+  console.error(
+    `Source bridge-removal proof ${approved.sha256} rebound to a fresh complete two-round closure; no local or remote mutation was made.`,
+  );
+  // Re-emit exactly the approved candidate shape so it can be passed through
+  // a human review pipeline without accidentally converting a rebind result
+  // into a second kind of authorization artifact.
+  process.stdout.write(canonicalSourceBridgeRemovalProofOutputText(
+    sourceBridgeRemovalProofOutput(receipt),
+  ));
+}
+
+async function deriveStableSourceBridgeRemovalProof({
+  options,
+  canonicalWorkflows,
+}) {
+  const deadline = Date.now() + SOURCE_CLOSURE_STABILITY_TIMEOUT_MS;
+  let attempts = 0;
+  while (true) {
+    const first = await loadSourceBridgeRemovalClosure({
+      options,
+      canonicalWorkflows,
+    });
+    await waitForSourceClosureStabilityInterval({ deadline });
+    const second = await loadSourceBridgeRemovalClosure({
+      options,
+      canonicalWorkflows,
+    });
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Source bridge-removal closure exceeded the ${SOURCE_CLOSURE_STABILITY_TIMEOUT_MS / 1000}-second stability budget after its second complete read. Fail closed: no receipt was emitted; wait for repository state to settle and derive a new proof.`,
+      );
+    }
+    const firstCanonical = canonicalSourceBridgeRemovalProof(first);
+    const secondCanonical = canonicalSourceBridgeRemovalProof(second);
+    if (firstCanonical === secondCanonical) {
+      return second;
+    }
+    attempts += 1;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Source bridge-removal closure remained unstable across ${attempts + 1} complete two-round read attempt(s) within ${SOURCE_CLOSURE_STABILITY_TIMEOUT_MS / 1000} seconds. Fail closed: no receipt was emitted; wait for repository state to settle and derive a new proof.`,
+      );
+    }
+    console.error(
+      `Source bridge-removal closure changed between complete readbacks; restarting stability window (${attempts}).`,
+    );
+  }
+}
+
+async function waitForSourceClosureStabilityInterval({ deadline }) {
+  const remaining = deadline - Date.now();
+  if (remaining < SOURCE_CLOSURE_STABILITY_INTERVAL_MS) {
+    throw new Error(
+      `Source bridge-removal closure cannot complete two reads separated by ${SOURCE_CLOSURE_STABILITY_INTERVAL_MS / 1000} seconds within the ${SOURCE_CLOSURE_STABILITY_TIMEOUT_MS / 1000}-second stability budget. Fail closed.`,
+    );
+  }
+  await new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, SOURCE_CLOSURE_STABILITY_INTERVAL_MS);
+  });
+}
+
+async function loadSourceBridgeRemovalClosure({
+  options,
+  canonicalWorkflows,
+}) {
+  assertSourceBridgeRemovalFixedPolicyOptions(
+    options,
+    "source bridge-removal closure derivation",
+  );
+  const closure = await loadCleanupSecurityClosure({
+    options,
+    canonicalWorkflows,
+    requireLegacyClear: true,
+  });
+  const retainedSourceRuleset = assertSourceSelfHostingRetainedRulesetClosure(
+    closure.rulesets,
+  );
+  const repository = closure.state.repository;
+  const canonicalWorkflowPaths = sourceCanonicalWorkflowPaths();
+  const workflowInventory = canonicalWorkflowPaths.map((path) => {
+    const matches = closure.state.workflow_inventory.filter(
+      (entry) => entry.path === path,
+    );
+    if (matches.length !== 1) {
+      throw new Error(
+        `Source closure cannot bind exactly one canonical workflow inventory object for ${path}.`,
+      );
+    }
+    return matches[0];
+  });
+  const workflowApi = await loadActiveCanonicalWorkflowApiIdentities({
+    repoSlug: options.repo.slug,
+    expectedPaths: canonicalWorkflowPaths,
+  });
+  const canary = await loadHistoricalSourceCanaryEvidence({
+    repoSlug: options.repo.slug,
+    repoId: repository.id,
+    defaultBranch: repository.default_branch,
+    defaultBranchHeadSha: repository.default_branch_head_sha,
+    prNumber: options.canaryPr,
+    headSha: options.canaryHead,
+    canonicalWorkflows,
+    controlPlaneOwner: options.controlPlaneOwner,
+  });
+  const selectedV2Writable = rulesetSecurityProjection(
+    closure.selectedV2,
+    RULESET_PROFILE_STATUS_ONLY,
+  ).writable;
+  const receipt = {
+    schema_version: 1,
+    scope: "source-bridge-removal",
+    repository: {
+      full_name: repository.full_name,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+      default_branch_head_sha: repository.default_branch_head_sha,
+    },
+    control_plane_owner: DEFAULT_CONTROL_PLANE_OWNER,
+    v2_ruleset: {
+      id: closure.selectedV2.id,
+      name: closure.selectedV2.name,
+      state: "active",
+      profile: RULESET_PROFILE_STATUS_ONLY,
+      context: options.context,
+      integration_id: options.integrationId,
+      strict_required_status_checks: true,
+      writable_sha256:
+        sourceBridgeRemovalRulesetWritableSha256(selectedV2Writable),
+    },
+    retained_source_ruleset: {
+      id: retainedSourceRuleset.id,
+      name: retainedSourceRuleset.name,
+      source_type: retainedSourceRuleset.source_type,
+      source: retainedSourceRuleset.source,
+      target: retainedSourceRuleset.target,
+      writable_sha256: sourceBridgeRemovalRulesetWritableSha256(
+        retainedSourceRuleset.writable,
+      ),
+    },
+    canary,
+    live_closure: {
+      security_sha256: sourceBridgeRemovalSecurityStateSha256(closure.state),
+      legacy_inventory_sha256:
+        sourceBridgeRemovalLegacyInventorySha256(closure.legacyInventory),
+      legacy_inventory: closure.legacyInventory,
+      legacy_status_required: false,
+      canonical_workflows: workflowInventory,
+      canonical_workflow_api: workflowApi,
+      security_state: closure.state,
+    },
+  };
+  // This also guards the script/validator schema boundary before the receipt
+  // becomes stdout data that a person may later approve by digest.
+  canonicalSourceBridgeRemovalProof(receipt);
+  return receipt;
+}
+
+function sourceCanonicalWorkflowPaths() {
+  return [
+    DEFAULT_CONTROLLER_WORKFLOW_PATH,
+    DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+    DEFAULT_WORKFLOW_PATH,
+  ].sort();
+}
+
+function assertSourceSelfHostingRetainedRulesetClosure(rulesets) {
+  if (!Array.isArray(rulesets)) {
+    throw new Error(
+      "Source closure requires a complete full-ruleset inventory before binding retained protections.",
+    );
+  }
+  const matches = rulesets.filter(
+    (ruleset) => ruleset?.id === SOURCE_SELF_HOSTING_RETAINED_RULESET_ID,
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      `Source closure requires exactly one retained ruleset id ${SOURCE_SELF_HOSTING_RETAINED_RULESET_ID}; found ${matches.length}.`,
+    );
+  }
+  return assertSourceSelfHostingRetainedRulesetPolicy(matches[0]);
+}
+
+async function loadActiveCanonicalWorkflowApiIdentities({
+  repoSlug,
+  expectedPaths,
+}) {
+  const pages = await ghJson(
+    `repos/${repoSlug}/actions/workflows?per_page=100`,
+    { paginate: true },
+  );
+  if (
+    !Array.isArray(pages) ||
+    pages.length === 0 ||
+    pages.some(
+      (page) =>
+        page === null ||
+        typeof page !== "object" ||
+        Array.isArray(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.workflows),
+    )
+  ) {
+    throw new Error(
+      "Source closure workflow API readback did not return complete paginated workflow objects.",
+    );
+  }
+  const workflows = pages.flatMap((page) => page.workflows);
+  const totalCount = pages[0].total_count;
+  if (
+    pages.some((page) => page.total_count !== totalCount) ||
+    workflows.length !== totalCount ||
+    workflows.some(
+      (workflow) =>
+        workflow === null ||
+        typeof workflow !== "object" ||
+        Array.isArray(workflow) ||
+        !Number.isSafeInteger(workflow.id) ||
+        workflow.id <= 0 ||
+        typeof workflow.path !== "string" ||
+        workflow.path === "" ||
+        typeof workflow.state !== "string" ||
+        workflow.state === "",
+    )
+  ) {
+    throw new Error(
+      "Source closure workflow API inventory is incomplete, malformed, or inconsistent with its total count.",
+    );
+  }
+  return expectedPaths.map((path) => {
+    const matches = workflows.filter((workflow) => workflow.path === path);
+    if (matches.length !== 1 || matches[0].state !== "active") {
+      throw new Error(
+        `Source closure requires exactly one active workflow API identity for ${path}.`,
+      );
+    }
+    return {
+      id: matches[0].id,
+      path,
+      state: "active",
+    };
+  });
+}
+
+function sourceBridgeRemovalProofOutput(receipt) {
+  return {
+    schema_version: SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION,
+    mode: "derive",
+    status: "candidate",
+    applied: false,
+    source_bridge_removal_receipt: receipt,
+    source_bridge_removal_receipt_sha256:
+      sourceBridgeRemovalProofSha256(receipt),
+  };
+}
+
+function canonicalSourceBridgeRemovalProofOutputText(output) {
+  return `${JSON.stringify(
+    JSON.parse(canonicalSourceBridgeRemovalProofOutput(output)),
+    null,
+    2,
+  )}\n`;
+}
+
+async function readApprovedSourceBridgeRemovalProof({ path, expectedSha256 }) {
+  const noFollow = fileSystemConstants.O_NOFOLLOW ?? 0;
+  let handle;
+  let primaryError = null;
+  try {
+    handle = await open(
+      path,
+      fileSystemConstants.O_RDONLY |
+        noFollow |
+        (fileSystemConstants.O_NONBLOCK ?? 0),
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`Source bridge-removal proof is missing: ${path}`);
+    }
+    throw new Error(
+      `Unable to open source bridge-removal proof: ${path}: ${error.message}`,
+    );
+  }
+  try {
+    const metadata = await handle.stat({ bigint: true });
+    if (!metadata.isFile()) {
+      throw new Error(
+        `Source bridge-removal proof must be a regular file: ${path}`,
+      );
+    }
+    if (metadata.size > BigInt(MAX_SOURCE_BRIDGE_REMOVAL_PROOF_BYTES)) {
+      throw new Error(
+        `Source bridge-removal proof exceeds the ${MAX_SOURCE_BRIDGE_REMOVAL_PROOF_BYTES}-byte admission limit: ${path}`,
+      );
+    }
+    if (noFollow === 0) {
+      const pathMetadata = await lstat(path, { bigint: true });
+      if (
+        !pathMetadata.isFile() ||
+        pathMetadata.isSymbolicLink() ||
+        pathMetadata.dev !== metadata.dev ||
+        pathMetadata.ino !== metadata.ino
+      ) {
+        throw new Error(
+          `Source bridge-removal proof changed or is not a regular non-symlink file while opening it: ${path}`,
+        );
+      }
+    }
+    const bytes = await readBoundedSourceBridgeRemovalProofBytes(handle);
+    const text = bytes.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(bytes)) {
+      throw new Error(
+        `Source bridge-removal proof is not exact UTF-8 text: ${path}`,
+      );
+    }
+    let output;
+    try {
+      output = JSON.parse(text);
+    } catch (error) {
+      throw new Error(
+        `Source bridge-removal proof is not valid JSON: ${error.message}`,
+      );
+    }
+    const canonicalOutputText = canonicalSourceBridgeRemovalProofOutputText(
+      output,
+    );
+    if (canonicalOutputText !== text) {
+      throw new Error(
+        "Source bridge-removal proof is not the unmodified canonical raw output from --derive-source-bridge-removal-proof.",
+      );
+    }
+    const admitted = validateSourceBridgeRemovalProofOutput(output);
+    assertSourceBridgeRemovalFixedReceiptPolicy(
+      admitted.source_bridge_removal_receipt,
+      "approved proof admission",
+    );
+    const actualSha256 = admitted.source_bridge_removal_receipt_sha256;
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(
+        `Source bridge-removal proof SHA-256 mismatched: expected ${expectedSha256}, read ${actualSha256}.`,
+      );
+    }
+    return {
+      receipt: admitted.source_bridge_removal_receipt,
+      sha256: actualSha256,
+    };
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      await handle.close();
+    } catch (error) {
+      if (primaryError === null) {
+        throw error;
+      }
+    }
+  }
+}
+
+async function readBoundedSourceBridgeRemovalProofBytes(handle) {
+  const chunks = [];
+  let total = 0;
+  let position = 0;
+  while (true) {
+    const remaining = MAX_SOURCE_BRIDGE_REMOVAL_PROOF_BYTES + 1 - total;
+    const chunk = Buffer.allocUnsafe(Math.min(65_536, remaining));
+    const { bytesRead } = await handle.read(
+      chunk,
+      0,
+      chunk.length,
+      position,
+    );
+    if (bytesRead === 0) {
+      return Buffer.concat(chunks, total);
+    }
+    total += bytesRead;
+    if (total > MAX_SOURCE_BRIDGE_REMOVAL_PROOF_BYTES) {
+      throw new Error(
+        `Source bridge-removal proof exceeds the ${MAX_SOURCE_BRIDGE_REMOVAL_PROOF_BYTES}-byte admission limit while reading its bound descriptor.`,
+      );
+    }
+    chunks.push(chunk.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+}
+
 async function printDerivedPostCleanupPlan({ options, canonicalWorkflows }) {
   const { plan } = await derivePostCleanupPlan({ options, canonicalWorkflows });
   process.stdout.write(canonicalPostCleanupPlanText(plan));
@@ -2838,10 +3875,7 @@ async function loadCleanupSecurityClosure({
       context: options.context,
       integrationId: options.integrationId,
     }) ||
-    (requireLegacyClear &&
-      rulesetHasRequiredStatusContext(selectedV2, LEGACY_STATUS_CONTEXT, {
-        integrationId: undefined,
-      }))
+    (requireLegacyClear && rulesetHasLegacyStatusContext(selectedV2))
   ) {
     throw new Error(
       `Cleanup closure requires the unique repository ruleset "${options.rulesetName}" to remain the ${rulesetProfileDescription(options.rulesetProfile, { active: true })}${requireLegacyClear ? ` without ${LEGACY_STATUS_CONTEXT}` : ""}.`,
@@ -2894,6 +3928,7 @@ async function loadCleanupSecurityClosure({
   return {
     legacyInventory,
     legacyInventoryBytes,
+    rulesets,
     rulesetProfile: options.rulesetProfile,
     selectedV2,
     state: buildCleanupSecurityState({
@@ -2985,7 +4020,7 @@ function deriveAuthorizedPostCleanupState(closure) {
         return [rule];
       }
       const checks = rule.parameters.required_status_checks.filter(
-        (check) => check.context !== LEGACY_STATUS_CONTEXT,
+        (check) => !isLegacyStatusContext(check.context),
       );
       if (checks.length === rule.parameters.required_status_checks.length) {
         return [rule];
@@ -3023,10 +4058,10 @@ function deriveAuthorizedPostCleanupState(closure) {
 
 function removeLegacyFromClassicStatusPolicy(classic) {
   const contexts = classic.contexts.filter(
-    (context) => context !== LEGACY_STATUS_CONTEXT,
+    (context) => !isLegacyStatusContext(context),
   );
   const checks = classic.checks.filter(
-    (check) => check.context !== LEGACY_STATUS_CONTEXT,
+    (check) => !isLegacyStatusContext(check.context),
   );
   if (contexts.length === 0 && checks.length === 0) {
     return null;
@@ -3066,8 +4101,8 @@ function decodeBoundLegacyInventory({
 function assertDecodedLegacyInventoryClear(inventory, repoSlug) {
   const classic = inventory.classic_required_status_checks;
   const classicHasLegacy = classic !== null &&
-    (classic.contexts.includes(LEGACY_STATUS_CONTEXT) ||
-      classic.checks.some((check) => check.context === LEGACY_STATUS_CONTEXT));
+    (classic.contexts.some((context) => isLegacyStatusContext(context)) ||
+      classic.checks.some((check) => isLegacyStatusContext(check.context)));
   if (inventory.rulesets.length > 0 || classicHasLegacy) {
     throw new Error(
       `${LEGACY_STATUS_CONTEXT} remains required after cleanup on ${repoSlug}; leave the v2 ruleset active, remove only the remaining authorized legacy requirement, and rerun this read-only verification.`,
@@ -3162,7 +4197,7 @@ async function loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch }) {
           rule?.type === "required_status_checks" &&
           Array.isArray(rule?.parameters?.required_status_checks) &&
           rule.parameters.required_status_checks.some(
-            (check) => check?.context === LEGACY_STATUS_CONTEXT,
+            (check) => isLegacyStatusContext(check?.context),
           ),
       )
       .map((rule) => rule.ruleset_id),
@@ -3278,6 +4313,17 @@ function rulesetMatchesProfileAtDefaultBranch({
   );
 }
 
+function rulesetHasLegacyStatusContext(ruleset) {
+  return (ruleset?.rules ?? []).some(
+    (rule) =>
+      rule?.type === "required_status_checks" &&
+      Array.isArray(rule?.parameters?.required_status_checks) &&
+      rule.parameters.required_status_checks.some((check) =>
+        isLegacyStatusContext(check?.context),
+      ),
+  );
+}
+
 function rulesetProfileDescription(profile, { active = false } = {}) {
   switch (normalizeRulesetProfile(profile)) {
     case DEFAULT_RULESET_PROFILE:
@@ -3352,6 +4398,19 @@ async function loadAndBindOrganizationFinalClosureProof({
   receiptPath,
   expectedSha256,
 }) {
+  // Reject the source self-hosting repository before reading an organization
+  // receipt. Its bridge has a separate authority domain; parsing a supplied
+  // organization artifact first would make that hard boundary dependent on
+  // unrelated receipt admission details.
+  const origin = await loadGitHubOriginRepository(targetRoot);
+  if (
+    origin.repository.slug.toLowerCase() ===
+    SOURCE_SELF_HOSTING_REPOSITORY_SLUG.toLowerCase()
+  ) {
+    throw new Error(
+      `Git origin repository ${origin.repository.slug} is the source self-hosting repository and cannot use the organization --remove-legacy-bridge receipt path. Use the separately authorized source-only bridge-removal lifecycle.`,
+    );
+  }
   const content = await readOptionalRegularFile(receiptPath);
   if (content === null) {
     throw new Error(`Organization final closure receipt is missing: ${receiptPath}`);
@@ -3379,7 +4438,6 @@ async function loadAndBindOrganizationFinalClosureProof({
     );
   }
 
-  const origin = await loadGitHubOriginRepository(targetRoot);
   const repository = validated.bridgeRemovalRepositories.find(
     (candidate) =>
       candidate.full_name.toLowerCase() === origin.repository.slug.toLowerCase(),
@@ -3496,6 +4554,500 @@ function assertOrganizationFinalClosureOriginMatchesProof(current, proof, phase)
   ) {
     throw new Error(
       `Git origin repository changed during ${phase}; refusing bridge removal success.`,
+    );
+  }
+}
+
+// The source-self-hosting bridge has a deliberately narrower authority than a
+// normal consumer installation: an approved receipt may authorize one local
+// deletion only. It never authorizes a generic workflow repair, a ruleset
+// write, staging, or a commit. Every remote read below is a read-only
+// rederivation of the complete source closure; the fresh v2 PR check remains
+// the merge authority for the resulting deletion.
+async function removeSourceLegacyBridgeFromWorktree({
+  targetRoot,
+  canonicalWorkflows,
+  sourceBridgeRemovalProofPath,
+  expectedSourceBridgeRemovalProofSha256,
+  apply,
+}) {
+  if (canonicalWorkflows.legacyBridge === undefined) {
+    throw new Error(
+      "Internal error: source bridge removal requires the canonical legacy bridge bytes.",
+    );
+  }
+  const worktreeWitness = await admitSourceGitWorktree(targetRoot);
+  const rootWitness = worktreeWitness.rootWitness;
+  assertSourceBridgeRemovalOrigin(
+    await loadGitHubOriginRepository(targetRoot),
+    "source bridge-removal local admission",
+  );
+  const approved = await readApprovedSourceBridgeRemovalProof({
+    path: sourceBridgeRemovalProofPath,
+    expectedSha256: expectedSourceBridgeRemovalProofSha256,
+  });
+  const proof = {
+    receipt: approved.receipt,
+    sha256: approved.sha256,
+    worktreeWitness,
+  };
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  await assertSourceBridgeRemovalLocalBinding({
+    targetRoot,
+    worktreeWitness,
+    receipt: proof.receipt,
+    phase: "source bridge-removal receipt local admission",
+  });
+  const parentWitnesses = await prepareVerifiedWorkflowParents({
+    targetRoot,
+    rootWitness,
+    create: false,
+  });
+  await revalidateDirectoryChain(
+    parentWitnesses,
+    "after source bridge-removal local inspection",
+  );
+  await assertSourceBridgeTrackedAtHead({
+    targetRoot,
+    bridgePath,
+    receipt: proof.receipt,
+  });
+  const currentBridge = await readOptionalRegularFile(bridgePath);
+  await assertSourceBridgeRemovalProofBindingStable({
+    targetRoot,
+    proof,
+    canonicalWorkflows,
+    phase: "source bridge-removal receipt admission",
+  });
+  const initialDiffState = await classifySourceBridgeRemovalWorktreeDiff({
+    targetRoot,
+  });
+
+  if (currentBridge === null) {
+    if (initialDiffState !== "already-removed") {
+      throw new Error(
+        `${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} is absent without the exact prior local deletion diff. Refusing to call an incomplete or sparse checkout an idempotent source bridge removal.`,
+      );
+    }
+    await assertSourceBridgeRemovalProofBindingStable({
+      targetRoot,
+      proof,
+      canonicalWorkflows,
+      phase: "source bridge-removal idempotent no-op success",
+    });
+    await assertExactSourceBridgeRemovalDiff({
+      targetRoot,
+      phase: "source bridge-removal idempotent no-op success",
+    });
+    console.log(
+      `No change: ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} is already the only unstaged local deletion in this bound source worktree.`,
+    );
+    return;
+  }
+
+  if (initialDiffState !== "clean") {
+    throw new Error(
+      `Source bridge removal requires a clean worktree before its first mutation; found local changes instead of an admitted exact prior deletion.`,
+    );
+  }
+  validateCanonicalLegacyBridgeWorkflowContent(currentBridge);
+  if (currentBridge !== canonicalWorkflows.legacyBridge) {
+    throw new Error(
+      `${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} differs from the exact canonical bridge bytes; refusing source-only removal.`,
+    );
+  }
+
+  console.log(`Source worktree: ${targetRoot}`);
+  console.log(
+    `Approved source bridge-removal receipt: ${proof.sha256} (${proof.receipt.repository.full_name}@${proof.receipt.repository.default_branch_head_sha})`,
+  );
+  console.log(`Only authorized local path: ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}`);
+  if (!apply) {
+    console.log(
+      "Dry run: the approved receipt matches a fresh complete two-round source closure; no local or remote mutation was made.",
+    );
+    console.log(
+      "Run again with --apply to remove only the exact canonical local bridge, then review the one-file deletion diff before opening the source deletion PR.",
+    );
+    return;
+  }
+
+  const rebindAtBoundary = async (
+    phase,
+    expectedDiffState,
+    allowedQuarantinePath = null,
+  ) => {
+    await assertSourceBridgeRemovalProofBindingStable({
+      targetRoot,
+      proof,
+      canonicalWorkflows,
+      phase,
+    });
+    await assertSourceBridgeRemovalWorktreeDiffState({
+      targetRoot,
+      expectedDiffState,
+      phase,
+      allowedQuarantinePath,
+    });
+  };
+  await removePreparedConsumerFile({
+    path: bridgePath,
+    expectedContent: canonicalWorkflows.legacyBridge,
+    parentWitnesses,
+    label: "source-legacy-bridge-workflow",
+    beforeRemove: async () => {
+      await rebindAtBoundary(
+        "immediately before source legacy bridge removal",
+        "clean",
+      );
+    },
+    beforeQuarantineRename: async () => {
+      await rebindAtBoundary(
+        "immediately before source legacy bridge quarantine rename",
+        "clean",
+      );
+    },
+    beforeFinalQuarantineRename: async () => {
+      await rebindAtBoundary(
+        "immediately before final source legacy bridge quarantine rename",
+        "clean",
+      );
+    },
+    beforeQuarantineUnlink: async ({ quarantinePath }) => {
+      await rebindAtBoundary(
+        "after source legacy bridge quarantine rename and before unlink",
+        "already-removed",
+        quarantinePath,
+      );
+    },
+  });
+  // The final remote proof rebind is deliberately the callback immediately
+  // before quarantine unlink, while the admitted object can still be restored
+  // if either remote or local state is no longer admissible. Do not perform
+  // fresh remote I/O after unlink: a later local-diff failure could no longer
+  // restore the quarantined bridge without risking an unrelated concurrent
+  // destination. The callback reclassifies the exact deletion state, and the
+  // checks below are local-only success readback.
+  if (await readOptionalRegularFile(bridgePath) !== null) {
+    throw new Error(
+      "Source legacy bridge remains after the local removal returned; refusing success.",
+    );
+  }
+  await revalidateDirectoryChain(
+    parentWitnesses,
+    "after source bridge-removal local apply success",
+  );
+  await assertExactSourceBridgeRemovalDiff({
+    targetRoot,
+    phase: "source bridge-removal local apply success",
+  });
+  console.log(
+    `Applied: removed only ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. No file was staged or committed; review the exact one-file deletion before opening the fresh v2-gated source PR.`,
+  );
+}
+
+async function assertSourceBridgeRemovalProofBindingStable({
+  targetRoot,
+  proof,
+  canonicalWorkflows,
+  phase,
+}) {
+  await assertSourceBridgeRemovalLocalBinding({
+    targetRoot,
+    worktreeWitness: proof.worktreeWitness,
+    receipt: proof.receipt,
+    phase: `${phase} before remote closure rederivation`,
+  });
+  const fresh = await deriveStableSourceBridgeRemovalProof({
+    options: sourceBridgeRemovalDeriveOptions(proof.receipt),
+    canonicalWorkflows,
+  });
+  if (
+    canonicalSourceBridgeRemovalProof(fresh) !==
+    canonicalSourceBridgeRemovalProof(proof.receipt)
+  ) {
+    throw new Error(
+      `The approved source bridge-removal receipt ${proof.sha256} no longer equals a fresh complete two-round source closure during ${phase}. It is evidence only: derive, review, and explicitly approve a new receipt before any source bridge deletion.`,
+    );
+  }
+  await assertSourceBridgeRemovalLocalBinding({
+    targetRoot,
+    worktreeWitness: proof.worktreeWitness,
+    receipt: proof.receipt,
+    phase: `${phase} after remote closure rederivation`,
+  });
+}
+
+function sourceBridgeRemovalDeriveOptions(receipt) {
+  assertSourceBridgeRemovalFixedReceiptPolicy(
+    receipt,
+    "approved source bridge-removal receipt",
+  );
+  return {
+    repo: parseRepoSlug(SOURCE_SELF_HOSTING_REPOSITORY_SLUG),
+    rulesetName: SOURCE_SELF_HOSTING_RULESET_NAME,
+    rulesetProfile: RULESET_PROFILE_STATUS_ONLY,
+    controlPlaneOwner: DEFAULT_CONTROL_PLANE_OWNER,
+    context: DEFAULT_STATUS_CONTEXT,
+    integrationId: DEFAULT_STATUS_INTEGRATION_ID,
+    canaryPr: receipt.canary.number,
+    canaryHead: receipt.canary.head_sha,
+  };
+}
+
+function assertSourceBridgeRemovalFixedPolicyOptions(options, phase) {
+  if (
+    options?.repo?.slug !== SOURCE_SELF_HOSTING_REPOSITORY_SLUG ||
+    options.rulesetName !== SOURCE_SELF_HOSTING_RULESET_NAME ||
+    options.rulesetProfile !== RULESET_PROFILE_STATUS_ONLY ||
+    options.controlPlaneOwner !== DEFAULT_CONTROL_PLANE_OWNER ||
+    options.context !== DEFAULT_STATUS_CONTEXT ||
+    options.integrationId !== DEFAULT_STATUS_INTEGRATION_ID
+  ) {
+    throw new Error(
+      `Source bridge-removal closure derivation during ${phase} must use the fixed ${SOURCE_SELF_HOSTING_REPOSITORY_SLUG} migration policy: ruleset "${SOURCE_SELF_HOSTING_RULESET_NAME}", ${RULESET_PROFILE_STATUS_ONLY}, ${DEFAULT_CONTROL_PLANE_OWNER}, and ${DEFAULT_STATUS_CONTEXT}/${DEFAULT_STATUS_INTEGRATION_ID}.`,
+    );
+  }
+}
+
+function assertSourceBridgeRemovalFixedReceiptPolicy(receipt, phase) {
+  if (
+    receipt?.v2_ruleset?.name !== SOURCE_SELF_HOSTING_RULESET_NAME ||
+    receipt?.control_plane_owner !== DEFAULT_CONTROL_PLANE_OWNER
+  ) {
+    throw new Error(
+      `Source bridge-removal receipt during ${phase} is not bound to fixed ruleset "${SOURCE_SELF_HOSTING_RULESET_NAME}" and control-plane owner ${DEFAULT_CONTROL_PLANE_OWNER}.`,
+    );
+  }
+}
+
+async function assertSourceBridgeRemovalLocalBinding({
+  targetRoot,
+  worktreeWitness,
+  receipt,
+  phase,
+}) {
+  // Preserve the initial Git administrative identity across every remote
+  // rebind. A fresh valid worktree is insufficient here: replacing .git with
+  // another valid marker/admin state must not inherit deletion authority.
+  if (worktreeWitness.targetRoot !== targetRoot) {
+    throw new Error(
+      `Source bridge-removal worktree witness is bound to a different local root during ${phase}.`,
+    );
+  }
+  await assertSourceGitWorktreeAdmissionStable(worktreeWitness, phase);
+  const originBefore = await loadGitHubOriginRepository(targetRoot);
+  assertSourceBridgeRemovalOrigin(originBefore, phase);
+  const [branch, head] = await Promise.all([
+    gitRevParse(targetRoot, "--abbrev-ref", "HEAD"),
+    gitRevParse(targetRoot, "HEAD"),
+  ]);
+  if (branch !== receipt.repository.default_branch) {
+    throw new Error(
+      `Source bridge removal requires the checked-out default branch ${receipt.repository.default_branch}; read ${branch} during ${phase}.`,
+    );
+  }
+  if (head !== receipt.repository.default_branch_head_sha) {
+    throw new Error(
+      `Source bridge removal requires local HEAD ${receipt.repository.default_branch_head_sha}; read ${head} during ${phase}.`,
+    );
+  }
+  const originAfter = await loadGitHubOriginRepository(targetRoot);
+  assertSourceBridgeRemovalOrigin(originAfter, phase);
+  if (
+    originBefore.repository.slug.toLowerCase() !==
+    originAfter.repository.slug.toLowerCase()
+  ) {
+    throw new Error(
+      `Git origin repository changed during ${phase}; refusing source bridge-removal success.`,
+    );
+  }
+  await assertSourceGitWorktreeAdmissionStable(worktreeWitness, phase);
+}
+
+function assertSourceBridgeRemovalOrigin(origin, phase) {
+  if (
+    origin.repository.slug.toLowerCase() !==
+    SOURCE_SELF_HOSTING_REPOSITORY_SLUG.toLowerCase()
+  ) {
+    throw new Error(
+      `--remove-source-legacy-bridge is restricted to Git origin ${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}; read ${origin.repository.slug} during ${phase}.`,
+    );
+  }
+}
+
+async function assertSourceBridgeTrackedAtHead({
+  targetRoot,
+  bridgePath,
+  receipt,
+}) {
+  const relativePath = DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH;
+  const expectedWorkflow = receipt.live_closure.canonical_workflows.find(
+    (workflow) => workflow.path === relativePath,
+  );
+  if (expectedWorkflow === undefined) {
+    throw new Error(
+      "Approved source bridge-removal receipt lacks the fixed legacy bridge workflow identity.",
+    );
+  }
+  const stdout = await runCommand("git", [
+    "-C",
+    targetRoot,
+    "ls-files",
+    "--stage",
+    "--",
+    relativePath,
+  ]);
+  const lines = stdout.split("\n").filter((line) => line !== "");
+  const indexEntry = lines[0]?.match(
+    /^([0-9]{6}) ([0-9a-f]{40}) 0\t(.+)$/u,
+  );
+  if (
+    lines.length !== 1 ||
+    indexEntry === null ||
+    indexEntry[1] !== expectedWorkflow.mode ||
+    indexEntry[2] === "" ||
+    indexEntry[3] !== relativePath
+  ) {
+    throw new Error(
+      `${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH} is not exactly one tracked regular file in the admitted source worktree index; refusing source bridge removal.`,
+    );
+  }
+  if (bridgePath !== join(targetRoot, ...relativePath.split("/"))) {
+    throw new Error("Internal error: source bridge path escaped its fixed repository-relative location.");
+  }
+}
+
+async function classifySourceBridgeRemovalWorktreeDiff({
+  targetRoot,
+  allowedQuarantinePath = null,
+}) {
+  const [unstaged, staged, untracked, porcelain] = await Promise.all([
+    runCommand("git", [
+      "-C",
+      targetRoot,
+      "diff",
+      "--no-ext-diff",
+      "--name-status",
+      "--no-renames",
+    ]),
+    runCommand("git", [
+      "-C",
+      targetRoot,
+      "diff",
+      "--cached",
+      "--no-ext-diff",
+      "--name-status",
+      "--no-renames",
+    ]),
+    runCommand("git", [
+      "-C",
+      targetRoot,
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+    ]),
+    runCommand("git", [
+      "-C",
+      targetRoot,
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+      "--no-renames",
+    ]),
+  ]);
+  if (
+    unstaged === "" &&
+    staged === "" &&
+    untracked === "" &&
+    porcelain === ""
+  ) {
+    return "clean";
+  }
+  const exactDeletion = `D\t${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}\n`;
+  const exactPorcelainDeletion =
+    ` D ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}\n`;
+  const allowedQuarantineRelativePath =
+    allowedQuarantinePath === null
+      ? null
+      : sourceBridgeRemovalQuarantineRelativePath({
+          targetRoot,
+          quarantinePath: allowedQuarantinePath,
+        });
+  const expectedUntracked =
+    allowedQuarantineRelativePath === null
+      ? ""
+      : `${allowedQuarantineRelativePath}\n`;
+  const expectedPorcelain =
+    allowedQuarantineRelativePath === null
+      ? exactPorcelainDeletion
+      : `${exactPorcelainDeletion}?? ${allowedQuarantineRelativePath}\n`;
+  if (
+    unstaged === exactDeletion &&
+    staged === "" &&
+    untracked === expectedUntracked &&
+    porcelain === expectedPorcelain
+  ) {
+    return "already-removed";
+  }
+  throw new Error(
+    "Source bridge removal requires a clean worktree, except for an exact pre-existing unstaged deletion of the fixed legacy bridge path from a prior interrupted/idempotent run. The only temporary untracked exception is the executor's one admitted quarantine object during its pre-unlink rebind; staged, renamed, or unrelated changes are not admitted.",
+  );
+}
+
+function sourceBridgeRemovalQuarantineRelativePath({
+  targetRoot,
+  quarantinePath,
+}) {
+  const relativePath = relative(
+    resolve(targetRoot),
+    resolve(quarantinePath),
+  );
+  const expectedParentSegments = dirname(
+    DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+  ).split("/");
+  const segments = relativePath.split("/");
+  if (
+    relativePath === "" ||
+    isAbsolute(relativePath) ||
+    segments.length !== expectedParentSegments.length + 2 ||
+    !expectedParentSegments.every(
+      (segment, index) => segments[index] === segment,
+    ) ||
+    !segments.at(-2).startsWith(".codex-review-gate-removal-") ||
+    segments.at(-1) !== "canonical-legacy-bridge.yml"
+  ) {
+    throw new Error(
+      "Internal error: source bridge-removal rebind received an unexpected quarantine path.",
+    );
+  }
+  return relativePath;
+}
+
+async function assertExactSourceBridgeRemovalDiff({ targetRoot, phase }) {
+  await assertSourceBridgeRemovalWorktreeDiffState({
+    targetRoot,
+    expectedDiffState: "already-removed",
+    phase,
+  });
+}
+
+async function assertSourceBridgeRemovalWorktreeDiffState({
+  targetRoot,
+  expectedDiffState,
+  phase,
+  allowedQuarantinePath = null,
+}) {
+  const state = await classifySourceBridgeRemovalWorktreeDiff({
+    targetRoot,
+    allowedQuarantinePath,
+  });
+  if (state !== expectedDiffState) {
+    throw new Error(
+      `Expected source bridge-removal worktree diff state ${expectedDiffState} during ${phase}; found ${state}.`,
     );
   }
 }
@@ -4137,7 +5689,7 @@ async function removePreparedConsumerFile({
       // Recheck remote target identity only after the quarantined object's
       // identity/content have been observed. The post-I/O local check below
       // then detects a concurrent local replacement before unlink.
-      await beforeQuarantineUnlink();
+      await beforeQuarantineUnlink({ quarantinePath });
     } catch (authorizationError) {
       restorationAttempted = true;
       try {
@@ -4446,11 +5998,25 @@ async function findLowerPrecedenceCodeowners(targetRoot) {
 // Git-reported top level prevents admitting a nested directory; the reported
 // git/common directories bind a main-worktree directory marker; and a linked
 // worktree additionally requires both its forward pointer and administrative
-// gitdir backpointer. dev/ino and mode/uid/gid then detect marker replacement
-// or access-policy change during this validation. Size, timestamps, and link
-// count are ignored because they do not change the selected property. A failed
-// Git probe is reported as unreadable/invalid rather than as a proved mismatch.
+// gitdir backpointer. For ordinary consumer preparation, this one-time check
+// returns the established root witness. Source bridge deletion also retains the
+// full worktree witness and revalidates it around every remote rebind.
+//
+// Protected property: Git administrative identity and access policy. The
+// marker and administrative paths use dev/ino plus mode/uid/gid; linked marker
+// and backpointer files additionally bind their exact bytes. Size, timestamps,
+// and link count are intentionally ignored because they do not identify a Git
+// administrative object or its access policy. A failed Git probe is reported
+// as unreadable/invalid rather than as a proved mismatch.
 async function assertLocalGitWorktree(targetRoot) {
+  return (await admitLocalGitWorktree(targetRoot)).rootWitness;
+}
+
+async function admitSourceGitWorktree(targetRoot) {
+  return admitLocalGitWorktree(targetRoot);
+}
+
+async function admitLocalGitWorktree(targetRoot) {
   if (/[\0\r\n]/u.test(targetRoot)) {
     throw new Error("--prepare-worktree path must not contain NUL or newline characters.");
   }
@@ -4459,24 +6025,113 @@ async function assertLocalGitWorktree(targetRoot) {
     "--prepare-worktree root",
   );
   const gitMarkerPath = join(targetRoot, ".git");
-  let gitMarker;
-  try {
-    gitMarker = await lstat(gitMarkerPath, { bigint: true });
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      gitMarker = null;
-    } else {
-      throw new Error(`Unable to inspect Git worktree marker: ${error.message}`);
+  let gitMarker = await readGitWorktreeMarkerWitness(gitMarkerPath);
+  const topology = await inspectLocalGitWorktreeTopology(targetRoot);
+
+  const [gitDirectoryWitness, commonDirectoryWitness] = await Promise.all([
+    readDirectoryWitness(
+      topology.canonicalGitDirectory,
+      "Git administrative directory",
+    ),
+    topology.canonicalCommonDirectory === topology.canonicalGitDirectory
+      ? Promise.resolve(null)
+      : readDirectoryWitness(
+          topology.canonicalCommonDirectory,
+          "Git common administrative directory",
+        ),
+  ]);
+
+  let linkedWorktree = null;
+  if (gitMarker.kind === "directory") {
+    const canonicalMarkerDirectory = await realpath(gitMarkerPath);
+    if (
+      canonicalMarkerDirectory !== topology.canonicalGitDirectory ||
+      canonicalMarkerDirectory !== topology.canonicalCommonDirectory
+    ) {
+      throw new Error(
+        `--prepare-worktree .git directory does not match Git's worktree metadata: ${gitMarkerPath}`,
+      );
     }
-  }
-  if (
-    gitMarker === null ||
-    gitMarker.isSymbolicLink() ||
-    (!gitMarker.isDirectory() && !gitMarker.isFile())
-  ) {
-    throw new Error(`--prepare-worktree is not a Git worktree: ${targetRoot}`);
+  } else {
+    linkedWorktree = await admitLinkedWorktreePointers({
+      targetRoot,
+      gitMarker,
+      canonicalGitDirectory: topology.canonicalGitDirectory,
+    });
+    // The forward-pointer read is the durable file-content witness. Retain
+    // that exact observed object rather than the pre-topology marker sample.
+    gitMarker = linkedWorktree.forwardMarker;
   }
 
+  await assertGitWorktreeMarkerWitnessStable(
+    gitMarker,
+    "after Git worktree marker inspection",
+  );
+  await revalidateDirectoryWitness(
+    gitDirectoryWitness,
+    "after Git administrative directory inspection",
+  );
+  if (commonDirectoryWitness !== null) {
+    await revalidateDirectoryWitness(
+      commonDirectoryWitness,
+      "after Git common administrative directory inspection",
+    );
+  }
+  if (linkedWorktree !== null) {
+    await assertGitAdministrativeFileWitnessStable(
+      linkedWorktree.forwardMarker,
+      "after linked-worktree forward marker inspection",
+    );
+    await assertGitAdministrativeFileWitnessStable(
+      linkedWorktree.backpointer,
+      "after linked-worktree backpointer inspection",
+    );
+  }
+  await revalidateDirectoryWitness(rootWitness, "after Git worktree marker inspection");
+  return {
+    targetRoot,
+    rootWitness,
+    canonicalTargetRoot: topology.canonicalTargetRoot,
+    canonicalGitDirectory: topology.canonicalGitDirectory,
+    canonicalCommonDirectory: topology.canonicalCommonDirectory,
+    gitMarker,
+    gitDirectoryWitness,
+    commonDirectoryWitness,
+    linkedWorktree,
+  };
+}
+
+async function assertSourceGitWorktreeAdmissionStable(witness, phase) {
+  await revalidateDirectoryWitness(witness.rootWitness, phase);
+  await assertGitWorktreeMarkerWitnessStable(witness.gitMarker, phase);
+  const topology = await inspectLocalGitWorktreeTopology(witness.targetRoot);
+  if (
+    topology.canonicalTargetRoot !== witness.canonicalTargetRoot ||
+    topology.canonicalGitDirectory !== witness.canonicalGitDirectory ||
+    topology.canonicalCommonDirectory !== witness.canonicalCommonDirectory
+  ) {
+    throw new Error(
+      `Git worktree administrative identity changed during ${phase}; refusing source bridge-removal success.`,
+    );
+  }
+  await revalidateDirectoryWitness(witness.gitDirectoryWitness, phase);
+  if (witness.commonDirectoryWitness !== null) {
+    await revalidateDirectoryWitness(witness.commonDirectoryWitness, phase);
+  }
+  if (witness.linkedWorktree !== null) {
+    await assertGitAdministrativeFileWitnessStable(
+      witness.linkedWorktree.forwardMarker,
+      phase,
+    );
+    await assertGitAdministrativeFileWitnessStable(
+      witness.linkedWorktree.backpointer,
+      phase,
+    );
+  }
+  await revalidateDirectoryWitness(witness.rootWitness, phase);
+}
+
+async function inspectLocalGitWorktreeTopology(targetRoot) {
   let insideWorktree;
   let bareRepository;
   let topLevel;
@@ -4499,7 +6154,6 @@ async function assertLocalGitWorktree(targetRoot) {
   if (insideWorktree !== "true" || bareRepository !== "false") {
     throw new Error(`--prepare-worktree must name a non-bare Git worktree: ${targetRoot}`);
   }
-
   const [canonicalTargetRoot, canonicalTopLevel, canonicalGitDirectory, canonicalCommonDirectory] =
     await Promise.all([
       realpath(targetRoot),
@@ -4512,67 +6166,127 @@ async function assertLocalGitWorktree(targetRoot) {
       `--prepare-worktree must name the exact Git worktree root: ${targetRoot}`,
     );
   }
-
-  if (gitMarker.isDirectory()) {
-    const canonicalMarkerDirectory = await realpath(gitMarkerPath);
-    if (
-      canonicalMarkerDirectory !== canonicalGitDirectory ||
-      canonicalMarkerDirectory !== canonicalCommonDirectory
-    ) {
-      throw new Error(
-        `--prepare-worktree .git directory does not match Git's worktree metadata: ${gitMarkerPath}`,
-      );
-    }
-  } else {
-    await assertLinkedWorktreeBackpointer({
-      targetRoot,
-      gitMarkerPath,
-      canonicalGitDirectory,
-    });
-  }
-
-  const currentGitMarker = await lstat(gitMarkerPath, { bigint: true });
-  assertGitMarkerStable(gitMarkerPath, gitMarker, currentGitMarker);
-  await revalidateDirectoryWitness(rootWitness, "after Git worktree marker inspection");
-  return rootWitness;
+  return {
+    canonicalTargetRoot,
+    canonicalGitDirectory,
+    canonicalCommonDirectory,
+  };
 }
 
-async function assertLinkedWorktreeBackpointer({
+async function readGitWorktreeMarkerWitness(gitMarkerPath) {
+  let metadata;
+  try {
+    metadata = await lstat(gitMarkerPath, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`--prepare-worktree is not a Git worktree: ${dirname(gitMarkerPath)}`);
+    }
+    throw new Error(`Unable to inspect Git worktree marker: ${error.message}`);
+  }
+  const witness = gitAdministrativePathWitnessFromMetadata(
+    gitMarkerPath,
+    metadata,
+    "Git worktree marker",
+  );
+  if (witness.kind === "directory") {
+    return witness;
+  }
+  return (await readGitAdministrativeFileWitness(
+    gitMarkerPath,
+    "Git worktree marker",
+  )).witness;
+}
+
+function gitAdministrativePathWitnessFromMetadata(path, metadata, label) {
+  if (
+    metadata === null ||
+    metadata.isSymbolicLink() ||
+    (!metadata.isDirectory() && !metadata.isFile())
+  ) {
+    throw new Error(`${label} is not a regular Git administrative path: ${path}`);
+  }
+  return {
+    path,
+    kind: metadata.isDirectory() ? "directory" : "file",
+    dev: metadata.dev,
+    ino: metadata.ino,
+    mode: metadata.mode,
+    uid: metadata.uid,
+    gid: metadata.gid,
+  };
+}
+
+async function readGitAdministrativeFileWitness(path, label) {
+  const beforeMetadata = await lstat(path, { bigint: true }).catch((error) => {
+    if (error?.code === "ENOENT") {
+      throw new Error(`${label} is missing: ${path}`);
+    }
+    throw error;
+  });
+  const before = gitAdministrativePathWitnessFromMetadata(
+    path,
+    beforeMetadata,
+    label,
+  );
+  if (before.kind !== "file") {
+    throw new Error(`${label} must be a regular file: ${path}`);
+  }
+  const content = await readFile(path);
+  const afterMetadata = await lstat(path, { bigint: true });
+  assertGitAdministrativePathWitnessStable(
+    before,
+    afterMetadata,
+    `${label} read`,
+  );
+  return {
+    witness: {
+      ...before,
+      content_sha256: createHash("sha256").update(content).digest("hex"),
+    },
+    content: content.toString("utf8"),
+  };
+}
+
+async function admitLinkedWorktreePointers({
   targetRoot,
-  gitMarkerPath,
+  gitMarker,
   canonicalGitDirectory,
 }) {
-  const markerContent = await readFile(gitMarkerPath, "utf8");
+  const { witness: forwardMarker, content: markerContent } =
+    await readGitAdministrativeFileWitness(
+      gitMarker.path,
+      "Linked-worktree .git marker",
+    );
+  if (
+    forwardMarker.dev !== gitMarker.dev ||
+    forwardMarker.ino !== gitMarker.ino ||
+    forwardMarker.mode !== gitMarker.mode ||
+    forwardMarker.uid !== gitMarker.uid ||
+    forwardMarker.gid !== gitMarker.gid
+  ) {
+    throw new Error(
+      `Git worktree marker changed during linked-worktree pointer admission: ${gitMarker.path}`,
+    );
+  }
   const markerMatch = markerContent.match(/^gitdir: ([^\0\r\n]+)\r?\n?$/u);
   if (markerMatch === null) {
-    throw new Error(`Invalid linked-worktree .git file: ${gitMarkerPath}`);
+    throw new Error(`Invalid linked-worktree .git file: ${gitMarker.path}`);
   }
   const declaredGitDirectory = isAbsolute(markerMatch[1])
     ? markerMatch[1]
     : resolve(targetRoot, markerMatch[1]);
   if (await realpath(declaredGitDirectory) !== canonicalGitDirectory) {
     throw new Error(
-      `Linked-worktree .git file does not name Git's administrative directory: ${gitMarkerPath}`,
+      `Linked-worktree .git file does not name Git's administrative directory: ${gitMarker.path}`,
     );
   }
 
   const backpointerPath = join(canonicalGitDirectory, "gitdir");
-  const backpointerMetadata = await lstat(backpointerPath).catch((error) => {
-    if (error?.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  });
-  if (
-    backpointerMetadata === null ||
-    backpointerMetadata.isSymbolicLink() ||
-    !backpointerMetadata.isFile()
-  ) {
-    throw new Error(
-      `Linked-worktree administrative directory lacks a regular gitdir backpointer: ${canonicalGitDirectory}`,
+  const { witness: backpointer, content: backpointerContent } =
+    await readGitAdministrativeFileWitness(
+      backpointerPath,
+      "Linked-worktree gitdir backpointer",
     );
-  }
-  const backpointerContent = await readFile(backpointerPath, "utf8");
   const backpointerMatch = backpointerContent.match(/^([^\0\r\n]+)\r?\n?$/u);
   if (backpointerMatch === null) {
     throw new Error(`Invalid linked-worktree gitdir backpointer: ${backpointerPath}`);
@@ -4582,28 +6296,65 @@ async function assertLinkedWorktreeBackpointer({
     : resolve(canonicalGitDirectory, backpointerMatch[1]);
   const [canonicalDeclaredMarker, canonicalActualMarker] = await Promise.all([
     realpath(declaredMarkerPath),
-    realpath(gitMarkerPath),
+    realpath(gitMarker.path),
   ]);
   if (canonicalDeclaredMarker !== canonicalActualMarker) {
     throw new Error(
       `Linked-worktree gitdir backpointer does not return to the admitted .git file: ${backpointerPath}`,
     );
   }
+  return { forwardMarker, backpointer };
 }
 
-function assertGitMarkerStable(path, expected, current) {
-  if (
-    expected.dev !== current.dev ||
-    expected.ino !== current.ino ||
-    expected.mode !== current.mode ||
-    expected.uid !== current.uid ||
-    expected.gid !== current.gid ||
-    expected.isDirectory() !== current.isDirectory() ||
-    expected.isFile() !== current.isFile() ||
-    current.isSymbolicLink()
-  ) {
-    throw new Error(`Git worktree marker changed during validation: ${path}`);
+async function assertGitWorktreeMarkerWitnessStable(witness, phase) {
+  const metadata = await lstat(witness.path, { bigint: true }).catch((error) => {
+    if (error?.code === "ENOENT") {
+      throw new Error(`Git worktree marker is missing during ${phase}: ${witness.path}`);
+    }
+    throw error;
+  });
+  assertGitAdministrativePathWitnessStable(witness, metadata, phase);
+}
+
+async function assertGitAdministrativeFileWitnessStable(witness, phase) {
+  const current = await readGitAdministrativeFileWitness(
+    witness.path,
+    "Git administrative file",
+  );
+  const metadata = await lstat(witness.path, { bigint: true });
+  assertGitAdministrativePathWitnessStable(witness, metadata, phase);
+  if (current.witness.content_sha256 !== witness.content_sha256) {
+    throw new Error(
+      `Git administrative file content changed during ${phase}: ${witness.path}`,
+    );
   }
+}
+
+function assertGitAdministrativePathWitnessStable(expected, metadata, phase) {
+  const current = gitAdministrativePathWitnessFromMetadata(
+    expected.path,
+    metadata,
+    "Git administrative path",
+  );
+  if (
+    current.kind !== expected.kind ||
+    current.dev !== expected.dev ||
+    current.ino !== expected.ino
+  ) {
+    throw new Error(
+      `Git worktree marker object identity changed during ${phase}: ${expected.path}`,
+    );
+  }
+  if (
+    current.mode !== expected.mode ||
+    current.uid !== expected.uid ||
+    current.gid !== expected.gid
+  ) {
+    throw new Error(
+      `Git worktree marker access policy changed during ${phase}: ${expected.path}`,
+    );
+  }
+  return current;
 }
 
 async function gitRevParse(targetRoot, ...args) {

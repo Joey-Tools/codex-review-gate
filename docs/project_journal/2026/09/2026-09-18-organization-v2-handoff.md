@@ -14,10 +14,10 @@ superseded_by:
 
 ## Summary
 
-- Stable Action `v2.0.4` and the floating `v2` alias are published from
-  `JoeyTeng/codex-review-gate-action`. This workstream implements and carries
-  out the user-approved organization-wide transition from the inherited v1
-  required status to v2.
+- Stable Node 24 Action `v2.1.0` and the floating `v2` alias are published
+  from `JoeyTeng/codex-review-gate-action`. This workstream implements and
+  carries out the user-approved organization-wide transition from the inherited
+  v1 required status to v2.
 - The active v2 cohort (the fixed, complete set of repositories migrated
   together) has exactly 10 members. `Joey-Tools` organization ruleset
   `16590367`, `Must Pass Codex Review`, retains its original 11-member legacy
@@ -1123,6 +1123,123 @@ evidence that a prior freeze remains in force.
   Node 24 v2 evidence succeeds; then the separately authorized cleanup can
   remove that bridge without altering v1 history.
 
+## Execution Update — 2026-09-25 (published Node 24 Action and source closure boundary)
+
+- Immutable stable `v2.1.0` is now published from
+  `JoeyTeng/codex-review-gate-action`, and the signed floating `v2` alias
+  resolves to its Node 24 payload. The GitHub Release is non-draft,
+  non-prerelease, immutable, and published by
+  `codex-review-gate-action-publisher[bot]`; it carries the deterministic
+  Action archive and signed provenance assets. This finishes the append-only
+  v2.1 release transition without rewriting frozen v2.0 or v1 history.
+- Fresh source canary `#74`, `test(gate): validate published Node 24 v2
+  canary`, ran at exact head
+  `fb40b3c4152f288fdde810d5f4cd32c273ff061e` against base
+  `1d598106b5ce206ecd75e05a79d42964ec954a91` with test merge
+  `7e0db2f05a785bc2a88b4e0f2844911315c646c1`. Its native
+  `codex/github-review-gate` CheckRun succeeded; the harmless PR was then
+  closed unmerged. This proves the historical Node 24 v2 verifier boundary but
+  is not a source bridge-deletion authorization.
+- The source v1 required-status transition remains complete: retained ruleset
+  `16410326` no longer requires `codex/review-gate`, while status-only v2
+  ruleset `23927388` remains Active and the legacy bridge remains installed.
+  The source repository is still outside the fixed 10-member organization
+  cohort, so the organization schema-2 final receipt cannot be repurposed for
+  this bridge.
+- The next source-only phase is deliberately two PRs. First, proof machinery
+  derives a canonical source bridge-removal receipt from two stable, complete
+  live snapshots five seconds apart. One 60-second attempt budget covers both
+  complete snapshots and the intervening wait; expiry, an incomplete snapshot,
+  or inequality remains pending/inconclusive and fails closed. This same
+  per-attempt budget applies to derive, rebind, and the mutation-bound local
+  executor rebind. It requires full ruleset/bypass-actor visibility. The
+  historical canary base must be an ancestor of the current default branch,
+  while the current live control plane and v2 policy are independently bound;
+  the proof-machinery merge does not need to recreate the old canary base.
+  The candidate receipt's exact SHA-256 needs independent approval, and is
+  re-derived live before every later local mutation. Second, a separately
+  reviewed bridge-delete PR may remove only the canonical bridge and must pass
+  its own fresh v2 check. A local receipt file is therefore evidence to bind
+  and revalidate, not a standalone authorization token.
+- The proof-machinery PR advances the source default-branch head when it
+  merges. A bridge-delete receipt must therefore be derived by the merged
+  helper against that then-current default branch and receive a new independent
+  SHA-256 approval; no receipt generated before the proof-machinery merge is
+  reusable for the deletion PR.
+- Deleting the tracked bridge YAML blocks ordinary new dispatches, but does not
+  promise that an historical Actions run cannot be rerun. The source closure
+  scope therefore does not claim permanent absence of v1 side effects and does
+  not add history purging or a time-based wait. Its safety claim is limited to
+  the live proof that current default-branch control plane and effective merge
+  policy no longer require the legacy context on ruleset/classic surfaces,
+  together with the bridge-delete PR's own fresh strict v2 exact-head gate.
+
+### Source proof-machinery admission hardening
+
+- The first source closure PR installs proof machinery and the constrained
+  source-only local deletion executor but leaves
+  `.github/workflows/codex-review-gate-legacy-bridge.yml` intact. The later
+  bridge-delete PR is a separate review and authorization boundary.
+- Release `v2.1.0` and closed canary `#74` are historical evidence only. They
+  cannot authorize deletion: after the proof-machinery PR lands, the merged
+  helper must derive a new two-round live receipt, a human must approve that
+  receipt's exact SHA-256, and the executor must rebind it immediately before
+  local mutation.
+- Source proof admission treats the current source rules as hard conditions,
+  not as a best-effort snapshot. Each closure read finds the unique
+  `source_type: Repository` ruleset named `Must Pass Codex Review v2`; it does
+  not globally hard-pin historical ID `23927388`. The current observed ruleset
+  `23927388` must be Active with the strict `codex/github-review-gate` required
+  status and an explicit empty bypass-actor list. The receipt and each rebind
+  bind that round's observed ID and full writable-projection fingerprint.
+  Retained ruleset `16410326`, `PR must pass codex review`, must retain `deletion`, parameterless
+  `non_fast_forward`, and its actual `pull_request` projection: review-thread
+  resolution remains required while code-owner review and stale-review
+  dismissal remain false. The v1 required status must remain absent.
+- The local executor binds the admitted project root and `.git` administrative
+  state across every rebind. It protects Git administrative identity, selected
+  Git content, and owner/access policy rather than treating timestamps or
+  ordinary directory churn as mutation. Replacing the marker with another
+  otherwise valid linked worktree must fail closed before bridge rename or
+  unlink.
+- Review hardening makes the stability budget and local mutation boundary
+  operational rather than documentary. The 60-second monotonic budget is
+  checked again after the second complete snapshot before an equal pair can
+  emit a receipt; a slow second read cannot turn an expired attempt into
+  success. Every remote rebind that precedes a mutation reclassifies the
+  whole worktree: it requires `clean` before either bridge-rename boundary and
+  only the exact admitted bridge deletion after quarantine rename. At that
+  latter boundary, the executor additionally permits exactly one task-owned
+  quarantine object at its fixed, verified relative path; it does not turn
+  arbitrary untracked files into an exception. The check remains inside the
+  restoration path, so an unrelated concurrent tracked, staged, or untracked
+  change before unlink restores the same admitted bridge object instead of
+  leaving a mixed worktree with an already-deleted bridge. There is deliberately
+  no new remote rebind after unlink: by then a rollback could overwrite a
+  concurrent destination. Success therefore ends with local-only exact-diff,
+  bridge-absence, and parent readback, while the normal same-UID
+  non-interference limit remains explicit rather than claimed away.
+- Source proof derive/rebind modes are fixed to
+  `Joey-Tools/codex-review-gate`, repository source type, `Must Pass Codex
+  Review v2`, and the source control-plane owner; same-shaped owner or ruleset
+  overrides are rejected. That fixed selector is not a global numeric-ID pin:
+  receipt/rebind binds the observed ID and full writable-projection fingerprint
+  for its closure round. Source-only and organization-handoff receipt schemas
+  are mutually isolated, so neither receipt type can authorize the other's
+  deletion path.
+- Before this proof-machinery PR is merged, a ruleset-admin read-only live
+  derive succeeded against the current source control plane. Its output was
+  deliberately not retained or approved: a pre-merge helper receipt cannot
+  authorize the later bridge-delete PR. The merged helper must create that
+  future receipt again from the then-current default branch.
+- Local validation for this PR includes `npm run check`, all 24 source-scoped
+  bootstrap tests, the complete bootstrap test file, the organization-handoff,
+  producer-receipt, v2, core/gate, CI-shard, and workflow-security-contract
+  test shards, plus project-journal validation. The unrelated monolithic
+  `test/v2-release-pipeline.test.mjs` was exercised separately but exceeded a
+  six-minute bounded window while repeatedly invoking its release-script
+  fixture; it is recorded as incomplete rather than passed.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -1144,13 +1261,18 @@ evidence that a prior freeze remains in force.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.
-5. Publish the append-only Node 24 v2.1 Action release, rerun the source v2
-   verifier against a fresh exact head, and only then complete the separately
-   authorized removal of the remaining source legacy bridge.
+5. Complete only the first PR of the source-only closure-proof machinery; this
+   active workstream does not record a transient receipt or bridge-delete PR.
+   After that machinery merges, use its default-branch helper and a
+   ruleset-admin credential to derive and independently approve a fresh source
+   bridge-removal receipt. Only after a live rebind may a separate bridge-delete
+   PR be prepared and merged through its own fresh v2 check; do not treat the
+   historical `#74` result, v2.1 publication, or an organization receipt as
+   deletion authorization.
 
 ## Evidence
 
-- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.0.4`
+- Stable release: `https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.0`
 - Old organization ruleset: `Joey-Tools` ruleset `16590367`, read through
   `GET /orgs/Joey-Tools/rulesets/16590367` on 2026-09-18.
 - Prior v2 decisions and implementation ledger:
