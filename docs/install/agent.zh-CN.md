@@ -60,6 +60,11 @@ GitHub.com/default-branch PR scope 时停止。
 自身时才使用此路径。它不是普通 consumer 或 repository-level cohort 的替代安装模式：其他任何
 位置仍必须使用 importable template 与 bootstrap 默认的 `full` profile。
 
+与普通 `full` profile 不同，retained source ruleset 的
+`require_code_owner_review: false` 和 `dismiss_stale_reviews_on_push: false`。
+其 CODEOWNERS 与 named-owner projection 是 control-plane ownership 与 drift detection 的
+closure evidence，而不是 source 的 Code Owner approval 或 stale-review protection。
+
 1. 用 canonical v2 verifier、controller 与 exact temporary legacy bridge 准备 source
    migration PR。source worktree preparation 必须传 `--legacy-bridge`；不要在那里传
    `--ruleset-profile status-only`，因为该 profile 只允许用于 remote stage。
@@ -98,10 +103,12 @@ GitHub.com/default-branch PR scope 时停止。
    默认 `full` profile。legacy required status 仍存在时，CLI 会拒绝未带 `--legacy-bridge` 的
    这个 source-only profile，避免 bridge 漂移后让 `codex/review-gate` 没有 producer。验证新 rule 只包含 strict、GitHub-Actions-bound 的
    `codex/github-review-gate` requirement。它必须是第二条 rule：现有 source rule 保留
-   deletion、non-fast-forward、pull-request 与相关 CODEOWNERS protection。在独立 canary
-   通过且 source-specific rule 激活后，legacy v1 status 与 v2 CheckRun 都必须继续 required，
-   直到 owner-approved cleanup action 只移除 legacy requirement、且 post-cleanup proof
-   成功。不得移除或扩大 legacy protection。
+   deletion、non-fast-forward、pull-request conditions 与 required review-thread resolution。
+   它**不**强制 Code Owner approval 或 stale-review dismissal；其 CODEOWNERS/owner projection
+   只是 control-plane ownership 与 drift-detection closure input。在独立 canary 通过且
+   source-specific rule 激活后，legacy v1 status 与 v2 CheckRun 都必须继续 required，直到
+   owner-approved cleanup action 只移除 legacy requirement、且 post-cleanup proof 成功。
+   不得移除或扩大 legacy protection。
 5. 不得用 organization schema-2 final-closure receipt 删除该 source bridge。没有单独授权、
    已记录的 source-local closure proof 时必须停止。
 6. source-only v2 rule 已被精确证明为 Active 后，用同一 `status-only` profile 与 bridge
@@ -176,6 +183,78 @@ GitHub.com/default-branch PR scope 时停止。
      --expected-post-cleanup-security-sha256 \
      "$EXPECTED_POST_CLEANUP_SECURITY_SHA256"
    ```
+
+8. source bridge removal 是独立的 two-PR flow。已发布的 `v2.1.0` payload 与 source canary
+   `#74` 都只是证据输入，均不授权删除。`#74` 是 closed-unmerged 的历史 canary；receipt 的
+   exact 输入是它的 PR/head/base/test-merge/CheckRun/run/job tuple：head 为
+   `fb40b3c4152f288fdde810d5f4cd32c273ff061e`、base 为
+   `1d598106b5ce206ecd75e05a79d42964ec954a91`、test merge 为
+   `7e0db2f05a785bc2a88b4e0f2844911315c646c1`。先合并 proof machinery，且保持 bridge
+   不变。之后才派生一个 receipt、让人独立批准其 exact receipt SHA-256，并准备第二个只删除
+   canonical bridge 的 PR；该 PR 合并前要通过 fresh v2 check。不得使用 organization schema-2
+   receipt。
+   proof-machinery merge 会推进 default-branch head。它合并前不得派生或批准 bridge-delete
+   receipt；必须在随后 current default branch 上使用已合并 helper 执行 derive，并独立批准这份
+   新 receipt 的 SHA-256。pre-merge receipt 不能复用。
+9. 使用可以读取完整 source ruleset detail 和显式 `bypass_actors` arrays 的 ruleset-admin
+   credential。missing、`null` 或 non-array bypass data 都是 redacted/malformed，必须停止。
+   派生 proof：
+
+   ```bash
+   SOURCE_BRIDGE_REMOVAL_PROOF="$(mktemp)"
+   node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+     --repo "$REPO" \
+     --control-plane-owner "$CONTROL_PLANE_OWNER" \
+     --ruleset-name "$V2_RULESET_NAME" \
+     --ruleset-profile status-only \
+     --legacy-bridge \
+     --derive-source-bridge-removal-proof \
+     --canary-pr 74 \
+     --canary-head fb40b3c4152f288fdde810d5f4cd32c273ff061e \
+     > "$SOURCE_BRIDGE_REMOVAL_PROOF"
+   jq . "$SOURCE_BRIDGE_REMOVAL_PROOF"
+   SOURCE_BRIDGE_REMOVAL_PROOF_SHA256="$(jq -er \
+     '.source_bridge_removal_receipt_sha256 | select(test("^[0-9a-f]{64}$"))' \
+     "$SOURCE_BRIDGE_REMOVAL_PROOF")"
+   ```
+
+   Receipt 绑定 current source identity/control plane/rulesets、全部 legacy required-status
+   surfaces，以及完整 historical `#74` PR/head/base/test-merge/CheckRun/run/job tuple。它的
+   base 必须是 current default branch 的 ancestor，但 proof-machinery PR 合入后不必等于 current
+   default-branch head。workflow/CODEOWNERS/owner projection 用于检测 source control-plane drift，
+   不是 retained source ruleset 强制 Code Owner approval 或 stale-review dismissal 的证据。Derive
+   需要两份 complete live snapshot、间隔五秒、stability ceiling 为
+   60 秒，且只有两份 snapshot 比较相等才输出 receipt。Rebind 必须将 fresh two-round live
+   evidence 与**同一份已独立批准**的 receipt 及精确 SHA-256 比较；它不是重新派生 replacement
+   后继续的许可。任何 live identity、policy、workflow、ancestry 或 canary evidence drift 都必须
+   停止，直到 fresh receipt 被审阅并取得新的 approval。
+10. 创建 local bridge-delete worktree 前，必须 rebind 完全相同、独立批准的 receipt。此步骤
+    read-only，会完成 fresh two-round live comparison；它不能替代之后 deletion boundary 的
+    rebind：
+
+    ```bash
+    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+      --repo "$REPO" \
+      --control-plane-owner "$CONTROL_PLANE_OWNER" \
+      --ruleset-name "$V2_RULESET_NAME" \
+      --ruleset-profile status-only \
+      --legacy-bridge \
+      --rebind-source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+      --expected-source-bridge-removal-proof-sha256 \
+      "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+    ```
+
+    该 read-only rebind 不会生成 replacement receipt 或刷新 approval；它会把 fresh live closure
+    evidence 与精确批准的 receipt 比较。后续的 source-only local executor 会在每个 bridge
+    quarantine/delete boundary 前再次执行同一比较。receipt、source identity、current security
+    projection、bridge bytes 或 canary binding 任一 drift 都必须拒绝。它仅限 source
+    self-hosting repository；不得调用 ordinary consumer 或 organization bridge-removal executor。
+
+    删除 tracked bridge YAML 会阻止普通的新 dispatch，但不承诺历史 Actions run 不能被 rerun。
+    绝不能把它表述成永久移除所有 v1 side effect。安全边界更窄：fresh live proof 证明 current
+    default-branch control plane 和 effective merge policy 不再在 ruleset 或 classic surfaces
+    要求 legacy context，且 bridge-delete PR 自身必须在合并前通过 fresh strict v2 exact-head gate。
+    不要引入 history purge 或按时间等待。
 
 ## Advanced：活动 v2 10 仓 organization handoff
 

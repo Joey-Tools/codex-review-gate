@@ -43,10 +43,24 @@
   it to authorize separate cohort temporary-bridge removal work. Keep every
   cohort bridge installed until the receipt exists and validates; a source-local
   bridge requires its own later removal proof.
-- [ ] Define and authorize a separate source-local closure proof before
-  removing `.github/workflows/codex-review-gate-legacy-bridge.yml` from
-  `Joey-Tools/codex-review-gate`. The organization schema-2 receipt cannot
-  authorize this source-local bridge removal.
+- [ ] Complete only the first PR of the separate source-only bridge-removal
+  flow for `Joey-Tools/codex-review-gate`: land closure-proof machinery while
+  retaining the bridge. Do not record a transient receipt or bridge-delete PR
+  as current state.
+- [ ] After the proof-machinery PR merges, use its default-branch helper and a
+  ruleset-admin credential with full bypass-actor visibility to derive a live
+  source closure receipt. The published `v2.1.0` payload and closed-unmerged
+  Node 24 canary `#74` are evidence inputs only; the receipt binds `#74`'s
+  exact PR/head/base/test-merge/CheckRun/run/job tuple together with a fresh
+  two-round current control-plane and effective-merge-policy closure. Obtain
+  independent approval for its exact receipt SHA-256, then create and validate
+  a separate bridge-delete PR. The helper must rebind that same approved receipt
+  against fresh live closure reads before local mutation; if the receipt does
+  not compare equal, stop, derive a new one, and obtain new approval. Neither
+  the receipt file nor the organization schema-2 receipt can authorize source
+  bridge removal by itself; the source-only executor is unavailable to ordinary
+  consumers, and bridge deletion only stops ordinary new dispatches rather than
+  guaranteeing that historical Actions runs cannot be rerun.
 
 ## Later
 

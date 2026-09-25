@@ -1927,11 +1927,11 @@ test("installation runbooks derive and verify one explicit post-cleanup security
     const sourceCommands = bootstrapRemoteCommands(sourceSelfHostingGuide);
     assert.equal(
       sourceCommands.length,
-      6,
-      `${name}: source self-hosting has stage, approved-plan, and closure commands`,
+      8,
+      `${name}: source self-hosting has stage, approved-plan, closure, and source-proof commands`,
     );
     const sourceStageCommands = sourceCommands.filter(({ text }) =>
-      !/--derive-post-cleanup-plan|--apply-post-cleanup-plan|--verify-post-cleanup/u.test(text),
+      !/--derive-post-cleanup-plan|--apply-post-cleanup-plan|--verify-post-cleanup|--derive-source-bridge-removal-proof|--rebind-source-bridge-removal-proof/u.test(text),
     );
     assert.equal(
       sourceStageCommands.length,
@@ -2041,12 +2041,64 @@ test("installation runbooks derive and verify one explicit post-cleanup security
     );
     assert.doesNotMatch(
       sourceFinalProbes[0].text,
-      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--derive-post-cleanup-plan|--apply-post-cleanup-plan|--activate|--canary-pr|--canary-head|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
+      /--expected-legacy-inventory-sha256|LEGACY_INVENTORY_SHA256|--derive-post-cleanup-plan|--apply-post-cleanup-plan|--derive-source-bridge-removal-proof|--rebind-source-bridge-removal-proof|--activate|--canary-pr|--canary-head|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
       `${name}: source closure must remain a separate read-only post-cleanup phase`,
+    );
+    const sourceProofDerivations = sourceCommands.filter(({ text }) =>
+      text.includes("--derive-source-bridge-removal-proof"),
+    );
+    assert.equal(
+      sourceProofDerivations.length,
+      1,
+      `${name}: one source-only historical-canary proof derivation`,
+    );
+    const [sourceProofDerivation] = sourceProofDerivations;
+    for (const required of [
+      /--repo "\$REPO"/u,
+      /--control-plane-owner "\$CONTROL_PLANE_OWNER"/u,
+      /--ruleset-name "\$V2_RULESET_NAME"/u,
+      /--ruleset-profile status-only/u,
+      /--legacy-bridge/u,
+      /--canary-pr 74/u,
+      /--canary-head fb40b3c4152f288fdde810d5f4cd32c273ff061e/u,
+    ]) {
+      assert.match(sourceProofDerivation.text, required, `${name}: ${required}`);
+    }
+    assert.doesNotMatch(
+      sourceProofDerivation.text,
+      /--expected-legacy-inventory-sha256|--expected-post-cleanup-security-sha256|--apply-post-cleanup-plan|--verify-post-cleanup|--rebind-source-bridge-removal-proof|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
+      `${name}: source proof derivation is an isolated read-only historical-canary phase`,
+    );
+
+    const sourceProofRebinds = sourceCommands.filter(({ text }) =>
+      text.includes("--rebind-source-bridge-removal-proof"),
+    );
+    assert.equal(
+      sourceProofRebinds.length,
+      1,
+      `${name}: one source-only approved-proof rebind`,
+    );
+    const [sourceProofRebind] = sourceProofRebinds;
+    for (const required of [
+      /--repo "\$REPO"/u,
+      /--control-plane-owner "\$CONTROL_PLANE_OWNER"/u,
+      /--ruleset-name "\$V2_RULESET_NAME"/u,
+      /--ruleset-profile status-only/u,
+      /--legacy-bridge/u,
+      /--rebind-source-bridge-removal-proof "\$SOURCE_BRIDGE_REMOVAL_PROOF"/u,
+      /--expected-source-bridge-removal-proof-sha256/u,
+      /"\$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"/u,
+    ]) {
+      assert.match(sourceProofRebind.text, required, `${name}: ${required}`);
+    }
+    assert.doesNotMatch(
+      sourceProofRebind.text,
+      /--expected-legacy-inventory-sha256|--expected-post-cleanup-security-sha256|--derive-post-cleanup-plan|--apply-post-cleanup-plan|--verify-post-cleanup|--derive-source-bridge-removal-proof|--canary-pr|--canary-head|--remove-legacy-bridge|(?:^|\s)--apply(?:\s|$)/u,
+      `${name}: source proof rebind is read-only and only accepts the independently approved receipt`,
     );
     assert.doesNotMatch(
       ordinaryGuide,
-      /--apply-post-cleanup-plan|--expected-post-cleanup-plan-sha256/u,
+      /--apply-post-cleanup-plan|--expected-post-cleanup-plan-sha256|--derive-source-bridge-removal-proof|--rebind-source-bridge-removal-proof|--expected-source-bridge-removal-proof-sha256/u,
       `${name}: ordinary consumer guidance must not expose the source-only executor`,
     );
 

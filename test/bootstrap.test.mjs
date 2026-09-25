@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -35,10 +36,19 @@ import {
   ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   RULESET_PROFILE_FULL,
   RULESET_PROFILE_STATUS_ONLY,
+  SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION,
+  SOURCE_BRIDGE_REMOVAL_PROOF_SCHEMA_VERSION,
+  SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+  SOURCE_SELF_HOSTING_RULESET_NAME,
+  SOURCE_SELF_HOSTING_RETAINED_RULESET_ID,
+  SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME,
+  assertSourceSelfHostingRetainedRulesetPolicy,
   assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
   canonicalOrganizationFinalClosureReceipt,
+  canonicalSourceBridgeRemovalProof,
+  canonicalSourceBridgeRemovalProofOutput,
   canonicalLegacyReviewGateInventoryBytes,
   buildUpdateRulesetPayload,
   codeownersHasEffectiveUnmanagedPatterns,
@@ -55,6 +65,7 @@ import {
   findEffectiveRulesetWithStatusOnlyPolicy,
   findEffectiveRulesetWithStatusContext,
   installedWorkflowMatchesCanonical,
+  isLegacyStatusContext,
   normalizeControlPlaneOwner,
   normalizeRulesetProfile,
   normalizeWorkflowPath,
@@ -71,12 +82,18 @@ import {
   rulesetHasStatusOnlyPolicy,
   rulesetHasStatusOnlyProfile,
   rulesetWritableFingerprint,
+  sourceBridgeRemovalLegacyInventorySha256,
+  sourceBridgeRemovalProofSha256,
+  sourceBridgeRemovalRulesetWritableSha256,
+  sourceBridgeRemovalSecurityStateSha256,
   validateCanonicalV2WorkflowContent,
   validateCanonicalV2ControllerWorkflowContent,
   validateCanonicalV2WorkflowInventory,
   validateCanonicalLegacyBridgeWorkflowContent,
   validateControlPlaneCodeownersContent,
   validateOrganizationFinalClosureOutput,
+  validateSourceBridgeRemovalProof,
+  validateSourceBridgeRemovalProofOutput,
   workflowCanWriteStatuses,
   workflowContainsCodexReviewGateCaller,
   workflowContainsLegacyV1Caller,
@@ -124,6 +141,7 @@ const CANARY_WORKFLOW_ID = 17;
 const CANARY_JOB_ID = 18017;
 const CANARY_CHECK_RUN_ID = 28017;
 const CANARY_MERGE_SHA = "fedcba9876543210fedcba9876543210fedcba98";
+const HISTORICAL_SOURCE_CANARY_BASE_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS = Object.freeze({
   strict: true,
   contexts: [],
@@ -1796,6 +1814,191 @@ test("validates historical v1 and current v2 organization final closure receipts
     assert.throws(
       () => validateOrganizationFinalClosureOutput(candidate),
       /final|receipt|repositories_verified|organization|plan_sha256|cohort|schema_version|keys|slug|default_branch|order|manifest/iu,
+      name,
+    );
+  }
+});
+
+test("validates source-only bridge-removal proof receipts independently from organization closure receipts", () => {
+  const output = buildSourceBridgeRemovalProofOutput();
+  const receipt = output.source_bridge_removal_receipt;
+  assert.equal(SOURCE_SELF_HOSTING_REPOSITORY_SLUG, "Joey-Tools/codex-review-gate");
+  assert.equal(SOURCE_BRIDGE_REMOVAL_PROOF_SCHEMA_VERSION, 1);
+  assert.equal(
+    SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION,
+    "source-bridge-removal-proof-output/v1",
+  );
+  assert.deepEqual(validateSourceBridgeRemovalProof(receipt), receipt);
+  assert.deepEqual(validateSourceBridgeRemovalProofOutput(output), output);
+  assert.equal(
+    canonicalSourceBridgeRemovalProof(receipt),
+    canonicalJsonForTest(receipt),
+  );
+  assert.equal(
+    sourceBridgeRemovalProofSha256(receipt),
+    output.source_bridge_removal_receipt_sha256,
+  );
+  const historicalBaseStillAncestor = buildSourceBridgeRemovalProofOutput({
+    defaultBranchHeadSha: "b".repeat(40),
+    canaryBaseSha: DEFAULT_BRANCH_SHA,
+  });
+  assert.equal(
+    validateSourceBridgeRemovalProof(
+      historicalBaseStillAncestor.source_bridge_removal_receipt,
+    ).canary.base_ancestry.status,
+    "ahead",
+    "a historical canary base need not equal the current default head once its ancestry is proven",
+  );
+
+  const wrongDigest = structuredClone(output);
+  wrongDigest.source_bridge_removal_receipt_sha256 = "f".repeat(64);
+  const organizationReceipt = buildFinalClosureOutput();
+  const extraKey = structuredClone(receipt);
+  extraKey.unreviewed_extension = true;
+  const sourceScopeMismatch = structuredClone(receipt);
+  sourceScopeMismatch.scope = "organization-bridge-removal";
+  const foreignSource = structuredClone(receipt);
+  foreignSource.repository.full_name = "Joey-Tools/consumer";
+  const wrongControlPlaneOwner = structuredClone(receipt);
+  wrongControlPlaneOwner.control_plane_owner = "@DifferentOwner";
+  const wrongV2RulesetName = structuredClone(receipt);
+  wrongV2RulesetName.v2_ruleset.name = "replacement v2 ruleset";
+  const wrongRetainedRuleset = structuredClone(receipt);
+  wrongRetainedRuleset.retained_source_ruleset.name =
+    "replacement retained ruleset";
+  const openCanary = structuredClone(receipt);
+  openCanary.canary.state = "open";
+  const mergedCanary = structuredClone(receipt);
+  mergedCanary.canary.merged = true;
+  const wrongCheckRunHead = structuredClone(receipt);
+  wrongCheckRunHead.canary.check_run.head_sha = "b".repeat(40);
+  const checkRunAfterClose = structuredClone(receipt);
+  checkRunAfterClose.canary.check_run.completed_at = "2026-09-25T12:01:00Z";
+  const wrongRunBinding = structuredClone(receipt);
+  wrongRunBinding.canary.run.display_title =
+    `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/${wrongRunBinding.canary.number}/${"c".repeat(40)}`;
+  const wrongJobBinding = structuredClone(receipt);
+  wrongJobBinding.canary.job.check_run_id += 1;
+  const nonAncestorBase = structuredClone(receipt);
+  nonAncestorBase.canary.base_ancestry.merge_base_sha = "d".repeat(40);
+  const unsortedCanonicalWorkflowInventory = structuredClone(receipt);
+  unsortedCanonicalWorkflowInventory.live_closure.canonical_workflows.reverse();
+  const legacyStillRequired = structuredClone(receipt);
+  legacyStillRequired.live_closure.legacy_status_required = true;
+
+  assert.throws(
+    () => validateSourceBridgeRemovalProofOutput(organizationReceipt),
+    /Source bridge-removal proof output|schema_version|keys/u,
+    "an organization receipt must never become source bridge-removal authority",
+  );
+  assert.throws(
+    () => validateSourceBridgeRemovalProofOutput(wrongDigest),
+    /SHA-256/u,
+  );
+  for (const [name, candidate] of [
+    ["extra-key", extraKey],
+    ["source-scope-mismatch", sourceScopeMismatch],
+    ["foreign-source", foreignSource],
+    ["control-plane-owner", wrongControlPlaneOwner],
+    ["v2-ruleset-name", wrongV2RulesetName],
+    ["retained-source-ruleset", wrongRetainedRuleset],
+    ["open-canary", openCanary],
+    ["merged-canary", mergedCanary],
+    ["check-run-head", wrongCheckRunHead],
+    ["check-run-after-closed-canary", checkRunAfterClose],
+    ["run-test-merge-binding", wrongRunBinding],
+    ["job-check-run-binding", wrongJobBinding],
+    ["historical-base-not-ancestor", nonAncestorBase],
+    ["canonical-workflow-order", unsortedCanonicalWorkflowInventory],
+    ["legacy-still-required", legacyStillRequired],
+  ]) {
+    assert.throws(
+      () => validateSourceBridgeRemovalProof(candidate),
+      /Source bridge-removal|source self-hosting|control-plane|v2_ruleset|retained_source_ruleset|canary|check_run|run|job|canonical|legacy/u,
+      name,
+    );
+  }
+});
+
+test("pins the source retained non-status ruleset to its actual reviewed policy", () => {
+  const baseline = sourceRetainedRulesetFixture();
+  const expectedWritable = JSON.parse(rulesetWritableFingerprint(baseline));
+  expectedWritable.rules.sort((left, right) =>
+    canonicalJsonForTest(left).localeCompare(canonicalJsonForTest(right))
+  );
+  assert.deepEqual(
+    assertSourceSelfHostingRetainedRulesetPolicy(baseline),
+    {
+      id: SOURCE_SELF_HOSTING_RETAINED_RULESET_ID,
+      name: SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME,
+      source_type: "Repository",
+      source: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+      target: "branch",
+      writable: expectedWritable,
+    },
+  );
+  const reorderedRules = structuredClone(baseline);
+  reorderedRules.rules.reverse();
+  assert.deepEqual(
+    assertSourceSelfHostingRetainedRulesetPolicy(reorderedRules),
+    assertSourceSelfHostingRetainedRulesetPolicy(baseline),
+    "the unordered rules collection must not change the fixed retained-policy projection",
+  );
+  for (const [name, mutate] of [
+    [
+      "deletion-removed",
+      (ruleset) => {
+        ruleset.rules = ruleset.rules.filter((rule) => rule.type !== "deletion");
+      },
+    ],
+    [
+      "non-fast-forward-parameters-added",
+      (ruleset) => {
+        ruleset.rules.find((rule) => rule.type === "non_fast_forward").parameters = {};
+      },
+    ],
+    [
+      "thread-resolution-relaxed",
+      (ruleset) => {
+        ruleset.rules.find(
+          (rule) => rule.type === "pull_request",
+        ).parameters.required_review_thread_resolution = false;
+      },
+    ],
+    [
+      "bypass-added",
+      (ruleset) => {
+        ruleset.bypass_actors = [{
+          actor_id: 1,
+          actor_type: "RepositoryRole",
+          bypass_mode: "always",
+        }];
+      },
+    ],
+    [
+      "name-drift",
+      (ruleset) => {
+        ruleset.name = "replacement retained policy";
+      },
+    ],
+    [
+      "id-drift",
+      (ruleset) => {
+        ruleset.id += 1;
+      },
+    ],
+    [
+      "conditions-drift",
+      (ruleset) => {
+        ruleset.conditions.ref_name.exclude = ["master"];
+      },
+    ],
+  ]) {
+    const candidate = structuredClone(baseline);
+    mutate(candidate);
+    assert.throws(
+      () => assertSourceSelfHostingRetainedRulesetPolicy(candidate),
+      /Source retained ruleset/u,
       name,
     );
   }
@@ -7790,6 +7993,1012 @@ test("source status-only cleanup derivation preserves every retained legacy prot
   }
 });
 
+test("derives a stable fixed-policy source proof without an explicit ruleset-name override", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-closure-proof-"),
+  );
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const preloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+  try {
+    createFakeGhExecutable(fakeBin);
+    writeFileSync(preloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    const { responses } = sourceBridgeRemovalFixtureResponses();
+    const result = runBootstrap(sourceBridgeRemovalArguments({
+      includeRulesetName: false,
+    }), {
+      addExpectedLegacyInventoryDigest: false,
+      env: {
+        ...fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+        NODE_OPTIONS: `--require=${preloadPath}`,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    const admitted = validateSourceBridgeRemovalProofOutput(output);
+    assert.equal(
+      admitted.source_bridge_removal_receipt.canary.base_ancestry.status,
+      "ahead",
+      "#74's historical base is proven an ancestor rather than required to equal today's default head",
+    );
+    assert.equal(
+      admitted.source_bridge_removal_receipt.v2_ruleset.name,
+      SOURCE_SELF_HOSTING_RULESET_NAME,
+      "source proof modes must replace the ordinary consumer default with their fixed source v2 policy",
+    );
+    assert.equal(
+      admitted.source_bridge_removal_receipt.canary.run.workflow_path,
+      DEFAULT_WORKFLOW_PATH,
+      "the durable run binding uses the bare canonical workflow path, not an action ref",
+    );
+    assert.equal(
+      admitted.source_bridge_removal_receipt.canary.run.id,
+      CANARY_RUN_ID,
+    );
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, /^POST graphql$/mu);
+    assert.match(
+      calls,
+      new RegExp(
+        `^GET repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/compare/${HISTORICAL_SOURCE_CANARY_BASE_SHA}\\.\\.\\.${DEFAULT_BRANCH_SHA}$`,
+        "mu",
+      ),
+    );
+    assert.doesNotMatch(
+      calls,
+      new RegExp(
+        `^GET repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/commits/(?:${CANARY_HEAD_SHA}|${CANARY_MERGE_SHA})/statuses`,
+        "mu",
+      ),
+      "closed historical canaries may retain v1 statuses; only current required-status policy is closure evidence",
+    );
+    assert.doesNotMatch(
+      calls,
+      /^(?:PUT|PATCH|DELETE) /mu,
+      "the only POST is the read-only GraphQL historical-PR query",
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source proof modes reject migration-policy ruleset and owner overrides before remote reads", () => {
+  for (const [name, argumentsToTest] of [
+    [
+      "ruleset-name",
+      sourceBridgeRemovalArguments({
+        v2RulesetName: "replacement source v2 ruleset",
+      }),
+    ],
+    [
+      "control-plane-owner",
+      [
+        ...sourceBridgeRemovalArguments(),
+        "--control-plane-owner",
+        "@DifferentOwner",
+      ],
+    ],
+  ]) {
+    const result = runBootstrap(argumentsToTest, {
+      addExpectedLegacyInventoryDigest: false,
+    });
+    assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+    assert.match(
+      result.stderr,
+      /fixed to ruleset "Must Pass Codex Review v2" and control-plane owner @JoeyTeng/u,
+      name,
+    );
+    assert.equal(result.stdout, "", `${name}: no source proof may be emitted`);
+  }
+});
+
+test("source proof treats GraphQL potentialMergeCommit as durable while cross-checking present REST merge SHAs", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-rest-test-merge-"),
+  );
+  const preloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+  try {
+    writeFileSync(preloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    for (const [name, restMergeSha, expectedStatus] of [
+      ["rest-null", null, 0],
+      ["rest-different", "d".repeat(40), 1],
+    ]) {
+      const fakeBin = join(fixtureRoot, `${name}-bin`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const fixture = sourceBridgeRemovalFixtureResponses({
+        pullRequestOverrides: { merge_commit_sha: restMergeSha },
+      });
+      const result = runBootstrap(sourceBridgeRemovalArguments(), {
+        addExpectedLegacyInventoryDigest: false,
+        env: {
+          ...fakeGhEnvironment({
+            fakeBin,
+            responses: fixture.responses,
+            stateDir: join(fixtureRoot, `${name}-state`),
+            callLog,
+          }),
+          NODE_OPTIONS: `--require=${preloadPath}`,
+        },
+      });
+      assert.equal(result.status, expectedStatus, `${name}: ${result.stderr}`);
+      if (expectedStatus === 0) {
+        assert.equal(
+          JSON.parse(result.stdout).source_bridge_removal_receipt.canary
+            .test_merge_sha,
+          CANARY_MERGE_SHA,
+          "a null REST field must not displace the durable GraphQL test merge",
+        );
+      } else {
+        assert.match(result.stderr, /GraphQL tuple disagrees/u, name);
+        assert.equal(result.stdout, "", `${name}: no proof may be emitted`);
+      }
+      assert.doesNotMatch(
+        readFileSync(callLog, "utf8"),
+        /^(?:PUT|PATCH|DELETE) /mu,
+        name,
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source proof rebind rejects a receipt after proof-machinery advances the default branch", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-proof-rebind-"),
+  );
+  const preloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+  const v2RulesetName = SOURCE_SELF_HOSTING_RULESET_NAME;
+  const commonArguments = [
+    "--repo",
+    SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    "--ruleset-name",
+    v2RulesetName,
+    "--ruleset-profile",
+    RULESET_PROFILE_STATUS_ONLY,
+    "--legacy-bridge",
+  ];
+  try {
+    writeFileSync(preloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    const deriveBin = join(fixtureRoot, "derive-bin");
+    createFakeGhExecutable(deriveBin);
+    const deriveLog = join(fixtureRoot, "derive.log");
+    const deriveFixture = sourceBridgeRemovalFixtureResponses({ v2RulesetName });
+    const derive = runBootstrap(sourceBridgeRemovalArguments({ v2RulesetName }), {
+      addExpectedLegacyInventoryDigest: false,
+      env: {
+        ...fakeGhEnvironment({
+          fakeBin: deriveBin,
+          responses: deriveFixture.responses,
+          stateDir: join(fixtureRoot, "derive-state"),
+          callLog: deriveLog,
+        }),
+        NODE_OPTIONS: `--require=${preloadPath}`,
+      },
+    });
+    assert.equal(derive.status, 0, derive.stderr);
+    const approvedPath = join(fixtureRoot, "approved-source-proof.json");
+    writeFileSync(approvedPath, derive.stdout, "utf8");
+    const approved = JSON.parse(derive.stdout);
+    const approvedSha256 = approved.source_bridge_removal_receipt_sha256;
+
+    const rebindBin = join(fixtureRoot, "rebind-bin");
+    const rebindLog = join(fixtureRoot, "rebind.log");
+    createFakeGhExecutable(rebindBin);
+    const rebindFixture = sourceBridgeRemovalFixtureResponses({
+      v2RulesetName,
+      currentDefaultBranchHeadSha: "c".repeat(40),
+    });
+    const rebind = runBootstrap([
+      ...commonArguments,
+      "--rebind-source-bridge-removal-proof",
+      approvedPath,
+      "--expected-source-bridge-removal-proof-sha256",
+      approvedSha256,
+    ], {
+      addExpectedLegacyInventoryDigest: false,
+      env: {
+        ...fakeGhEnvironment({
+          fakeBin: rebindBin,
+          responses: rebindFixture.responses,
+          stateDir: join(fixtureRoot, "rebind-state"),
+          callLog: rebindLog,
+        }),
+        NODE_OPTIONS: `--require=${preloadPath}`,
+      },
+    });
+    assert.equal(rebind.status, 1, rebind.stderr);
+    assert.match(
+      rebind.stderr,
+      /no longer equals a fresh two-round live source closure|derive, review, and explicitly approve a new receipt/u,
+    );
+    assert.doesNotMatch(
+      readFileSync(rebindLog, "utf8"),
+      /^(?:PUT|PATCH|DELETE) /mu,
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source proof rejects closed-canary tuple, CheckRun, run, job, and ancestry binding drift", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-historical-binding-"),
+  );
+  const preloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+  try {
+    writeFileSync(preloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    for (const [name, mutate, expected] of [
+      [
+        "not-closed-unmerged",
+        ({ responses }) => {
+          responses[`repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/pulls/74`].state = "open";
+        },
+        /closed, unmerged, non-draft/u,
+      ],
+      [
+        "graphql-test-merge-disagrees",
+        ({ responses }) => {
+          responses["POST graphql"].data.repository.pullRequest.potentialMergeCommit = {
+            oid: "d".repeat(40),
+          };
+        },
+        /GraphQL tuple disagrees/u,
+      ],
+      [
+        "test-merge-parent-order",
+        ({ responses }) => {
+          responses[
+            `repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/git/commits/${CANARY_MERGE_SHA}`
+          ].parents.reverse();
+        },
+        /test-merge.*ordered base\/head parents/u,
+      ],
+      [
+        "historical-base-no-longer-ancestor",
+        ({ responses }) => {
+          responses[
+            `repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/compare/${HISTORICAL_SOURCE_CANARY_BASE_SHA}...${DEFAULT_BRANCH_SHA}`
+          ] = {
+            base_commit: { sha: HISTORICAL_SOURCE_CANARY_BASE_SHA },
+            merge_base_commit: { sha: "d".repeat(40) },
+            status: "behind",
+            ahead_by: 0,
+          };
+        },
+        /not a proven ancestor/u,
+      ],
+      [
+        "check-run-not-native-v2",
+        ({ responses }) => {
+          responses[
+            `repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/commits/${CANARY_HEAD_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`
+          ][0].check_runs[0].app.slug = "untrusted-actions";
+        },
+        /not a successful native GitHub Actions CheckRun/u,
+      ],
+      [
+        "run-path-is-an-action-ref",
+        ({ responses }) => {
+          responses[
+            `repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/actions/runs/${CANARY_RUN_ID}`
+          ].path = `${DEFAULT_WORKFLOW_PATH}@v2`;
+        },
+        /exact successful canonical/u,
+      ],
+      [
+        "job-check-run-reverse-link",
+        ({ responses }) => {
+          responses[
+            `repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/actions/runs/${CANARY_RUN_ID}/attempts/1/jobs?per_page=100`
+          ][0].jobs[0].check_run_url =
+            `https://api.github.com/repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/check-runs/${CANARY_CHECK_RUN_ID + 1}`;
+        },
+        /does not resolve to the unique CheckRun/u,
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, `${name}-bin`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const fixture = sourceBridgeRemovalFixtureResponses();
+      mutate(fixture);
+      const result = runBootstrap(sourceBridgeRemovalArguments(), {
+        addExpectedLegacyInventoryDigest: false,
+        env: {
+          ...fakeGhEnvironment({
+            fakeBin,
+            responses: fixture.responses,
+            stateDir: join(fixtureRoot, `${name}-state`),
+            callLog,
+          }),
+          NODE_OPTIONS: `--require=${preloadPath}`,
+        },
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, expected, name);
+      assert.equal(existsSync(callLog), true, name);
+      assert.doesNotMatch(
+        readFileSync(callLog, "utf8"),
+        /^(?:PUT|PATCH|DELETE) /mu,
+        name,
+      );
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source proof fails closed for hidden ruleset bypasses and case-insensitive legacy status requirements", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-closure-policy-"),
+  );
+  const preloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+  const sourceRepo = SOURCE_SELF_HOSTING_REPOSITORY_SLUG;
+  try {
+    writeFileSync(preloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    assert.equal(isLegacyStatusContext("CODEX/REVIEW-GATE"), true);
+    assert.equal(isLegacyStatusContext("codex/github-review-gate"), false);
+    for (const [name, mutate, expected] of [
+      [
+        "redacted-bypass-actors",
+        ({ responses, selectedV2 }) => {
+          selectedV2.bypass_actors = null;
+          responses[`repos/${sourceRepo}/rulesets/${selectedV2.id}`] = selectedV2;
+          responses[
+            `repos/${sourceRepo}/rulesets?includes_parents=true&per_page=100`
+          ][0][0] = selectedV2;
+        },
+        /bypass_actors|complete ruleset API object/u,
+      ],
+      [
+        "uppercase-classic-legacy-context",
+        ({ responses }) => {
+          const classic = {
+            strict: true,
+            contexts: ["CODEX/REVIEW-GATE"],
+            checks: [],
+          };
+          responses[
+            `repos/${sourceRepo}/branches/master/protection/required_status_checks`
+          ] = classic;
+          responses[`repos/${sourceRepo}/branches/master/protection`] = {
+            required_status_checks: classic,
+          };
+        },
+        /codex\/review-gate remains required after cleanup|legacy status context/u,
+      ],
+      [
+        "retained-policy-missing-deletion",
+        ({ retainedSourceRuleset }) => {
+          retainedSourceRuleset.rules = retainedSourceRuleset.rules.filter(
+            (rule) => rule.type !== "deletion",
+          );
+        },
+        /retained ruleset.*exact non-status protection policy/u,
+      ],
+      [
+        "retained-policy-non-fast-forward-parameters",
+        ({ retainedSourceRuleset }) => {
+          retainedSourceRuleset.rules.find(
+            (rule) => rule.type === "non_fast_forward",
+          ).parameters = {};
+        },
+        /retained ruleset.*exact non-status protection policy/u,
+      ],
+      [
+        "retained-policy-thread-resolution-disabled",
+        ({ retainedSourceRuleset }) => {
+          retainedSourceRuleset.rules.find(
+            (rule) => rule.type === "pull_request",
+          ).parameters.required_review_thread_resolution = false;
+        },
+        /retained ruleset.*exact non-status protection policy/u,
+      ],
+      [
+        "retained-policy-bypass-actor",
+        ({ retainedSourceRuleset }) => {
+          retainedSourceRuleset.bypass_actors = [{
+            actor_id: 1,
+            actor_type: "RepositoryRole",
+            bypass_mode: "always",
+          }];
+        },
+        /retained ruleset.*exact non-status protection policy/u,
+      ],
+      [
+        "retained-policy-name-drift",
+        ({ retainedSourceRuleset }) => {
+          retainedSourceRuleset.name = "replacement retained policy";
+        },
+        /retained ruleset.*exact source repository branch identity/u,
+      ],
+      [
+        "retained-policy-id-drift",
+        ({ responses, retainedSourceRuleset }) => {
+          const originalId = retainedSourceRuleset.id;
+          retainedSourceRuleset.id = originalId + 1;
+          delete responses[`repos/${sourceRepo}/rulesets/${originalId}`];
+          responses[`repos/${sourceRepo}/rulesets/${retainedSourceRuleset.id}`] =
+            retainedSourceRuleset;
+        },
+        /requires exactly one retained ruleset id/u,
+      ],
+      [
+        "retained-policy-conditions-drift",
+        ({ retainedSourceRuleset }) => {
+          retainedSourceRuleset.conditions.ref_name.exclude = ["master"];
+        },
+        /retained ruleset.*exact non-status protection policy/u,
+      ],
+    ]) {
+      const fakeBin = join(fixtureRoot, `${name}-bin`);
+      const callLog = join(fixtureRoot, `${name}.log`);
+      createFakeGhExecutable(fakeBin);
+      const fixture = sourceBridgeRemovalFixtureResponses();
+      mutate(fixture);
+      const result = runBootstrap(sourceBridgeRemovalArguments(), {
+        addExpectedLegacyInventoryDigest: false,
+        env: {
+          ...fakeGhEnvironment({
+            fakeBin,
+            responses: fixture.responses,
+            stateDir: join(fixtureRoot, `${name}-state`),
+            callLog,
+          }),
+          NODE_OPTIONS: `--require=${preloadPath}`,
+        },
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, expected, name);
+      assert.equal(existsSync(callLog), true, name);
+      assert.doesNotMatch(
+        readFileSync(callLog, "utf8"),
+        /^(?:PUT|PATCH|DELETE) /mu,
+        name,
+      );
+      assert.equal(result.stdout, "", `${name}: no proof may be emitted`);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source proof keeps pending when complete source snapshots do not stabilize", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-closure-instability-"),
+  );
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const preloadPath = join(fixtureRoot, "unstable-source-closure.cjs");
+  try {
+    createFakeGhExecutable(fakeBin);
+    writeFileSync(preloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    const { responses } = sourceBridgeRemovalFixtureResponses();
+    const permissionEndpoint =
+      `repos/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}/collaborators/JoeyTeng/permission`;
+    responses[permissionEndpoint] = {
+      __fake_sequence: [
+        controlPlaneOwnerPermissionFixture({ permission: "write" }),
+        controlPlaneOwnerPermissionFixture({ permission: "maintain" }),
+      ],
+    };
+    const result = runBootstrap(sourceBridgeRemovalArguments(), {
+      addExpectedLegacyInventoryDigest: false,
+      env: {
+        ...fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+        CODEX_SOURCE_CLOSURE_TEST_CLOCK: "unstable",
+        NODE_OPTIONS: `--require=${preloadPath}`,
+      },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /closure remained unstable.*Fail closed: no receipt was emitted/u,
+    );
+    assert.equal(result.stdout, "");
+    assert.doesNotMatch(
+      readFileSync(callLog, "utf8"),
+      /^(?:PUT|PATCH|DELETE) /mu,
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source bridge deletion CLI admits only its isolated local authority", () => {
+  const nonWorktree = join(tmpdir(), "codex-review-gate-no-source-worktree");
+  const placeholderProof = join(tmpdir(), "codex-review-gate-unread-proof.json");
+  const approvedSha256 = "a".repeat(64);
+  const base = [
+    "--prepare-worktree",
+    nonWorktree,
+    "--remove-source-legacy-bridge",
+    "--source-bridge-removal-proof",
+    placeholderProof,
+    "--expected-source-bridge-removal-proof-sha256",
+    approvedSha256,
+  ];
+  for (const [name, args, expected] of [
+    [
+      "missing-approved-proof",
+      ["--prepare-worktree", nonWorktree, "--remove-source-legacy-bridge"],
+      /requires --source-bridge-removal-proof/u,
+    ],
+    [
+      "remote-mode",
+      [
+        "--repo",
+        SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+        "--remove-source-legacy-bridge",
+        "--source-bridge-removal-proof",
+        placeholderProof,
+        "--expected-source-bridge-removal-proof-sha256",
+        approvedSha256,
+      ],
+      /local source-only operation and requires --prepare-worktree/u,
+    ],
+    [
+      "retained-bridge-phase",
+      [...base, "--legacy-bridge"],
+      /mutually exclusive lifecycle phases/u,
+    ],
+    [
+      "organization-receipt-phase",
+      [...base, "--remove-legacy-bridge"],
+      /different authorization domains and are mutually exclusive/u,
+    ],
+    [
+      "canary-input",
+      [...base, "--canary-pr", "74"],
+      /separate local source-only operation/u,
+    ],
+    [
+      "ruleset-override",
+      [...base, "--ruleset-name", "Unexpected source ruleset"],
+      /do not admit migration-policy overrides/u,
+    ],
+    [
+      "bad-approved-sha",
+      [
+        ...base.slice(0, -1),
+        "not-a-sha",
+      ],
+      /must be an exact lowercase 64-hex SHA-256/u,
+    ],
+    [
+      "orphan-source-proof",
+      [
+        "--prepare-worktree",
+        nonWorktree,
+        "--source-bridge-removal-proof",
+        placeholderProof,
+      ],
+      /valid only with --remove-source-legacy-bridge/u,
+    ],
+  ]) {
+    const result = runBootstrap(args, { addExpectedLegacyInventoryDigest: false });
+    assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+    assert.match(result.stderr, expected, name);
+    assert.equal(result.stdout, "", `${name}: admission rejects before a dry run`);
+  }
+});
+
+test("source and organization bridge-deletion receipt paths reject each other's repository authority", () => {
+  const sourceOriginTarget = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-origin-boundary-"),
+  );
+  const organizationSourceTarget = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-org-source-boundary-"),
+  );
+  try {
+    initializeGitRepository(sourceOriginTarget);
+    runGit([
+      "-C",
+      sourceOriginTarget,
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/Joey-Tools/ordinary-consumer.git",
+    ]);
+    const sourceProofArgs = prepareSourceBridgeRemovalProof(sourceOriginTarget);
+    const sourcePathResult = runBootstrap([
+      "--prepare-worktree",
+      sourceOriginTarget,
+      "--remove-source-legacy-bridge",
+      ...sourceProofArgs,
+    ]);
+    assert.equal(sourcePathResult.status, 1, sourcePathResult.stderr);
+    assert.match(sourcePathResult.stderr, /restricted to Git origin/u);
+    assert.doesNotMatch(sourcePathResult.stdout, /Dry run|Applied/u);
+
+    initializeGitRepository(organizationSourceTarget);
+    const bridgePath = join(
+      organizationSourceTarget,
+      ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+    );
+    mkdirSync(join(organizationSourceTarget, ".github", "workflows"), {
+      recursive: true,
+    });
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    const organizationArgs = prepareFinalClosureReceipt(organizationSourceTarget, {
+      repoSlug: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    });
+    const organizationPathResult = runBootstrap([
+      "--prepare-worktree",
+      organizationSourceTarget,
+      "--remove-legacy-bridge",
+      ...organizationArgs,
+      "--apply",
+    ]);
+    assert.equal(organizationPathResult.status, 1, organizationPathResult.stderr);
+    assert.match(
+      organizationPathResult.stderr,
+      /source self-hosting repository.*cannot use the organization --remove-legacy-bridge receipt path/u,
+    );
+    assert.equal(
+      readFileSync(bridgePath, "utf8"),
+      CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+      "the generic organization path must reject before changing the source bridge",
+    );
+  } finally {
+    rmSync(sourceOriginTarget, { recursive: true, force: true });
+    rmSync(organizationSourceTarget, { recursive: true, force: true });
+  }
+});
+
+test("source bridge deletion restores the canonical bridge when source closure drifts after quarantine", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-delete-drift-"),
+  );
+  const targetRoot = join(fixtureRoot, "source-worktree");
+  const timingPreloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+  const driftPreloadPath = join(fixtureRoot, "post-rename-source-drift.cjs");
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    runGit(["-C", targetRoot, "symbolic-ref", "HEAD", "refs/heads/master"]);
+    runGit(["-C", targetRoot, "config", "user.name", "Codex Test"]);
+    runGit(["-C", targetRoot, "config", "user.email", "codex-test@example.invalid"]);
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+    runGit(["-C", targetRoot, "add", ".github"]);
+    runGit(["-C", targetRoot, "commit", "-qm", "source bridge fixture"]);
+    const sourceHead = runGit(["-C", targetRoot, "rev-parse", "HEAD"]).trim();
+    runGit([
+      "-C",
+      targetRoot,
+      "remote",
+      "add",
+      "origin",
+      `https://github.com/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}.git`,
+    ]);
+    writeFileSync(timingPreloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    writeFileSync(
+      driftPreloadPath,
+      sourceBridgeRemovalPostRenameRemoteDriftPreloadSource(),
+      "utf8",
+    );
+
+    const deriveBin = join(fixtureRoot, "derive-bin");
+    const deriveLog = join(fixtureRoot, "derive.log");
+    createFakeGhExecutable(deriveBin);
+    const deriveFixture = sourceBridgeRemovalFixtureResponses({
+      currentDefaultBranchHeadSha: sourceHead,
+    });
+    const derive = runBootstrap(sourceBridgeRemovalArguments(), {
+      addExpectedLegacyInventoryDigest: false,
+      env: {
+        ...fakeGhEnvironment({
+          fakeBin: deriveBin,
+          responses: deriveFixture.responses,
+          stateDir: join(fixtureRoot, "derive-state"),
+          callLog: deriveLog,
+        }),
+        NODE_OPTIONS: `--require=${timingPreloadPath}`,
+      },
+    });
+    assert.equal(derive.status, 0, derive.stderr);
+    const proofPath = join(fixtureRoot, "approved-source-proof.json");
+    writeFileSync(proofPath, derive.stdout, "utf8");
+    const approvedSha256 = JSON.parse(
+      derive.stdout,
+    ).source_bridge_removal_receipt_sha256;
+
+    const applyBin = join(fixtureRoot, "apply-bin");
+    const applyLog = join(fixtureRoot, "apply.log");
+    createFakeGhExecutable(applyBin);
+    const applyFixture = sourceBridgeRemovalFixtureResponses({
+      currentDefaultBranchHeadSha: sourceHead,
+    });
+    const apply = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-source-legacy-bridge",
+      "--source-bridge-removal-proof",
+      proofPath,
+      "--expected-source-bridge-removal-proof-sha256",
+      approvedSha256,
+      "--apply",
+    ], {
+      env: {
+        ...fakeGhEnvironment({
+          fakeBin: applyBin,
+          responses: applyFixture.responses,
+          stateDir: join(fixtureRoot, "apply-state"),
+          callLog: applyLog,
+        }),
+        CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT: targetRoot,
+        NODE_OPTIONS: `--require=${timingPreloadPath} --require=${driftPreloadPath}`,
+      },
+    });
+    assert.equal(apply.status, 1, apply.stderr);
+    assert.match(
+      apply.stderr,
+      /no longer equals a fresh complete two-round source closure.*after source legacy bridge quarantine rename and before unlink/u,
+    );
+    assert.match(
+      apply.stderr,
+      /admitted exact bridge remains installed.*atomically restored/u,
+    );
+    assert.equal(
+      readFileSync(bridgePath, "utf8"),
+      CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+      "a source security drift after quarantine must restore the admitted bridge",
+    );
+    assert.equal(
+      runGit(["-C", targetRoot, "status", "--porcelain"]),
+      "",
+      "restoration must leave no staged or unstaged bridge deletion",
+    );
+    assert.doesNotMatch(apply.stdout, /Applied: removed only/u);
+    assert.doesNotMatch(
+      readFileSync(applyLog, "utf8"),
+      /^(?:PUT|PATCH|DELETE) /mu,
+      "source deletion rebind is read-only against GitHub",
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source bridge deletion rejects a substituted valid linked-worktree marker before quarantine rename", () => {
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-source-linked-marker-replacement-"),
+  );
+  const repositoryRoot = join(fixtureRoot, "repository");
+  const targetRoot = join(fixtureRoot, "source-worktree");
+  const timingPreloadPath = join(fixtureRoot, "fast-source-closure.cjs");
+  const replacementPreloadPath = join(
+    fixtureRoot,
+    "replace-linked-marker-before-quarantine.cjs",
+  );
+  const replacementAdminPath = join(fixtureRoot, "replacement-admin");
+  const replacementMarkerPath = join(fixtureRoot, "replacement-marker");
+  const displacedMarkerPath = join(fixtureRoot, "displaced-marker");
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  const repositoryBridgePath = join(
+    repositoryRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(repositoryRoot);
+    runGit(["-C", repositoryRoot, "config", "user.name", "Codex Test"]);
+    runGit([
+      "-C",
+      repositoryRoot,
+      "config",
+      "user.email",
+      "codex-test@example.invalid",
+    ]);
+    mkdirSync(join(repositoryRoot, ".github", "workflows"), {
+      recursive: true,
+    });
+    writeFileSync(
+      join(repositoryRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(repositoryRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      repositoryBridgePath,
+      CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(repositoryRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+    runGit(["-C", repositoryRoot, "add", ".github"]);
+    runGit(["-C", repositoryRoot, "commit", "-qm", "source bridge fixture"]);
+    runGit(["-C", repositoryRoot, "checkout", "-qb", "parking"]);
+    runGit([
+      "-C",
+      repositoryRoot,
+      "worktree",
+      "add",
+      "--quiet",
+      targetRoot,
+      "master",
+    ]);
+    runGit([
+      "-C",
+      targetRoot,
+      "remote",
+      "add",
+      "origin",
+      `https://github.com/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}.git`,
+    ]);
+    const sourceHead = runGit(["-C", targetRoot, "rev-parse", "HEAD"]).trim();
+    const markerPath = join(targetRoot, ".git");
+    const originalMarkerContent = readFileSync(markerPath, "utf8");
+    const markerMatch = originalMarkerContent.match(/^gitdir: ([^\r\n]+)\r?\n?$/u);
+    assert.ok(
+      markerMatch,
+      "the fixture must create a normal linked-worktree marker",
+    );
+    const originalAdminPath = resolve(targetRoot, markerMatch[1]);
+    const commonDirectory = runGit([
+      "-C",
+      targetRoot,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]).trim();
+    cpSync(originalAdminPath, replacementAdminPath, { recursive: true });
+    // The copied linked-worktree administration remains genuinely usable: it
+    // points at the same common object/config store and back to this marker.
+    writeFileSync(
+      join(replacementAdminPath, "commondir"),
+      `${commonDirectory}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(replacementAdminPath, "gitdir"),
+      `${markerPath}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      replacementMarkerPath,
+      `gitdir: ${replacementAdminPath}\n`,
+      "utf8",
+    );
+
+    // Prove the alternate marker/admin state is a valid linked worktree with
+    // the same origin, default branch, and HEAD before using it as the race.
+    renameSync(markerPath, displacedMarkerPath);
+    renameSync(replacementMarkerPath, markerPath);
+    assert.equal(runGit(["-C", targetRoot, "status", "--porcelain"]), "");
+    assert.equal(
+      runGit(["-C", targetRoot, "remote", "get-url", "origin"]).trim(),
+      `https://github.com/${SOURCE_SELF_HOSTING_REPOSITORY_SLUG}.git`,
+    );
+    assert.equal(
+      runGit(["-C", targetRoot, "branch", "--show-current"]).trim(),
+      "master",
+    );
+    assert.equal(
+      runGit(["-C", targetRoot, "rev-parse", "HEAD"]).trim(),
+      sourceHead,
+    );
+    renameSync(markerPath, replacementMarkerPath);
+    renameSync(displacedMarkerPath, markerPath);
+
+    writeFileSync(timingPreloadPath, sourceClosureTimingPreloadSource(), "utf8");
+    writeFileSync(
+      replacementPreloadPath,
+      sourceBridgeRemovalLinkedMarkerReplacementPreloadSource(),
+      "utf8",
+    );
+    const deriveBin = join(fixtureRoot, "derive-bin");
+    createFakeGhExecutable(deriveBin);
+    const deriveFixture = sourceBridgeRemovalFixtureResponses({
+      currentDefaultBranchHeadSha: sourceHead,
+    });
+    const derive = runBootstrap(sourceBridgeRemovalArguments({
+      includeRulesetName: false,
+    }), {
+      addExpectedLegacyInventoryDigest: false,
+      env: {
+        ...fakeGhEnvironment({
+          fakeBin: deriveBin,
+          responses: deriveFixture.responses,
+          stateDir: join(fixtureRoot, "derive-state"),
+          callLog: join(fixtureRoot, "derive.log"),
+        }),
+        NODE_OPTIONS: `--require=${timingPreloadPath}`,
+      },
+    });
+    assert.equal(derive.status, 0, derive.stderr);
+    const proofPath = join(fixtureRoot, "approved-source-proof.json");
+    writeFileSync(proofPath, derive.stdout, "utf8");
+    const approvedSha256 = JSON.parse(
+      derive.stdout,
+    ).source_bridge_removal_receipt_sha256;
+
+    const applyBin = join(fixtureRoot, "apply-bin");
+    const applyLog = join(fixtureRoot, "apply.log");
+    createFakeGhExecutable(applyBin);
+    const applyFixture = sourceBridgeRemovalFixtureResponses({
+      currentDefaultBranchHeadSha: sourceHead,
+    });
+    const apply = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-source-legacy-bridge",
+      "--source-bridge-removal-proof",
+      proofPath,
+      "--expected-source-bridge-removal-proof-sha256",
+      approvedSha256,
+      "--apply",
+    ], {
+      env: {
+        ...fakeGhEnvironment({
+          fakeBin: applyBin,
+          responses: applyFixture.responses,
+          stateDir: join(fixtureRoot, "apply-state"),
+          callLog: applyLog,
+        }),
+        CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT: targetRoot,
+        CODEX_SOURCE_CLOSURE_TEST_REPLACEMENT_MARKER: replacementMarkerPath,
+        CODEX_SOURCE_CLOSURE_TEST_DISPLACED_MARKER: displacedMarkerPath,
+        NODE_OPTIONS: `--require=${timingPreloadPath} --require=${replacementPreloadPath}`,
+      },
+    });
+    assert.equal(apply.status, 1, apply.stderr);
+    assert.match(
+      apply.stderr,
+      /Git worktree marker object identity changed during immediately before source legacy bridge quarantine rename/u,
+    );
+    assert.equal(
+      readFileSync(bridgePath, "utf8"),
+      CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+      "the valid substituted administrative marker must be rejected before bridge rename or unlink",
+    );
+    assert.equal(
+      runGit(["-C", targetRoot, "status", "--porcelain"]),
+      "",
+      "the pre-rename rejection must retain the tracked bridge without an unstaged deletion",
+    );
+    assert.doesNotMatch(apply.stdout, /Applied: removed only/u);
+    assert.doesNotMatch(
+      readFileSync(applyLog, "utf8"),
+      /^(?:PUT|PATCH|DELETE) /mu,
+      "source deletion rebind remains read-only against GitHub",
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("general bootstrap help omits the source-only cleanup executor", () => {
   const help = runBootstrap(["--help"], {
     addExpectedLegacyInventoryDigest: false,
@@ -9233,6 +10442,202 @@ function canaryRunResponses(repoSlug, overrides = {}) {
   };
 }
 
+function sourceBridgeRemovalArguments({
+  canaryPr = 74,
+  canaryHead = CANARY_HEAD_SHA,
+  v2RulesetName = SOURCE_SELF_HOSTING_RULESET_NAME,
+  includeRulesetName = true,
+} = {}) {
+  return [
+    "--repo",
+    SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    ...(includeRulesetName ? ["--ruleset-name", v2RulesetName] : []),
+    "--ruleset-profile",
+    RULESET_PROFILE_STATUS_ONLY,
+    "--legacy-bridge",
+    "--derive-source-bridge-removal-proof",
+    "--canary-pr",
+    String(canaryPr),
+    "--canary-head",
+    canaryHead,
+  ];
+}
+
+function sourceBridgeRemovalFixtureResponses({
+  repoSlug = SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+  v2RulesetName = SOURCE_SELF_HOSTING_RULESET_NAME,
+  currentDefaultBranchHeadSha = DEFAULT_BRANCH_SHA,
+  historicalBaseSha = HISTORICAL_SOURCE_CANARY_BASE_SHA,
+  checkRunOverrides = {},
+  runOverrides = {},
+  jobOverrides = {},
+  pullRequestOverrides = {},
+  graphPullRequestOverrides = {},
+  comparisonOverrides = {},
+  workflowApiOverrides = {},
+  selectedV2Overrides = {},
+} = {}) {
+  const selectedV2 = {
+    ...statusOnlyRulesetFixture(23927388, repoSlug, {
+      name: v2RulesetName,
+      enforcement: "active",
+    }),
+    ...selectedV2Overrides,
+  };
+  const retainedSourceRuleset = sourceRetainedRulesetFixture(repoSlug);
+  const closedAt = "2026-09-25T12:00:00Z";
+  const historicalPullRequest = {
+    state: "closed",
+    merged: false,
+    merged_at: null,
+    draft: false,
+    changed_files: 1,
+    closed_at: closedAt,
+    base: {
+      ref: "master",
+      sha: historicalBaseSha,
+      repo: { full_name: repoSlug },
+    },
+    head: {
+      sha: CANARY_HEAD_SHA,
+      repo: { full_name: repoSlug },
+    },
+    merge_commit_sha: CANARY_MERGE_SHA,
+    ...pullRequestOverrides,
+  };
+  const graphPullRequest = {
+    number: 74,
+    state: "CLOSED",
+    isDraft: false,
+    merged: false,
+    mergedAt: null,
+    closedAt,
+    baseRefName: "master",
+    baseRefOid: historicalBaseSha,
+    headRefOid: CANARY_HEAD_SHA,
+    potentialMergeCommit: { oid: CANARY_MERGE_SHA },
+    baseRepository: { nameWithOwner: repoSlug },
+    headRepository: { nameWithOwner: repoSlug },
+    ...graphPullRequestOverrides,
+  };
+  const historicalCheckRun = {
+    ...canonicalCanaryCheckRunFixture(repoSlug),
+    completed_at: "2026-09-25T11:59:00Z",
+    ...checkRunOverrides,
+  };
+  const historicalRun = {
+    ...canaryRunResponses(repoSlug, {
+      display_title:
+        `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/74/${CANARY_MERGE_SHA}`,
+      pull_requests: [],
+      ...runOverrides,
+    })[`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}`],
+  };
+  const historicalJob = {
+    ...canonicalCanaryJobFixture(repoSlug),
+    ...jobOverrides,
+  };
+  const workflowApi = [
+    {
+      id: CANARY_WORKFLOW_ID,
+      path: DEFAULT_WORKFLOW_PATH,
+      state: "active",
+    },
+    {
+      id: CANARY_WORKFLOW_ID + 1,
+      path: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+      state: "active",
+    },
+    {
+      id: CANARY_WORKFLOW_ID + 2,
+      path: DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+      state: "active",
+    },
+  ].map((workflow) => ({ ...workflow, ...workflowApiOverrides[workflow.path] }));
+  const responses = {
+    ...canonicalRemoteWorkflowResponses(repoSlug, { legacyBridge: true }),
+    [`repos/${repoSlug}/branches/master`]: {
+      name: "master",
+      commit: { sha: currentDefaultBranchHeadSha },
+    },
+    [`repos/${repoSlug}/git/trees/${currentDefaultBranchHeadSha}`]: {
+      truncated: false,
+      tree: [{ path: ".github", sha: "github-tree", type: "tree" }],
+    },
+    [`repos/${repoSlug}/codeowners/errors?ref=${currentDefaultBranchHeadSha}`]: {
+      errors: [],
+    },
+    [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[
+      selectedV2,
+      retainedSourceRuleset,
+    ]],
+    [`repos/${repoSlug}/rulesets/${selectedV2.id}`]: selectedV2,
+    [`repos/${repoSlug}/rulesets/${retainedSourceRuleset.id}`]: retainedSourceRuleset,
+    [`repos/${repoSlug}/actions/workflows?per_page=100`]: [{
+      total_count: workflowApi.length,
+      workflows: workflowApi,
+    }],
+    [`repos/${repoSlug}/pulls/74`]: historicalPullRequest,
+    "POST graphql": {
+      data: { repository: { pullRequest: graphPullRequest } },
+    },
+    [`repos/${repoSlug}/pulls/74/files?per_page=100`]: [[{
+      filename: "docs/.codex-review-gate-node24-canary.md",
+    }]],
+    [`repos/${repoSlug}/git/trees/${historicalBaseSha}`]: {
+      truncated: false,
+      tree: [{ path: ".github", sha: "github-tree", type: "tree" }],
+    },
+    [`repos/${repoSlug}/codeowners/errors?ref=${historicalBaseSha}`]: {
+      errors: [],
+    },
+    [`repos/${repoSlug}/git/commits/${CANARY_MERGE_SHA}`]: {
+      sha: CANARY_MERGE_SHA,
+      parents: [{ sha: historicalBaseSha }, { sha: CANARY_HEAD_SHA }],
+    },
+    [`repos/${repoSlug}/compare/${historicalBaseSha}...${currentDefaultBranchHeadSha}`]: {
+      base_commit: { sha: historicalBaseSha },
+      merge_base_commit: { sha: historicalBaseSha },
+      status: historicalBaseSha === currentDefaultBranchHeadSha ? "identical" : "ahead",
+      ahead_by: historicalBaseSha === currentDefaultBranchHeadSha ? 0 : 1,
+      ...comparisonOverrides,
+    },
+    [`repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/check-runs?check_name=codex%2Fgithub-review-gate&filter=latest&per_page=100`]: [{
+      total_count: 1,
+      check_runs: [historicalCheckRun],
+    }],
+    [`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}`]: historicalRun,
+    [`repos/${repoSlug}/actions/workflows/${CANARY_WORKFLOW_ID}`]: {
+      id: CANARY_WORKFLOW_ID,
+      path: DEFAULT_WORKFLOW_PATH,
+      state: "active",
+    },
+    [`repos/${repoSlug}/actions/runs/${CANARY_RUN_ID}/attempts/1/jobs?per_page=100`]: [{
+      total_count: 1,
+      jobs: [historicalJob],
+    }],
+    // Historical #74 may retain v1 producer statuses. The source proof must
+    // prove they are not required now, not retroactively erase them.
+    [`repos/${repoSlug}/commits/${CANARY_HEAD_SHA}/statuses?per_page=100`]: [[{
+      context: LEGACY_STATUS_CONTEXT,
+      state: "success",
+      sha: CANARY_HEAD_SHA,
+    }]],
+    [`repos/${repoSlug}/commits/${CANARY_MERGE_SHA}/statuses?per_page=100`]: [[{
+      context: LEGACY_STATUS_CONTEXT,
+      state: "success",
+      sha: CANARY_MERGE_SHA,
+    }]],
+  };
+  return {
+    responses,
+    selectedV2,
+    retainedSourceRuleset,
+    historicalPullRequest,
+    graphPullRequest,
+  };
+}
+
 function canonicalCanaryRunPullRequestFixture(
   repoSlug,
   {
@@ -9393,6 +10798,39 @@ function sourceLegacyRulesetFixture(id, repoSlug) {
   return legacy;
 }
 
+function sourceRetainedRulesetFixture(repoSlug = SOURCE_SELF_HOSTING_REPOSITORY_SLUG) {
+  return {
+    id: SOURCE_SELF_HOSTING_RETAINED_RULESET_ID,
+    name: SOURCE_SELF_HOSTING_RETAINED_RULESET_NAME,
+    source_type: "Repository",
+    source: repoSlug,
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [],
+    conditions: {
+      ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] },
+    },
+    rules: [
+      { type: "deletion" },
+      { type: "non_fast_forward" },
+      {
+        type: "pull_request",
+        parameters: {
+          allowed_merge_methods: ["squash"],
+          dismiss_stale_reviews_on_push: false,
+          dismissal_restriction: { allowed_actors: [], enabled: false },
+          require_code_owner_review: false,
+          require_extra_approval_for_unattributed_changes: true,
+          require_last_push_approval: false,
+          required_approving_review_count: 0,
+          required_review_thread_resolution: true,
+          required_reviewers: [],
+        },
+      },
+    ],
+  };
+}
+
 function activeLegacyRulesetFixture(
   id,
   { name = "Legacy Codex Review", sourceType = "Repository" } = {},
@@ -9442,6 +10880,100 @@ function fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }) {
     FAKE_GH_STATE_DIR: stateDir,
     FAKE_GH_CALL_LOG: callLog,
   };
+}
+
+function sourceClosureTimingPreloadSource() {
+  return `
+const nativeSetTimeout = global.setTimeout;
+global.setTimeout = (callback, delay, ...args) => {
+  if (delay === 5000) {
+    queueMicrotask(() => callback(...args));
+    return 0;
+  }
+  return nativeSetTimeout(callback, delay, ...args);
+};
+if (process.env.CODEX_SOURCE_CLOSURE_TEST_CLOCK === "unstable") {
+  const values = [0, 0, 60000];
+  let index = 0;
+  Date.now = () => values[Math.min(index++, values.length - 1)];
+}
+`;
+}
+
+function sourceBridgeRemovalPostRenameRemoteDriftPreloadSource() {
+  return `
+const fs = require("node:fs");
+const { join } = require("node:path");
+const { syncBuiltinESMExports } = require("node:module");
+
+const originalRename = fs.promises.rename.bind(fs.promises);
+const targetRoot = process.env.CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT;
+const bridgePath = join(
+  targetRoot,
+  ".github",
+  "workflows",
+  "codex-review-gate-legacy-bridge.yml",
+);
+const permissionEndpoint =
+  "repos/Joey-Tools/codex-review-gate/collaborators/JoeyTeng/permission";
+let injected = false;
+
+fs.promises.rename = async function patchedRename(from, to) {
+  const result = await originalRename(from, to);
+  if (!injected && String(from) === bridgePath) {
+    injected = true;
+    const responses = JSON.parse(process.env.FAKE_GH_RESPONSES || "{}");
+    const permission = responses[permissionEndpoint];
+    if (
+      permission === null ||
+      typeof permission !== "object" ||
+      Array.isArray(permission)
+    ) {
+      throw new Error("source drift fixture lacks the control-plane permission response");
+    }
+    responses[permissionEndpoint] = { ...permission, permission: "maintain" };
+    process.env.FAKE_GH_RESPONSES = JSON.stringify(responses);
+  }
+  return result;
+};
+
+syncBuiltinESMExports();
+`;
+}
+
+function sourceBridgeRemovalLinkedMarkerReplacementPreloadSource() {
+  return `
+const fs = require("node:fs");
+const { join } = require("node:path");
+const { syncBuiltinESMExports } = require("node:module");
+
+const originalMkdtemp = fs.promises.mkdtemp.bind(fs.promises);
+const targetRoot = process.env.CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT;
+const markerPath = join(targetRoot, ".git");
+const replacementMarkerPath =
+  process.env.CODEX_SOURCE_CLOSURE_TEST_REPLACEMENT_MARKER;
+const displacedMarkerPath =
+  process.env.CODEX_SOURCE_CLOSURE_TEST_DISPLACED_MARKER;
+const quarantinePrefix = join(
+  targetRoot,
+  ".github",
+  "workflows",
+  ".codex-review-gate-removal-",
+);
+let injected = false;
+
+fs.promises.mkdtemp = async function patchedMkdtemp(prefix, ...args) {
+  const directory = await originalMkdtemp(prefix, ...args);
+  if (!injected && String(prefix) === quarantinePrefix) {
+    injected = true;
+    fs.renameSync(markerPath, displacedMarkerPath);
+    fs.renameSync(replacementMarkerPath, markerPath);
+  }
+  return directory;
+};
+
+syncBuiltinESMExports();
+`;
 }
 
 function countLines(content, expected) {
@@ -9569,6 +11101,184 @@ function buildFinalClosureOutput({
   };
 }
 
+function buildSourceBridgeRemovalProofOutput({
+  defaultBranch = "master",
+  defaultBranchHeadSha = DEFAULT_BRANCH_SHA,
+  canaryBaseSha = DEFAULT_BRANCH_SHA,
+  canaryHeadSha = CANARY_HEAD_SHA,
+  canaryTestMergeSha = CANARY_MERGE_SHA,
+} = {}) {
+  const retainedSourceRuleset = sourceRetainedRulesetFixture();
+  const retainedSourceWritable =
+    assertSourceSelfHostingRetainedRulesetPolicy(
+      retainedSourceRuleset,
+    ).writable;
+  const v2Writable = {
+    bypass_actors: [],
+    conditions: { ref_name: { exclude: [], include: ["~DEFAULT_BRANCH"] } },
+    enforcement: "active",
+    id: 23927388,
+    name: SOURCE_SELF_HOSTING_RULESET_NAME,
+    rules: [],
+    source: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    source_type: "Repository",
+    target: "branch",
+  };
+  const canonicalWorkflows = [
+    DEFAULT_CONTROLLER_WORKFLOW_PATH,
+    DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+    DEFAULT_WORKFLOW_PATH,
+  ].sort().map((path) => ({
+    path,
+    mode: "100644",
+    content_sha256: createHash("sha256")
+      .update(`${path}:canonical`, "utf8")
+      .digest("hex"),
+  }));
+  const repository = {
+    full_name: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+    id: CANARY_REPOSITORY_ID,
+    node_id: "R_kgDOCodexReviewGate",
+    default_branch: defaultBranch,
+    default_branch_head_sha: defaultBranchHeadSha,
+  };
+  const securityState = {
+    schema_version: 1,
+    repository,
+    actions_workflow_permissions: {},
+    control_plane_owner: {
+      login: DEFAULT_CONTROL_PLANE_OWNER.slice(1).toLowerCase(),
+      type: "User",
+      id: 42,
+      node_id: "U_kgDOCodexControlPlane",
+      permission: "admin",
+    },
+    rulesets: [{
+      id: 23927388,
+      name: SOURCE_SELF_HOSTING_RULESET_NAME,
+      source_type: "Repository",
+      source: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+      writable: v2Writable,
+    }, {
+      id: retainedSourceRuleset.id,
+      name: retainedSourceRuleset.name,
+      source_type: retainedSourceRuleset.source_type,
+      source: retainedSourceRuleset.source,
+      writable: retainedSourceWritable,
+    }],
+    workflow_inventory: canonicalWorkflows,
+    codeowners: {},
+    classic_branch_protection: {},
+  };
+  const receipt = {
+    schema_version: SOURCE_BRIDGE_REMOVAL_PROOF_SCHEMA_VERSION,
+    scope: "source-bridge-removal",
+    repository,
+    control_plane_owner: DEFAULT_CONTROL_PLANE_OWNER,
+    v2_ruleset: {
+      id: 23927388,
+      name: SOURCE_SELF_HOSTING_RULESET_NAME,
+      state: "active",
+      profile: RULESET_PROFILE_STATUS_ONLY,
+      context: DEFAULT_STATUS_CONTEXT,
+      integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+    strict_required_status_checks: true,
+      writable_sha256: sourceBridgeRemovalRulesetWritableSha256(v2Writable),
+    },
+    retained_source_ruleset: {
+      id: retainedSourceRuleset.id,
+      name: retainedSourceRuleset.name,
+      source_type: retainedSourceRuleset.source_type,
+      source: retainedSourceRuleset.source,
+      target: retainedSourceRuleset.target,
+      writable_sha256: sourceBridgeRemovalRulesetWritableSha256(
+        retainedSourceWritable,
+      ),
+    },
+    canary: {
+      number: 74,
+      state: "closed",
+      merged: false,
+      closed_at: "2026-09-25T12:00:00Z",
+      base: { ref: defaultBranch, sha: canaryBaseSha },
+      base_ancestry: {
+        base_sha: canaryBaseSha,
+        current_default_branch_head_sha: defaultBranchHeadSha,
+        merge_base_sha: canaryBaseSha,
+        status: canaryBaseSha === defaultBranchHeadSha ? "identical" : "ahead",
+      },
+      head_sha: canaryHeadSha,
+      test_merge_sha: canaryTestMergeSha,
+      check_run: {
+        id: CANARY_CHECK_RUN_ID,
+        name: DEFAULT_STATUS_CONTEXT,
+        head_sha: canaryHeadSha,
+        status: "completed",
+        conclusion: "success",
+        completed_at: "2026-09-25T11:59:00Z",
+        app_id: DEFAULT_STATUS_INTEGRATION_ID,
+        app_slug: "github-actions",
+      },
+      run: {
+        id: CANARY_RUN_ID,
+        attempt: 2,
+        workflow_id: CANARY_WORKFLOW_ID,
+        workflow_path: DEFAULT_WORKFLOW_PATH,
+        event: "pull_request",
+        head_sha: canaryHeadSha,
+        status: "completed",
+        conclusion: "success",
+        display_title:
+          `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/74/${canaryTestMergeSha}`,
+      },
+      job: {
+        id: CANARY_JOB_ID,
+        run_id: CANARY_RUN_ID,
+        name: DEFAULT_STATUS_CONTEXT,
+        head_sha: canaryHeadSha,
+        status: "completed",
+        conclusion: "success",
+        check_run_id: CANARY_CHECK_RUN_ID,
+      },
+    },
+    live_closure: {
+      security_sha256: sourceBridgeRemovalSecurityStateSha256(securityState),
+      legacy_inventory_sha256: sourceBridgeRemovalLegacyInventorySha256({
+        repository: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+        repository_id: CANARY_REPOSITORY_ID,
+        repository_node_id: "R_kgDOCodexReviewGate",
+        default_branch: defaultBranch,
+        classic_required_status_checks: EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS,
+        rulesets: [],
+      }),
+      legacy_inventory: {
+        repository: SOURCE_SELF_HOSTING_REPOSITORY_SLUG,
+        repository_id: CANARY_REPOSITORY_ID,
+        repository_node_id: "R_kgDOCodexReviewGate",
+        default_branch: defaultBranch,
+        classic_required_status_checks: EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS,
+        rulesets: [],
+      },
+      legacy_status_required: false,
+      canonical_workflows: canonicalWorkflows,
+      canonical_workflow_api: canonicalWorkflows.map((workflow, index) => ({
+        id: index + 100,
+        path: workflow.path,
+        state: "active",
+      })),
+      security_state: securityState,
+    },
+  };
+  return {
+    schema_version: SOURCE_BRIDGE_REMOVAL_PROOF_OUTPUT_SCHEMA_VERSION,
+    mode: "derive",
+    status: "candidate",
+    applied: false,
+    source_bridge_removal_receipt: receipt,
+    source_bridge_removal_receipt_sha256: sourceBridgeRemovalProofSha256(receipt),
+  };
+}
+
 function finalClosureFixtureFormat(format) {
   switch (format) {
     case "v1":
@@ -9643,6 +11353,23 @@ function prepareFinalClosureReceipt(targetRoot, options = {}) {
     receiptPath,
     "--expected-final-closure-receipt-sha256",
     output.final_closure_receipt_sha256,
+  ];
+}
+
+function prepareSourceBridgeRemovalProof(targetRoot, output = undefined) {
+  const proof = output ?? buildSourceBridgeRemovalProofOutput();
+  const proofPath = join(targetRoot, "source-bridge-removal-proof.json");
+  const canonicalOutput = `${JSON.stringify(
+    JSON.parse(canonicalSourceBridgeRemovalProofOutput(proof)),
+    null,
+    2,
+  )}\n`;
+  writeFileSync(proofPath, canonicalOutput, "utf8");
+  return [
+    "--source-bridge-removal-proof",
+    proofPath,
+    "--expected-source-bridge-removal-proof-sha256",
+    proof.source_bridge_removal_receipt_sha256,
   ];
 }
 
