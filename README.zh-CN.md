@@ -132,16 +132,14 @@ review-thread resolution。其 CODEOWNERS/owner projection 是 source control-pl
 与 drift detection 的 receipt material，不是实际强制的 Code Owner approval 或 stale-review
 policy。
 它不是通用 consumer 或 cohort template。source repository 使用 canonical v2 verifier 和
-controller；其 repository-local v1 required status 已退休，精确的 temporary legacy
-bridge 则有意保留。之后物理删除该 bridge 必须先有单独派生的 source-only closure receipt，
-并由人独立批准其精确 SHA-256。已发布的 `v2.1.0` payload 与 closed-unmerged 历史 canary
-`#74` 都只是证据输入，绝不构成 bridge 删除授权；`#74` 贡献的是精确的
-PR/head/base/test-merge/CheckRun/run/job tuple。receipt 还绑定 fresh two-round live source
-closure。本地删除前必须让**同一份**已独立批准的 receipt（及其精确 SHA-256）与 fresh GitHub
-evidence rebind 后完全相等；若发生 drift，必须停止，重新派生、审阅并独立批准新的 receipt，
-之后才可再次尝试删除。source-only executor 不可用于普通 consumer。删除 YAML 只能阻止普通的
-新 dispatch，不能承诺 GitHub 无法 rerun 历史 Actions run。receipt file 不能单独作为可信授权，
-organization schema-2 cohort receipt 也不能授权此操作。proof-machinery PR 与之后的
-bridge-delete PR 有意保持为两个独立阶段。source-only closure flow 见
-[人类安装指南](docs/install/human.zh-CN.md)；publisher recovery states 与 release-protection
-baseline 见 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。
+controller；其 repository-local v1 required status 和 temporary legacy bridge 均已退休。
+该 bridge 只会在独立的 source-only executor 使用已明确批准的 closure receipt SHA-256
+`d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`，并在每个本地 mutation
+boundary 对 fresh two-round GitHub evidence 重新绑定成功后删除。已发布的 `v2.1.0` payload
+与 closed-unmerged 历史 canary `#74` 仍只是证据输入，绝不是可独立使用的删除授权。source-only
+executor 不可用于普通 consumer，也不得对当前 source default branch 重跑：它要求 exact
+canonical bridge file，缺失即拒绝。安装指南中保留的历史 source-only flow 仅供审计和未来刻意
+重新引入 bridge 时参考；它不影响 canonical bridge template 或 active cohort 的独立 cleanup。
+删除 YAML 只能阻止普通的新 dispatch，不能承诺 GitHub 无法 rerun 历史 Actions run。历史
+source-only flow 见 [人类安装指南](docs/install/human.zh-CN.md)；publisher recovery states 与
+release-protection baseline 见 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。
