@@ -16,7 +16,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 
@@ -4675,7 +4675,11 @@ async function removeSourceLegacyBridgeFromWorktree({
     return;
   }
 
-  const rebindAtBoundary = async (phase, expectedDiffState) => {
+  const rebindAtBoundary = async (
+    phase,
+    expectedDiffState,
+    allowedQuarantinePath = null,
+  ) => {
     await assertSourceBridgeRemovalProofBindingStable({
       targetRoot,
       proof,
@@ -4686,6 +4690,7 @@ async function removeSourceLegacyBridgeFromWorktree({
       targetRoot,
       expectedDiffState,
       phase,
+      allowedQuarantinePath,
     });
   };
   await removePreparedConsumerFile({
@@ -4711,19 +4716,21 @@ async function removeSourceLegacyBridgeFromWorktree({
         "clean",
       );
     },
-    beforeQuarantineUnlink: async () => {
+    beforeQuarantineUnlink: async ({ quarantinePath }) => {
       await rebindAtBoundary(
         "after source legacy bridge quarantine rename and before unlink",
         "already-removed",
+        quarantinePath,
       );
     },
   });
-  await assertSourceBridgeRemovalProofBindingStable({
-    targetRoot,
-    proof,
-    canonicalWorkflows,
-    phase: "source bridge-removal local apply success",
-  });
+  // The final remote proof rebind is deliberately the callback immediately
+  // before quarantine unlink, while the admitted object can still be restored
+  // if either remote or local state is no longer admissible. Do not perform
+  // fresh remote I/O after unlink: a later local-diff failure could no longer
+  // restore the quarantined bridge without risking an unrelated concurrent
+  // destination. The callback reclassifies the exact deletion state, and the
+  // checks below are local-only success readback.
   if (await readOptionalRegularFile(bridgePath) !== null) {
     throw new Error(
       "Source legacy bridge remains after the local removal returned; refusing success.",
@@ -4914,7 +4921,10 @@ async function assertSourceBridgeTrackedAtHead({
   }
 }
 
-async function classifySourceBridgeRemovalWorktreeDiff({ targetRoot }) {
+async function classifySourceBridgeRemovalWorktreeDiff({
+  targetRoot,
+  allowedQuarantinePath = null,
+}) {
   const [unstaged, staged, untracked, porcelain] = await Promise.all([
     runCommand("git", [
       "-C",
@@ -4960,17 +4970,61 @@ async function classifySourceBridgeRemovalWorktreeDiff({ targetRoot }) {
   const exactDeletion = `D\t${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}\n`;
   const exactPorcelainDeletion =
     ` D ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}\n`;
+  const allowedQuarantineRelativePath =
+    allowedQuarantinePath === null
+      ? null
+      : sourceBridgeRemovalQuarantineRelativePath({
+          targetRoot,
+          quarantinePath: allowedQuarantinePath,
+        });
+  const expectedUntracked =
+    allowedQuarantineRelativePath === null
+      ? ""
+      : `${allowedQuarantineRelativePath}\n`;
+  const expectedPorcelain =
+    allowedQuarantineRelativePath === null
+      ? exactPorcelainDeletion
+      : `${exactPorcelainDeletion}?? ${allowedQuarantineRelativePath}\n`;
   if (
     unstaged === exactDeletion &&
     staged === "" &&
-    untracked === "" &&
-    porcelain === exactPorcelainDeletion
+    untracked === expectedUntracked &&
+    porcelain === expectedPorcelain
   ) {
     return "already-removed";
   }
   throw new Error(
-    "Source bridge removal requires a clean worktree, except for an exact pre-existing unstaged deletion of the fixed legacy bridge path from a prior interrupted/idempotent run. Staged, untracked, renamed, or unrelated changes are not admitted.",
+    "Source bridge removal requires a clean worktree, except for an exact pre-existing unstaged deletion of the fixed legacy bridge path from a prior interrupted/idempotent run. The only temporary untracked exception is the executor's one admitted quarantine object during its pre-unlink rebind; staged, renamed, or unrelated changes are not admitted.",
   );
+}
+
+function sourceBridgeRemovalQuarantineRelativePath({
+  targetRoot,
+  quarantinePath,
+}) {
+  const relativePath = relative(
+    resolve(targetRoot),
+    resolve(quarantinePath),
+  );
+  const expectedParentSegments = dirname(
+    DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+  ).split("/");
+  const segments = relativePath.split("/");
+  if (
+    relativePath === "" ||
+    isAbsolute(relativePath) ||
+    segments.length !== expectedParentSegments.length + 2 ||
+    !expectedParentSegments.every(
+      (segment, index) => segments[index] === segment,
+    ) ||
+    !segments.at(-2).startsWith(".codex-review-gate-removal-") ||
+    segments.at(-1) !== "canonical-legacy-bridge.yml"
+  ) {
+    throw new Error(
+      "Internal error: source bridge-removal rebind received an unexpected quarantine path.",
+    );
+  }
+  return relativePath;
 }
 
 async function assertExactSourceBridgeRemovalDiff({ targetRoot, phase }) {
@@ -4985,8 +5039,12 @@ async function assertSourceBridgeRemovalWorktreeDiffState({
   targetRoot,
   expectedDiffState,
   phase,
+  allowedQuarantinePath = null,
 }) {
-  const state = await classifySourceBridgeRemovalWorktreeDiff({ targetRoot });
+  const state = await classifySourceBridgeRemovalWorktreeDiff({
+    targetRoot,
+    allowedQuarantinePath,
+  });
   if (state !== expectedDiffState) {
     throw new Error(
       `Expected source bridge-removal worktree diff state ${expectedDiffState} during ${phase}; found ${state}.`,
@@ -5631,7 +5689,7 @@ async function removePreparedConsumerFile({
       // Recheck remote target identity only after the quarantined object's
       // identity/content have been observed. The post-I/O local check below
       // then detects a concurrent local replacement before unlink.
-      await beforeQuarantineUnlink();
+      await beforeQuarantineUnlink({ quarantinePath });
     } catch (authorizationError) {
       restorationAttempted = true;
       try {

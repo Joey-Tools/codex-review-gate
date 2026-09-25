@@ -8817,10 +8817,42 @@ test("source bridge deletion restores the canonical bridge when source closure d
   }
 });
 
-test("source bridge deletion rejects unrelated worktree changes at every mutation rebind boundary", () => {
-  for (const [phase, expectsRestoration] of [
-    ["before-quarantine-rename", false],
-    ["after-quarantine-rename-before-unlink", true],
+test("source bridge deletion keeps remote rebinds inside the restorable pre-unlink boundary", () => {
+  for (const {
+    phase,
+    expectsRestoration,
+    expectsSuccess,
+    expectedWorktreeStatus,
+  } of [
+    {
+      phase: "before-quarantine-rename",
+      expectsRestoration: false,
+      expectsSuccess: false,
+      expectedWorktreeStatus: " M README.md\n",
+    },
+    {
+      phase: "after-quarantine-rename-tracked-before-unlink",
+      expectsRestoration: true,
+      expectsSuccess: false,
+      expectedWorktreeStatus: " M README.md\n",
+    },
+    {
+      phase: "after-quarantine-rename-staged-before-unlink",
+      expectsRestoration: true,
+      expectsSuccess: false,
+      expectedWorktreeStatus: "M  README.md\n",
+    },
+    {
+      phase: "after-quarantine-rename-untracked-before-unlink",
+      expectsRestoration: true,
+      expectsSuccess: false,
+      expectedWorktreeStatus: "?? unrelated-source-bridge-race.txt\n",
+    },
+    {
+      phase: "post-unlink-remote-rebind",
+      expectsRestoration: false,
+      expectsSuccess: true,
+    },
   ]) {
     const fixtureRoot = mkdtempSync(
       join(tmpdir(), `codex-review-gate-source-delete-worktree-diff-${phase}-`),
@@ -8828,6 +8860,7 @@ test("source bridge deletion rejects unrelated worktree changes at every mutatio
     const targetRoot = join(fixtureRoot, "source-worktree");
     const timingPreloadPath = join(fixtureRoot, "fast-source-closure.cjs");
     const diffPreloadPath = join(fixtureRoot, "source-worktree-diff-race.cjs");
+    const postUnlinkMarkerPath = join(fixtureRoot, "post-unlink-marker");
     const bridgePath = join(
       targetRoot,
       ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
@@ -8931,9 +8964,38 @@ test("source bridge deletion rejects unrelated worktree changes at every mutatio
           }),
           CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT: targetRoot,
           CODEX_SOURCE_CLOSURE_TEST_WORKTREE_DIFF_RACE_PHASE: phase,
+          CODEX_SOURCE_CLOSURE_TEST_POST_UNLINK_MARKER: postUnlinkMarkerPath,
+          ...(expectsSuccess
+            ? {
+                FAKE_GH_POST_UNLINK_MARKER: postUnlinkMarkerPath,
+                FAKE_GH_POST_UNLINK_MUTATION_TARGET: join(targetRoot, "README.md"),
+              }
+            : {}),
           NODE_OPTIONS: `--require=${timingPreloadPath} --require=${diffPreloadPath}`,
         },
       });
+      if (expectsSuccess) {
+        assert.equal(apply.status, 0, `${phase}: ${apply.stderr}`);
+        assert.equal(existsSync(postUnlinkMarkerPath), true, phase);
+        assert.equal(existsSync(bridgePath), false, phase);
+        assert.equal(
+          readFileSync(join(targetRoot, "README.md"), "utf8"),
+          "fixture base\n",
+          phase,
+        );
+        assert.equal(
+          runGit(["-C", targetRoot, "status", "--porcelain"]),
+          ` D ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}\n`,
+          phase,
+        );
+        assert.match(apply.stdout, /Applied: removed only/u, phase);
+        assert.doesNotMatch(
+          readFileSync(applyLog, "utf8"),
+          /^(?:PUT|PATCH|DELETE) /mu,
+          phase,
+        );
+        continue;
+      }
       assert.equal(apply.status, 1, `${phase}: ${apply.stderr}`);
       assert.match(
         apply.stderr,
@@ -8957,7 +9019,7 @@ test("source bridge deletion rejects unrelated worktree changes at every mutatio
       assert.equal(restoredBridge.ino, admittedBridge.ino, phase);
       assert.equal(
         runGit(["-C", targetRoot, "status", "--porcelain"]),
-        " M README.md\n",
+        expectedWorktreeStatus,
         phase,
       );
       assert.doesNotMatch(apply.stdout, /Applied: removed only/u, phase);
@@ -11139,13 +11201,16 @@ syncBuiltinESMExports();
 function sourceBridgeRemovalWorktreeDiffRacePreloadSource() {
   return `
 const fs = require("node:fs");
+const { execFileSync } = require("node:child_process");
 const { join } = require("node:path");
 const { syncBuiltinESMExports } = require("node:module");
 
 const originalMkdtemp = fs.promises.mkdtemp.bind(fs.promises);
 const originalRename = fs.promises.rename.bind(fs.promises);
+const originalUnlink = fs.promises.unlink.bind(fs.promises);
 const targetRoot = process.env.CODEX_SOURCE_CLOSURE_TEST_RACE_ROOT;
 const phase = process.env.CODEX_SOURCE_CLOSURE_TEST_WORKTREE_DIFF_RACE_PHASE;
+const postUnlinkMarkerPath = process.env.CODEX_SOURCE_CLOSURE_TEST_POST_UNLINK_MARKER;
 const bridgePath = join(
   targetRoot,
   ".github",
@@ -11168,6 +11233,21 @@ function injectUnrelatedTrackedDiff() {
   );
 }
 
+function injectUnrelatedStagedDiff() {
+  injectUnrelatedTrackedDiff();
+  execFileSync("git", ["-C", targetRoot, "add", "README.md"], {
+    stdio: "ignore",
+  });
+}
+
+function injectUnrelatedUntrackedFile() {
+  fs.writeFileSync(
+    join(targetRoot, "unrelated-source-bridge-race.txt"),
+    "unrelated untracked worktree change\\n",
+    "utf8",
+  );
+}
+
 if (phase === "before-quarantine-rename") {
   fs.promises.mkdtemp = async function patchedMkdtemp(prefix, ...args) {
     const directory = await originalMkdtemp(prefix, ...args);
@@ -11177,12 +11257,34 @@ if (phase === "before-quarantine-rename") {
     }
     return directory;
   };
-} else if (phase === "after-quarantine-rename-before-unlink") {
+} else if (
+  phase === "after-quarantine-rename-tracked-before-unlink" ||
+  phase === "after-quarantine-rename-staged-before-unlink" ||
+  phase === "after-quarantine-rename-untracked-before-unlink"
+) {
   fs.promises.rename = async function patchedRename(from, to) {
     const result = await originalRename(from, to);
     if (!injected && String(from) === bridgePath) {
       injected = true;
-      injectUnrelatedTrackedDiff();
+      if (phase === "after-quarantine-rename-staged-before-unlink") {
+        injectUnrelatedStagedDiff();
+      } else if (phase === "after-quarantine-rename-untracked-before-unlink") {
+        injectUnrelatedUntrackedFile();
+      } else {
+        injectUnrelatedTrackedDiff();
+      }
+    }
+    return result;
+  };
+} else if (phase === "post-unlink-remote-rebind") {
+  if (!postUnlinkMarkerPath) {
+    throw new Error("post-unlink race fixture requires a marker path");
+  }
+  fs.promises.unlink = async function patchedUnlink(path, ...args) {
+    const result = await originalUnlink(path, ...args);
+    if (!injected && String(path).startsWith(quarantinePrefix)) {
+      injected = true;
+      fs.writeFileSync(postUnlinkMarkerPath, "unlinked\\n", "utf8");
     }
     return result;
   };
@@ -11702,7 +11804,7 @@ function createFakeGhExecutable(fakeBin) {
     fakeGh,
     `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const responses = JSON.parse(process.env.FAKE_GH_RESPONSES);
@@ -11718,6 +11820,20 @@ const endpoint = process.argv[5];
 const methodIndex = process.argv.indexOf("--method");
 const method = methodIndex === -1 ? "GET" : process.argv[methodIndex + 1];
 const requestKey = \`\${method} \${endpoint}\`;
+if (
+  process.env.FAKE_GH_POST_UNLINK_MARKER &&
+  existsSync(process.env.FAKE_GH_POST_UNLINK_MARKER)
+) {
+  if (!process.env.FAKE_GH_POST_UNLINK_MUTATION_TARGET) {
+    process.stderr.write("post-unlink fake-gh mutation target is required\\n");
+    process.exit(2);
+  }
+  appendFileSync(
+    process.env.FAKE_GH_POST_UNLINK_MUTATION_TARGET,
+    "unexpected post-unlink remote request\\n",
+    "utf8",
+  );
+}
 const inputIndex = process.argv.indexOf("--input");
 const requestBody = inputIndex === -1 ? null : readFileSync(0, "utf8");
 if (process.env.FAKE_GH_CALL_LOG) {

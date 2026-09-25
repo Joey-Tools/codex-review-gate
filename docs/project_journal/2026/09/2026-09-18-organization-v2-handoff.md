@@ -1206,13 +1206,19 @@ evidence that a prior freeze remains in force.
   operational rather than documentary. The 60-second monotonic budget is
   checked again after the second complete snapshot before an equal pair can
   emit a receipt; a slow second read cannot turn an expired attempt into
-  success. After every remote rebind, the local executor reclassifies the
+  success. Every remote rebind that precedes a mutation reclassifies the
   whole worktree: it requires `clean` before either bridge-rename boundary and
-  only the exact admitted bridge deletion after quarantine rename. The latter
-  check remains inside the restoration path, so an unrelated concurrent
-  tracked, staged, or untracked change before unlink restores the same
-  admitted bridge object instead of leaving a mixed worktree with an already
-  deleted bridge.
+  only the exact admitted bridge deletion after quarantine rename. At that
+  latter boundary, the executor additionally permits exactly one task-owned
+  quarantine object at its fixed, verified relative path; it does not turn
+  arbitrary untracked files into an exception. The check remains inside the
+  restoration path, so an unrelated concurrent tracked, staged, or untracked
+  change before unlink restores the same admitted bridge object instead of
+  leaving a mixed worktree with an already-deleted bridge. There is deliberately
+  no new remote rebind after unlink: by then a rollback could overwrite a
+  concurrent destination. Success therefore ends with local-only exact-diff,
+  bridge-absence, and parent readback, while the normal same-UID
+  non-interference limit remains explicit rather than claimed away.
 - Source proof derive/rebind modes are fixed to
   `Joey-Tools/codex-review-gate`, repository source type, `Must Pass Codex
   Review v2`, and the source control-plane owner; same-shaped owner or ruleset
