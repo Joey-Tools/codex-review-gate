@@ -3,7 +3,7 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-24
+updated: 2026-09-25
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -137,10 +137,10 @@ the global cutover is closed.
   `codex/review-gate` required-status rule has been removed.
 - The completed policy mutation covers only the old organization rule and the
   fixed active cohort: all eight repository-local legacy cleanup surfaces now
-  require only `test`. It did not change the source repository's independent
-  local ruleset `16410326`, which remains a temporary `codex/review-gate` v1
-  self-gate pending a dedicated source bootstrap. The source repository is not
-  a hidden eleventh cohort member or a ninth cleanup surface.
+  require only `test`. A later, separately approved source-local cleanup also
+  removed only `codex/review-gate` from independent ruleset `16410326` while
+  retaining its non-status protections and temporary bridge. The source
+  repository is not a hidden eleventh cohort member or a ninth cleanup surface.
 - The initial read-only inventory found that all 11 originally selected members
   inherited old organization rule `16590367`; nine additionally retained a
   repository-level legacy `codex/review-gate` requirement. Later bootstrap and
@@ -1091,14 +1091,40 @@ evidence that a prior freeze remains in force.
   receipt; an inherited effective-rule projection cannot replace the direct
   organization detail proof.
 
+## Execution Update — 2026-09-25 (post-cutover fresh-audit authorization)
+
+- The original activation manifest format requires its canary evidence to have
+  been reviewed while the organization handoff was in flight. No completed,
+  reviewable instance of that historical manifest was retained for the already
+  cut-over cohort. It must not be reconstructed after the fact or represented
+  as historical activation proof.
+- The user authorized a distinct post-cutover path: establish new v2 canaries
+  for the fixed active 10-member cohort, then bind those new observations and
+  the current exact policy/workflow readback in a separately identified closure
+  receipt. This path will prove current configuration and current v2 behavior,
+  not rewrite or claim the historical activation transaction.
+- The new path must retain the fixed cohort identity, explicit writable
+  `bypass_actors` readback, two stable complete snapshots, and the archived
+  `codex-waited-delivery` exclusion. It must not restore any v1 required status.
+  No bridge-removal mutation is authorized until its implementation, fresh
+  evidence, receipt, and per-repository removal PRs are independently reviewed.
+- Freshness is an enforced protocol property, not an operator label: every
+  canary binds its exact GitHub `created_at` through the reviewed manifest,
+  stable snapshots, and receipt, and must be strictly later than the fixed
+  batch boundary `2026-09-24T23:38:00Z`. A self-consistent historical PR/run
+  substitution with an older, malformed, or manifest-mismatched timestamp is
+  rejected. The source self-hosting repository is likewise excluded by its
+  slug, numeric ID, and node ID on both producer and bridge-removal admission;
+  it retains its independent source-local closure-proof path.
+
 ## Next Steps
 
-1. Keep the temporary legacy bridges installed. Before any active-cohort
-   bridge-removal PR, use a ruleset-write-capable credential for every
-   manifest-bound detail read, obtain a fresh applicable policy-mutation freeze,
-   and mint the canonical schema-2 final read-only closure receipt against the
-   now-cut-over state. That receipt cannot authorize a source-local bridge
-   outside the frozen cohort.
+1. Implement and review the authorized post-cutover fresh-audit path. Under a
+   fresh applicable policy-mutation freeze, collect new exact v2 canary evidence
+   for all ten active repositories, verify current policy/workflow state with a
+   ruleset-write-capable credential, mint its new receipt, and only then open
+   separate active-cohort bridge-removal PRs. That receipt cannot authorize a
+   source-local bridge outside the frozen cohort.
 2. Treat the cohort v1 status transition as complete: do not restore
    `codex/review-gate` in the old organization rule or on any fixed active
    cohort repository. The old organization ruleset intentionally remains Active
@@ -1109,9 +1135,9 @@ evidence that a prior freeze remains in force.
    protections remain. Keep the source bridge installed until a distinct,
    separately authorized source-local closure proof exists; the organization
    closure receipt cannot authorize it.
-4. If a durable provenance record is needed, investigate the observed v2
-   activation separately; it is not required for the currently verified policy
-   state and was intentionally deferred by the switch-first decision.
+4. Do not backfill the historical activation manifest or use a post-cutover
+   receipt to claim that historical activation evidence was independently
+   captured. Any later provenance investigation remains audit-only.
 
 ## Evidence
 

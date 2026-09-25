@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   validateOrganizationFinalClosureOutput,
+  validateOrganizationBridgeRemovalProofOutput,
   validateCanonicalV2WorkflowInventory,
   validateFrozenHandoffV2WorkflowInventory,
 } from "../src/bootstrap.mjs";
@@ -29,12 +30,19 @@ import {
   MANIFEST_SCHEMA_VERSION,
   NONTERMINAL_WORKFLOW_RUN_STATUSES,
   OUTPUT_SCHEMA_VERSION,
+  POST_CUTOVER_AUDIT_KIND,
+  POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
+  POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION,
+  POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION,
+  POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION,
   REQUIRED_REPOSITORY_COUNT,
   RetryableHandoffEvidenceUnstableError,
+  SOURCE_SELF_HOSTING_REPOSITORY,
   V2_RULESET_NAME,
   V2_STATUS_CONTEXT,
   V2_VERIFIER_RUN_NAME_PREFIX,
   buildFinalClosureReceipt,
+  buildPostCutoverAuditReceipt,
   buildV2OrganizationRulesetPayload,
   canonicalJson,
   deriveLegacyOrganizationCutoverPayload,
@@ -43,6 +51,7 @@ import {
   loadStableSnapshots,
   mapWithConcurrency,
   parseWorkflowRunPath,
+  postCutoverAuditPlanDigest,
   runCli,
   scanLegacyWriterRuns,
   sha256Canonical,
@@ -51,6 +60,7 @@ import {
   validateLegacyStatusPages,
   validateDefaultBranchResponse,
   validateManifest,
+  validatePostCutoverAuditManifest,
   validateV2CheckRunResponse,
 } from "../scripts/organization-review-gate-handoff.mjs";
 
@@ -439,12 +449,16 @@ function assertManifestRejected(mutator, pattern) {
   assert.throws(() => validateManifest(manifest), pattern);
 }
 
-function canaryPullGraphqlResponse(repo) {
+function canaryPullGraphqlResponse(
+  repo,
+  { createdAt = "2026-09-25T00:00:00Z" } = {},
+) {
   return {
     data: {
       repository: {
         pullRequest: {
           number: repo.canary.pull_number,
+          createdAt,
           state: "OPEN",
           merged: false,
           isDraft: false,
@@ -601,6 +615,141 @@ function integrationManifestFixture() {
   return { manifest, codeownersBytes };
 }
 
+function postCutoverAuditManifestFromHandoff(
+  handoffManifest,
+  { createdAt = "2026-09-25T00:00:00Z" } = {},
+) {
+  return {
+    schema_version: POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION,
+    audit_kind: POST_CUTOVER_AUDIT_KIND,
+    organization: clone(handoffManifest.organization),
+    legacy_ruleset: {
+      id: handoffManifest.legacy_ruleset.id,
+      legacy_only_repository: clone(
+        handoffManifest.legacy_ruleset.legacy_only_repository,
+      ),
+      expected_after: deriveLegacyOrganizationCutoverPayload(handoffManifest),
+    },
+    v2_ruleset: {
+      id: handoffManifest.v2_ruleset.id,
+      name: handoffManifest.v2_ruleset.name,
+      expected: buildV2OrganizationRulesetPayload(handoffManifest, "active"),
+    },
+    repositories: handoffManifest.repositories.map((repository) => ({
+      slug: repository.slug,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+      workflows: clone(repository.workflows),
+      codeowners: clone(repository.codeowners),
+      v2_ruleset: clone(repository.v2_ruleset),
+      canary: {
+        pull_number: repository.canary.pull_number,
+        created_at: createdAt,
+        head_sha: repository.canary.head_sha,
+        base_sha: repository.canary.base_sha,
+        test_merge_sha: repository.canary.test_merge_sha,
+        v2_check_run_id: repository.canary.v2_check_run_id,
+        v2_run_id: repository.canary.v2_run_id,
+        v2_job_id: repository.canary.v2_job_id,
+        v2_workflow_id: repository.canary.v2_workflow_id,
+        v2_run_attempt: repository.canary.v2_run_attempt,
+      },
+    })),
+  };
+}
+
+function postCutoverAuditManifestFixture() {
+  const { manifest } = integrationManifestFixture();
+  return postCutoverAuditManifestFromHandoff(manifest);
+}
+
+function postCutoverAuditSnapshotFixture(
+  manifest,
+  { createdAt = undefined } = {},
+) {
+  return {
+    organization: {
+      organization: clone(manifest.organization),
+      legacy_only_repository: {
+        full_name: manifest.legacy_ruleset.legacy_only_repository.slug,
+        id: manifest.legacy_ruleset.legacy_only_repository.id,
+        node_id: manifest.legacy_ruleset.legacy_only_repository.node_id,
+        default_branch: manifest.legacy_ruleset.legacy_only_repository.default_branch,
+        archived: true,
+      },
+      legacy: {
+        id: manifest.legacy_ruleset.id,
+        source_type: "Organization",
+        source: manifest.organization.login,
+        writable: clone(manifest.legacy_ruleset.expected_after),
+      },
+      v2: {
+        id: manifest.v2_ruleset.id,
+        source_type: "Organization",
+        source: manifest.organization.login,
+        writable: clone(manifest.v2_ruleset.expected),
+      },
+    },
+    repositories: manifest.repositories.map((repository) => ({
+      identity: {
+        full_name: repository.slug,
+        id: repository.id,
+        node_id: repository.node_id,
+        default_branch: repository.default_branch,
+      },
+      canary: {
+        number: repository.canary.pull_number,
+        state: "OPEN",
+        merged: false,
+        draft: false,
+        mergeable: "MERGEABLE",
+        head_sha: repository.canary.head_sha,
+        base_ref: repository.default_branch,
+        base_sha: repository.canary.base_sha,
+        test_merge_sha: repository.canary.test_merge_sha,
+        created_at: createdAt ?? repository.canary.created_at,
+      },
+      canary_evidence: {
+        check_run: {
+          id: repository.canary.v2_check_run_id,
+          head_sha: repository.canary.head_sha,
+        },
+        run: {
+          id: repository.canary.v2_run_id,
+          workflow_id: repository.canary.v2_workflow_id,
+          run_attempt: repository.canary.v2_run_attempt,
+          head_sha: repository.canary.head_sha,
+        },
+        job: {
+          id: repository.canary.v2_job_id,
+          check_run_id: repository.canary.v2_check_run_id,
+        },
+      },
+    })),
+  };
+}
+
+function postCutoverAuditSourceSubstitutionManifest(signal) {
+  const { manifest } = integrationManifestFixture();
+  const repository = manifest.repositories[0];
+  const originalId = repository.id;
+  if (signal === "slug" || signal === "all") {
+    repository.slug = SOURCE_SELF_HOSTING_REPOSITORY.slug;
+  }
+  if (signal === "id" || signal === "all") {
+    repository.id = SOURCE_SELF_HOSTING_REPOSITORY.id;
+    manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids =
+      manifest.legacy_ruleset.expected_before.conditions.repository_id.repository_ids.map(
+        (id) => (id === originalId ? SOURCE_SELF_HOSTING_REPOSITORY.id : id),
+      );
+  }
+  if (signal === "node_id" || signal === "all") {
+    repository.node_id = SOURCE_SELF_HOSTING_REPOSITORY.node_id;
+  }
+  return postCutoverAuditManifestFromHandoff(manifest);
+}
+
 function encodeEndpointPathForTest(value) {
   return value.split("/").map(encodeURIComponent).join("/");
 }
@@ -672,6 +821,7 @@ function createFakeGhHarness(
     additionalActionsWorkflows = [],
     additionalLocalRulesetIds = [],
     canaryState = "open",
+    canaryCreatedAt = "2026-09-25T00:00:00Z",
     defaultWorkflowPermissions = "read",
     newerLegacyStatusContext = null,
     unexpectedWorkflowTree = false,
@@ -1239,7 +1389,9 @@ function createFakeGhHarness(
     if (canaryState !== "closed") {
       assert.equal(canaryState, "open");
     }
-    const graphQlResponse = canaryPullGraphqlResponse(repository);
+    const graphQlResponse = canaryPullGraphqlResponse(repository, {
+      createdAt: canaryCreatedAt,
+    });
     if (canaryState === "closed") {
       graphQlResponse.data.repository.pullRequest.state = "CLOSED";
     }
@@ -1929,6 +2081,16 @@ function createFakeGhHarness(
   };
 }
 
+function createFakePostCutoverAuditHarness(t, options = {}) {
+  const harness = createFakeGhHarness(t, options);
+  const manifest = postCutoverAuditManifestFromHandoff(harness.manifest);
+  writeFileSync(harness.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  writeFileSync(harness.v2StatePath, "active\n");
+  writeFileSync(harness.legacyStatePath, "after\n");
+  writeFileSync(harness.cleanupStatePath, "after\n");
+  return { ...harness, manifest };
+}
+
 function fakeGhRequests(logPath) {
   const text = readFileSync(logPath, "utf8").trim();
   if (text === "") return [];
@@ -2021,6 +2183,28 @@ test("exports the closed organization handoff protocol constants", () => {
   assert.equal(MANIFEST_SCHEMA_VERSION, "organization-review-gate-handoff-manifest/v3");
   assert.equal(OUTPUT_SCHEMA_VERSION, "organization-review-gate-handoff-output/v2");
   assert.equal(FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION, 2);
+  assert.equal(
+    POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION,
+    "organization-review-gate-post-cutover-audit-manifest/v1",
+  );
+  assert.equal(
+    POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION,
+    "organization-review-gate-post-cutover-audit-output/v1",
+  );
+  assert.equal(
+    POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION,
+    "organization-review-gate-post-cutover-audit-receipt/v1",
+  );
+  assert.equal(POST_CUTOVER_AUDIT_KIND, "fresh-v2-canary");
+  assert.equal(
+    POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
+    "2026-09-24T23:38:00Z",
+  );
+  assert.deepEqual(SOURCE_SELF_HOSTING_REPOSITORY, {
+    slug: "Joey-Tools/codex-review-gate",
+    id: 1238138775,
+    node_id: "R_kgDOScx_lw",
+  });
   assert.equal(REQUIRED_REPOSITORY_COUNT, 10);
   assert.equal(LEGACY_SELECTOR_REPOSITORY_COUNT, 11);
   assert.equal(V2_RULESET_NAME, "Must Pass Codex Review v2");
@@ -5089,6 +5273,12 @@ test("GraphQL canary evidence binds the supported potential test merge commit", 
     test_merge_sha: repo.canary.test_merge_sha,
     changed_files: 1,
   });
+  assert.equal(
+    validateCanaryPullGraphqlResponse(response, repo, {
+      requireFreshCreatedAt: true,
+    }).created_at,
+    "2026-09-25T00:00:00Z",
+  );
   for (const [name, mutate] of [
     ["wrong number", (value) => { value.data.repository.pullRequest.number += 1; }],
     ["merged", (value) => { value.data.repository.pullRequest.merged = true; }],
@@ -5111,6 +5301,42 @@ test("GraphQL canary evidence binds the supported potential test merge commit", 
         /exact open, mergeable, non-draft, same-repository, current-base PR\/head\/test-merge/u,
       );
     });
+  }
+});
+
+test("post-cutover canary observations require a canonical fresh creation timestamp", () => {
+  const repo = manifestFixture().repositories[0];
+  for (const [name, createdAt, error] of [
+    [
+      "before cutoff",
+      "2026-09-24T23:37:59Z",
+      /strictly later than the post-cutover freshness boundary/u,
+    ],
+    [
+      "at cutoff",
+      POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
+      /strictly later than the post-cutover freshness boundary/u,
+    ],
+    [
+      "fractional precision",
+      "2026-09-25T00:00:00.000Z",
+      /canonical GitHub ISO UTC timestamp with second precision/u,
+    ],
+    [
+      "invalid calendar value",
+      "2026-02-30T00:00:00Z",
+      /not a valid GitHub ISO UTC timestamp/u,
+    ],
+  ]) {
+    const response = canaryPullGraphqlResponse(repo, { createdAt });
+    assert.throws(
+      () =>
+        validateCanaryPullGraphqlResponse(response, repo, {
+          requireFreshCreatedAt: true,
+        }),
+      error,
+      name,
+    );
   }
 });
 
@@ -6383,4 +6609,353 @@ test("classic cleanup removes v1 from both legacy representations and preserves 
     () => deriveRepositoryCleanupAction({ ...action, surface: "unknown" }),
     /Unsupported repository cleanup surface/u,
   );
+});
+
+test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t);
+  assert.deepEqual(validatePostCutoverAuditManifest(harness.manifest), harness.manifest);
+
+  const output = await runFakeCli(harness, "post-cutover-audit");
+  assert.deepEqual(Object.keys(output).sort(), [
+    "action",
+    "applied",
+    "audit_kind",
+    "manifest_sha256",
+    "mode",
+    "organization",
+    "plan_sha256",
+    "post_cutover_audit_receipt",
+    "post_cutover_audit_receipt_sha256",
+    "repositories_verified",
+    "schema_version",
+    "snapshot_sha256",
+    "status",
+  ]);
+  assert.equal(output.schema_version, POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION);
+  assert.equal(output.mode, "post-cutover-audit");
+  assert.equal(output.audit_kind, POST_CUTOVER_AUDIT_KIND);
+  assert.equal(output.status, "fresh-v2-canaries-verified");
+  assert.equal(output.applied, false);
+  assert.equal(output.action, null);
+  assert.equal(output.repositories_verified, REQUIRED_REPOSITORY_COUNT);
+  assert.equal(
+    output.plan_sha256,
+    postCutoverAuditPlanDigest({
+      mode: "post-cutover-audit",
+      audit_kind: POST_CUTOVER_AUDIT_KIND,
+      manifest_sha256: output.manifest_sha256,
+      snapshot_sha256: output.snapshot_sha256,
+      action: null,
+    }),
+  );
+  assert.equal(
+    output.post_cutover_audit_receipt_sha256,
+    sha256Canonical(output.post_cutover_audit_receipt),
+  );
+  const receipt = output.post_cutover_audit_receipt;
+  assert.equal(receipt.schema_version, POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION);
+  assert.equal(receipt.audit_kind, POST_CUTOVER_AUDIT_KIND);
+  assert.deepEqual(receipt.manifest_repositories, receipt.repositories);
+  assert.equal(receipt.manifest_repositories.length, REQUIRED_REPOSITORY_COUNT);
+  assert.equal(receipt.v2_canaries.length, REQUIRED_REPOSITORY_COUNT);
+  assert.equal(receipt.legacy.legacy_status_context, "absent");
+  assert.deepEqual(receipt.v2.required_status, {
+    context: V2_STATUS_CONTEXT,
+    integration_id: GITHUB_ACTIONS_INTEGRATION_ID,
+    strict: true,
+  });
+  assert.deepEqual(
+    validateOrganizationBridgeRemovalProofOutput(output).receipt,
+    receipt,
+  );
+  for (const [index, canary] of receipt.v2_canaries.entries()) {
+    assert.deepEqual(
+      {
+        full_name: canary.full_name,
+        id: canary.id,
+        node_id: canary.node_id,
+        default_branch: canary.default_branch,
+      },
+      receipt.repositories[index],
+    );
+    assert.deepEqual(Object.keys(canary).sort(), [
+      "base_sha",
+      "created_at",
+      "default_branch",
+      "full_name",
+      "head_sha",
+      "id",
+      "node_id",
+      "pull_number",
+      "test_merge_sha",
+      "v2_check_run_id",
+      "v2_job_id",
+      "v2_run_attempt",
+      "v2_run_id",
+      "v2_workflow_id",
+    ]);
+    assert.equal(canary.created_at, "2026-09-25T00:00:00Z");
+  }
+  const requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(mutationRequests(requests), []);
+  for (const repository of harness.manifest.repositories) {
+    const checkRunEndpoint =
+      `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
+      `${repository.canary.head_sha}/check-runs?check_name=` +
+      `${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=latest&per_page=100`;
+    assert.equal(
+      countRequest(requests, "GET", checkRunEndpoint),
+      2,
+      `${repository.slug} must re-read the native v2 CheckRun in both stable snapshots`,
+    );
+    for (const [label, endpoint] of [
+      [
+        "Actions run",
+        `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/${repository.canary.v2_run_id}`,
+      ],
+      [
+        "Actions workflow",
+        `repos/${encodeEndpointPathForTest(repository.slug)}/actions/workflows/${repository.canary.v2_workflow_id}`,
+      ],
+      [
+        "Actions job attempt",
+        `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`,
+      ],
+    ]) {
+      assert.equal(
+        countRequest(requests, "GET", endpoint),
+        2,
+        `${repository.slug} must re-read the native v2 ${label} in both stable snapshots`,
+      );
+    }
+    const canaryPullRequests = requests.filter(
+      (request) =>
+        request.method === "POST" &&
+        request.endpoint === "graphql" &&
+        request.body?.variables?.owner === repository.slug.split("/")[0] &&
+        request.body?.variables?.name === repository.slug.split("/")[1] &&
+        request.body?.variables?.number === repository.canary.pull_number,
+    );
+    assert.equal(
+      canaryPullRequests.length,
+      2,
+      `${repository.slug} must re-read the exact open canary pull in both stable snapshots`,
+    );
+    for (const request of canaryPullRequests) {
+      assert.match(request.body?.query ?? "", /\bcreatedAt\b/u);
+    }
+  }
+});
+
+test("post-cutover audit rejects stale and malformed observed canary creation times", async (t) => {
+  for (const [name, canaryCreatedAt, error] of [
+    [
+      "before cutoff",
+      "2026-09-24T23:37:59Z",
+      /strictly later than the post-cutover freshness boundary/u,
+    ],
+    [
+      "malformed fractional timestamp",
+      "2026-09-25T00:00:00.000Z",
+      /canonical GitHub ISO UTC timestamp with second precision/u,
+    ],
+  ]) {
+    await t.test(name, async (t) => {
+      const harness = createFakePostCutoverAuditHarness(t, { canaryCreatedAt });
+      await assert.rejects(runFakeCli(harness, "post-cutover-audit"), error);
+      assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+    });
+  }
+});
+
+test("post-cutover audit has no write or recovery invocation path and rejects schema cross-use", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t);
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit", [
+      "--apply",
+      "--expected-plan-sha256",
+      "0".repeat(64),
+    ]),
+    /--apply is valid only with/u,
+  );
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit", ["--recover-created-v2"]),
+    /--recover-created-v2 is valid only with stage mode/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+
+  const historicalManifest = integrationManifestFixture().manifest;
+  writeFileSync(
+    harness.manifestPath,
+    `${JSON.stringify(historicalManifest, null, 2)}\n`,
+  );
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit"),
+    /post-cutover audit manifest\.schema_version/u,
+  );
+  writeFileSync(harness.manifestPath, `${JSON.stringify(harness.manifest, null, 2)}\n`);
+  await assert.rejects(
+    runFakeCli(harness, "verify"),
+    /post-cutover audit manifest is read-only/u,
+  );
+});
+
+test("post-cutover stable-pair contract fails closed when fresh canary state keeps drifting", async () => {
+  let phase = 0;
+  let clock = 0;
+  let loads = 0;
+  await assert.rejects(
+    loadStableSnapshots(
+      "Post-cutover fresh v2 audit",
+      async () => {
+        loads += 1;
+        return {
+          canary: {
+            head_sha: `${phase}`.padStart(40, "0"),
+            v2_check_run_id: phase + 1,
+          },
+        };
+      },
+      {
+        intervalMs: 5,
+        timeoutMs: 10,
+        now: () => clock,
+        sleep: async (milliseconds) => {
+          clock += milliseconds;
+          phase += 1;
+        },
+      },
+    ),
+    /remained unstable for 10ms/u,
+  );
+  assert.equal(loads, 4, "a drifting audit must read full pairs before timing out");
+});
+
+test("post-cutover audit rejects missing bypass disclosure, residual legacy policy, and org mismatch", async (t) => {
+  await t.test("missing repository-v2 bypass disclosure", async (t) => {
+    const harness = createFakePostCutoverAuditHarness(t, {
+      mutateRepositoryV2RulesetReadback: (ruleset) => {
+        delete ruleset.bypass_actors;
+        return ruleset;
+      },
+    });
+    await assert.rejects(
+      runFakeCli(harness, "post-cutover-audit"),
+      /omitted bypass_actors/u,
+    );
+    assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+  });
+
+  await t.test("residual local legacy context", async (t) => {
+    const harness = createFakePostCutoverAuditHarness(t);
+    writeFileSync(harness.cleanupStatePath, "before\n");
+    await assert.rejects(
+      runFakeCli(harness, "post-cutover-audit"),
+      /still requires codex\/review-gate/u,
+    );
+    assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+  });
+
+  await t.test("organization legacy expected-after mismatch", async (t) => {
+    const harness = createFakePostCutoverAuditHarness(t);
+    writeFileSync(harness.legacyStatePath, "before\n");
+    await assert.rejects(
+      runFakeCli(harness, "post-cutover-audit"),
+      /Post-cutover legacy organization ruleset drifted/u,
+    );
+    assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+  });
+});
+
+test("post-cutover receipt requires canonical one-to-one canary bindings", () => {
+  const manifest = postCutoverAuditManifestFixture();
+  assert.deepEqual(validatePostCutoverAuditManifest(manifest), manifest);
+  const duplicateCheckRun = clone(manifest);
+  duplicateCheckRun.repositories[1].canary.v2_check_run_id =
+    duplicateCheckRun.repositories[0].canary.v2_check_run_id;
+  assert.throws(
+    () => validatePostCutoverAuditManifest(duplicateCheckRun),
+    /v2_check_run_id must be one-to-one/u,
+  );
+
+  const unexpectedLegacyField = clone(manifest);
+  unexpectedLegacyField.repositories[0].canary.legacy_status_id = 123;
+  assert.throws(
+    () => validatePostCutoverAuditManifest(unexpectedLegacyField),
+    /must contain exactly these keys/u,
+  );
+
+  const beforeCutoff = clone(manifest);
+  beforeCutoff.repositories[0].canary.created_at = "2026-09-24T23:37:59Z";
+  assert.throws(
+    () => validatePostCutoverAuditManifest(beforeCutoff),
+    /strictly later than the post-cutover freshness boundary/u,
+  );
+
+  const malformedCreatedAt = clone(manifest);
+  malformedCreatedAt.repositories[0].canary.created_at =
+    "2026-09-25T00:00:00.000Z";
+  assert.throws(
+    () => validatePostCutoverAuditManifest(malformedCreatedAt),
+    /canonical GitHub ISO UTC timestamp with second precision/u,
+  );
+});
+
+test("post-cutover receipt builder copies only strictly fresh observed created_at values", () => {
+  const manifest = postCutoverAuditManifestFixture();
+  const snapshot = postCutoverAuditSnapshotFixture(manifest);
+  const receipt = buildPostCutoverAuditReceipt(manifest, snapshot);
+  assert.deepEqual(
+    receipt.v2_canaries.map((canary) => canary.created_at),
+    Array(REQUIRED_REPOSITORY_COUNT).fill("2026-09-25T00:00:00Z"),
+  );
+
+  const staleSnapshot = postCutoverAuditSnapshotFixture(manifest, {
+    createdAt: "2026-09-24T23:37:59Z",
+  });
+  assert.throws(
+    () => buildPostCutoverAuditReceipt(manifest, staleSnapshot),
+    /strictly later than the post-cutover freshness boundary/u,
+  );
+
+  const mismatchedSnapshot = postCutoverAuditSnapshotFixture(manifest, {
+    createdAt: "2026-09-25T00:00:01Z",
+  });
+  assert.throws(
+    () => buildPostCutoverAuditReceipt(manifest, mismatchedSnapshot),
+    /observed created_at does not exactly match the manifest-bound fresh canary/u,
+  );
+});
+
+test("post-cutover manifest and receipt explicitly exclude source self-hosting by every identity signal", async (t) => {
+  for (const signal of ["slug", "id", "node_id", "all"]) {
+    await t.test(`recomputed active-cohort source substitution by ${signal}`, () => {
+      const manifest = postCutoverAuditSourceSubstitutionManifest(signal);
+      assert.throws(
+        () => validatePostCutoverAuditManifest(manifest),
+        /must explicitly exclude source self-hosting repository Joey-Tools\/codex-review-gate by slug\/id\/node identity/u,
+      );
+      assert.throws(
+        () => buildPostCutoverAuditReceipt(manifest, {}),
+        /must explicitly exclude source self-hosting repository Joey-Tools\/codex-review-gate by slug\/id\/node identity/u,
+      );
+    });
+  }
+
+  await t.test("archived legacy-only selector cannot substitute the source", () => {
+    const manifest = postCutoverAuditManifestFixture();
+    const originalId = manifest.legacy_ruleset.legacy_only_repository.id;
+    Object.assign(
+      manifest.legacy_ruleset.legacy_only_repository,
+      SOURCE_SELF_HOSTING_REPOSITORY,
+    );
+    manifest.legacy_ruleset.expected_after.conditions.repository_id.repository_ids =
+      manifest.legacy_ruleset.expected_after.conditions.repository_id.repository_ids.map(
+        (id) => (id === originalId ? SOURCE_SELF_HOSTING_REPOSITORY.id : id),
+      );
+    assert.throws(
+      () => validatePostCutoverAuditManifest(manifest),
+      /must explicitly exclude source self-hosting repository Joey-Tools\/codex-review-gate by slug\/id\/node identity/u,
+    );
+  });
 });

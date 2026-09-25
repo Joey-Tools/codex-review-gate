@@ -33,12 +33,17 @@ import {
   LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   LEGACY_STATUS_CONTEXT,
   ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
+  POST_CUTOVER_AUDIT_KIND,
+  POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
+  POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION,
+  POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION,
   RULESET_PROFILE_FULL,
   RULESET_PROFILE_STATUS_ONLY,
   assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
   canonicalOrganizationFinalClosureReceipt,
+  canonicalOrganizationPostCutoverAuditReceipt,
   canonicalLegacyReviewGateInventoryBytes,
   buildUpdateRulesetPayload,
   codeownersHasEffectiveUnmanagedPatterns,
@@ -59,6 +64,7 @@ import {
   normalizeRulesetProfile,
   normalizeWorkflowPath,
   organizationFinalClosurePlanSha256,
+  organizationPostCutoverAuditPlanSha256,
   parseGitHubRepositoryRemote,
   parseRepoSlug,
   requiredStatusCheckContexts,
@@ -77,6 +83,8 @@ import {
   validateCanonicalLegacyBridgeWorkflowContent,
   validateControlPlaneCodeownersContent,
   validateOrganizationFinalClosureOutput,
+  validateOrganizationBridgeRemovalProofOutput,
+  validateOrganizationPostCutoverAuditOutput,
   workflowCanWriteStatuses,
   workflowContainsCodexReviewGateCaller,
   workflowContainsLegacyV1Caller,
@@ -1801,6 +1809,142 @@ test("validates historical v1 and current v2 organization final closure receipts
   }
 });
 
+test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
+  const output = buildPostCutoverAuditOutput();
+  const validated = validateOrganizationPostCutoverAuditOutput(output);
+  const genericValidated = validateOrganizationBridgeRemovalProofOutput(output);
+  assert.deepEqual(
+    validated.receipt,
+    output.post_cutover_audit_receipt,
+  );
+  assert.equal(
+    genericValidated.proofKind,
+    "post-cutover-audit-v1",
+  );
+  assert.deepEqual(
+    genericValidated.bridgeRemovalRepositories,
+    output.post_cutover_audit_receipt.manifest_repositories,
+  );
+  assert.equal(
+    genericValidated.canonicalReceipt,
+    canonicalOrganizationPostCutoverAuditReceipt(
+      output.post_cutover_audit_receipt,
+    ),
+  );
+  assert.throws(
+    () => validateOrganizationFinalClosureOutput(output),
+    /handoff output|unexpected or missing field/u,
+    "the historical handoff validator remains handoff-only",
+  );
+  assert.throws(
+    () => validateOrganizationBridgeRemovalProofOutput(
+      buildFinalClosureOutput({ format: "v1" }),
+    ),
+    /historical evidence.*not an admitted bridge-removal proof/u,
+    "historical handoff evidence is not bridge-removal authority",
+  );
+
+  const malformedAuditKind = structuredClone(output);
+  malformedAuditKind.audit_kind = "historical-v2-canary";
+
+  const crossPairedReceiptSchema = structuredClone(output);
+  crossPairedReceiptSchema.post_cutover_audit_receipt.schema_version =
+    "organization-review-gate-handoff-receipt/v2";
+
+  const crossPairedOutputSchema = structuredClone(output);
+  crossPairedOutputSchema.schema_version =
+    "organization-review-gate-handoff-output/v2";
+
+  const archivedCohort = structuredClone(output);
+  const archiveSubstitution = substituteArchivedLegacyOnlyReceiptRepository(
+    archivedCohort.post_cutover_audit_receipt.repositories,
+  );
+  archivedCohort.post_cutover_audit_receipt.repositories = archiveSubstitution;
+  archivedCohort.post_cutover_audit_receipt.manifest_repositories =
+    structuredClone(archiveSubstitution);
+
+  const sourceSelfHostingCohort = structuredClone(output);
+  const sourceSelfHostingSubstitution =
+    substituteSourceSelfHostingReceiptRepository(
+      sourceSelfHostingCohort.post_cutover_audit_receipt.repositories,
+    );
+  sourceSelfHostingCohort.post_cutover_audit_receipt.repositories =
+    sourceSelfHostingSubstitution;
+  sourceSelfHostingCohort.post_cutover_audit_receipt.manifest_repositories =
+    structuredClone(sourceSelfHostingSubstitution);
+  sourceSelfHostingCohort.post_cutover_audit_receipt.v2_canaries =
+    sourceSelfHostingSubstitution.map((repository, index) => ({
+      ...sourceSelfHostingCohort.post_cutover_audit_receipt.v2_canaries[index],
+      ...repository,
+    }));
+  refreshPostCutoverAuditReceiptDigest(sourceSelfHostingCohort);
+
+  const mismatchedManifestCohort = structuredClone(output);
+  mismatchedManifestCohort.post_cutover_audit_receipt.manifest_repositories[0]
+    .node_id = "R_kgDOMismatchedManifest";
+
+  const crossLinkedCanary = structuredClone(output);
+  crossLinkedCanary.post_cutover_audit_receipt.v2_canaries[0].id += 1;
+
+  const duplicateCanaryRun = structuredClone(output);
+  duplicateCanaryRun.post_cutover_audit_receipt.v2_canaries[1].v2_run_id =
+    duplicateCanaryRun.post_cutover_audit_receipt.v2_canaries[0].v2_run_id;
+
+  const missingCanary = structuredClone(output);
+  missingCanary.post_cutover_audit_receipt.v2_canaries.pop();
+
+  const malformedCanarySha = structuredClone(output);
+  malformedCanarySha.post_cutover_audit_receipt.v2_canaries[0].head_sha =
+    "a".repeat(39);
+
+  const staleCanaries = structuredClone(output);
+  for (const canary of staleCanaries.post_cutover_audit_receipt.v2_canaries) {
+    canary.created_at = new Date(
+      Date.parse(POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE) - 1_000,
+    )
+      .toISOString()
+      .replace(".000Z", "Z");
+  }
+  refreshPostCutoverAuditReceiptDigest(staleCanaries);
+
+  const cutoffCanaries = structuredClone(output);
+  for (const canary of cutoffCanaries.post_cutover_audit_receipt.v2_canaries) {
+    canary.created_at = POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE;
+  }
+  refreshPostCutoverAuditReceiptDigest(cutoffCanaries);
+
+  const malformedCanaryTimestamp = structuredClone(output);
+  malformedCanaryTimestamp.post_cutover_audit_receipt.v2_canaries[0].created_at =
+    "2026-09-25T00:00:00.000Z";
+  refreshPostCutoverAuditReceiptDigest(malformedCanaryTimestamp);
+
+  const wrongReceiptDigest = structuredClone(output);
+  wrongReceiptDigest.post_cutover_audit_receipt_sha256 = "f".repeat(64);
+
+  for (const [name, candidate] of [
+    ["wrong-audit-kind", malformedAuditKind],
+    ["cross-paired-receipt-schema", crossPairedReceiptSchema],
+    ["cross-paired-output-schema", crossPairedOutputSchema],
+    ["archived-legacy-only-cohort", archivedCohort],
+    ["source-self-hosting-cohort", sourceSelfHostingCohort],
+    ["manifest-observed-cohort-mismatch", mismatchedManifestCohort],
+    ["cross-linked-canary-repository", crossLinkedCanary],
+    ["duplicate-canary-run", duplicateCanaryRun],
+    ["missing-canary", missingCanary],
+    ["malformed-canary-sha", malformedCanarySha],
+    ["stale-canaries", staleCanaries],
+    ["cutoff-canaries", cutoffCanaries],
+    ["malformed-canary-timestamp", malformedCanaryTimestamp],
+    ["wrong-receipt-digest", wrongReceiptDigest],
+  ]) {
+    assert.throws(
+      () => validateOrganizationBridgeRemovalProofOutput(candidate),
+      /audit_kind|schema_version|handoff output|archived|manifest|canaries|canary|created_at|freshness|SHA|sha256|unexpected or missing field/u,
+      name,
+    );
+  }
+});
+
 test("normalizes workflow paths to repository workflow files", () => {
   assert.equal(
     normalizeWorkflowPath(" .github/workflows/codex-review-gate.yml "),
@@ -2045,7 +2189,53 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
   }
 });
 
-test("legacy bridge removal requires an exact repository-bound final closure receipt", () => {
+test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-audit-removal-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot);
+    const auditProofEnv = finalClosureGhEnvironment(targetRoot);
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], { env: auditProofEnv });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Admitted bridge-removal proof/u);
+    assert.match(result.stdout, /Applied: remove the exact temporary legacy bridge/u);
+    assert.equal(existsSync(bridgePath), false);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy bridge removal requires an exact repository-bound admitted bridge-removal proof", () => {
   for (const scenario of [
     {
       name: "missing-proof",
@@ -2065,7 +2255,7 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
       prepare: (targetRoot) => prepareFinalClosureReceipt(targetRoot, {
         format: "v1",
       }),
-      expected: /not authorized for bridge removal/u,
+      expected: /historical evidence.*not an admitted bridge-removal proof/u,
     },
     {
       name: "v2-archived-legacy-only-origin",
@@ -2117,7 +2307,7 @@ test("legacy bridge removal requires an exact repository-bound final closure rec
         args[3] = "f".repeat(64);
         return args;
       },
-      expected: /does not match the admitted receipt/u,
+      expected: /does not match the admitted bridge-removal proof receipt/u,
     },
   ]) {
     const targetRoot = mkdtempSync(
@@ -9569,6 +9759,88 @@ function buildFinalClosureOutput({
   };
 }
 
+function buildPostCutoverAuditOutput({
+  repoSlug = "Joey-Tools/consumer",
+  repositoryId = 1234,
+  repositoryNodeId = "R_kgDOConsumer",
+  defaultBranch = "master",
+} = {}) {
+  const handoffOutput = buildFinalClosureOutput({
+    format: "v2",
+    repoSlug,
+    repositoryId,
+    repositoryNodeId,
+    defaultBranch,
+  });
+  const sourceReceipt = handoffOutput.final_closure_receipt;
+  const repositories = structuredClone(sourceReceipt.manifest_repositories);
+  const receipt = {
+    schema_version: POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION,
+    audit_kind: POST_CUTOVER_AUDIT_KIND,
+    organization: structuredClone(sourceReceipt.organization),
+    manifest_sha256: sourceReceipt.manifest_sha256,
+    snapshot_sha256: sourceReceipt.snapshot_sha256,
+    legacy: {
+      id: 16590367,
+      enforcement: "active",
+      writable_sha256: "3".repeat(64),
+      legacy_status_context: "absent",
+    },
+    v2: {
+      id: 26590367,
+      enforcement: "active",
+      writable_sha256: "4".repeat(64),
+      required_status: {
+        context: DEFAULT_STATUS_CONTEXT,
+        integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+        strict: true,
+      },
+    },
+    manifest_repositories: structuredClone(repositories),
+    repositories,
+    v2_canaries: repositories.map((repository, index) => ({
+      ...repository,
+      pull_number: index + 1,
+      created_at: "2026-09-25T00:00:00Z",
+      head_sha: postCutoverAuditFixtureSha(index + 1),
+      base_sha: postCutoverAuditFixtureSha(index + 101),
+      test_merge_sha: postCutoverAuditFixtureSha(index + 201),
+      v2_check_run_id: index + 10_001,
+      v2_run_id: index + 20_001,
+      v2_job_id: index + 30_001,
+      v2_workflow_id: index + 40_001,
+      v2_run_attempt: 1,
+    })),
+  };
+  return {
+    schema_version: POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION,
+    mode: "post-cutover-audit",
+    audit_kind: POST_CUTOVER_AUDIT_KIND,
+    organization: receipt.organization,
+    manifest_sha256: receipt.manifest_sha256,
+    snapshot_sha256: receipt.snapshot_sha256,
+    status: "fresh-v2-canaries-verified",
+    applied: false,
+    plan_sha256: organizationPostCutoverAuditPlanSha256({
+      mode: "post-cutover-audit",
+      audit_kind: POST_CUTOVER_AUDIT_KIND,
+      manifest_sha256: receipt.manifest_sha256,
+      snapshot_sha256: receipt.snapshot_sha256,
+      action: null,
+    }),
+    action: null,
+    repositories_verified: receipt.repositories.length,
+    post_cutover_audit_receipt: receipt,
+    post_cutover_audit_receipt_sha256: createHash("sha256")
+      .update(canonicalOrganizationPostCutoverAuditReceipt(receipt))
+      .digest("hex"),
+  };
+}
+
+function postCutoverAuditFixtureSha(value) {
+  return value.toString(16).padStart(40, "0");
+}
+
 function finalClosureFixtureFormat(format) {
   switch (format) {
     case "v1":
@@ -9606,9 +9878,33 @@ function substituteArchivedLegacyOnlyReceiptRepository(repositories) {
   );
 }
 
+function substituteSourceSelfHostingReceiptRepository(repositories) {
+  return [
+    ...repositories.slice(1),
+    {
+      full_name: "Joey-Tools/codex-review-gate",
+      id: 1_238_138_775,
+      node_id: "R_kgDOScx_lw",
+      default_branch: "master",
+    },
+  ].sort((left, right) =>
+    left.full_name < right.full_name
+      ? -1
+      : left.full_name > right.full_name
+        ? 1
+        : 0
+  );
+}
+
 function refreshFinalClosureReceiptDigest(output) {
   output.final_closure_receipt_sha256 = createHash("sha256")
     .update(canonicalJsonForTest(output.final_closure_receipt))
+    .digest("hex");
+}
+
+function refreshPostCutoverAuditReceiptDigest(output) {
+  output.post_cutover_audit_receipt_sha256 = createHash("sha256")
+    .update(canonicalJsonForTest(output.post_cutover_audit_receipt))
     .digest("hex");
 }
 
@@ -9643,6 +9939,27 @@ function prepareFinalClosureReceipt(targetRoot, options = {}) {
     receiptPath,
     "--expected-final-closure-receipt-sha256",
     output.final_closure_receipt_sha256,
+  ];
+}
+
+function preparePostCutoverAuditProof(targetRoot, options = {}) {
+  const output = options.output ?? buildPostCutoverAuditOutput(options);
+  const receiptPath = join(targetRoot, "post-cutover-audit.json");
+  const repoSlug = output.post_cutover_audit_receipt.repositories[0].full_name;
+  runGit([
+    "-C",
+    targetRoot,
+    "remote",
+    "add",
+    "origin",
+    `https://github.com/${options.originRepoSlug ?? repoSlug}.git`,
+  ]);
+  writeFileSync(receiptPath, `${JSON.stringify(output, null, 2)}\n`, "utf8");
+  return [
+    "--final-closure-receipt",
+    receiptPath,
+    "--expected-final-closure-receipt-sha256",
+    output.post_cutover_audit_receipt_sha256,
   ];
 }
 

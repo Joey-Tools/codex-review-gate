@@ -20,6 +20,17 @@ v1 and v2 manifests must not be reused for this cutover. Version 3 binds the
 activation timing and the one temporary scheduler boundary described below, so
 an older manifest cannot silently omit either control.
 
+## Completed-cutover alternative
+
+This v3 template is historical-handoff evidence, not a form to backfill after
+the cutover. If its contemporaneous canary, scheduler, legacy-status, or
+cleanup evidence was never retained, do not fill those placeholders from a
+later observation. Use the independent
+[`organization-review-gate-post-cutover-audit`](../organization-review-gate-post-cutover-audit/README.md)
+protocol instead. It creates fresh v2 canaries for the fixed active cohort and
+emits a new receipt whose scope is explicitly current-state proof rather than
+a claim about the historical handoff.
+
 The template is intentionally not executable as checked in. Replace every
 `REPLACE_WITH_...` value with an API-read identity after the corresponding
 repository migration and canary are complete. Do not replace placeholders with

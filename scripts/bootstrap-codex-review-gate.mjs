@@ -37,7 +37,6 @@ import {
   assertCompleteRulesetApiObject,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
-  canonicalOrganizationFinalClosureReceipt,
   canonicalClassicRequiredStatusChecks,
   canonicalLegacyReviewGateInventoryBytes,
   buildUpdateRulesetPayload,
@@ -62,7 +61,7 @@ import {
   validateCanonicalV2VerifierWorkflowContent,
   validateCanonicalV2WorkflowInventory,
   validateControlPlaneCodeownersContent,
-  validateOrganizationFinalClosureOutput,
+  validateOrganizationBridgeRemovalProofOutput,
   workflowContainsCodexReviewGateCaller,
   workflowContainsLegacyV1Caller,
   workflowSingleProducerPolicyViolations,
@@ -737,7 +736,7 @@ function readCliOptions() {
       values["expected-final-closure-receipt-sha256"] === undefined)
   ) {
     throw new Error(
-      "--remove-legacy-bridge requires --final-closure-receipt and --expected-final-closure-receipt-sha256 from a successful organization handoff final verify.",
+      "--remove-legacy-bridge requires --final-closure-receipt and --expected-final-closure-receipt-sha256 from an admitted bridge-removal proof. Allowed schema pairs are organization-review-gate-handoff-output/v2 + final_closure_receipt schema_version 2, and organization-review-gate-post-cutover-audit-output/v1 + organization-review-gate-post-cutover-audit-receipt/v1.",
     );
   }
   if (
@@ -937,11 +936,11 @@ Options:
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
   --legacy-bridge         Explicitly require/install the exact temporary v1 producer at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. Keep this flag through legacy cleanup verification.
-  --remove-legacy-bridge  Local-only post-cutover removal of an exact canonical bridge. Requires a repository-bound final closure receipt.
+  --remove-legacy-bridge  Local-only post-cutover removal of an exact canonical bridge. Requires a repository-bound admitted bridge-removal proof.
   --final-closure-receipt
-                          JSON output from organization handoff mode verify after final closure.
+                          JSON admitted bridge-removal proof. Allowed pairs: handoff output/v2 + final_closure_receipt schema_version 2, or post-cutover audit output/v1 + post-cutover audit receipt/v1.
   --expected-final-closure-receipt-sha256
-                          Exact canonical receipt SHA-256 copied from that successful verify output.
+                          Exact canonical receipt SHA-256 copied from the admitted bridge-removal proof.
   --expected-legacy-inventory-sha256
                           Exact lowercase SHA-256 from the external owner approval snapshot. Required for every remote staging/activation preview and apply.
   --derive-post-cleanup-plan
@@ -3347,35 +3346,33 @@ async function loadCanonicalWorkflows({ includeLegacyBridge = false } = {}) {
   return canonicalWorkflows;
 }
 
-async function loadAndBindOrganizationFinalClosureProof({
+async function loadAndBindOrganizationBridgeRemovalProof({
   targetRoot,
   receiptPath,
   expectedSha256,
 }) {
   const content = await readOptionalRegularFile(receiptPath);
   if (content === null) {
-    throw new Error(`Organization final closure receipt is missing: ${receiptPath}`);
+    throw new Error(`Admitted bridge-removal proof is missing: ${receiptPath}`);
   }
   let output;
   try {
     output = JSON.parse(content);
   } catch (error) {
     throw new Error(
-      `Organization final closure receipt is not valid JSON: ${error.message}`,
+      `Admitted bridge-removal proof is not valid JSON: ${error.message}`,
     );
   }
-  const validated = validateOrganizationFinalClosureOutput(output);
-  const computedSha256 = fingerprintText(
-    canonicalOrganizationFinalClosureReceipt(validated.receipt),
-  );
+  const validated = validateOrganizationBridgeRemovalProofOutput(output);
+  const computedSha256 = fingerprintText(validated.canonicalReceipt);
   if (validated.claimedSha256 !== computedSha256) {
     throw new Error(
-      "Organization final closure receipt SHA-256 does not match its canonical content.",
+      "Admitted bridge-removal proof receipt SHA-256 does not match its canonical content.",
     );
   }
   if (expectedSha256 !== computedSha256) {
     throw new Error(
-      `--expected-final-closure-receipt-sha256 does not match the admitted receipt (expected ${computedSha256}).`,
+      `--expected-final-closure-receipt-sha256 does not match the admitted bridge-removal proof receipt (expected ${computedSha256}).`,
     );
   }
 
@@ -3386,7 +3383,7 @@ async function loadAndBindOrganizationFinalClosureProof({
   );
   if (repository === undefined) {
     throw new Error(
-      `Git origin repository ${origin.repository.slug} is not authorized for bridge removal by the organization final closure receipt.`,
+      `Git origin repository ${origin.repository.slug} is not authorized for bridge removal by the admitted bridge-removal proof.`,
     );
   }
   const proof = {
@@ -3511,8 +3508,8 @@ async function prepareConsumerWorktree({
   apply,
 }) {
   const rootWitness = await assertLocalGitWorktree(targetRoot);
-  const finalClosureProof = removeLegacyBridge
-    ? await loadAndBindOrganizationFinalClosureProof({
+  const bridgeRemovalProof = removeLegacyBridge
+    ? await loadAndBindOrganizationBridgeRemovalProof({
         targetRoot,
         receiptPath: finalClosureReceiptPath,
         expectedSha256: expectedFinalClosureReceiptSha256,
@@ -3576,12 +3573,12 @@ async function prepareConsumerWorktree({
   // unrelated remote API dependency. It still precedes every mutation and
   // binds the receipt to the current GitHub object, not merely to a reusable
   // OWNER/REPO path: a repository can be deleted and recreated with the same
-  // slug between the organization handoff and this local cutover.
-  if (finalClosureProof !== null) {
+  // slug between proof production and this local cutover.
+  if (bridgeRemovalProof !== null) {
     await assertOrganizationFinalClosureBindingStable(
       targetRoot,
-      finalClosureProof,
-      "final closure receipt admission",
+      bridgeRemovalProof,
+      "bridge-removal proof admission",
     );
   }
 
@@ -3602,7 +3599,7 @@ async function prepareConsumerWorktree({
       `Post-cutover legacy bridge removal: ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}`,
     );
     console.log(
-      `Final organization closure: ${finalClosureProof.repository.full_name} at ${finalClosureProof.sha256}`,
+      `Admitted bridge-removal proof: ${bridgeRemovalProof.repository.full_name} at ${bridgeRemovalProof.sha256}`,
     );
   }
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} -> ${controlPlaneOwner}`);
@@ -3640,10 +3637,10 @@ async function prepareConsumerWorktree({
       finalNoopState,
       "no-op success readback",
     );
-    if (finalClosureProof !== null) {
+    if (bridgeRemovalProof !== null) {
       await assertOrganizationFinalClosureBindingStable(
         targetRoot,
-        finalClosureProof,
+        bridgeRemovalProof,
         "no-op success readback",
       );
     }
@@ -3747,7 +3744,7 @@ async function prepareConsumerWorktree({
   const beforePlannedMutation = async (phase) => {
     // The initial local inventory can only be compared before the first
     // planned change: later checkpoints intentionally include prior applied
-    // changes. The remote final-closure proof, however, must bind every
+    // changes. The remote bridge-removal proof, however, must bind every
     // planned mutation boundary so a same-slug repository recreation or a
     // retargeted origin cannot authorize a later local change.
     if (!initialLocalSecurityBoundaryComplete) {
@@ -3766,10 +3763,10 @@ async function prepareConsumerWorktree({
       );
       initialLocalSecurityBoundaryComplete = true;
     }
-    if (finalClosureProof !== null) {
+    if (bridgeRemovalProof !== null) {
       await assertOrganizationFinalClosureBindingStable(
         targetRoot,
-        finalClosureProof,
+        bridgeRemovalProof,
         phase,
       );
     }
@@ -3897,10 +3894,10 @@ async function prepareConsumerWorktree({
       successBoundaryState,
       "immediately before local apply success",
     );
-    if (finalClosureProof !== null) {
+    if (bridgeRemovalProof !== null) {
       await assertOrganizationFinalClosureBindingStable(
         targetRoot,
-        finalClosureProof,
+        bridgeRemovalProof,
         "immediately before local apply success",
       );
     }

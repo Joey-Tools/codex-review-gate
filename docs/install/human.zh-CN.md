@@ -15,6 +15,25 @@ Canary 验证完成后关闭、不合并。
 organization ruleset 仍保留原始 11 仓 legacy selector。下方另有窄范围的 source repository
 self-hosting 例外，它不属于该 cohort。修改任一例外 scope 前，必须先阅读对应 section。
 
+### 已完成 cutover 的 fresh audit
+
+若历史 organization handoff 已完成、但 v3 manifest 缺少当时的证据，不得事后回填。应使用独立的
+[post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)：它为固定 cohort 的 10 个仓库各创建一个新的、open、
+non-draft、same-repository 的无害 canary PR，绑定其 exact v2 CheckRun/run/job evidence，并在两轮
+stable snapshot 后才签发供后续 bridge-removal PR 使用的 receipt。它排除已归档的
+`Joey-Tools/codex-waited-delivery` 与 source-local bridge。已部署的 frozen v3 consumer profile
+是本 audit 的被验证对象；后续 bridge-removal PR 才会规范化 workflow/CODEOWNERS，且它们是需要完整
+review 的 control-plane change，不是 deletion-only edit。只有 snapshot 与 receipt 成功后，才关闭这些
+canary，且保持 unmerged。每个 PR 的 GitHub exact UTC `created_at` 必须晚于固定 cutoff
+`2026-09-24T23:38:00Z`；helper 会读取并验证它、将它绑定进 receipt，所以即使其他 ID 自洽，旧 canary
+仍会被拒绝。
+
+```bash
+node scripts/organization-review-gate-handoff.mjs \
+  --manifest "$POST_CUTOVER_MANIFEST" \
+  --mode post-cutover-audit > "$POST_CUTOVER_OUTPUT"
+```
+
 ## 安装内容
 
 完整安装包含三个必需 asset groups：
