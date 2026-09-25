@@ -1112,6 +1112,16 @@ evidence that a prior freeze remains in force.
   published, the signed floating `v2` alias advances without consumer workflow
   edits. A fresh exact-head v2 verifier result is then required before the
   remaining source v1 bridge is removed.
+- Source PR #72 landed the append-only publisher control plane before this
+  intent. This release intent therefore changes no publisher workflow, script,
+  or release-control test: it declares `runs.using: node24`, version `2.1.0`,
+  and a schema-3 manifest bound to the published `v2.0.4` wrapper head. Its
+  merge starts the ordinary staged publisher, but does not itself claim that a
+  v2.1 tag, Release, Marketplace update, or floating alias already exists.
+- v1 remains frozen and is not republished or retrofitted with a runtime
+  declaration. Its remaining source bridge stays in place only until fresh
+  Node 24 v2 evidence succeeds; then the separately authorized cleanup can
+  remove that bridge without altering v1 history.
 
 ## Next Steps
 

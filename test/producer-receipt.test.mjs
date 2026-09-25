@@ -609,7 +609,7 @@ test("the live v2 direct runtime uses only the closed JavaScript Action ABI", as
   assert.doesNotMatch(actionDefinition, /using:\s*composite|\n\s*steps:|\$\{\{/u);
   assert.match(
     actionDefinition,
-    /runs:\n  using: node20\n  main: src\/v2\/gate-runtime\.mjs\n?$/u,
+    /runs:\n  using: node24\n  main: src\/v2\/gate-runtime\.mjs\n?$/u,
   );
 });
 

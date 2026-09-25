@@ -2758,7 +2758,7 @@ test("the JavaScript Action exposes only the adopted public outcome ABI", () => 
 
   const runs = action.slice(action.indexOf("\nruns:\n"));
   assert.deepEqual(directKeys(runs, 2), ["using", "main"]);
-  assert.match(runs, /^  using: node20$/mu);
+  assert.match(runs, /^  using: node24$/mu);
   assert.match(runs, /^  main: src\/v2\/gate-runtime\.mjs$/mu);
   assert.doesNotMatch(
     runs,
