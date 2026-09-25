@@ -264,6 +264,75 @@ export const POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY = Object.freeze(
   archived: true,
 });
 
+// A post-cutover audit is a narrow authorization for the already migrated
+// cohort, not a generic ten-repository receipt format. Bind every persistent
+// GitHub identity signal plus the default-branch selector so a digest-valid,
+// self-consistent receipt cannot substitute another Joey-Tools repository.
+// Keep this consumer-side list independent from the producer implementation:
+// the receipt validator is the last local authority before bridge removal.
+export const POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES = Object.freeze([
+  Object.freeze({
+    full_name: "Joey-Tools/codex-apple-notes-toolkit",
+    id: 1_242_512_097,
+    node_id: "R_kgDOSg864Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-debug-triage",
+    id: 1_242_512_092,
+    node_id: "R_kgDOSg863A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-personal-sync",
+    id: 1_242_511_852,
+    node_id: "R_kgDOSg857A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-private-workflows",
+    id: 1_242_512_336,
+    node_id: "R_kgDOSg870A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-project-journal",
+    id: 1_242_511_845,
+    node_id: "R_kgDOSg855Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-review-workflows",
+    id: 1_242_511_842,
+    node_id: "R_kgDOSg854g",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-rollout-backup",
+    id: 1_242_512_323,
+    node_id: "R_kgDOSg87ww",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-session-retrospective-history",
+    id: 1_246_526_548,
+    node_id: "R_kgDOSkx8VA",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-toolbox",
+    id: 1_242_511_840,
+    node_id: "R_kgDOSg854A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-workflow-hygiene",
+    id: 1_242_512_084,
+    node_id: "R_kgDOSg861A",
+    default_branch: "master",
+  }),
+]);
+
 const CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY =
   POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY;
 
@@ -631,6 +700,11 @@ export function validateOrganizationPostCutoverAuditReceipt(receipt) {
     repositories,
     "repositories",
   );
+  assertPostCutoverAuditFixedActiveCohort(
+    manifestRepositories,
+    "manifest_repositories",
+  );
+  assertPostCutoverAuditFixedActiveCohort(repositories, "repositories");
   if (canonicalJson(manifestRepositories) !== canonicalJson(repositories)) {
     throw new Error(
       "Post-cutover audit receipt manifest_repositories must exactly match the observed repositories identity cohort.",
@@ -981,6 +1055,17 @@ function assertPostCutoverAuditCohortExcludesSourceSelfHostingRepository(
   ) {
     throw new Error(
       `Post-cutover audit receipt ${field} must not admit the source self-hosting repository; source bridge removal requires its separate source-local proof.`,
+    );
+  }
+}
+
+function assertPostCutoverAuditFixedActiveCohort(repositories, field) {
+  if (
+    canonicalJson(repositories) !==
+    canonicalJson(POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES)
+  ) {
+    throw new Error(
+      `Post-cutover audit receipt ${field} must exactly match the fixed active ten-member cohort by full_name, id, node_id, and default_branch.`,
     );
   }
 }

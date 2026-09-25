@@ -30,6 +30,7 @@ import {
   MANIFEST_SCHEMA_VERSION,
   NONTERMINAL_WORKFLOW_RUN_STATUSES,
   OUTPUT_SCHEMA_VERSION,
+  POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
   POST_CUTOVER_AUDIT_KIND,
   POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
   POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION,
@@ -86,6 +87,15 @@ const JOEY_TEMPLATE = JSON.parse(
     "utf8",
   ),
 );
+const POST_CUTOVER_AUDIT_TEMPLATE = JSON.parse(
+  readFileSync(
+    new URL(
+      "../templates/organization-review-gate-post-cutover-audit/joey-tools-10-member-manifest.template.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
 
 const HISTORICAL_HANDOFF_CONTROLLER_BYTES = readFileSync(
   new URL(
@@ -131,17 +141,30 @@ const ORGANIZATION = {
 };
 
 const REPOSITORIES = [
-  ["codex-apple-notes-toolkit", 1242512097, 16583474],
-  ["codex-debug-triage", 1242512092, 16583544],
-  ["codex-personal-sync", 1242511852, 16583466],
-  ["codex-private-workflows", 1242512336, null],
-  ["codex-project-journal", 1242511845, 16583303],
-  ["codex-review-workflows", 1242511842, 16583548],
-  ["codex-rollout-backup", 1242512323, 16583521],
-  ["codex-toolbox", 1242511840, 16583093],
-  ["codex-workflow-hygiene", 1242512084, 16583522],
-  ["codex-session-retrospective-history", 1246526548, null],
+  ["codex-apple-notes-toolkit", 1242512097, 16583474, "R_kgDOSg864Q"],
+  ["codex-debug-triage", 1242512092, 16583544, "R_kgDOSg863A"],
+  ["codex-personal-sync", 1242511852, 16583466, "R_kgDOSg857A"],
+  ["codex-private-workflows", 1242512336, null, "R_kgDOSg870A"],
+  ["codex-project-journal", 1242511845, 16583303, "R_kgDOSg855Q"],
+  ["codex-review-workflows", 1242511842, 16583548, "R_kgDOSg854g"],
+  ["codex-rollout-backup", 1242512323, 16583521, "R_kgDOSg87ww"],
+  ["codex-toolbox", 1242511840, 16583093, "R_kgDOSg854A"],
+  ["codex-workflow-hygiene", 1242512084, 16583522, "R_kgDOSg861A"],
+  ["codex-session-retrospective-history", 1246526548, null, "R_kgDOSkx8VA"],
 ];
+
+// Keep this local fixture independent from the producer constant. It freezes
+// every identity signal documented in the post-cutover audit template.
+const EXPECTED_POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES = Object.freeze(
+  REPOSITORIES.map(([name, id, , nodeId]) =>
+    Object.freeze({
+      slug: `${ORGANIZATION.login}/${name}`,
+      id,
+      node_id: nodeId,
+      default_branch: "master",
+    }),
+  ),
+);
 
 const ARCHIVED_LEGACY_ONLY_REPOSITORY = Object.freeze({
   slug: "Joey-Tools/codex-waited-delivery",
@@ -338,7 +361,7 @@ function repositoryCleanupAction(rulesetId, index) {
   };
 }
 
-function repositoryEntry([name, id, cleanupRulesetId], index) {
+function repositoryEntry([name, id, cleanupRulesetId, nodeId], index) {
   const digit = ((index % 14) + 1).toString(16);
   const slug = `${ORGANIZATION.login}/${name}`;
   const isActivationSchedulerRepository =
@@ -346,7 +369,7 @@ function repositoryEntry([name, id, cleanupRulesetId], index) {
   return {
     slug,
     id,
-    node_id: `R_kgDO${id}`,
+    node_id: nodeId,
     default_branch: "master",
     workflows: clone(CANONICAL_WORKFLOW_IDENTITIES),
     legacy_writer_scan_timeout_ms: isActivationSchedulerRepository
@@ -748,6 +771,27 @@ function postCutoverAuditSourceSubstitutionManifest(signal) {
     repository.node_id = SOURCE_SELF_HOSTING_REPOSITORY.node_id;
   }
   return postCutoverAuditManifestFromHandoff(manifest);
+}
+
+const POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT = Object.freeze({
+  slug: "Joey-Tools/codex-workspace",
+  id: 1_242_513_000,
+  node_id: "R_kgDOUnrelatedCohort",
+  default_branch: "master",
+});
+
+function replacePostCutoverAuditActiveRepository(manifest, replacement) {
+  const originalId = manifest.repositories[0].id;
+  Object.assign(manifest.repositories[0], replacement);
+  for (const ruleset of [
+    manifest.legacy_ruleset.expected_after,
+    manifest.v2_ruleset.expected,
+  ]) {
+    ruleset.conditions.repository_id.repository_ids =
+      ruleset.conditions.repository_id.repository_ids.map((id) =>
+        id === originalId ? replacement.id : id,
+      );
+  }
 }
 
 function encodeEndpointPathForTest(value) {
@@ -2205,6 +2249,19 @@ test("exports the closed organization handoff protocol constants", () => {
     id: 1238138775,
     node_id: "R_kgDOScx_lw",
   });
+  assert.deepEqual(
+    POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
+    EXPECTED_POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
+  );
+  assert.deepEqual(
+    POST_CUTOVER_AUDIT_TEMPLATE.repositories.map((repository) => ({
+      slug: repository.slug,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+    })),
+    EXPECTED_POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
+  );
   assert.equal(REQUIRED_REPOSITORY_COUNT, 10);
   assert.equal(LEGACY_SELECTOR_REPOSITORY_COUNT, 11);
   assert.equal(V2_RULESET_NAME, "Must Pass Codex Review v2");
@@ -6906,6 +6963,61 @@ test("post-cutover receipt requires canonical one-to-one canary bindings", () =>
     () => validatePostCutoverAuditManifest(malformedCreatedAt),
     /canonical GitHub ISO UTC timestamp with second precision/u,
   );
+});
+
+test("post-cutover audit fixes every active cohort identity before audit or receipt authorization", async (t) => {
+  await t.test("manifest substitution fails before any live audit read", async (t) => {
+    const harness = createFakePostCutoverAuditHarness(t);
+    replacePostCutoverAuditActiveRepository(
+      harness.manifest,
+      POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT,
+    );
+    writeFileSync(
+      harness.manifestPath,
+      `${JSON.stringify(harness.manifest, null, 2)}\n`,
+    );
+
+    await assert.rejects(
+      runFakeCli(harness, "post-cutover-audit"),
+      /must bind the fixed post-cutover active 10-member cohort/u,
+    );
+    assert.deepEqual(
+      fakeGhRequests(harness.logPath),
+      [],
+      "a self-consistent replacement manifest must fail before it can read live audit evidence",
+    );
+  });
+
+  await t.test("receipt builder rejects a replacement with matching selector and snapshot identities", () => {
+    const manifest = postCutoverAuditManifestFixture();
+    replacePostCutoverAuditActiveRepository(
+      manifest,
+      POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT,
+    );
+    const snapshot = postCutoverAuditSnapshotFixture(manifest);
+    const expectedIdentity = {
+      full_name: POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT.slug,
+      id: POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT.id,
+      node_id: POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT.node_id,
+      default_branch:
+        POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT.default_branch,
+    };
+    assert.deepEqual(snapshot.repositories[0].identity, expectedIdentity);
+    for (const ruleset of [
+      manifest.legacy_ruleset.expected_after,
+      manifest.v2_ruleset.expected,
+    ]) {
+      assert.ok(
+        ruleset.conditions.repository_id.repository_ids.includes(
+          POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_REPLACEMENT.id,
+        ),
+      );
+    }
+    assert.throws(
+      () => buildPostCutoverAuditReceipt(manifest, snapshot),
+      /must bind the fixed post-cutover active 10-member cohort/u,
+    );
+  });
 });
 
 test("post-cutover audit fixes the archived legacy-only identity before receipt authorization", async (t) => {

@@ -1124,6 +1124,31 @@ evidence that a prior freeze remains in force.
   three persistent identity signals. A substituted archived object or a
   source-origin historical receipt therefore cannot authorize the active
   consumer cohort.
+- The post-cutover producer now also pins every active member to the documented
+  10-entry `{slug, id, node_id, default_branch}` identity set before any audit
+  read and again while building its receipt. Matching organization-ruleset
+  selectors, workflow snapshots, and canary data cannot admit a replacement
+  `Joey-Tools` repository. This is a new post-cutover-audit-v1 authorization
+  boundary only; it leaves the published v3 historical handoff contract and
+  its archive/source exclusions unchanged.
+- The bridge-removal consumer now independently enforces that same fixed
+  active cohort and, for post-cutover-audit-v1 receipts only, re-reads the
+  receipt-bound organization identity and complete legacy/v2 rule details at
+  admission and every local mutation/removal-quarantine boundary. Their
+  exact writable-policy SHA-256 values, organization source, and branch target
+  must still match; unreadable policy, a restored `codex/review-gate`, or any
+  drift leaves the bridge installed: a pre-rename failure prevents removal,
+  while a post-quarantine failure atomically restores the admitted object.
+  Repository binding remains the established origin/live identity/default-branch
+  proof, and the consumer also re-reads classic and effective default-branch
+  status surfaces to prove no repository-local `codex/review-gate` remains.
+  Because this receipt has no repository-local writable-policy hash, that
+  latter check is intentionally a live no-v1 proof rather than an invented
+  full-policy equality claim; historical handoff-v2 compatibility remains
+  identity-only.
+- Validation for this boundary passed `npm run check:organization-handoff`,
+  the focused replacement-cohort regression, the protocol-constant/template
+  regression, and the full handoff suite (`232/232` passing).
 
 ## Next Steps
 

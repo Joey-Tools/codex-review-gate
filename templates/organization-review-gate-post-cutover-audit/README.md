@@ -45,6 +45,15 @@ The fixed active cohort has exactly these ten repositories, in template order:
 9. `Joey-Tools/codex-workflow-hygiene`
 10. `Joey-Tools/codex-session-retrospective-history`
 
+This is an immutable authorization cohort, not a count-only or selector-only
+constraint. For every listed entry, the checked-in JSON template's exact
+`slug`, numeric `id`, `node_id`, and `default_branch` form one fixed identity
+tuple. The producer canonically compares the complete ten-member identity set
+before it makes any GitHub audit read or mints a receipt. Replacing one member
+with another `Joey-Tools` repository—even if all organization-ruleset selectors,
+workflow snapshots, and canary fields remain self-consistent—fails closed and
+cannot authorize bridge removal.
+
 `Joey-Tools/codex-waited-delivery` is the one fixed historical archived,
 legacy-only repository. Its exact slug, numeric ID, node ID, `master` default
 branch, and `archived: true` state are immutable audit inputs: another
@@ -177,3 +186,22 @@ It does not authorize a source-local bridge, `codex-waited-delivery`, a subset,
 or a replacement repository. Treat each resulting PR as a normal
 control-plane change: obtain the required reviews, pass the v2 gate, and merge
 only after its current exact head is clean.
+
+The consumer independently enforces the same fixed ten-member identity cohort
+from the receipt's `full_name`, numeric `id`, `node_id`, and `default_branch`;
+a digest-valid receipt with a substituted but otherwise self-consistent cohort
+is not authority. For this post-cutover receipt format only, it also re-reads
+the receipt-bound organization identity plus the exact legacy and v2 ruleset
+details at proof admission and before every local mutation/removal-quarantine
+boundary. Each detail must retain its ID, organization source, branch target,
+and the receipt's SHA-256 of its complete writable policy. An unreadable
+detail, restored `codex/review-gate`, or any legacy/v2 policy drift leaves the
+bridge installed. The receipt does not carry a replayable repository-local
+ruleset-policy snapshot, so the consumer does not invent an unbound complete
+repository-policy hash comparison. It does re-read the target default branch's
+classic required-status and effective-ruleset surfaces and requires that neither
+still requires `codex/review-gate`; the separate origin/live-repository
+identity/default-branch rebind continues to select the exact repository object.
+These are point-in-time checks at the listed boundaries, not a claim of a
+continuous remote lock. Historical handoff-v2 proofs remain identity-only
+compatible because they contain no writable-policy fingerprints.

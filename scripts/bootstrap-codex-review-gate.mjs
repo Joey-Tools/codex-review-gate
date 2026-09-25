@@ -3389,6 +3389,8 @@ async function loadAndBindOrganizationBridgeRemovalProof({
   const proof = {
     receiptPath,
     sha256: computedSha256,
+    proofKind: validated.proofKind,
+    receipt: validated.receipt,
     organization: validated.receipt.organization,
     repository,
     originRepository: origin.repository,
@@ -3446,6 +3448,143 @@ function organizationFinalClosureRepositoryIdentity(value, label) {
   return identity;
 }
 
+function organizationFinalClosureOrganizationIdentity(value, label) {
+  const identity = {
+    login: value?.login,
+    id: value?.id,
+    node_id: value?.node_id,
+  };
+  if (
+    typeof identity.login !== "string" ||
+    identity.login === "" ||
+    !Number.isSafeInteger(identity.id) ||
+    identity.id <= 0 ||
+    typeof identity.node_id !== "string" ||
+    identity.node_id === ""
+  ) {
+    throw new Error(`${label} does not provide a complete GitHub organization identity.`);
+  }
+  return identity;
+}
+
+function assertPostCutoverAuditOrganizationRulesetBinding({
+  ruleset,
+  expected,
+  organization,
+  label,
+}) {
+  const complete = assertCompleteRulesetApiObject(ruleset);
+  if (
+    complete.id !== expected.id ||
+    complete.source_type !== "Organization" ||
+    complete.source !== organization.login ||
+    complete.target !== "branch"
+  ) {
+    throw new Error(
+      `${label} no longer has the receipt-bound organization identity, source, and branch target.`,
+    );
+  }
+  const writableSha256 = fingerprintText(rulesetWritableFingerprint(complete));
+  if (writableSha256 !== expected.writable_sha256) {
+    if (
+      label === "Post-cutover audit legacy organization ruleset" &&
+      rulesetHasRequiredStatusContext(complete, LEGACY_STATUS_CONTEXT, {
+        integrationId: undefined,
+      })
+    ) {
+      throw new Error(
+        `${label} restored ${LEGACY_STATUS_CONTEXT} after the audit.`,
+      );
+    }
+    throw new Error(
+      `${label} writable policy drifted after the audit (expected ${expected.writable_sha256}, read ${writableSha256}).`,
+    );
+  }
+}
+
+// The post-cutover receipt is the only admitted removal proof that commits
+// writable-policy hashes. Re-read exactly those two organization rulesets
+// before every local mutation boundary, so the consumer never treats the
+// audit as a perpetual authorization after a later v1 restoration or policy
+// rewrite. The receipt deliberately does not contain a replayable complete
+// repository-local policy snapshot. The separate live repository check below
+// therefore proves only the security property actually bound by this receipt:
+// no legacy status remains effective through either classic protection or an
+// effective ruleset. It must not invent an unbound repository-policy hash.
+// The existing origin -> live repository identity/default-branch -> origin
+// binding remains the independent consumer object-selection proof. Historical
+// handoff-v2 proofs also retain their published identity-only compatibility
+// because they contain no policy fingerprints.
+async function assertPostCutoverAuditOrganizationPolicyStable(proof, phase) {
+  if (proof.proofKind !== "post-cutover-audit-v1") return;
+
+  const organization = proof.organization;
+  try {
+    const [liveOrganization, legacyRuleset, v2Ruleset] = await Promise.all([
+      ghJson(`orgs/${encodeURIComponent(organization.login)}`),
+      ghJson(
+        `orgs/${encodeURIComponent(organization.login)}/rulesets/${proof.receipt.legacy.id}`,
+      ),
+      ghJson(
+        `orgs/${encodeURIComponent(organization.login)}/rulesets/${proof.receipt.v2.id}`,
+      ),
+    ]);
+    const liveIdentity = organizationFinalClosureOrganizationIdentity(
+      liveOrganization,
+      `GitHub organization during ${phase}`,
+    );
+    if (
+      liveIdentity.login !== organization.login ||
+      liveIdentity.id !== organization.id ||
+      liveIdentity.node_id !== organization.node_id
+    ) {
+      throw new Error(
+        `GitHub organization identity changed during ${phase}; refusing bridge removal success.`,
+      );
+    }
+    assertPostCutoverAuditOrganizationRulesetBinding({
+      ruleset: legacyRuleset,
+      expected: proof.receipt.legacy,
+      organization,
+      label: "Post-cutover audit legacy organization ruleset",
+    });
+    assertPostCutoverAuditOrganizationRulesetBinding({
+      ruleset: v2Ruleset,
+      expected: proof.receipt.v2,
+      organization,
+      label: "Post-cutover audit v2 organization ruleset",
+    });
+  } catch (error) {
+    throw new Error(
+      `Post-cutover audit organization policy is unreadable or drifted during ${phase}; refusing bridge removal success.\n${error.message}`,
+    );
+  }
+}
+
+async function assertPostCutoverAuditRepositoryLegacyPolicyClear(proof, phase) {
+  if (proof.proofKind !== "post-cutover-audit-v1") return;
+
+  const repository = proof.repository;
+  try {
+    const bytes = await loadCanonicalLegacyInventoryBytes({
+      repoSlug: repository.full_name,
+      defaultBranch: repository.default_branch,
+    });
+    const inventory = decodeBoundLegacyInventory({
+      bytes,
+      repoSlug: repository.full_name,
+      repositoryId: repository.id,
+      repositoryNodeId: repository.node_id,
+      defaultBranch: repository.default_branch,
+    });
+    assertDecodedLegacyInventoryClear(inventory, repository.full_name);
+  } catch (error) {
+    throw new Error(
+      `Post-cutover audit repository legacy-policy is unreadable or restored during ${phase}; refusing bridge removal success.\n${error.message}`,
+    );
+  }
+}
+
 async function loadCurrentOrganizationFinalClosureRepository(
   originRepository,
   phase,
@@ -3478,6 +3617,8 @@ async function assertOrganizationFinalClosureBindingStable(
       `GitHub origin repository identity or default branch changed during ${phase}; refusing bridge removal success.`,
     );
   }
+  await assertPostCutoverAuditOrganizationPolicyStable(proof, phase);
+  await assertPostCutoverAuditRepositoryLegacyPolicyClear(proof, phase);
   const afterMetadataRead = await loadGitHubOriginRepository(targetRoot);
   assertOrganizationFinalClosureOriginMatchesProof(
     afterMetadataRead,

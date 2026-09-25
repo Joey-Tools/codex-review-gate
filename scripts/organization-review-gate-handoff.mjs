@@ -86,6 +86,73 @@ export const SOURCE_SELF_HOSTING_REPOSITORY = Object.freeze({
   id: 1_238_138_775,
   node_id: "R_kgDOScx_lw",
 });
+// This post-cutover audit is a scoped authorization for the already migrated
+// cohort, not a general ten-repository policy reader.  Bind every persistent
+// GitHub identity signal plus the default-branch selector so a manifest cannot
+// substitute another Joey-Tools repository while preserving matching ruleset
+// selectors, workflow snapshots, and fresh-canary evidence.
+export const POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES = Object.freeze([
+  Object.freeze({
+    slug: "Joey-Tools/codex-apple-notes-toolkit",
+    id: 1_242_512_097,
+    node_id: "R_kgDOSg864Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-debug-triage",
+    id: 1_242_512_092,
+    node_id: "R_kgDOSg863A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-personal-sync",
+    id: 1_242_511_852,
+    node_id: "R_kgDOSg857A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-private-workflows",
+    id: 1_242_512_336,
+    node_id: "R_kgDOSg870A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-project-journal",
+    id: 1_242_511_845,
+    node_id: "R_kgDOSg855Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-review-workflows",
+    id: 1_242_511_842,
+    node_id: "R_kgDOSg854g",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-rollout-backup",
+    id: 1_242_512_323,
+    node_id: "R_kgDOSg87ww",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-toolbox",
+    id: 1_242_511_840,
+    node_id: "R_kgDOSg854A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-workflow-hygiene",
+    id: 1_242_512_084,
+    node_id: "R_kgDOSg861A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-session-retrospective-history",
+    id: 1_246_526_548,
+    node_id: "R_kgDOSkx8VA",
+    default_branch: "master",
+  }),
+]);
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
 // These are every documented nonterminal Actions workflow-run state. A run in
@@ -928,6 +995,34 @@ function assertPostCutoverArchivedLegacyOnlyRepositoryIdentity(value, label) {
   }
 }
 
+function canonicalPostCutoverAuditActiveCohortIdentities(repositories) {
+  return repositories
+    .map((repository) => ({
+      slug: repository.slug ?? repository.full_name,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+    }))
+    .sort((left, right) =>
+      Buffer.compare(
+        Buffer.from(left.slug ?? "", "utf8"),
+        Buffer.from(right.slug ?? "", "utf8"),
+      ),
+    );
+}
+
+function assertPostCutoverAuditFixedActiveCohort(repositories, label) {
+  const expected = canonicalPostCutoverAuditActiveCohortIdentities(
+    POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
+  );
+  const actual = canonicalPostCutoverAuditActiveCohortIdentities(repositories);
+  if (canonicalJson(actual) !== canonicalJson(expected)) {
+    throw new Error(
+      `${label} must bind the fixed post-cutover active ${REQUIRED_REPOSITORY_COUNT}-member cohort by exact slug, id, node_id, and default_branch; another Joey-Tools repository cannot substitute a documented member.`,
+    );
+  }
+}
+
 export function validateManifest(input) {
   assertExactKeys(
     input,
@@ -1516,6 +1611,11 @@ export function validatePostCutoverAuditManifest(input) {
       seen.add(repo.canary[field]);
     }
   }
+
+  assertPostCutoverAuditFixedActiveCohort(
+    input.repositories,
+    "post-cutover audit manifest.repositories",
+  );
 
   const legacyOnlyRepository = input.legacy_ruleset.legacy_only_repository;
   if (
@@ -5526,6 +5626,14 @@ export function buildPostCutoverAuditReceipt(manifest, snapshot) {
   );
   const repositories = canonicalPostCutoverAuditRepositoryIdentities(
     snapshot.repositories.map((repository) => repository.identity),
+    "Post-cutover audit receipt repositories",
+  );
+  assertPostCutoverAuditFixedActiveCohort(
+    manifestRepositories,
+    "Post-cutover audit receipt manifest_repositories",
+  );
+  assertPostCutoverAuditFixedActiveCohort(
+    repositories,
     "Post-cutover audit receipt repositories",
   );
   if (

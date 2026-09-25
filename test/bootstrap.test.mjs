@@ -33,6 +33,7 @@ import {
   LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   LEGACY_STATUS_CONTEXT,
   ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
+  POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
   POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY,
   POST_CUTOVER_AUDIT_KIND,
   POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
@@ -140,6 +141,71 @@ const EMPTY_CLASSIC_REQUIRED_STATUS_CHECKS = Object.freeze({
 });
 const EXPECTED_LEGACY_INVENTORY_FIXTURE_KEY =
   "__test_expected_legacy_inventory_approval";
+// Keep this independent from the production consumer constant. The audit
+// fixture and its four forged variants must catch a wrong member, id, node,
+// or default-branch value in the consumer's immutable receipt authority.
+const POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_FIXTURE_COHORT = Object.freeze([
+  Object.freeze({
+    full_name: "Joey-Tools/codex-apple-notes-toolkit",
+    id: 1_242_512_097,
+    node_id: "R_kgDOSg864Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-debug-triage",
+    id: 1_242_512_092,
+    node_id: "R_kgDOSg863A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-personal-sync",
+    id: 1_242_511_852,
+    node_id: "R_kgDOSg857A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-private-workflows",
+    id: 1_242_512_336,
+    node_id: "R_kgDOSg870A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-project-journal",
+    id: 1_242_511_845,
+    node_id: "R_kgDOSg855Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-review-workflows",
+    id: 1_242_511_842,
+    node_id: "R_kgDOSg854g",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-rollout-backup",
+    id: 1_242_512_323,
+    node_id: "R_kgDOSg87ww",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-session-retrospective-history",
+    id: 1_246_526_548,
+    node_id: "R_kgDOSkx8VA",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-toolbox",
+    id: 1_242_511_840,
+    node_id: "R_kgDOSg854A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-workflow-hygiene",
+    id: 1_242_512_084,
+    node_id: "R_kgDOSg861A",
+    default_branch: "master",
+  }),
+]);
 
 test("builds a disabled complete default-branch ruleset payload", () => {
   const payload = buildCreateRulesetPayload();
@@ -1823,6 +1889,11 @@ test("handoff v2 receipts exclude source self-hosting by every identity signal",
 
 test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
   const output = buildPostCutoverAuditOutput();
+  assert.deepEqual(
+    POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
+    POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_FIXTURE_COHORT,
+    "the consumer's immutable cohort must match the independently recorded ten-member identities",
+  );
   const validated = validateOrganizationPostCutoverAuditOutput(output);
   const genericValidated = validateOrganizationBridgeRemovalProofOutput(output);
   assert.deepEqual(
@@ -1905,6 +1976,24 @@ test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
   mismatchedManifestCohort.post_cutover_audit_receipt.manifest_repositories[0]
     .node_id = "R_kgDOMismatchedManifest";
 
+  const forgedFixedCohorts = [
+    ["full-name", "full_name", "Joey-Tools/codex-replacement"],
+    ["id", "id", 1_242_512_098],
+    ["node-id", "node_id", "R_kgDOForgedCohort"],
+    ["default-branch", "default_branch", "main"],
+  ].map(([name, field, value]) => {
+    const candidate = structuredClone(output);
+    for (const repositories of [
+      candidate.post_cutover_audit_receipt.manifest_repositories,
+      candidate.post_cutover_audit_receipt.repositories,
+      candidate.post_cutover_audit_receipt.v2_canaries,
+    ]) {
+      repositories[0][field] = value;
+    }
+    refreshPostCutoverAuditReceiptDigest(candidate);
+    return [`forged-fixed-active-cohort-${name}`, candidate];
+  });
+
   const crossLinkedCanary = structuredClone(output);
   crossLinkedCanary.post_cutover_audit_receipt.v2_canaries[0].id += 1;
 
@@ -1951,6 +2040,7 @@ test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
     ["source-self-hosting-cohort", sourceSelfHostingCohort],
     ["substituted-archived-legacy-only-receipt", substitutedArchivedLegacyOnlyReceipt],
     ["manifest-observed-cohort-mismatch", mismatchedManifestCohort],
+    ...forgedFixedCohorts,
     ["cross-linked-canary-repository", crossLinkedCanary],
     ["duplicate-canary-run", duplicateCanaryRun],
     ["missing-canary", missingCanary],
@@ -1962,7 +2052,7 @@ test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
   ]) {
     assert.throws(
       () => validateOrganizationBridgeRemovalProofOutput(candidate),
-      /audit_kind|schema_version|handoff output|archived|manifest|canaries|canary|created_at|freshness|SHA|sha256|unexpected or missing field/u,
+      /audit_kind|schema_version|handoff output|archived|fixed active|manifest|canaries|canary|created_at|freshness|SHA|sha256|unexpected or missing field/u,
       name,
     );
   }
@@ -2222,8 +2312,14 @@ test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
   );
   try {
     initializeGitRepository(targetRoot);
-    const auditProofArgs = preparePostCutoverAuditProof(targetRoot);
-    const auditProofEnv = finalClosureGhEnvironment(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(
+      targetRoot,
+      auditFixture,
+    );
     mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
     writeFileSync(
       join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
@@ -2253,6 +2349,317 @@ test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
     assert.match(result.stdout, /Admitted bridge-removal proof/u);
     assert.match(result.stdout, /Applied: remove the exact temporary legacy bridge/u);
     assert.equal(existsSync(bridgePath), false);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable policy after admission before bridge removal", () => {
+  for (const [name, configure, expected, wrapper] of [
+    [
+      "restored-legacy-v1-status",
+      (fixture) => {
+        const restoredLegacyRuleset = structuredClone(fixture.legacyRuleset);
+        restoredLegacyRuleset.rules.push({
+          type: "required_status_checks",
+          parameters: {
+            required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+            strict_required_status_checks_policy: true,
+          },
+        });
+        return {
+          legacyRulesetResponse: {
+            __fake_sequence: [
+              fixture.legacyRuleset,
+              fixture.legacyRuleset,
+              restoredLegacyRuleset,
+            ],
+          },
+        };
+      },
+      /restored codex\/review-gate after the audit/u,
+      /Post-cutover audit organization policy is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "restored-repository-legacy-status",
+      (fixture) => {
+        const repository = fixture.output.post_cutover_audit_receipt
+          .manifest_repositories[0];
+        const restoredRepositoryRuleset = {
+          id: 36_590_367,
+          name: "Restored repository legacy status",
+          source_type: "Repository",
+          source: repository.full_name,
+          target: "branch",
+          enforcement: "active",
+          bypass_actors: [],
+          conditions: {
+            ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] },
+          },
+          rules: [{
+            type: "required_status_checks",
+            parameters: {
+              required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+              strict_required_status_checks_policy: true,
+            },
+          }],
+        };
+        return {
+          repositoryEffectiveRulesResponse: {
+            __fake_sequence: [
+              [[]],
+              [[]],
+              [[{
+                type: "required_status_checks",
+                ruleset_id: restoredRepositoryRuleset.id,
+                parameters: {
+                  required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+                  strict_required_status_checks_policy: true,
+                },
+              }]],
+            ],
+          },
+          repositoryRulesetResponses: {
+            [restoredRepositoryRuleset.id]: restoredRepositoryRuleset,
+          },
+        };
+      },
+      /codex\/review-gate remains required after cleanup/u,
+      /Post-cutover audit repository legacy-policy is unreadable or restored during immediately before legacy bridge removal/u,
+    ],
+    [
+      "v2-writable-policy-drift",
+      (fixture) => {
+        const driftedV2Ruleset = structuredClone(fixture.v2Ruleset);
+        driftedV2Ruleset.rules[0].parameters.strict_required_status_checks_policy =
+          false;
+        return {
+          v2RulesetResponse: {
+            __fake_sequence: [
+              fixture.v2Ruleset,
+              fixture.v2Ruleset,
+              driftedV2Ruleset,
+            ],
+          },
+        };
+      },
+      /v2 organization ruleset writable policy drifted after the audit/u,
+      /Post-cutover audit organization policy is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+    [
+      "unreadable-v2-policy",
+      (fixture) => ({
+        v2RulesetResponse: {
+          __fake_sequence: [
+            fixture.v2Ruleset,
+            fixture.v2Ruleset,
+            {
+              __fake_http_error: 403,
+              message: "v2 ruleset readback is unavailable",
+            },
+          ],
+        },
+      }),
+      /v2 ruleset readback is unavailable/u,
+      /Post-cutover audit organization policy is unreadable or drifted during immediately before legacy bridge removal/u,
+    ],
+  ]) {
+    const targetRoot = mkdtempSync(
+      join(tmpdir(), `codex-review-gate-post-cutover-live-policy-${name}-`),
+    );
+    const workflowsDirectory = join(targetRoot, ".github", "workflows");
+    const bridgePath = join(
+      targetRoot,
+      ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+    );
+    const codeownersPath = join(targetRoot, ".github", "CODEOWNERS");
+    try {
+      initializeGitRepository(targetRoot);
+      const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+      const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+        output: auditFixture.output,
+      });
+      const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+        ...auditFixture,
+        ...configure(auditFixture),
+      });
+      mkdirSync(workflowsDirectory, { recursive: true });
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+        CANONICAL_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(
+        join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+        CANONICAL_CONTROLLER_WORKFLOW,
+        "utf8",
+      );
+      writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+      // Make CODEOWNERS a preceding planned mutation. The third ruleset read
+      // is therefore immediately before removal, not proof admission.
+      writeFileSync(codeownersPath, "# retained ownership\n", "utf8");
+      const preloadPath = join(targetRoot, "bridge-policy-revalidation.cjs");
+      const bridgeMutationLog = join(targetRoot, "bridge-mutation-calls.log");
+      writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+
+      const result = runBootstrap([
+        "--prepare-worktree",
+        targetRoot,
+        "--remove-legacy-bridge",
+        ...auditProofArgs,
+        "--apply",
+      ], {
+        env: {
+          ...auditProofEnv,
+          NODE_OPTIONS: `--require=${preloadPath}`,
+          CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+          CODEX_BOOTSTRAP_TEST_BRIDGE_MUTATION_LOG: bridgeMutationLog,
+        },
+      });
+
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stdout, /Admitted bridge-removal proof/u, name);
+      assert.match(
+        result.stderr,
+        wrapper,
+        name,
+      );
+      assert.match(result.stderr, expected, name);
+      assert.match(result.stderr, /Partial local apply: completed CODEOWNERS/u, name);
+      assert.equal(
+        readFileSync(codeownersPath, "utf8"),
+        ensureControlPlaneCodeownersContent("# retained ownership\n").content,
+        name,
+      );
+      assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW, name);
+      assert.equal(
+        existsSync(bridgeMutationLog),
+        false,
+        `${name}: no bridge rename or quarantine unlink may run after live policy drift`,
+      );
+      assert.equal(
+        readdirSync(workflowsDirectory, { withFileTypes: true }).some(
+          (entry) =>
+            entry.isDirectory() &&
+            entry.name.startsWith(".codex-review-gate-removal-"),
+        ),
+        false,
+        `${name}: live policy failure must prevent removal quarantine creation`,
+      );
+      assert.doesNotMatch(result.stdout, /Applied: remove|Next:/u, name);
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("post-cutover audit repository legacy revalidation restores the admitted bridge before unlink", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-post-rename-legacy-"),
+  );
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const absentClassicStatus = () => ({
+      __fake_http_error: 404,
+      message: "Required status checks not enabled",
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      // Admission, CODEOWNERS, removal, and both pre-rename checkpoints read
+      // a clear target policy. The sixth live read is after quarantine rename
+      // and before unlink, when a restored classic legacy status must recover
+      // the exact admitted bridge instead of reporting deletion success.
+      classicRequiredStatusChecksResponse: {
+        __fake_sequence: [
+          absentClassicStatus(),
+          absentClassicStatus(),
+          absentClassicStatus(),
+          absentClassicStatus(),
+          absentClassicStatus(),
+          {
+            strict: true,
+            contexts: [LEGACY_STATUS_CONTEXT],
+            checks: [],
+          },
+        ],
+      },
+    });
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      "# retained ownership\n",
+      "utf8",
+    );
+    const admittedBridgeIdentity = lstatSync(bridgePath);
+    const preloadPath = join(targetRoot, "post-rename-legacy-policy.cjs");
+    const bridgeMutationLog = join(targetRoot, "bridge-mutation-calls.log");
+    writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], {
+      env: {
+        ...auditProofEnv,
+        NODE_OPTIONS: `--require=${preloadPath}`,
+        CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+        CODEX_BOOTSTRAP_TEST_BRIDGE_MUTATION_LOG: bridgeMutationLog,
+      },
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stdout, /Admitted bridge-removal proof/u);
+    assert.match(
+      result.stderr,
+      /Post-cutover audit repository legacy-policy is unreadable or restored during after legacy bridge quarantine rename and before unlink/u,
+    );
+    assert.match(result.stderr, /codex\/review-gate remains required after cleanup/u);
+    assert.match(
+      result.stderr,
+      /atomically restored without overwriting any concurrent destination, and no removal success was reported/u,
+    );
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+    const restoredBridgeIdentity = lstatSync(bridgePath);
+    assert.equal(restoredBridgeIdentity.dev, admittedBridgeIdentity.dev);
+    assert.equal(restoredBridgeIdentity.ino, admittedBridgeIdentity.ino);
+    assert.equal(
+      readFileSync(bridgeMutationLog, "utf8"),
+      "rename\nunlink\n",
+      "the only quarantine unlink is the safe cleanup after atomically restoring the admitted bridge",
+    );
+    assert.equal(
+      readdirSync(workflowsDirectory, { withFileTypes: true }).some(
+        (entry) =>
+          entry.isDirectory() &&
+          entry.name.startsWith(".codex-review-gate-removal-"),
+      ),
+      false,
+      "restoration must remove its empty task-owned quarantine directory",
+    );
+    assert.doesNotMatch(result.stdout, /Applied: remove|Next:/u);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
   }
@@ -9819,27 +10226,21 @@ function buildSourceSelfHostingFinalClosureOutput(signal, options = {}) {
   return output;
 }
 
-function buildPostCutoverAuditOutput({
-  repoSlug = "Joey-Tools/consumer",
-  repositoryId = 1234,
-  repositoryNodeId = "R_kgDOConsumer",
-  defaultBranch = "master",
-} = {}) {
-  const handoffOutput = buildFinalClosureOutput({
-    format: "v2",
-    repoSlug,
-    repositoryId,
-    repositoryNodeId,
-    defaultBranch,
-  });
-  const sourceReceipt = handoffOutput.final_closure_receipt;
-  const repositories = structuredClone(sourceReceipt.manifest_repositories);
+function buildPostCutoverAuditOutput() {
+  const organization = {
+    login: "Joey-Tools",
+    id: 991,
+    node_id: "O_kgDOJoeyTools",
+  };
+  const repositories = structuredClone(
+    POST_CUTOVER_AUDIT_ACTIVE_REPOSITORY_FIXTURE_COHORT,
+  );
   const receipt = {
     schema_version: POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION,
     audit_kind: POST_CUTOVER_AUDIT_KIND,
-    organization: structuredClone(sourceReceipt.organization),
-    manifest_sha256: sourceReceipt.manifest_sha256,
-    snapshot_sha256: sourceReceipt.snapshot_sha256,
+    organization,
+    manifest_sha256: "1".repeat(64),
+    snapshot_sha256: "2".repeat(64),
     legacy: {
       id: 16590367,
       enforcement: "active",
@@ -9898,6 +10299,65 @@ function buildPostCutoverAuditOutput({
       .update(canonicalOrganizationPostCutoverAuditReceipt(receipt))
       .digest("hex"),
   };
+}
+
+function buildPostCutoverAuditLivePolicyFixture() {
+  const output = buildPostCutoverAuditOutput();
+  const receipt = output.post_cutover_audit_receipt;
+  const activeRepositoryIds = receipt.manifest_repositories.map(
+    (repository) => repository.id,
+  );
+  const legacyRuleset = {
+    id: receipt.legacy.id,
+    name: "Must Pass Codex Review",
+    source_type: "Organization",
+    source: receipt.organization.login,
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [],
+    conditions: {
+      ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] },
+      repository_id: {
+        repository_ids: [
+          ...activeRepositoryIds,
+          receipt.legacy_only_repository.id,
+        ],
+      },
+    },
+    rules: [{ type: "deletion" }, { type: "non_fast_forward" }],
+  };
+  const v2Ruleset = {
+    id: receipt.v2.id,
+    name: "Must Pass Codex Review v2",
+    source_type: "Organization",
+    source: receipt.organization.login,
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [],
+    conditions: {
+      ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] },
+      repository_id: { repository_ids: activeRepositoryIds },
+    },
+    rules: [{
+      type: "required_status_checks",
+      parameters: {
+        required_status_checks: [{
+          context: DEFAULT_STATUS_CONTEXT,
+          integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+        }],
+        strict_required_status_checks_policy: true,
+        do_not_enforce_on_create: true,
+      },
+    }],
+  };
+  receipt.legacy.writable_sha256 = createHash("sha256")
+    .update(rulesetWritableFingerprint(legacyRuleset), "utf8")
+    .digest("hex");
+  receipt.v2.writable_sha256 = createHash("sha256")
+    .update(rulesetWritableFingerprint(v2Ruleset), "utf8")
+    .digest("hex");
+  refreshPostCutoverAuditReceiptDigest(output);
+  return { output, legacyRuleset, v2Ruleset };
 }
 
 function postCutoverAuditFixtureSha(value) {
@@ -10082,7 +10542,58 @@ function finalClosureGhEnvironment(
     : {
         ...environment,
         FAKE_GH_ORIGIN_DRIFT_TARGET_ROOT: targetRoot,
-      };
+    };
+}
+
+function postCutoverAuditGhEnvironment(
+  targetRoot,
+  {
+    output,
+    legacyRuleset,
+    v2Ruleset,
+    legacyRulesetResponse = legacyRuleset,
+    v2RulesetResponse = v2Ruleset,
+    repositoryEffectiveRulesResponse = [[]],
+    classicRequiredStatusChecksResponse = {
+      __fake_http_error: 404,
+      message: "Required status checks not enabled",
+    },
+    repositoryRulesetResponses = {},
+  },
+) {
+  const receipt = output.post_cutover_audit_receipt;
+  const repository = receipt.manifest_repositories[0];
+  const branch = encodeURIComponent(repository.default_branch);
+  const fakeBin = join(targetRoot, ".post-cutover-audit-gh-bin");
+  const stateDir = join(targetRoot, ".post-cutover-audit-gh-state");
+  const callLog = join(targetRoot, ".post-cutover-audit-gh-calls.log");
+  createFakeGhExecutable(fakeBin);
+  return fakeGhEnvironment({
+    fakeBin,
+    stateDir,
+    callLog,
+    responses: {
+      [`repos/${repository.full_name}`]: repository,
+      [`orgs/${receipt.organization.login}`]: receipt.organization,
+      [`orgs/${receipt.organization.login}/rulesets/${receipt.legacy.id}`]:
+        legacyRulesetResponse,
+      [`orgs/${receipt.organization.login}/rulesets/${receipt.v2.id}`]:
+        v2RulesetResponse,
+      [`repos/${repository.full_name}/rules/branches/${branch}?per_page=100`]:
+        repositoryEffectiveRulesResponse,
+      [`repos/${repository.full_name}/branches/${branch}/protection/required_status_checks`]:
+        classicRequiredStatusChecksResponse,
+      [`repos/${repository.full_name}/branches/${branch}`]: {
+        name: repository.default_branch,
+      },
+      ...Object.fromEntries(
+        Object.entries(repositoryRulesetResponses).map(([id, response]) => [
+          `repos/${repository.full_name}/rulesets/${id}`,
+          response,
+        ]),
+      ),
+    },
+  });
 }
 
 function runGit(args) {
