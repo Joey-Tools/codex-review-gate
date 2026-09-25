@@ -1178,10 +1178,11 @@ evidence that a prior freeze remains in force.
   historical handoff-v2 route intentionally retains its compatible single-read
   behavior.
 - The code and protocol record were validated with `npm run check`, the full
-  `test/bootstrap.test.mjs` suite, `git diff --check`, and project-journal
-  validation. The changes remain pending review and merge in source PR `#71`;
-  they do not yet authorize a live organization audit or any v1 bridge
-  removal.
+  `test/bootstrap.test.mjs` and
+  `test/organization-review-gate-handoff.test.mjs` suites, `git diff --check`,
+  and project-journal validation. The changes remain pending review and merge
+  in source PR `#71`; they do not yet authorize a live organization audit or
+  any v1 bridge removal.
 
 ## Next Steps
 

@@ -140,6 +140,13 @@ const ORGANIZATION = {
   node_id: "O_kgDOCodexReviewGate",
 };
 
+const POST_CUTOVER_AUDIT_ORGANIZATION_FIXTURE = Object.freeze({
+  login: "Joey-Tools",
+  id: 283_943_935,
+  node_id: "O_kgDOEOyj_w",
+});
+const POST_CUTOVER_AUDIT_V2_RULESET_ID_FIXTURE = 23_787_657;
+
 const REPOSITORIES = [
   ["codex-apple-notes-toolkit", 1242512097, 16583474, "R_kgDOSg864Q"],
   ["codex-debug-triage", 1242512092, 16583544, "R_kgDOSg863A"],
@@ -684,7 +691,17 @@ function postCutoverAuditManifestFromHandoff(
 
 function postCutoverAuditManifestFixture() {
   const { manifest } = integrationManifestFixture();
+  applyPostCutoverAuditFixtureIdentity(manifest);
   return postCutoverAuditManifestFromHandoff(manifest);
+}
+
+function applyPostCutoverAuditFixtureIdentity(manifest) {
+  // Keep the native post-cutover fixture independent from the historical
+  // handoff fixture: bridge-removal consumers deliberately anchor this format
+  // to the one real Joey-Tools organization and organization v2 ruleset.
+  manifest.organization = clone(POST_CUTOVER_AUDIT_ORGANIZATION_FIXTURE);
+  manifest.v2_ruleset.id = POST_CUTOVER_AUDIT_V2_RULESET_ID_FIXTURE;
+  return manifest;
 }
 
 function postCutoverAuditSnapshotFixture(
@@ -902,6 +919,7 @@ function createFakeGhHarness(
     apiSortRepositoryCleanupRulesetArrays = false,
     mutateRepositoryV2RulesetReadback = null,
     mutateRepositoryCleanupRulesetReadback = null,
+    manifestFixtureTransform = null,
   } = {},
 ) {
   for (const [label, value] of [
@@ -913,6 +931,12 @@ function createFakeGhHarness(
     if (!Array.isArray(value)) {
       throw new Error(`${label} must be an array.`);
     }
+  }
+  if (
+    manifestFixtureTransform !== null &&
+    typeof manifestFixtureTransform !== "function"
+  ) {
+    throw new Error("manifestFixtureTransform must be a function or null.");
   }
   for (const [label, value] of [
     [
@@ -934,6 +958,9 @@ function createFakeGhHarness(
     ...additionalWorkflowFiles,
   ];
   const { manifest, codeownersBytes } = integrationManifestFixture();
+  if (manifestFixtureTransform !== null) {
+    manifestFixtureTransform(manifest);
+  }
   for (const [label, value] of [
     ["repositoryIdentityFailureIndex", repositoryIdentityFailureIndex],
     ["repositoryIdentityDelayIndex", repositoryIdentityDelayIndex],
@@ -2126,7 +2153,10 @@ function createFakeGhHarness(
 }
 
 function createFakePostCutoverAuditHarness(t, options = {}) {
-  const harness = createFakeGhHarness(t, options);
+  const harness = createFakeGhHarness(t, {
+    ...options,
+    manifestFixtureTransform: applyPostCutoverAuditFixtureIdentity,
+  });
   const manifest = postCutoverAuditManifestFromHandoff(harness.manifest);
   writeFileSync(harness.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(harness.v2StatePath, "active\n");
