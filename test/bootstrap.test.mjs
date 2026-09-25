@@ -33,6 +33,7 @@ import {
   LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
   LEGACY_STATUS_CONTEXT,
   ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE,
+  POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY,
   POST_CUTOVER_AUDIT_KIND,
   POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
   POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION,
@@ -1809,6 +1810,17 @@ test("validates historical v1 and current v2 organization final closure receipts
   }
 });
 
+test("handoff v2 receipts exclude source self-hosting by every identity signal", () => {
+  for (const signal of ["slug", "id", "node_id", "all"]) {
+    const output = buildSourceSelfHostingFinalClosureOutput(signal);
+    assert.throws(
+      () => validateOrganizationBridgeRemovalProofOutput(output),
+      /must not authorize the source self-hosting repository/u,
+      signal,
+    );
+  }
+});
+
 test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
   const output = buildPostCutoverAuditOutput();
   const validated = validateOrganizationPostCutoverAuditOutput(output);
@@ -1879,6 +1891,16 @@ test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
     }));
   refreshPostCutoverAuditReceiptDigest(sourceSelfHostingCohort);
 
+  const substitutedArchivedLegacyOnlyReceipt = structuredClone(output);
+  substitutedArchivedLegacyOnlyReceipt.post_cutover_audit_receipt.legacy_only_repository = {
+    full_name: "Joey-Tools/another-archived-repository",
+    id: 1_242_512_998,
+    node_id: "R_kgDOAnotherArchived",
+    default_branch: "master",
+    archived: true,
+  };
+  refreshPostCutoverAuditReceiptDigest(substitutedArchivedLegacyOnlyReceipt);
+
   const mismatchedManifestCohort = structuredClone(output);
   mismatchedManifestCohort.post_cutover_audit_receipt.manifest_repositories[0]
     .node_id = "R_kgDOMismatchedManifest";
@@ -1927,6 +1949,7 @@ test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
     ["cross-paired-output-schema", crossPairedOutputSchema],
     ["archived-legacy-only-cohort", archivedCohort],
     ["source-self-hosting-cohort", sourceSelfHostingCohort],
+    ["substituted-archived-legacy-only-receipt", substitutedArchivedLegacyOnlyReceipt],
     ["manifest-observed-cohort-mismatch", mismatchedManifestCohort],
     ["cross-linked-canary-repository", crossLinkedCanary],
     ["duplicate-canary-run", duplicateCanaryRun],
@@ -2264,6 +2287,16 @@ test("legacy bridge removal requires an exact repository-bound admitted bridge-r
       }),
       expected: /not authorized for bridge removal/u,
       codeownersContent: "# proof-admission-sentinel\n",
+    },
+    {
+      name: "v2-source-self-hosting-origin",
+      prepare: (targetRoot) => prepareFinalClosureReceipt(targetRoot, {
+        output: buildSourceSelfHostingFinalClosureOutput("all"),
+        originRepoSlug: "Joey-Tools/codex-review-gate",
+      }),
+      expected: /must not authorize the source self-hosting repository/u,
+      codeownersContent: "# proof-admission-sentinel\n",
+      assertPreflightNoLocalMutation: true,
     },
     {
       name: "v2-observed-cohort-substitutes-archived-legacy-only",
@@ -9759,6 +9792,33 @@ function buildFinalClosureOutput({
   };
 }
 
+function buildSourceSelfHostingFinalClosureOutput(signal, options = {}) {
+  const output = buildFinalClosureOutput(options);
+  const source = {
+    full_name: "Joey-Tools/codex-review-gate",
+    id: 1_238_138_775,
+    node_id: "R_kgDOScx_lw",
+  };
+  const replacement = {
+    ...output.final_closure_receipt.repositories[0],
+  };
+  if (signal === "slug" || signal === "all") {
+    replacement.full_name = source.full_name;
+  }
+  if (signal === "id" || signal === "all") {
+    replacement.id = source.id;
+  }
+  if (signal === "node_id" || signal === "all") {
+    replacement.node_id = source.node_id;
+  }
+  output.final_closure_receipt.repositories[0] = replacement;
+  output.final_closure_receipt.manifest_repositories[0] = structuredClone(
+    replacement,
+  );
+  refreshFinalClosureReceiptDigest(output);
+  return output;
+}
+
 function buildPostCutoverAuditOutput({
   repoSlug = "Joey-Tools/consumer",
   repositoryId = 1234,
@@ -9786,6 +9846,9 @@ function buildPostCutoverAuditOutput({
       writable_sha256: "3".repeat(64),
       legacy_status_context: "absent",
     },
+    legacy_only_repository: structuredClone(
+      POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY,
+    ),
     v2: {
       id: 26590367,
       enforcement: "active",

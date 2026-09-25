@@ -1116,6 +1116,14 @@ evidence that a prior freeze remains in force.
   rejected. The source self-hosting repository is likewise excluded by its
   slug, numeric ID, and node ID on both producer and bridge-removal admission;
   it retains its independent source-local closure-proof path.
+- Independent pre-PR review closed two authorization gaps before any consumer
+  bridge removal: the post-cutover producer and receipt now pin the archived
+  legacy-only object to `Joey-Tools/codex-waited-delivery` by slug, numeric ID,
+  node ID, default branch, and `archived: true`; and the retained historical
+  handoff-v2 proof route rejects the source self-hosting object by the same
+  three persistent identity signals. A substituted archived object or a
+  source-origin historical receipt therefore cannot authorize the active
+  consumer cohort.
 
 ## Next Steps
 

@@ -60,8 +60,9 @@ GitHub.com/default-branch PR scope 时停止。
 应遵循独立的 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)：为每个固定活动 member 创建一个**新的**、
 same-repository、open、non-draft 的无害 canary PR；绑定 exact native v2 CheckRun/run/job evidence；
 要求两轮 stable 的 full-cohort snapshot；之后保留完整 receipt output 供 bridge-removal PR 使用。
-已归档的 `Joey-Tools/codex-waited-delivery` 与 `Joey-Tools/codex-review-gate` 的 source bridge
-不在 scope 内。已部署的 frozen v3 consumer profile 是 audit subject；bridge-removal PR 会规范化
+固定的已归档 identity `Joey-Tools/codex-waited-delivery`（精确 slug、numeric ID、node ID、`master`
+default branch 及 `archived: true`）和 `Joey-Tools/codex-review-gate` 的 source bridge
+不在 scope 内；不得用任意已归档仓替代该历史例外。已部署的 frozen v3 consumer profile 是 audit subject；bridge-removal PR 会规范化
 workflow/CODEOWNERS，属于需要完整 review 的 control-plane change，而不是 deletion-only edit。只有
 snapshot 与 receipt 成功后，才关闭新的 canary，且保持 unmerged。PR 的 exact GitHub UTC `created_at`
 必须晚于固定 cutoff `2026-09-24T23:38:00Z`；helper 会读取、验证并将它绑定进 receipt，所以即使其他 ID

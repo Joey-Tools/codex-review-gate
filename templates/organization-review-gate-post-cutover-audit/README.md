@@ -45,10 +45,14 @@ The fixed active cohort has exactly these ten repositories, in template order:
 9. `Joey-Tools/codex-workflow-hygiene`
 10. `Joey-Tools/codex-session-retrospective-history`
 
-`Joey-Tools/codex-waited-delivery` is archived and legacy-only. It remains
-bound in `legacy_ruleset.legacy_only_repository` because the old organization
-rule still protects its deletion/non-fast-forward policy, but it is not a
-canary, receipt, or bridge-removal member. Do not create a migration, canary,
+`Joey-Tools/codex-waited-delivery` is the one fixed historical archived,
+legacy-only repository. Its exact slug, numeric ID, node ID, `master` default
+branch, and `archived: true` state are immutable audit inputs: another
+archived repository cannot replace it. It remains bound in
+`legacy_ruleset.legacy_only_repository` because the old organization rule
+still protects its deletion/non-fast-forward policy. It is not an active
+canary or bridge-removal member, although the consumable receipt records this
+identity to preserve that exclusion. Do not create a migration, canary,
 cleanup, or removal PR for it.
 
 `Joey-Tools/codex-review-gate` is source-local and outside this cohort. Its

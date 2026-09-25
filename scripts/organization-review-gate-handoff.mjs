@@ -13,6 +13,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   decodeGitHubBlobContent,
+  POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY as POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY,
   POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
   rulesetCoversDefaultBranch,
   validateFrozenHandoffV2WorkflowInventory,
@@ -32,6 +33,14 @@ export const POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION =
 export const POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION =
   "organization-review-gate-post-cutover-audit-receipt/v1";
 export const POST_CUTOVER_AUDIT_KIND = "fresh-v2-canary";
+const POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_MANIFEST_IDENTITY = Object.freeze({
+  slug: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.full_name,
+  id: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.id,
+  node_id: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.node_id,
+  default_branch:
+    POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.default_branch,
+  archived: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.archived,
+});
 export const V2_RULESET_NAME = "Must Pass Codex Review v2";
 export const V2_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
@@ -903,6 +912,22 @@ function assertPostCutoverExcludesSourceSelfHostingRepository(value, label) {
   }
 }
 
+function assertPostCutoverArchivedLegacyOnlyRepositoryIdentity(value, label) {
+  const expected = POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_MANIFEST_IDENTITY;
+  const mismatchedFields = [
+    "slug",
+    "id",
+    "node_id",
+    "default_branch",
+    "archived",
+  ].filter((field) => value[field] !== expected[field]);
+  if (mismatchedFields.length > 0) {
+    throw new Error(
+      `${label} must bind the fixed historical archived legacy-only repository ${expected.slug} by exact slug, id, node_id, default_branch, and archived state; mismatched ${mismatchedFields.join(", ")}.`,
+    );
+  }
+}
+
 export function validateManifest(input) {
   assertExactKeys(
     input,
@@ -1371,6 +1396,10 @@ export function validatePostCutoverAuditManifest(input) {
     "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
   );
   assertPostCutoverExcludesSourceSelfHostingRepository(
+    input.legacy_ruleset.legacy_only_repository,
+    "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
+  );
+  assertPostCutoverArchivedLegacyOnlyRepositoryIdentity(
     input.legacy_ruleset.legacy_only_repository,
     "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
   );
@@ -1881,6 +1910,27 @@ async function loadLegacyOnlyRepositoryIdentity(manifest, label) {
       archived: repository.archived,
     },
     label,
+  );
+  return identity;
+}
+
+function postCutoverArchivedLegacyOnlyRepositoryReceiptIdentity() {
+  return cloneJson(POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY);
+}
+
+async function loadPostCutoverArchivedLegacyOnlyRepositoryIdentity(
+  manifest,
+  label,
+) {
+  assertPostCutoverArchivedLegacyOnlyRepositoryIdentity(
+    manifest.legacy_ruleset.legacy_only_repository,
+    "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
+  );
+  const identity = await loadLegacyOnlyRepositoryIdentity(manifest, label);
+  assertExactSnapshot(
+    identity,
+    postCutoverArchivedLegacyOnlyRepositoryReceiptIdentity(),
+    `${label} fixed historical identity`,
   );
   return identity;
 }
@@ -4441,7 +4491,7 @@ async function loadPostCutoverAuditOrganizationRound(manifest) {
         "Post-cutover v2 organization ruleset",
       ),
       loadOrganizationRulesetSummaries(manifest),
-      loadLegacyOnlyRepositoryIdentity(
+      loadPostCutoverArchivedLegacyOnlyRepositoryIdentity(
         manifest,
         "Post-cutover archived legacy-only repository identity",
       ),
@@ -5438,14 +5488,8 @@ export function buildPostCutoverAuditReceipt(manifest, snapshot) {
   );
   assertExactSnapshot(
     snapshot?.organization?.legacy_only_repository,
-    {
-      full_name: manifest.legacy_ruleset.legacy_only_repository.slug,
-      id: manifest.legacy_ruleset.legacy_only_repository.id,
-      node_id: manifest.legacy_ruleset.legacy_only_repository.node_id,
-      default_branch: manifest.legacy_ruleset.legacy_only_repository.default_branch,
-      archived: true,
-    },
-    "Post-cutover audit receipt archived legacy-only repository identity",
+    postCutoverArchivedLegacyOnlyRepositoryReceiptIdentity(),
+    "Post-cutover audit receipt fixed historical archived legacy-only repository identity",
   );
   if (
     snapshot?.organization?.legacy?.id !== manifest.legacy_ruleset.id ||
@@ -5537,6 +5581,9 @@ export function buildPostCutoverAuditReceipt(manifest, snapshot) {
       writable_sha256: sha256Canonical(snapshot.organization.legacy.writable),
       legacy_status_context: "absent",
     },
+    legacy_only_repository: cloneJson(
+      snapshot.organization.legacy_only_repository,
+    ),
     v2: {
       id: snapshot.organization.v2.id,
       enforcement: snapshot.organization.v2.writable.enforcement,

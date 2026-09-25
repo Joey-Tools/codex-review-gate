@@ -256,11 +256,16 @@ export const POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE =
 // protection and must never receive bridge-removal authorization. The slug
 // catches a same-slug replacement or rename/transfer path; id and node_id
 // bind the persistent GitHub object identity.
-const CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY = Object.freeze({
+export const POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY = Object.freeze({
   full_name: "Joey-Tools/codex-waited-delivery",
   id: 1_242_512_099,
   node_id: "R_kgDOSg864w",
+  default_branch: "master",
+  archived: true,
 });
+
+const CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY =
+  POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY;
 
 // The source repository follows a separate source-local cleanup protocol. It
 // must not be smuggled into the organization consumer cohort, even if a proof
@@ -567,6 +572,7 @@ export function validateOrganizationPostCutoverAuditReceipt(receipt) {
       "manifest_sha256",
       "snapshot_sha256",
       "legacy",
+      "legacy_only_repository",
       "v2",
       "manifest_repositories",
       "repositories",
@@ -587,6 +593,11 @@ export function validateOrganizationPostCutoverAuditReceipt(receipt) {
   const organization = validateReceiptOrganization(receipt.organization);
   assertReceiptSha256(receipt.manifest_sha256, "post-cutover audit receipt manifest_sha256");
   assertReceiptSha256(receipt.snapshot_sha256, "post-cutover audit receipt snapshot_sha256");
+  const legacyOnlyRepository =
+    validatePostCutoverAuditArchivedLegacyOnlyRepository(
+      receipt.legacy_only_repository,
+      organization,
+    );
   const legacyRuleset = validatePostCutoverAuditLegacyRuleset(
     receipt.legacy,
   );
@@ -637,11 +648,47 @@ export function validateOrganizationPostCutoverAuditReceipt(receipt) {
     manifest_sha256: receipt.manifest_sha256,
     snapshot_sha256: receipt.snapshot_sha256,
     legacy: legacyRuleset,
+    legacy_only_repository: legacyOnlyRepository,
     v2: v2Ruleset,
     manifest_repositories: manifestRepositories,
     repositories,
     v2_canaries: v2Canaries,
   };
+}
+
+function validatePostCutoverAuditArchivedLegacyOnlyRepository(
+  value,
+  organization,
+) {
+  const label = "Post-cutover audit archived legacy-only repository";
+  assertPlainReceiptObject(value, label);
+  assertExactReceiptKeys(
+    value,
+    ["full_name", "id", "node_id", "default_branch", "archived"],
+    label,
+  );
+  const identity = validateReceiptRepository(
+    {
+      full_name: value.full_name,
+      id: value.id,
+      node_id: value.node_id,
+      default_branch: value.default_branch,
+    },
+    organization,
+    0,
+  );
+  if (value.archived !== true) {
+    throw new Error(`${label} archived must be true.`);
+  }
+  if (
+    canonicalJson({ ...identity, archived: value.archived }) !==
+    canonicalJson(POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY)
+  ) {
+    throw new Error(
+      `${label} must bind the fixed historical Joey-Tools/codex-waited-delivery identity by exact slug, id, node_id, default_branch, and archived state.`,
+    );
+  }
+  return { ...identity, archived: true };
 }
 
 // Only these two proof pairs carry current bridge-removal authority. The
@@ -747,6 +794,14 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
       "repositories",
     );
     assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
+      manifestRepositories,
+      "manifest_repositories",
+    );
+    assertSchemaTwoCohortExcludesSourceSelfHostingRepository(
+      repositories,
+      "repositories",
+    );
+    assertSchemaTwoCohortExcludesSourceSelfHostingRepository(
       manifestRepositories,
       "manifest_repositories",
     );
@@ -1077,6 +1132,25 @@ function assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
   ) {
     throw new Error(
       `Organization final closure receipt ${field} must not authorize the current archived legacy-only repository.`,
+    );
+  }
+}
+
+function assertSchemaTwoCohortExcludesSourceSelfHostingRepository(
+  repositories,
+  field,
+) {
+  const source = SOURCE_SELF_HOSTING_REPOSITORY;
+  if (
+    repositories.some(
+      (repository) =>
+        repository.full_name.toLowerCase() === source.full_name.toLowerCase() ||
+        repository.id === source.id ||
+        repository.node_id === source.node_id,
+    )
+  ) {
+    throw new Error(
+      `Organization final closure receipt ${field} must not authorize the source self-hosting repository; source bridge removal requires its separate source-local proof.`,
     );
   }
 }

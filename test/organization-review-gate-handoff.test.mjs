@@ -6655,6 +6655,13 @@ test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", asy
   const receipt = output.post_cutover_audit_receipt;
   assert.equal(receipt.schema_version, POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION);
   assert.equal(receipt.audit_kind, POST_CUTOVER_AUDIT_KIND);
+  assert.deepEqual(receipt.legacy_only_repository, {
+    full_name: ARCHIVED_LEGACY_ONLY_REPOSITORY.slug,
+    id: ARCHIVED_LEGACY_ONLY_REPOSITORY.id,
+    node_id: ARCHIVED_LEGACY_ONLY_REPOSITORY.node_id,
+    default_branch: ARCHIVED_LEGACY_ONLY_REPOSITORY.default_branch,
+    archived: true,
+  });
   assert.deepEqual(receipt.manifest_repositories, receipt.repositories);
   assert.equal(receipt.manifest_repositories.length, REQUIRED_REPOSITORY_COUNT);
   assert.equal(receipt.v2_canaries.length, REQUIRED_REPOSITORY_COUNT);
@@ -6899,6 +6906,56 @@ test("post-cutover receipt requires canonical one-to-one canary bindings", () =>
     () => validatePostCutoverAuditManifest(malformedCreatedAt),
     /canonical GitHub ISO UTC timestamp with second precision/u,
   );
+});
+
+test("post-cutover audit fixes the archived legacy-only identity before receipt authorization", async (t) => {
+  const replacement = {
+    slug: "Joey-Tools/another-archived-repository",
+    id: 1_242_512_998,
+    node_id: "R_kgDOAnotherArchived",
+    default_branch: "master",
+    archived: true,
+  };
+
+  await t.test("manifest substitution fails before any live read", async (t) => {
+    const harness = createFakePostCutoverAuditHarness(t);
+    const originalId = harness.manifest.legacy_ruleset.legacy_only_repository.id;
+    harness.manifest.legacy_ruleset.legacy_only_repository = clone(replacement);
+    harness.manifest.legacy_ruleset.expected_after.conditions.repository_id.repository_ids =
+      harness.manifest.legacy_ruleset.expected_after.conditions.repository_id.repository_ids.map(
+        (id) => (id === originalId ? replacement.id : id),
+      );
+    writeFileSync(
+      harness.manifestPath,
+      `${JSON.stringify(harness.manifest, null, 2)}\n`,
+    );
+
+    await assert.rejects(
+      runFakeCli(harness, "post-cutover-audit"),
+      /must bind the fixed historical archived legacy-only repository Joey-Tools\/codex-waited-delivery/u,
+    );
+    assert.deepEqual(
+      fakeGhRequests(harness.logPath),
+      [],
+      "the substituted manifest must fail before the audit can emit a bridge-removal receipt",
+    );
+  });
+
+  await t.test("receipt builder rejects a substituted live archived snapshot", () => {
+    const manifest = postCutoverAuditManifestFixture();
+    const snapshot = postCutoverAuditSnapshotFixture(manifest);
+    snapshot.organization.legacy_only_repository = {
+      full_name: replacement.slug,
+      id: replacement.id,
+      node_id: replacement.node_id,
+      default_branch: replacement.default_branch,
+      archived: replacement.archived,
+    };
+    assert.throws(
+      () => buildPostCutoverAuditReceipt(manifest, snapshot),
+      /fixed historical archived legacy-only repository identity/u,
+    );
+  });
 });
 
 test("post-cutover receipt builder copies only strictly fresh observed created_at values", () => {

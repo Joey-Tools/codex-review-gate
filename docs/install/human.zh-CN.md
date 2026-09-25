@@ -20,8 +20,9 @@ self-hosting 例外，它不属于该 cohort。修改任一例外 scope 前，�
 若历史 organization handoff 已完成、但 v3 manifest 缺少当时的证据，不得事后回填。应使用独立的
 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)：它为固定 cohort 的 10 个仓库各创建一个新的、open、
 non-draft、same-repository 的无害 canary PR，绑定其 exact v2 CheckRun/run/job evidence，并在两轮
-stable snapshot 后才签发供后续 bridge-removal PR 使用的 receipt。它排除已归档的
-`Joey-Tools/codex-waited-delivery` 与 source-local bridge。已部署的 frozen v3 consumer profile
+stable snapshot 后才签发供后续 bridge-removal PR 使用的 receipt。它排除固定的已归档 identity
+`Joey-Tools/codex-waited-delivery`（精确的 slug、numeric ID、node ID、`master` default branch 及
+`archived: true`），以及 source-local bridge；不得用另一个已归档仓库替换这两个排除项。已部署的 frozen v3 consumer profile
 是本 audit 的被验证对象；后续 bridge-removal PR 才会规范化 workflow/CODEOWNERS，且它们是需要完整
 review 的 control-plane change，不是 deletion-only edit。只有 snapshot 与 receipt 成功后，才关闭这些
 canary，且保持 unmerged。每个 PR 的 GitHub exact UTC `created_at` 必须晚于固定 cutoff

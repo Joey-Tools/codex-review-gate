@@ -70,9 +70,11 @@ v3 handoff manifest, do not backfill it. Follow the independent
 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md): create one **new**, same-repository, open,
 non-draft harmless canary PR for every fixed active member; bind exact native
 v2 CheckRun/run/job evidence; require two stable full-cohort snapshots; then
-preserve the complete receipt output for bridge-removal PRs. The archive
-`Joey-Tools/codex-waited-delivery` and `Joey-Tools/codex-review-gate` source
-bridge are outside the scope. Accept the deployed frozen v3 consumer profile
+preserve the complete receipt output for bridge-removal PRs. The fixed archive
+`Joey-Tools/codex-waited-delivery` (exact slug, numeric ID, node ID, `master`
+default branch, and `archived: true`) and `Joey-Tools/codex-review-gate` source
+bridge are outside the scope; an arbitrary archived repository cannot replace
+that historical exception. Accept the deployed frozen v3 consumer profile
 as the audit subject; bridge-removal PRs normalize workflow/CODEOWNERS and are
 full reviewed control-plane changes, not deletion-only edits. Close the fresh
 canaries unmerged only after the snapshots and receipt succeed. The exact

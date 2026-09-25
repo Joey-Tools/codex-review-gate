@@ -27,8 +27,11 @@ lacks contemporaneous evidence, do not backfill it. Use the independent
 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md): it creates ten new, open, non-draft,
 same-repository harmless canary PRs, binds their exact v2 CheckRun/run/job
 evidence, and requires two stable snapshots before issuing a receipt for later
-bridge-removal PRs. It excludes archived `Joey-Tools/codex-waited-delivery`
-and the source-local bridge. The deployed frozen v3 consumer profile is
+bridge-removal PRs. It excludes the fixed archived
+`Joey-Tools/codex-waited-delivery` identity (exact slug, numeric ID, node ID,
+`master` default branch, and `archived: true`) and the source-local bridge;
+another archived repository cannot substitute for either exclusion. The
+deployed frozen v3 consumer profile is
 accepted as the audit subject; bridge-removal PRs later normalize
 workflow/CODEOWNERS and require full review. Close the canaries unmerged only
 after the snapshots and receipt succeed. Each PR's exact GitHub UTC
