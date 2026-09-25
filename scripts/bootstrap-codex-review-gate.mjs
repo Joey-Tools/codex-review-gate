@@ -35,6 +35,7 @@ import {
   DEFAULT_WORKFLOW_PATH,
   LEGACY_STATUS_CONTEXT,
   assertCompleteRulesetApiObject,
+  assertPostCutoverAuditOrganizationV2RulesetSemantics,
   assertDirectoryWitnessStable,
   buildCreateRulesetPayload,
   canonicalClassicRequiredStatusChecks,
@@ -3135,7 +3136,12 @@ function postCleanupRulesetFingerprint(
   });
 }
 
-async function loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch }) {
+// Protected property: the repository object/default branch and every
+// legacy-relevant effective ruleset or classic required-status observation.
+// A stable snapshot intentionally ignores unrelated policy churn: it neither
+// authorizes nor mutates that policy, while it must never infer that the
+// legacy producer is absent from an incomplete or changing view.
+async function loadCanonicalLegacyInventorySnapshot({ repoSlug, defaultBranch }) {
   const repository = await loadLegacyInventoryRepositoryMetadata({
     repoSlug,
     defaultBranch,
@@ -3181,6 +3187,15 @@ async function loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch }) {
   const classicRequiredStatusChecks = classicResponse === GH_NOT_FOUND
     ? null
     : classicResponse;
+  const finalBranch = await ghJson(`repos/${repoSlug}/branches/${branchUri}`);
+  if (finalBranch?.name !== defaultBranch) {
+    throw new Error(
+      "The approved default branch was not readable after the legacy inventory readback.",
+    );
+  }
+  // Keep this identity read after the trailing default-branch lookup. A
+  // same-slug replacement otherwise could occur after the metadata check and
+  // be silently paired with an older branch/policy observation.
   const finalRepository = await loadLegacyInventoryRepositoryMetadata({
     repoSlug,
     defaultBranch,
@@ -3193,12 +3208,6 @@ async function loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch }) {
       "Repository identity changed during the legacy inventory readback.",
     );
   }
-  const finalBranch = await ghJson(`repos/${repoSlug}/branches/${branchUri}`);
-  if (finalBranch?.name !== defaultBranch) {
-    throw new Error(
-      "The approved default branch was not readable after the legacy inventory readback.",
-    );
-  }
   return canonicalLegacyReviewGateInventoryBytes({
     repository: repoSlug,
     repositoryId: repository.id,
@@ -3208,6 +3217,29 @@ async function loadCanonicalLegacyInventoryBytes({ repoSlug, defaultBranch }) {
     rulesets,
     classicRequiredStatusChecks,
   });
+}
+
+async function loadCanonicalLegacyInventoryBytes({
+  repoSlug,
+  defaultBranch,
+  requireStableNoLegacyObservation = false,
+}) {
+  const first = await loadCanonicalLegacyInventorySnapshot({
+    repoSlug,
+    defaultBranch,
+  });
+  if (!requireStableNoLegacyObservation) return first;
+
+  const second = await loadCanonicalLegacyInventorySnapshot({
+    repoSlug,
+    defaultBranch,
+  });
+  if (first !== second) {
+    throw new Error(
+      "Repository identity/default branch or effective/classic legacy-policy observations changed across two complete legacy inventory readbacks.",
+    );
+  }
+  return second;
 }
 
 async function loadLegacyInventoryRepositoryMetadata({ repoSlug, defaultBranch }) {
@@ -3472,6 +3504,7 @@ function assertPostCutoverAuditOrganizationRulesetBinding({
   expected,
   organization,
   label,
+  requireFixedV2Semantics = false,
 }) {
   const complete = assertCompleteRulesetApiObject(ruleset);
   if (
@@ -3483,6 +3516,13 @@ function assertPostCutoverAuditOrganizationRulesetBinding({
     throw new Error(
       `${label} no longer has the receipt-bound organization identity, source, and branch target.`,
     );
+  }
+  if (requireFixedV2Semantics) {
+    // A receipt and its expected SHA-256 are caller-controlled input.  The
+    // fixed semantic anchor below proves that the current organization v2
+    // gate is still active and strict before the receipt hash is used as a
+    // drift detector; it is not merely self-consistent with a forged receipt.
+    assertPostCutoverAuditOrganizationV2RulesetSemantics(complete, label);
   }
   const writableSha256 = fingerprintText(rulesetWritableFingerprint(complete));
   if (writableSha256 !== expected.writable_sha256) {
@@ -3553,6 +3593,7 @@ async function assertPostCutoverAuditOrganizationPolicyStable(proof, phase) {
       expected: proof.receipt.v2,
       organization,
       label: "Post-cutover audit v2 organization ruleset",
+      requireFixedV2Semantics: true,
     });
   } catch (error) {
     throw new Error(
@@ -3569,6 +3610,7 @@ async function assertPostCutoverAuditRepositoryLegacyPolicyClear(proof, phase) {
     const bytes = await loadCanonicalLegacyInventoryBytes({
       repoSlug: repository.full_name,
       defaultBranch: repository.default_branch,
+      requireStableNoLegacyObservation: true,
     });
     const inventory = decodeBoundLegacyInventory({
       bytes,

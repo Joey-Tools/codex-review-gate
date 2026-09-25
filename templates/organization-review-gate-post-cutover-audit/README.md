@@ -193,15 +193,24 @@ a digest-valid receipt with a substituted but otherwise self-consistent cohort
 is not authority. For this post-cutover receipt format only, it also re-reads
 the receipt-bound organization identity plus the exact legacy and v2 ruleset
 details at proof admission and before every local mutation/removal-quarantine
-boundary. Each detail must retain its ID, organization source, branch target,
-and the receipt's SHA-256 of its complete writable policy. An unreadable
-detail, restored `codex/review-gate`, or any legacy/v2 policy drift leaves the
-bridge installed. The receipt does not carry a replayable repository-local
-ruleset-policy snapshot, so the consumer does not invent an unbound complete
-repository-policy hash comparison. It does re-read the target default branch's
-classic required-status and effective-ruleset surfaces and requires that neither
-still requires `codex/review-gate`; the separate origin/live-repository
-identity/default-branch rebind continues to select the exact repository object.
-These are point-in-time checks at the listed boundaries, not a claim of a
-continuous remote lock. Historical handoff-v2 proofs remain identity-only
-compatible because they contain no writable-policy fingerprints.
+boundary. The receipt is complete historical/integrity evidence, but it is not
+a cryptographic authorization: both its file and expected digest are supplied
+by the bridge-removal caller. Before trusting its v2 writable-policy hash as a
+drift detector, the consumer independently anchors the live fixed Joey-Tools
+organization identity and known organization-v2 semantics: ruleset ID/name,
+organization source, branch target, Active enforcement, no bypass actors, the
+exact ten-member default-branch selector (normalizing only GitHub's unordered
+repository-ID selector order), and one strict
+`codex/github-review-gate` status requirement from GitHub Actions integration
+`15368`, including the materialized `do_not_enforce_on_create: true` field. An
+unreadable detail, restored `codex/review-gate`, disabled or weakened v2, or
+any legacy/v2 policy drift leaves the bridge installed. The receipt does not
+carry a replayable repository-local ruleset-policy snapshot, so the consumer
+does not invent an unbound complete repository-policy hash comparison. It does
+re-read the target default branch's classic required-status and effective-
+ruleset surfaces and requires that neither still requires
+`codex/review-gate`; the separate origin/live-repository identity/default-
+branch rebind continues to select the exact repository object. These are
+point-in-time checks at the listed boundaries, not a claim of a continuous
+remote lock. Historical handoff-v2 proofs remain identity-only compatible
+because they contain no writable-policy fingerprints.

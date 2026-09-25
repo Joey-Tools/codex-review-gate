@@ -1150,11 +1150,44 @@ evidence that a prior freeze remains in force.
   the focused replacement-cohort regression, the protocol-constant/template
   regression, and the full handoff suite (`232/232` passing).
 
+## Execution Update — 2026-09-25 (bridge-removal authority hardening)
+
+- Independent review found that a post-cutover receipt and its expected digest
+  are caller-supplied inputs. Comparing a live v2 writable-policy hash only to
+  that self-supplied value could therefore accept a digest-valid forged receipt
+  after an administrator had disabled or weakened v2. The consumer now treats
+  the receipt as historical/integrity evidence rather than cryptographic
+  authorization: before it uses the receipt hash as a drift detector, it
+  independently verifies the fixed Joey-Tools organization identity and the
+  complete known v2 semantics (ruleset identity, Active enforcement, no
+  bypasses, exact ten-member default-branch selector, and exactly one strict
+  `codex/github-review-gate` requirement from integration `15368`, including
+  `do_not_enforce_on_create: true`). Only unordered selector-ID ordering is
+  normalized. Disabled and non-strict self-consistent forged-receipt
+  regressions leave the bridge installed.
+- Independent review also found that a single no-v1 read could observe the
+  effective rules before a legacy rule appeared. For post-cutover-audit-v1
+  only, every bridge-removal boundary now requires two equal complete
+  repository snapshots: initial object identity/default branch, paginated
+  effective rules, all matched legacy-detail reads, classic required-status,
+  trailing branch read, then trailing object identity. The protected property
+  is the selected repository object/default branch plus every legacy-relevant
+  effective or classic status observation; unrelated policy churn is not made
+  an equality precondition. Any mismatch or unreadable read fails before
+  unlink; after quarantine it uses the existing atomic bridge restore. The
+  historical handoff-v2 route intentionally retains its compatible single-read
+  behavior.
+- The code and protocol record were validated with `npm run check`, the full
+  `test/bootstrap.test.mjs` suite, `git diff --check`, and project-journal
+  validation. The changes remain pending review and merge in source PR `#71`;
+  they do not yet authorize a live organization audit or any v1 bridge
+  removal.
+
 ## Next Steps
 
-1. Implement and review the authorized post-cutover fresh-audit path. Under a
-   fresh applicable policy-mutation freeze, collect new exact v2 canary evidence
-   for all ten active repositories, verify current policy/workflow state with a
+1. Review and merge source PR `#71`. Under a fresh applicable
+   policy-mutation freeze, then collect new exact v2 canary evidence for all
+   ten active repositories, verify current policy/workflow state with a
    ruleset-write-capable credential, mint its new receipt, and only then open
    separate active-cohort bridge-removal PRs. That receipt cannot authorize a
    source-local bridge outside the frozen cohort.
