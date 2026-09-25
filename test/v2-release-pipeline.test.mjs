@@ -32,6 +32,26 @@ const baselinePath = join(repositoryRoot, "docs", "release", "action-v2-reposito
 const actionMetadata = readFileSync(join(repositoryRoot, "packages", "action", "action.yml"), "utf8");
 const PRIMARY = "AD403DAB5377F9FA0F7D775EC2844D3367B8A71B";
 const SUBKEY = "4DD48552DDEAF6D961769DD4A49827EC48984E2C";
+const CONTRACT_FIXTURES = Object.freeze({
+  v2_0: Object.freeze({
+    manifest_schema: "urn:joey-tools:codex-review-gate:release-manifest:2",
+    schema_version: 2,
+    plan_schema: "codex-review-gate-action-release-plan-v2",
+    candidate_schema: "codex-review-gate-action-candidate-v2",
+    provenance_schema: "codex-review-gate-action-release-provenance-v2",
+    toolchain: "node20",
+    release_schema: 2,
+  }),
+  v2_1: Object.freeze({
+    manifest_schema: "urn:joey-tools:codex-review-gate:release-manifest:3",
+    schema_version: 3,
+    plan_schema: "codex-review-gate-action-release-plan-v3",
+    candidate_schema: "codex-review-gate-action-candidate-v3",
+    provenance_schema: "codex-review-gate-action-release-provenance-v3",
+    toolchain: "node24",
+    release_schema: 3,
+  }),
+});
 const RELEASE_SIGNING_PUBLIC_KEY = `-----BEGIN PGP PUBLIC KEY BLOCK-----
 
 mDMEaowbyBYJKwYBBAHaRw8BAQdAY29ZomqF1Ca0db1zFK6QQSB5UR2wK+mh77cC
@@ -498,14 +518,26 @@ function stagedActionSnapshot(source) {
   return { tree, files };
 }
 
-function releaseManifest(version, snapshot, expectedHead, previousVersion) {
+function contractFixture(version) {
+  const fixture = CONTRACT_FIXTURES[version];
+  assert.ok(fixture, `unknown release contract fixture: ${version}`);
+  return fixture;
+}
+
+function actionMetadataForToolchain(toolchain) {
+  assert.match(actionMetadata, /^  using: node(?:20|24)$/mu, "action metadata fixture must declare a supported Node runtime");
+  return actionMetadata.replace(/^  using: node(?:20|24)$/mu, `  using: ${toolchain}`);
+}
+
+function releaseManifest(version, snapshot, expectedHead, previousVersion, contract = "v2_0") {
+  const policy = contractFixture(contract);
   return {
-    $schema: "urn:joey-tools:codex-review-gate:release-manifest:2",
-    schema_version: 2,
+    $schema: policy.manifest_schema,
+    schema_version: policy.schema_version,
     version,
     contract_versions: {
-      toolchain: "node20",
-      release_schema: 2,
+      toolchain: policy.toolchain,
+      release_schema: policy.release_schema,
       status: 2,
       template: 2,
       baseline: 3,
@@ -524,7 +556,7 @@ function releaseManifest(version, snapshot, expectedHead, previousVersion) {
     files: snapshot.files,
     entrypoint: {
       metadata_path: "action.yml",
-      using: "node20",
+      using: policy.toolchain,
       main: "src/v2/gate-runtime.mjs",
     },
     signer: {
@@ -536,11 +568,12 @@ function releaseManifest(version, snapshot, expectedHead, previousVersion) {
   };
 }
 
-function writeActionPayload(source, version) {
+function writeActionPayload(source, version, contract = "v2_0") {
+  const policy = contractFixture(contract);
   const actionRoot = join(source, "packages", "action");
   write(
     join(actionRoot, "action.yml"),
-    actionMetadata,
+    actionMetadataForToolchain(policy.toolchain),
   );
   writeJson(join(actionRoot, "package.json"), {
     name: "codex-review-gate-action",
@@ -557,17 +590,17 @@ function writeActionPayload(source, version) {
   );
 }
 
-function writeReleaseIntent(source, version, expectedHead, previousVersion) {
-  writeActionPayload(source, version);
+function writeReleaseIntent(source, version, expectedHead, previousVersion, contract = "v2_0") {
+  writeActionPayload(source, version, contract);
   const snapshot = stagedActionSnapshot(source);
   writeJson(
     join(source, "release-manifest.json"),
-    releaseManifest(version, snapshot, expectedHead, previousVersion),
+    releaseManifest(version, snapshot, expectedHead, previousVersion, contract),
   );
   return commit(source, `Release intent ${version}`);
 }
 
-function fixture(t, version = "2.0.0", { includeLegacyWorkflow = false } = {}) {
+function fixture(t, version = "2.0.0", { includeLegacyWorkflow = false, contract = "v2_0" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "action-release-pipeline-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const targetWork = join(root, "target-work");
@@ -606,16 +639,16 @@ function fixture(t, version = "2.0.0", { includeLegacyWorkflow = false } = {}) {
   baseline.latest_legacy_release_commit = initialTarget;
   writeJson(join(source, "docs", "release", "action-v2-repository-baselines.json"), baseline);
 
-  writeActionPayload(source, "2.0.0-rc.0");
+  writeActionPayload(source, "2.0.0-rc.0", contract);
   const bootstrapSnapshot = stagedActionSnapshot(source);
   writeJson(
     join(source, "release-manifest.json"),
-    releaseManifest("2.0.0-rc.0", bootstrapSnapshot, initialTarget, "1.5.1"),
+    releaseManifest("2.0.0-rc.0", bootstrapSnapshot, initialTarget, "1.5.1", contract),
   );
   commit(source, "Install release controls");
 
-  const sourceCommit = writeReleaseIntent(source, version, initialTarget, "1.5.1");
-  return { root, target, source, releases, initialTarget, sourceCommit };
+  const sourceCommit = writeReleaseIntent(source, version, initialTarget, "1.5.1", contract);
+  return { root, target, source, releases, initialTarget, sourceCommit, contract };
 }
 
 function releaseArgs(state, ...args) {
@@ -817,7 +850,13 @@ function invokeVerifyPublished(state, built, options = {}) {
 
 function advanceIntent(state, version, expectedHead, previousVersion) {
   git(state.source, ["switch", "-q", "master"]);
-  const sourceCommit = writeReleaseIntent(state.source, version, expectedHead, previousVersion);
+  const sourceCommit = writeReleaseIntent(
+    state.source,
+    version,
+    expectedHead,
+    previousVersion,
+    state.contract,
+  );
   state.sourceCommit = sourceCommit;
   return sourceCommit;
 }
@@ -3908,6 +3947,39 @@ test("schema-v2 manifest produces deterministic node20 candidates with a NUL inv
   );
   assert.equal(candidate.payload.files.filter((entry) => entry.path.startsWith("src/v2/")).length, 1);
   assert.equal(candidate.payload.files.find((entry) => entry.path === "src/v2/gate-runtime.mjs")?.mode, "100644");
+});
+
+test("schema-v3 v2.1 release produces Node24 evidence and advances the v2 alias", (t) => {
+  const state = fixture(t, "2.1.0", { contract: "v2_1" });
+  const built = buildAssembledCandidate(state, { label: "node24-v2-1" });
+  const manifest = JSON.parse(git(state.source, ["show", `${state.sourceCommit}:release-manifest.json`]));
+  const candidate = JSON.parse(readFileSync(join(built.assembled, "candidate.json"), "utf8"));
+
+  assert.equal(manifest.$schema, CONTRACT_FIXTURES.v2_1.manifest_schema);
+  assert.equal(manifest.schema_version, 3);
+  assert.deepEqual(manifest.entrypoint, {
+    metadata_path: "action.yml",
+    using: "node24",
+    main: "src/v2/gate-runtime.mjs",
+  });
+  assert.equal(candidate.schema, CONTRACT_FIXTURES.v2_1.candidate_schema);
+  assert.equal(candidate.schema_version, 3);
+  assert.equal(candidate.plan.schema, CONTRACT_FIXTURES.v2_1.plan_schema);
+  assert.equal(candidate.plan.schema_version, 3);
+  assert.equal(candidate.plan.release_contract, "codex-review-gate-action-v2.1-contract-v1");
+  assert.equal(candidate.plan.major_alias, "v2");
+
+  const output = publishCandidate(state, built);
+  assert.match(output, /reconcile_state=fresh/u);
+  const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v2.1.0^{}"]);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), releaseCommit);
+  const provenance = JSON.parse(readFileSync(
+    join(state.releases, "v2.1.0", "release-provenance.json"),
+    "utf8",
+  ));
+  assert.equal(provenance.schema, CONTRACT_FIXTURES.v2_1.provenance_schema);
+  assert.equal(provenance.schema_version, 3);
+  assert.equal(provenance.plan.major_alias, "v2");
 });
 
 test("candidate transport is validated before extraction and rejects symlinks", (t) => {
@@ -7567,6 +7639,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  158,
+  159,
   "release pipeline shard registration inventory drift",
 );

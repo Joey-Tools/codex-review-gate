@@ -3,7 +3,7 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-24
+updated: 2026-09-25
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -1091,6 +1091,28 @@ evidence that a prior freeze remains in force.
   receipt; an inherited effective-rule projection cannot replace the direct
   organization detail proof.
 
+## Execution Update — 2026-09-25 (Node 24 v2.1 release-contract recovery)
+
+- GitHub Actions no longer makes the Node 20 Action runtime available. The
+  current floating `v2` payload still declares `runs.using: node20`, so its
+  verifier can fail before the gate runtime emits a report. That state is not
+  accepted as v2 validation and cannot authorize removal of the remaining
+  source legacy bridge.
+- The remediation is append-only rather than a retroactive v2.0 edit. The
+  frozen v2.0 contract remains Node 20/schema-2 for published historical
+  provenance. A separate v2.1 contract uses manifest/plan/candidate/
+  publication-plan/provenance schema version 3 and declares the same direct
+  `src/v2/gate-runtime.mjs` entrypoint under Node 24. Contract selection is
+  bound to each manifest and provenance schema, preventing a current Node 24
+  publisher policy from rewriting the meaning of a v2.0 release.
+- The control-plane support and the v2.1 release intent are intentionally
+  separate changes: the former registers and tests both contracts, while the
+  latter atomically changes the Action metadata, package version, manifest,
+  payload inventory, and release boundary. After the immutable v2.1 release is
+  published, the signed floating `v2` alias advances without consumer workflow
+  edits. A fresh exact-head v2 verifier result is then required before the
+  remaining source v1 bridge is removed.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -1112,6 +1134,9 @@ evidence that a prior freeze remains in force.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.
+5. Publish the append-only Node 24 v2.1 Action release, rerun the source v2
+   verifier against a fresh exact head, and only then complete the separately
+   authorized removal of the remaining source legacy bridge.
 
 ## Evidence
 

@@ -16,7 +16,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
 
 import {
   buildCandidate,
@@ -96,6 +95,43 @@ const APP_BYPASS = [{
   actor_type: "Integration",
   bypass_mode: "always",
 }];
+
+const CONTRACT_FIXTURES = Object.freeze({
+  v2_0: Object.freeze({
+    manifest_schema: "urn:joey-tools:codex-review-gate:release-manifest:2",
+    schema_version: 2,
+    release_contract: "codex-review-gate-action-v2.0-contract-v1",
+    plan_schema: "codex-review-gate-action-release-plan-v2",
+    candidate_schema: "codex-review-gate-action-candidate-v2",
+    publication_plan_schema: "codex-review-gate-action-publication-plan-v2",
+    provenance_schema: "codex-review-gate-action-release-provenance-v2",
+    toolchain: "node20",
+    release_schema: 2,
+  }),
+  v2_1: Object.freeze({
+    manifest_schema: "urn:joey-tools:codex-review-gate:release-manifest:3",
+    schema_version: 3,
+    release_contract: "codex-review-gate-action-v2.1-contract-v1",
+    plan_schema: "codex-review-gate-action-release-plan-v3",
+    candidate_schema: "codex-review-gate-action-candidate-v3",
+    publication_plan_schema: "codex-review-gate-action-publication-plan-v3",
+    provenance_schema: "codex-review-gate-action-release-provenance-v3",
+    toolchain: "node24",
+    release_schema: 3,
+  }),
+});
+
+function contractFixture(version) {
+  const fixture = CONTRACT_FIXTURES[version];
+  assert.ok(fixture, `unknown release contract fixture: ${version}`);
+  return fixture;
+}
+
+function actionMetadataForToolchain(toolchain) {
+  assert.match(ACTION_METADATA, /^  using: node(?:20|24)$/mu, "action metadata fixture must declare a supported Node runtime");
+  const rewritten = ACTION_METADATA.replace(/^  using: node(?:20|24)$/mu, `  using: ${toolchain}`);
+  return rewritten;
+}
 
 test("publisher identity preflight creates a short-lived RS256 App JWT", () => {
   const now = 1_800_000_000;
@@ -1143,19 +1179,26 @@ function inventoryRecord(path, sha256, size, mode = "100644") {
   return { path, type: "file", mode, size, sha256 };
 }
 
-function manifest({ version = "2.0.0", tree = "a".repeat(40), files, expectedHead = TARGET_HEAD } = {}) {
+function manifest({
+  version = "2.0.0",
+  tree = "a".repeat(40),
+  files,
+  expectedHead = TARGET_HEAD,
+  contract = "v2_0",
+} = {}) {
+  const policy = contractFixture(contract);
   const payloadFiles = files ?? [
     inventoryRecord("action.yml", "b".repeat(64), 85),
     inventoryRecord("package.json", "c".repeat(64), 180),
     inventoryRecord("src/v2/gate-runtime.mjs", "d".repeat(64), 32),
   ];
   return {
-    $schema: "urn:joey-tools:codex-review-gate:release-manifest:2",
-    schema_version: 2,
+    $schema: policy.manifest_schema,
+    schema_version: policy.schema_version,
     version,
     contract_versions: {
-      toolchain: "node20",
-      release_schema: 2,
+      toolchain: policy.toolchain,
+      release_schema: policy.release_schema,
       status: 2,
       template: 2,
       baseline: 3,
@@ -1174,7 +1217,7 @@ function manifest({ version = "2.0.0", tree = "a".repeat(40), files, expectedHea
     files: payloadFiles,
     entrypoint: {
       metadata_path: "action.yml",
-      using: "node20",
+      using: policy.toolchain,
       main: "src/v2/gate-runtime.mjs",
     },
     signer: {
@@ -1322,11 +1365,11 @@ function writeJson(path, value) {
   write(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function replaceRootActionDescription(replacement) {
+function replaceRootActionDescription(replacement, metadata = ACTION_METADATA) {
   const rootDescription = /^description:[^\r\n]*$/mu;
-  assert.match(ACTION_METADATA, rootDescription, "root Action description fixture must exist");
-  const replaced = ACTION_METADATA.replace(rootDescription, replacement);
-  assert.notEqual(replaced, ACTION_METADATA, "root Action description fixture must change");
+  assert.match(metadata, rootDescription, "root Action description fixture must exist");
+  const replaced = metadata.replace(rootDescription, replacement);
+  assert.notEqual(replaced, metadata, "root Action description fixture must change");
   return replaced;
 }
 
@@ -1383,7 +1426,8 @@ function nulInventoryDigest(records) {
   return hash.digest("hex");
 }
 
-function releaseFixture(t, { version = "2.0.0" } = {}) {
+function releaseFixture(t, { version = "2.0.0", contract = "v2_0" } = {}) {
+  const policy = contractFixture(contract);
   const root = mkdtempSync(join(tmpdir(), "release-provenance-fixture-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const targetRepo = join(root, "target");
@@ -1399,7 +1443,7 @@ function releaseFixture(t, { version = "2.0.0" } = {}) {
   git(repo, ["init", "-q", "--initial-branch=master"]);
   git(repo, ["config", "user.name", "Release Fixture"]);
   git(repo, ["config", "user.email", "release-fixture@example.invalid"]);
-  write(join(repo, "packages", "action", "action.yml"), ACTION_METADATA);
+  write(join(repo, "packages", "action", "action.yml"), actionMetadataForToolchain(policy.toolchain));
   writeJson(join(repo, "packages", "action", "package.json"), {
     name: "codex-review-gate-action",
     version,
@@ -1416,7 +1460,13 @@ function releaseFixture(t, { version = "2.0.0" } = {}) {
   const payloadCommit = commit(repo, "Install release payload");
   const tree = git(repo, ["rev-parse", `${payloadCommit}:packages/action`]);
   const files = payloadInventory(repo, payloadCommit);
-  writeJson(join(repo, "release-manifest.json"), manifest({ version, tree, files, expectedHead: targetHead }));
+  writeJson(join(repo, "release-manifest.json"), manifest({
+    version,
+    tree,
+    files,
+    expectedHead: targetHead,
+    contract,
+  }));
   const sourceCommit = commit(repo, `Release intent ${version}`);
   const admissionBefore = git(repo, ["rev-parse", `${sourceCommit}^`]);
   const plan = createReleasePlan({
@@ -1435,7 +1485,20 @@ function releaseFixture(t, { version = "2.0.0" } = {}) {
     planPath,
     outputDir: candidateDir,
   });
-  return { root, repo, targetRepo, targetHead, sourceCommit, plan, candidateDir, candidate, tree, files };
+  return {
+    root,
+    repo,
+    targetRepo,
+    targetHead,
+    sourceCommit,
+    plan,
+    candidateDir,
+    candidate,
+    tree,
+    files,
+    contract,
+    policy,
+  };
 }
 
 function materializeTargetRelease(state, {
@@ -1854,37 +1917,39 @@ test("workflow dispatch rebuilds only from a byte-exact persisted push admission
   }), /control inventory/u);
 });
 
-test("Action metadata parser admits only the closed node20 JavaScript schema", () => {
-  assert.equal(validateActionMetadata(Buffer.from(ACTION_METADATA)), true);
-  const replaceDescription = (replacement) => replaceRootActionDescription(replacement);
+test("current Action metadata parser admits only the closed node24 JavaScript schema", () => {
+  const metadata = actionMetadataForToolchain("node24");
+  assert.equal(validateActionMetadata(Buffer.from(metadata)), true);
+  const replaceDescription = (replacement) => replaceRootActionDescription(replacement, metadata);
   const invalid = new Map([
     ["malformed flow scalar", replaceDescription("description: [")],
-    ["duplicate key", ACTION_METADATA.replace("author: JoeyTeng\n", "author: JoeyTeng\nauthor: Mallory\n")],
-    ["duplicate runs", ACTION_METADATA.replace("runs:\n", "runs:\n  using: node20\n  main: src/v2/gate-runtime.mjs\nruns:\n")],
-    ["duplicate runs using", ACTION_METADATA.replace("  using: node20", "  using: node20\n  using: node20")],
-    ["duplicate runs main", ACTION_METADATA.replace("  main: src/v2/gate-runtime.mjs", "  main: src/v2/gate-runtime.mjs\n  main: src/v2/gate-runtime.mjs")],
-    ["unknown top-level key", `${ACTION_METADATA}unexpected: value\n`],
+    ["duplicate key", metadata.replace("author: JoeyTeng\n", "author: JoeyTeng\nauthor: Mallory\n")],
+    ["duplicate runs", metadata.replace("runs:\n", "runs:\n  using: node24\n  main: src/v2/gate-runtime.mjs\nruns:\n")],
+    ["duplicate runs using", metadata.replace("  using: node24", "  using: node24\n  using: node24")],
+    ["duplicate runs main", metadata.replace("  main: src/v2/gate-runtime.mjs", "  main: src/v2/gate-runtime.mjs\n  main: src/v2/gate-runtime.mjs")],
+    ["unknown top-level key", `${metadata}unexpected: value\n`],
     ["anchor", replaceDescription("description: &desc Reconcile evidence.")],
     ["alias", replaceDescription("description: *desc")],
     ["tag", replaceDescription("description: !str Reconcile evidence.")],
-    ["merge key", ACTION_METADATA.replace("  icon: shield\n", "  <<: *branding\n  icon: shield\n")],
-    ["multiple documents", `---\n${ACTION_METADATA}`],
+    ["merge key", metadata.replace("  icon: shield\n", "  <<: *branding\n  icon: shield\n")],
+    ["multiple documents", `---\n${metadata}`],
     ["block scalar", replaceDescription("description: |\n  Reconcile evidence.")],
-    ["flow mapping", ACTION_METADATA.replace("branding:\n  icon: shield\n  color: blue", "branding: {icon: shield, color: blue}")],
-    ["tab indentation", ACTION_METADATA.replace("  using: node20", "\tusing: node20")],
-    ["control character", ACTION_METADATA.replace("author: JoeyTeng", "author: JoeyTeng\u0001")],
+    ["flow mapping", metadata.replace("branding:\n  icon: shield\n  color: blue", "branding: {icon: shield, color: blue}")],
+    ["tab indentation", metadata.replace("  using: node24", "\tusing: node24")],
+    ["control character", metadata.replace("author: JoeyTeng", "author: JoeyTeng\u0001")],
     ["NEL structural injection", replaceRootActionDescription(
-      "description: harmless\u0085  runs:\u0085    using: node20",
+      "description: harmless\u0085  runs:\u0085    using: node24",
+      metadata,
     )],
-    ["Unicode line separator indentation", ACTION_METADATA.replace("  using: node20", "\u2028\u2028using: node20")],
-    ["Unicode paragraph separator indentation", ACTION_METADATA.replace("  main: src/v2/gate-runtime.mjs", "\u2029\u2029main: src/v2/gate-runtime.mjs")],
-    ["non-breaking-space indentation", ACTION_METADATA.replace("  using: node20", "\u00a0\u00a0using: node20")],
-    ["non-ASCII scalar", ACTION_METADATA.replace("author: JoeyTeng", "author: JoeyTéng")],
-    ["extra lifecycle hook", ACTION_METADATA.replace(
+    ["Unicode line separator indentation", metadata.replace("  using: node24", "\u2028\u2028using: node24")],
+    ["Unicode paragraph separator indentation", metadata.replace("  main: src/v2/gate-runtime.mjs", "\u2029\u2029main: src/v2/gate-runtime.mjs")],
+    ["non-breaking-space indentation", metadata.replace("  using: node24", "\u00a0\u00a0using: node24")],
+    ["non-ASCII scalar", metadata.replace("author: JoeyTeng", "author: JoeyTéng")],
+    ["extra lifecycle hook", metadata.replace(
       "  main: src/v2/gate-runtime.mjs",
       "  main: src/v2/gate-runtime.mjs\n  post: cleanup.mjs",
     )],
-    ["unknown input", ACTION_METADATA.replace("inputs:\n", "inputs:\n  unexpected:\n    description: Unknown.\n    required: false\n")],
+    ["unknown input", metadata.replace("inputs:\n", "inputs:\n  unexpected:\n    description: Unknown.\n    required: false\n")],
   ]);
   for (const [label, source] of invalid) {
     assert.throws(
@@ -2156,43 +2221,23 @@ test("provenance binds workflow, release objects, signatures, and alias transiti
   writeFileSync(archivePath, archiveBytes, { flag: "w" });
 });
 
-test("historical verification routes immutable v2.0 provenance through its frozen contract after publisher evolution", async (t) => {
-  const state = releaseFixture(t);
-  const outputDir = join(state.root, "historical-release-assets");
+test("historical v2.0 Node20 provenance remains verifiable after the v2.1 Node24 contract is current", (t) => {
+  const state = releaseFixture(t, { contract: "v2_0" });
+  const outputDir = join(state.root, "historical-v2-0-release-assets");
+  const parsedManifest = readReleaseManifest(join(state.repo, "release-manifest.json"));
+  assert.equal(parsedManifest.$schema, CONTRACT_FIXTURES.v2_0.manifest_schema);
+  assert.equal(parsedManifest.schema_version, 2);
+  assert.deepEqual(parsedManifest.entrypoint, {
+    metadata_path: "action.yml",
+    using: "node20",
+    main: "src/v2/gate-runtime.mjs",
+  });
+  assert.equal(state.plan.schema, CONTRACT_FIXTURES.v2_0.plan_schema);
+  assert.equal(state.plan.release_contract, CONTRACT_FIXTURES.v2_0.release_contract);
+  assert.equal(state.candidate.schema, CONTRACT_FIXTURES.v2_0.candidate_schema);
   const { releaseCommit, fullTagObject } = materializeTargetRelease(state);
-  write(join(state.repo, "packages", "action", "action.yml"),
-    ACTION_METADATA.replace("  main: src/v2/gate-runtime.mjs", "  main: src/v3/gate-runtime.mjs"));
-  write(join(state.repo, "packages", "action", "src", "v3", "gate-runtime.mjs"), "export {};\n");
-  commit(state.repo, "Upgrade publisher runtime policy after v2.0");
 
-  const upgradedGeneratorPath = join(state.root, "upgraded-publisher.mjs");
-  const currentContractNeedle = "const CURRENT_RELEASE_CONTRACT = RELEASE_CONTRACT_V2_0;";
-  const futureContract = `const FUTURE_CURRENT_RELEASE_CONTRACT = deepFreeze({
-  ...RELEASE_CONTRACT_V2_0,
-  id: "codex-review-gate-action-v3.0-contract-v1",
-  manifest: {
-    schema: "urn:joey-tools:codex-review-gate:release-manifest:3",
-    schema_version: 3,
-    contract_versions: { ...V2_0_CONTRACT_VERSIONS, toolchain: "node24", release_schema: 3 },
-  },
-  plan: { schema: "codex-review-gate-action-release-plan-v3", schema_version: 3 },
-  candidate: { schema: "codex-review-gate-action-candidate-v3", schema_version: 3 },
-  publication_plan: { schema: "codex-review-gate-action-publication-plan-v3", schema_version: 3 },
-  provenance: { schema: "codex-review-gate-action-release-provenance-v3", schema_version: 3 },
-  entrypoint: { metadata_path: "action.yml", using: "node24", main: "src/v3/gate-runtime.mjs" },
-  runtime_paths: ["src/v3/gate-runtime.mjs"],
-});
-const CURRENT_RELEASE_CONTRACT = FUTURE_CURRENT_RELEASE_CONTRACT;`;
-  const upgradedGenerator = PROVENANCE_GENERATOR.replace(currentContractNeedle, futureContract);
-  assert.notEqual(upgradedGenerator, PROVENANCE_GENERATOR);
-  writeFileSync(upgradedGeneratorPath, upgradedGenerator, { flag: "wx", mode: 0o600 });
-  const upgradedPublisher = await import(pathToFileURL(upgradedGeneratorPath).href);
-  assert.throws(
-    () => upgradedPublisher.readReleaseManifest(join(state.repo, "release-manifest.json")),
-    /unsupported release manifest schema/u,
-  );
-
-  const finalized = upgradedPublisher.finalizeProvenance({
+  const finalized = finalizeProvenance({
     candidateDir: state.candidateDir,
     releaseCommit,
     fullTagObject,
@@ -2212,7 +2257,7 @@ const CURRENT_RELEASE_CONTRACT = FUTURE_CURRENT_RELEASE_CONTRACT;`;
     mode: 0o600,
   });
 
-  assert.equal(upgradedPublisher.verifyPublishedAssets({
+  assert.equal(verifyPublishedAssets({
     assetDir: outputDir,
     repo: state.repo,
     targetRepo: state.targetRepo,
@@ -2220,22 +2265,106 @@ const CURRENT_RELEASE_CONTRACT = FUTURE_CURRENT_RELEASE_CONTRACT;`;
     releaseCommit,
     fullTagObject,
   }), true);
-  assert.match(PROVENANCE_GENERATOR,
-    /HISTORICAL_RELEASE_CONTRACTS[\s\S]*RELEASE_PROVENANCE_SCHEMA/u);
+});
 
-  const provenancePath = join(outputDir, "release-provenance.json");
-  const unsupported = JSON.parse(readFileSync(provenancePath, "utf8"));
-  unsupported.schema = "codex-review-gate-action-release-provenance-v3";
-  unsupported.schema_version = 3;
-  writeJson(provenancePath, unsupported);
-  assert.throws(() => upgradedPublisher.verifyPublishedAssets({
+test("v2.1 Node24 manifest selects v3 records and binds the v2 floating alias", (t) => {
+  const state = releaseFixture(t, { version: "2.1.0", contract: "v2_1" });
+  const parsedManifest = readReleaseManifest(join(state.repo, "release-manifest.json"));
+  assert.equal(parsedManifest.$schema, CONTRACT_FIXTURES.v2_1.manifest_schema);
+  assert.equal(parsedManifest.schema_version, 3);
+  assert.deepEqual(parsedManifest.contract_versions, {
+    toolchain: "node24",
+    release_schema: 3,
+    status: 2,
+    template: 2,
+    baseline: 3,
+  });
+  assert.deepEqual(parsedManifest.entrypoint, {
+    metadata_path: "action.yml",
+    using: "node24",
+    main: "src/v2/gate-runtime.mjs",
+  });
+  assert.equal(state.plan.schema, CONTRACT_FIXTURES.v2_1.plan_schema);
+  assert.equal(state.plan.schema_version, 3);
+  assert.equal(state.plan.release_contract, CONTRACT_FIXTURES.v2_1.release_contract);
+  assert.equal(state.plan.major_alias, "v2");
+  assert.equal(state.candidate.schema, CONTRACT_FIXTURES.v2_1.candidate_schema);
+  assert.equal(state.candidate.schema_version, 3);
+
+  const admittedPlanPath = join(state.root, "v2-1-admitted-push-plan.json");
+  writeJson(admittedPlanPath, state.plan);
+  assert.deepEqual(createReleasePlan({
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    admissionPlanPath: admittedPlanPath,
+  }), state.plan);
+
+  const publicationPlan = createPublicationPlan({
+    candidateDir: state.candidateDir,
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    liveMasterRef: state.sourceCommit,
+  });
+  assert.equal(publicationPlan.schema, CONTRACT_FIXTURES.v2_1.publication_plan_schema);
+  assert.equal(publicationPlan.schema_version, 3);
+  const publicationPlanPath = join(state.root, "v2-1-publication-plan.json");
+  writeJson(publicationPlanPath, publicationPlan);
+  assert.deepEqual(validatePublicationPlan({
+    publicationPlanPath,
+    candidateDir: state.candidateDir,
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    liveMasterRef: state.sourceCommit,
+  }), publicationPlan);
+  const mixedPublicationPlan = {
+    ...publicationPlan,
+    schema: CONTRACT_FIXTURES.v2_0.publication_plan_schema,
+    schema_version: 2,
+  };
+  writeJson(publicationPlanPath, mixedPublicationPlan);
+  assert.throws(() => validatePublicationPlan({
+    publicationPlanPath,
+    candidateDir: state.candidateDir,
+    repo: state.repo,
+    sourceRef: state.sourceCommit,
+    controlRef: state.sourceCommit,
+    liveMasterRef: state.sourceCommit,
+  }), /publication plan contract differs/u);
+  writeJson(publicationPlanPath, publicationPlan);
+
+  const outputDir = join(state.root, "v2-1-release-assets");
+  const { releaseCommit, fullTagObject } = materializeTargetRelease(state);
+  const finalized = finalizeProvenance({
+    candidateDir: state.candidateDir,
+    releaseCommit,
+    fullTagObject,
+    releaseParent: state.targetHead,
+    aliasName: "v2",
+    aliasBefore: "none",
+    aliasMode: "create",
+    workflowRef: WORKFLOW_REF,
+    workflowRunId: "123456",
+    workflowRunAttempt: "2",
+    outputDir,
+  });
+  assert.equal(finalized.provenance.schema, CONTRACT_FIXTURES.v2_1.provenance_schema);
+  assert.equal(finalized.provenance.schema_version, 3);
+  assert.equal(finalized.provenance.alias_transition.name, "v2");
+  writeFileSync(join(outputDir, "release-provenance.json.asc"), "test-only detached signature\n", {
+    flag: "wx",
+    mode: 0o600,
+  });
+  assert.equal(verifyPublishedAssets({
     assetDir: outputDir,
     repo: state.repo,
     targetRepo: state.targetRepo,
     sourceRef: state.sourceCommit,
     releaseCommit,
     fullTagObject,
-  }), /unsupported published provenance schema/u);
+  }), true);
 });
 
 test("published provenance is cross-checked against actual wrapper and annotated tag objects", (t) => {

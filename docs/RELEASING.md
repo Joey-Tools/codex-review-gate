@@ -129,6 +129,27 @@ Published provenance selects this frozen contract for historical verification;
 later publisher evolution must not reinterpret v2.0 artifacts through a newer
 schema.
 
+### Runtime contract evolution
+
+The v2.0 contract is historical and immutable, including its
+`runs.using: node20` Action entrypoint. It remains registered exclusively so
+that published v2.0 plans, candidates, publication plans, and provenance can
+be verified according to the policy that produced them.
+
+A later v2.1 release intent selects its own append-only contract:
+`release_contract=codex-review-gate-action-v2.1-contract-v1`, manifest schema
+`urn:joey-tools:codex-review-gate:release-manifest:3`, and version-3 plan,
+candidate, publication-plan, and provenance schemas. That contract declares
+`runs.using: node24` while retaining `main: src/v2/gate-runtime.mjs`. The
+manifest/provenance selector—not the publisher's current default—chooses the
+contract used for every construction and historical verification. Therefore a
+Node 24 migration must never retroactively reinterpret a v2.0 artifact, and a
+v2.0 manifest cannot authorize a Node 24 payload.
+
+This is the GitHub Action execution-runtime policy only. It does not by itself
+change the source publisher's runner toolchain or the repository's dual-runtime
+CI coverage.
+
 ## Workflow stages and privilege boundary
 
 The dedicated publisher runs in the source repository and has these logical
