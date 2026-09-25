@@ -47,6 +47,7 @@ import {
   ensureControlPlaneCodeownersContent,
   findEffectiveRulesetWithProfilePolicy,
   installedWorkflowMatchesCanonical,
+  isLegacyStatusContext,
   normalizeControlPlaneOwner,
   normalizeRulesetProfile,
   normalizeWorkflowPath,
@@ -3066,8 +3067,8 @@ function decodeBoundLegacyInventory({
 function assertDecodedLegacyInventoryClear(inventory, repoSlug) {
   const classic = inventory.classic_required_status_checks;
   const classicHasLegacy = classic !== null &&
-    (classic.contexts.includes(LEGACY_STATUS_CONTEXT) ||
-      classic.checks.some((check) => check.context === LEGACY_STATUS_CONTEXT));
+    (classic.contexts.some(isLegacyStatusContext) ||
+      classic.checks.some((check) => isLegacyStatusContext(check.context)));
   if (inventory.rulesets.length > 0 || classicHasLegacy) {
     throw new Error(
       `${LEGACY_STATUS_CONTEXT} remains required after cleanup on ${repoSlug}; leave the v2 ruleset active, remove only the remaining authorized legacy requirement, and rerun this read-only verification.`,
@@ -3167,7 +3168,7 @@ async function loadCanonicalLegacyInventorySnapshot({ repoSlug, defaultBranch })
           rule?.type === "required_status_checks" &&
           Array.isArray(rule?.parameters?.required_status_checks) &&
           rule.parameters.required_status_checks.some(
-            (check) => check?.context === LEGACY_STATUS_CONTEXT,
+            (check) => isLegacyStatusContext(check?.context),
           ),
       )
       .map((rule) => rule.ruleset_id),

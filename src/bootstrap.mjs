@@ -11,6 +11,16 @@ export const DEFAULT_VERIFIER_RUN_NAME =
   `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/\${{ github.event.pull_request.number }}/\${{ github.sha }}`;
 export const DEFAULT_CONTROLLER_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-controller.yml";
+
+// GitHub status-context matching is case-insensitive.  A legacy spelling
+// variant must therefore remain a legacy blocker rather than being mistaken
+// for proof that the old gate disappeared.
+export function isLegacyStatusContext(value) {
+  return (
+    typeof value === "string" &&
+    value.toLowerCase() === LEGACY_STATUS_CONTEXT.toLowerCase()
+  );
+}
 export const DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-legacy-bridge.yml";
 export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
@@ -1975,7 +1985,7 @@ export function buildCanonicalLegacyReviewGateInventory({
     if (
       rule.type === "required_status_checks" &&
       rule.parameters.required_status_checks.some(
-        (check) => check.context === LEGACY_STATUS_CONTEXT,
+        (check) => isLegacyStatusContext(check.context),
       )
     ) {
       effectiveLegacyRules.push(rule);
@@ -2012,7 +2022,7 @@ export function buildCanonicalLegacyReviewGateInventory({
         (rule) =>
           rule.type === "required_status_checks" &&
           rule.parameters.required_status_checks.some(
-            (check) => check.context === LEGACY_STATUS_CONTEXT,
+            (check) => isLegacyStatusContext(check.context),
           ),
       )
     ) {

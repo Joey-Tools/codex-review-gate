@@ -1177,6 +1177,11 @@ evidence that a prior freeze remains in force.
   unlink; after quarantine it uses the existing atomic bridge restore. The
   historical handoff-v2 route intentionally retains its compatible single-read
   behavior.
+- The same no-v1 reader now treats status contexts case-insensitively, matching
+  GitHub's status-context semantics and the producer's existing audit rule. A
+  restored `CODEX/REVIEW-GATE` variant in either effective rules or classic
+  branch protection is therefore a legacy blocker, not a clean observation;
+  focused regressions cover both surfaces.
 - The code and protocol record were validated with `npm run check`, the full
   `test/bootstrap.test.mjs` and
   `test/organization-review-gate-handoff.test.mjs` suites, `git diff --check`,

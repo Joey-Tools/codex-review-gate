@@ -2476,6 +2476,67 @@ test("post-cutover audit rejects self-consistent forged receipt hashes for disab
   }
 });
 
+test("post-cutover audit rejects a case-variant legacy context in classic protection", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-classic-legacy-variant-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      classicRequiredStatusChecksResponse: {
+        strict: true,
+        contexts: [LEGACY_STATUS_CONTEXT.toUpperCase()],
+        checks: [],
+      },
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], { env: auditProofEnv });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Post-cutover audit repository legacy-policy is unreadable or restored during bridge-removal proof admission/u,
+    );
+    assert.match(result.stderr, /codex\/review-gate remains required after cleanup/u);
+    assert.equal(existsSync(bridgePath), true);
+    assert.doesNotMatch(result.stdout, /Admitted bridge-removal proof|Applied: remove/u);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
 test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable policy after admission before bridge removal", () => {
   for (const [name, configure, expected, wrapper] of [
     [
@@ -2505,6 +2566,7 @@ test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable
     [
       "restored-repository-legacy-status",
       (fixture) => {
+        const restoredLegacyContext = LEGACY_STATUS_CONTEXT.toUpperCase();
         const repository = fixture.output.post_cutover_audit_receipt
           .manifest_repositories[0];
         const restoredRepositoryRuleset = {
@@ -2521,7 +2583,7 @@ test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable
           rules: [{
             type: "required_status_checks",
             parameters: {
-              required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+              required_status_checks: [{ context: restoredLegacyContext }],
               strict_required_status_checks_policy: true,
             },
           }],
@@ -2537,7 +2599,7 @@ test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable
                 type: "required_status_checks",
                 ruleset_id: restoredRepositoryRuleset.id,
                 parameters: {
-                  required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+                  required_status_checks: [{ context: restoredLegacyContext }],
                   strict_required_status_checks_policy: true,
                 },
               }]],
@@ -2545,7 +2607,7 @@ test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable
                 type: "required_status_checks",
                 ruleset_id: restoredRepositoryRuleset.id,
                 parameters: {
-                  required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+                  required_status_checks: [{ context: restoredLegacyContext }],
                   strict_required_status_checks_policy: true,
                 },
               }]],
@@ -2706,6 +2768,7 @@ test("post-cutover audit repository legacy revalidation restores the admitted br
     });
     const repository = auditFixture.output.post_cutover_audit_receipt
       .manifest_repositories[0];
+    const restoredLegacyContext = LEGACY_STATUS_CONTEXT.toUpperCase();
     const restoredRepositoryRuleset = {
       id: 36_590_367,
       name: "Restored repository legacy status",
@@ -2720,7 +2783,7 @@ test("post-cutover audit repository legacy revalidation restores the admitted br
       rules: [{
         type: "required_status_checks",
         parameters: {
-          required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+          required_status_checks: [{ context: restoredLegacyContext }],
           strict_required_status_checks_policy: true,
         },
       }],
@@ -2729,7 +2792,7 @@ test("post-cutover audit repository legacy revalidation restores the admitted br
       type: "required_status_checks",
       ruleset_id: restoredRepositoryRuleset.id,
       parameters: {
-        required_status_checks: [{ context: LEGACY_STATUS_CONTEXT }],
+        required_status_checks: [{ context: restoredLegacyContext }],
         strict_required_status_checks_policy: true,
       },
     }];
