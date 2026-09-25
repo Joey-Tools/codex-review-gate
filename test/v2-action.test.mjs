@@ -35,7 +35,7 @@ test("direct gate Action exposes the adopted production ABI and entrypoint", () 
     "retry_safe",
   ]);
   const runs = action.slice(action.indexOf("\nruns:\n"));
-  assert.match(runs, /^  using: node20$/mu);
+  assert.match(runs, /^  using: node24$/mu);
   assert.match(runs, /^  main: src\/v2\/gate-runtime\.mjs$/mu);
   assert.doesNotMatch(
     runs,

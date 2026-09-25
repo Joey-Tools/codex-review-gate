@@ -88,7 +88,7 @@ test("v2 publishes one direct JavaScript Action and no reusable-workflow ABI", (
 
   const runs = action.slice(action.indexOf("\nruns:\n"));
   assert.deepEqual(topLevelYamlKeys(runs), ["using", "main"]);
-  assert.match(runs, /^  using: node20$/mu);
+  assert.match(runs, /^  using: node24$/mu);
   assert.match(runs, /^  main: src\/v2\/gate-runtime\.mjs$/mu);
   assert.doesNotMatch(
     runs,
