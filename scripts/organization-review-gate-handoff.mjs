@@ -13,15 +13,34 @@ import { pathToFileURL } from "node:url";
 
 import {
   decodeGitHubBlobContent,
+  POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY as POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY,
+  POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
   rulesetCoversDefaultBranch,
   validateFrozenHandoffV2WorkflowInventory,
 } from "../src/bootstrap.mjs";
+
+export { POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE } from "../src/bootstrap.mjs";
 
 export const MANIFEST_SCHEMA_VERSION =
   "organization-review-gate-handoff-manifest/v3";
 export const OUTPUT_SCHEMA_VERSION =
   "organization-review-gate-handoff-output/v2";
 export const FINAL_CLOSURE_RECEIPT_SCHEMA_VERSION = 2;
+export const POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION =
+  "organization-review-gate-post-cutover-audit-manifest/v1";
+export const POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION =
+  "organization-review-gate-post-cutover-audit-output/v1";
+export const POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION =
+  "organization-review-gate-post-cutover-audit-receipt/v1";
+export const POST_CUTOVER_AUDIT_KIND = "fresh-v2-canary";
+const POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_MANIFEST_IDENTITY = Object.freeze({
+  slug: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.full_name,
+  id: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.id,
+  node_id: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.node_id,
+  default_branch:
+    POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.default_branch,
+  archived: POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY.archived,
+});
 export const V2_RULESET_NAME = "Must Pass Codex Review v2";
 export const V2_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
@@ -59,6 +78,81 @@ export const REQUIRED_REPOSITORY_COUNT = 10;
 // organization rule intentionally retains one archived repository so its
 // deletion/non-fast-forward protection survives the v1 status-rule removal.
 export const LEGACY_SELECTOR_REPOSITORY_COUNT = 11;
+// Source self-hosting follows its own closure protocol. It must never be
+// admitted into the organization fresh-audit cohort, even if a rename,
+// transfer, or manifest substitution preserves only one identity signal.
+export const SOURCE_SELF_HOSTING_REPOSITORY = Object.freeze({
+  slug: "Joey-Tools/codex-review-gate",
+  id: 1_238_138_775,
+  node_id: "R_kgDOScx_lw",
+});
+// This post-cutover audit is a scoped authorization for the already migrated
+// cohort, not a general ten-repository policy reader.  Bind every persistent
+// GitHub identity signal plus the default-branch selector so a manifest cannot
+// substitute another Joey-Tools repository while preserving matching ruleset
+// selectors, workflow snapshots, and fresh-canary evidence.
+export const POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES = Object.freeze([
+  Object.freeze({
+    slug: "Joey-Tools/codex-apple-notes-toolkit",
+    id: 1_242_512_097,
+    node_id: "R_kgDOSg864Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-debug-triage",
+    id: 1_242_512_092,
+    node_id: "R_kgDOSg863A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-personal-sync",
+    id: 1_242_511_852,
+    node_id: "R_kgDOSg857A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-private-workflows",
+    id: 1_242_512_336,
+    node_id: "R_kgDOSg870A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-project-journal",
+    id: 1_242_511_845,
+    node_id: "R_kgDOSg855Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-review-workflows",
+    id: 1_242_511_842,
+    node_id: "R_kgDOSg854g",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-rollout-backup",
+    id: 1_242_512_323,
+    node_id: "R_kgDOSg87ww",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-toolbox",
+    id: 1_242_511_840,
+    node_id: "R_kgDOSg854A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-workflow-hygiene",
+    id: 1_242_512_084,
+    node_id: "R_kgDOSg861A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    slug: "Joey-Tools/codex-session-retrospective-history",
+    id: 1_246_526_548,
+    node_id: "R_kgDOSkx8VA",
+    default_branch: "master",
+  }),
+]);
 export const CODEOWNERS_PATH = ".github/CODEOWNERS";
 export const V2_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
 // These are every documented nonterminal Actions workflow-run state. A run in
@@ -76,6 +170,7 @@ const CANARY_PULL_QUERY = `query CanaryPull($owner: String!, $name: String!, $nu
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       number
+      createdAt
       state
       isDraft
       merged
@@ -90,6 +185,43 @@ const CANARY_PULL_QUERY = `query CanaryPull($owner: String!, $name: String!, $nu
     }
   }
 }`;
+
+const GITHUB_ISO_UTC_SECOND_TIMESTAMP =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u;
+const POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE_MILLISECONDS =
+  parseCanonicalGitHubIsoUtcTimestamp(
+    POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
+    "Post-cutover audit freshness boundary",
+  );
+
+function parseCanonicalGitHubIsoUtcTimestamp(value, label) {
+  if (
+    typeof value !== "string" ||
+    !GITHUB_ISO_UTC_SECOND_TIMESTAMP.test(value)
+  ) {
+    throw new Error(
+      `${label} must be a canonical GitHub ISO UTC timestamp with second precision.`,
+    );
+  }
+  const milliseconds = Date.parse(value);
+  if (
+    !Number.isSafeInteger(milliseconds) ||
+    new Date(milliseconds).toISOString() !== `${value.slice(0, -1)}.000Z`
+  ) {
+    throw new Error(`${label} is not a valid GitHub ISO UTC timestamp.`);
+  }
+  return milliseconds;
+}
+
+function assertFreshPostCutoverCanaryCreatedAt(value, label) {
+  const milliseconds = parseCanonicalGitHubIsoUtcTimestamp(value, label);
+  if (milliseconds <= POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE_MILLISECONDS) {
+    throw new Error(
+      `${label} must be strictly later than the post-cutover freshness boundary ${POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE}.`,
+    );
+  }
+  return value;
+}
 export const CANONICAL_WORKFLOW_IDENTITIES = Object.freeze({
   verifier: Object.freeze({
     path: ".github/workflows/codex-review-gate.yml",
@@ -160,6 +292,7 @@ const MODES = new Set([
   "derive-cutover",
   "apply-repository-cleanup",
   "verify",
+  "post-cutover-audit",
 ]);
 const WORKFLOW_KEYS = ["verifier", "controller", "legacy_bridge"];
 const CONTROL_PLANE_CODEOWNERS_BEGIN =
@@ -824,6 +957,72 @@ function assertLegacyOnlyRepositoryIdentity(value, organization, label) {
   }
 }
 
+function assertPostCutoverExcludesSourceSelfHostingRepository(value, label) {
+  const slug = value.slug ?? value.full_name;
+  const matchingSignals = [];
+  if (
+    typeof slug === "string" &&
+    slug.toLowerCase() === SOURCE_SELF_HOSTING_REPOSITORY.slug.toLowerCase()
+  ) {
+    matchingSignals.push("slug");
+  }
+  if (value.id === SOURCE_SELF_HOSTING_REPOSITORY.id) {
+    matchingSignals.push("id");
+  }
+  if (value.node_id === SOURCE_SELF_HOSTING_REPOSITORY.node_id) {
+    matchingSignals.push("node_id");
+  }
+  if (matchingSignals.length > 0) {
+    throw new Error(
+      `${label} must explicitly exclude source self-hosting repository ${SOURCE_SELF_HOSTING_REPOSITORY.slug} by slug/id/node identity; matched ${matchingSignals.join(", ")}. Its bridge requires its own source-local closure proof.`,
+    );
+  }
+}
+
+function assertPostCutoverArchivedLegacyOnlyRepositoryIdentity(value, label) {
+  const expected = POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_MANIFEST_IDENTITY;
+  const mismatchedFields = [
+    "slug",
+    "id",
+    "node_id",
+    "default_branch",
+    "archived",
+  ].filter((field) => value[field] !== expected[field]);
+  if (mismatchedFields.length > 0) {
+    throw new Error(
+      `${label} must bind the fixed historical archived legacy-only repository ${expected.slug} by exact slug, id, node_id, default_branch, and archived state; mismatched ${mismatchedFields.join(", ")}.`,
+    );
+  }
+}
+
+function canonicalPostCutoverAuditActiveCohortIdentities(repositories) {
+  return repositories
+    .map((repository) => ({
+      slug: repository.slug ?? repository.full_name,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+    }))
+    .sort((left, right) =>
+      Buffer.compare(
+        Buffer.from(left.slug ?? "", "utf8"),
+        Buffer.from(right.slug ?? "", "utf8"),
+      ),
+    );
+}
+
+function assertPostCutoverAuditFixedActiveCohort(repositories, label) {
+  const expected = canonicalPostCutoverAuditActiveCohortIdentities(
+    POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES,
+  );
+  const actual = canonicalPostCutoverAuditActiveCohortIdentities(repositories);
+  if (canonicalJson(actual) !== canonicalJson(expected)) {
+    throw new Error(
+      `${label} must bind the fixed post-cutover active ${REQUIRED_REPOSITORY_COUNT}-member cohort by exact slug, id, node_id, and default_branch; another Joey-Tools repository cannot substitute a documented member.`,
+    );
+  }
+}
+
 export function validateManifest(input) {
   assertExactKeys(
     input,
@@ -1068,6 +1267,379 @@ export function validateManifest(input) {
   buildV2OrganizationRulesetPayload(input, "disabled");
   deriveLegacyOrganizationCutoverPayload(input);
   assertJsonData(input, "manifest");
+  return cloneJson(input);
+}
+
+function assertPostCutoverSelectorRepositoryIds(
+  repositoryIds,
+  activeRepositoryIds,
+  legacyOnlyRepository,
+  label,
+) {
+  if (
+    !Array.isArray(repositoryIds) ||
+    repositoryIds.some((id) => !Number.isSafeInteger(id) || id <= 0)
+  ) {
+    throw new Error(`${label} must be an array of positive safe-integer IDs.`);
+  }
+  const expectedIds = [...activeRepositoryIds, legacyOnlyRepository.id];
+  if (
+    repositoryIds.length !== LEGACY_SELECTOR_REPOSITORY_COUNT ||
+    new Set(repositoryIds).size !== repositoryIds.length ||
+    canonicalJson([...repositoryIds].sort((left, right) => left - right)) !==
+      canonicalJson([...expectedIds].sort((left, right) => left - right))
+  ) {
+    throw new Error(
+      `${label} must select exactly the ten active repositories and the one archived legacy-only repository.`,
+    );
+  }
+}
+
+function assertPostCutoverDefaultBranchConditions(conditions, label) {
+  assertExactKeys(conditions, ["ref_name", "repository_id"], label);
+  assertExactKeys(
+    conditions.ref_name,
+    ["include", "exclude"],
+    `${label}.ref_name`,
+  );
+  if (
+    canonicalJson(conditions.ref_name.include) !==
+      canonicalJson(["~DEFAULT_BRANCH"]) ||
+    canonicalJson(conditions.ref_name.exclude) !== canonicalJson([])
+  ) {
+    throw new Error(`${label}.ref_name must select exactly ~DEFAULT_BRANCH.`);
+  }
+  assertExactKeys(
+    conditions.repository_id,
+    ["repository_ids"],
+    `${label}.repository_id`,
+  );
+}
+
+function assertPostCutoverLegacyOrganizationRulesetPolicy(
+  ruleset,
+  activeRepositoryIds,
+  legacyOnlyRepository,
+  label,
+) {
+  assertWritableRuleset(ruleset, label);
+  if (ruleset.enforcement !== "active") {
+    throw new Error(`${label} must remain active after the v1 bridge removal.`);
+  }
+  if (ruleset.bypass_actors.length !== 0) {
+    throw new Error(`${label} must have an explicit empty bypass list.`);
+  }
+  assertPostCutoverDefaultBranchConditions(ruleset.conditions, `${label}.conditions`);
+  assertPostCutoverSelectorRepositoryIds(
+    ruleset.conditions.repository_id.repository_ids,
+    activeRepositoryIds,
+    legacyOnlyRepository,
+    `${label}.conditions.repository_id.repository_ids`,
+  );
+  if (
+    requiredStatusRules(ruleset).length !== 0 ||
+    ruleset.rules.length !== 2 ||
+    ruleset.rules.filter((rule) => rule.type === "deletion").length !== 1 ||
+    ruleset.rules.filter((rule) => rule.type === "non_fast_forward").length !== 1
+  ) {
+    throw new Error(
+      `${label} must retain exactly deletion and non_fast_forward rules, with no legacy status context.`,
+    );
+  }
+}
+
+function postCutoverV2OrganizationStatusParameters() {
+  return {
+    required_status_checks: [
+      {
+        context: V2_STATUS_CONTEXT,
+        integration_id: GITHUB_ACTIONS_INTEGRATION_ID,
+      },
+    ],
+    strict_required_status_checks_policy: true,
+    do_not_enforce_on_create: true,
+  };
+}
+
+function assertPostCutoverV2OrganizationRulesetPolicy(
+  ruleset,
+  activeRepositoryIds,
+  label,
+) {
+  assertWritableRuleset(ruleset, label);
+  if (
+    ruleset.name !== V2_RULESET_NAME ||
+    ruleset.enforcement !== "active" ||
+    ruleset.bypass_actors.length !== 0
+  ) {
+    throw new Error(
+      `${label} must be the active ${V2_RULESET_NAME} policy with an explicit empty bypass list.`,
+    );
+  }
+  assertPostCutoverDefaultBranchConditions(ruleset.conditions, `${label}.conditions`);
+  const ids = ruleset.conditions.repository_id.repository_ids;
+  if (
+    !Array.isArray(ids) ||
+    ids.some((id) => !Number.isSafeInteger(id) || id <= 0) ||
+    ids.length !== REQUIRED_REPOSITORY_COUNT ||
+    new Set(ids).size !== ids.length ||
+    canonicalJson([...ids].sort((left, right) => left - right)) !==
+      canonicalJson([...activeRepositoryIds].sort((left, right) => left - right))
+  ) {
+    throw new Error(
+      `${label}.conditions.repository_id.repository_ids must select exactly the ten active repositories.`,
+    );
+  }
+  if (
+    ruleset.rules.length !== 1 ||
+    ruleset.rules[0].type !== "required_status_checks"
+  ) {
+    throw new Error(`${label} must contain exactly one v2 required_status_checks rule.`);
+  }
+  assertExactSnapshot(
+    ruleset.rules[0].parameters,
+    postCutoverV2OrganizationStatusParameters(),
+    `${label}.required_status_checks.parameters`,
+  );
+}
+
+function assertPostCutoverCanary(canary, label) {
+  assertExactKeys(
+    canary,
+    [
+      "pull_number",
+      "created_at",
+      "head_sha",
+      "base_sha",
+      "test_merge_sha",
+      "v2_check_run_id",
+      "v2_run_id",
+      "v2_job_id",
+      "v2_workflow_id",
+      "v2_run_attempt",
+    ],
+    label,
+  );
+  assertPositiveInteger(canary.pull_number, `${label}.pull_number`);
+  assertFreshPostCutoverCanaryCreatedAt(
+    canary.created_at,
+    `${label}.created_at`,
+  );
+  assertHex(canary.head_sha, 40, `${label}.head_sha`);
+  assertHex(canary.base_sha, 40, `${label}.base_sha`);
+  assertHex(canary.test_merge_sha, 40, `${label}.test_merge_sha`);
+  assertPositiveInteger(canary.v2_check_run_id, `${label}.v2_check_run_id`);
+  assertPositiveInteger(canary.v2_run_id, `${label}.v2_run_id`);
+  assertPositiveInteger(canary.v2_job_id, `${label}.v2_job_id`);
+  assertPositiveInteger(canary.v2_workflow_id, `${label}.v2_workflow_id`);
+  assertPositiveInteger(canary.v2_run_attempt, `${label}.v2_run_attempt`);
+}
+
+export function validatePostCutoverAuditManifest(input) {
+  assertPlainObject(input, "post-cutover audit manifest");
+  if (input.schema_version !== POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION) {
+    throw new Error(
+      `post-cutover audit manifest.schema_version must be "${POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION}".`,
+    );
+  }
+  if (input.audit_kind !== POST_CUTOVER_AUDIT_KIND) {
+    throw new Error(
+      `post-cutover audit manifest.audit_kind must be "${POST_CUTOVER_AUDIT_KIND}".`,
+    );
+  }
+  assertExactKeys(
+    input,
+    [
+      "schema_version",
+      "audit_kind",
+      "organization",
+      "legacy_ruleset",
+      "v2_ruleset",
+      "repositories",
+    ],
+    "post-cutover audit manifest",
+  );
+  assertExactKeys(
+    input.organization,
+    ["login", "id", "node_id"],
+    "post-cutover audit manifest.organization",
+  );
+  if (!/^[A-Za-z0-9-]+$/u.test(input.organization.login ?? "")) {
+    throw new Error("post-cutover audit manifest.organization.login is malformed.");
+  }
+  assertPositiveInteger(
+    input.organization.id,
+    "post-cutover audit manifest.organization.id",
+  );
+  assertNonEmptyString(
+    input.organization.node_id,
+    "post-cutover audit manifest.organization.node_id",
+  );
+
+  assertExactKeys(
+    input.legacy_ruleset,
+    ["id", "legacy_only_repository", "expected_after"],
+    "post-cutover audit manifest.legacy_ruleset",
+  );
+  assertPositiveInteger(
+    input.legacy_ruleset.id,
+    "post-cutover audit manifest.legacy_ruleset.id",
+  );
+  assertLegacyOnlyRepositoryIdentity(
+    input.legacy_ruleset.legacy_only_repository,
+    input.organization,
+    "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
+  );
+  assertPostCutoverExcludesSourceSelfHostingRepository(
+    input.legacy_ruleset.legacy_only_repository,
+    "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
+  );
+  assertPostCutoverArchivedLegacyOnlyRepositoryIdentity(
+    input.legacy_ruleset.legacy_only_repository,
+    "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
+  );
+
+  assertExactKeys(
+    input.v2_ruleset,
+    ["id", "name", "expected"],
+    "post-cutover audit manifest.v2_ruleset",
+  );
+  assertPositiveInteger(
+    input.v2_ruleset.id,
+    "post-cutover audit manifest.v2_ruleset.id",
+  );
+  if (input.v2_ruleset.name !== V2_RULESET_NAME) {
+    throw new Error(
+      `post-cutover audit manifest.v2_ruleset.name must be "${V2_RULESET_NAME}".`,
+    );
+  }
+  if (input.v2_ruleset.id === input.legacy_ruleset.id) {
+    throw new Error(
+      "post-cutover audit manifest legacy and v2 organization ruleset IDs must differ.",
+    );
+  }
+
+  if (
+    !Array.isArray(input.repositories) ||
+    input.repositories.length !== REQUIRED_REPOSITORY_COUNT
+  ) {
+    throw new Error(
+      `post-cutover audit manifest.repositories must contain exactly ${REQUIRED_REPOSITORY_COUNT} entries.`,
+    );
+  }
+  const seenIds = new Set();
+  const seenSlugs = new Set();
+  const seenNodeIds = new Set();
+  const seenCanaryCheckRunIds = new Set();
+  const seenCanaryRunIds = new Set();
+  const seenCanaryJobIds = new Set();
+  for (const [index, repo] of input.repositories.entries()) {
+    const label = `post-cutover audit manifest.repositories[${index}]`;
+    assertExactKeys(
+      repo,
+      [
+        "slug",
+        "id",
+        "node_id",
+        "default_branch",
+        "workflows",
+        "codeowners",
+        "v2_ruleset",
+        "canary",
+      ],
+      label,
+    );
+    assertSlug(repo.slug, `${label}.slug`);
+    const [owner] = repo.slug.split("/");
+    if (owner.toLowerCase() !== input.organization.login.toLowerCase()) {
+      throw new Error(`${label}.slug must belong to manifest.organization.login.`);
+    }
+    assertPositiveInteger(repo.id, `${label}.id`);
+    assertNonEmptyString(repo.node_id, `${label}.node_id`);
+    assertNonEmptyString(repo.default_branch, `${label}.default_branch`);
+    if (repo.default_branch.startsWith("refs/") || repo.default_branch.includes("..")) {
+      throw new Error(`${label}.default_branch is malformed.`);
+    }
+    assertPostCutoverExcludesSourceSelfHostingRepository(repo, label);
+    if (
+      seenIds.has(repo.id) ||
+      seenSlugs.has(repo.slug.toLowerCase()) ||
+      seenNodeIds.has(repo.node_id)
+    ) {
+      throw new Error(`${label} duplicates a repository identity.`);
+    }
+    seenIds.add(repo.id);
+    seenSlugs.add(repo.slug.toLowerCase());
+    seenNodeIds.add(repo.node_id);
+
+    assertExactKeys(repo.workflows, WORKFLOW_KEYS, `${label}.workflows`);
+    const workflowPaths = new Set();
+    for (const key of WORKFLOW_KEYS) {
+      assertWorkflowDescriptor(repo.workflows[key], `${label}.workflows.${key}`);
+      if (
+        canonicalJson(repo.workflows[key]) !==
+        canonicalJson(CANONICAL_WORKFLOW_IDENTITIES[key])
+      ) {
+        throw new Error(
+          `${label}.workflows.${key} must match the frozen handoff workflow identity.`,
+        );
+      }
+      if (workflowPaths.has(repo.workflows[key].path)) {
+        throw new Error(`${label}.workflows paths must be distinct.`);
+      }
+      workflowPaths.add(repo.workflows[key].path);
+    }
+    assertCodeownersDescriptor(repo.codeowners, `${label}.codeowners`);
+    assertExactKeys(repo.v2_ruleset, ["id", "expected"], `${label}.v2_ruleset`);
+    assertPositiveInteger(repo.v2_ruleset.id, `${label}.v2_ruleset.id`);
+    assertV2RepositoryRulesetPolicy(
+      repo.v2_ruleset.expected,
+      repo.default_branch,
+      `${label}.v2_ruleset.expected`,
+    );
+    assertPostCutoverCanary(repo.canary, `${label}.canary`);
+    for (const [field, seen] of [
+      ["v2_check_run_id", seenCanaryCheckRunIds],
+      ["v2_run_id", seenCanaryRunIds],
+      ["v2_job_id", seenCanaryJobIds],
+    ]) {
+      if (seen.has(repo.canary[field])) {
+        throw new Error(
+          `${label}.canary.${field} must be one-to-one across the active cohort.`,
+        );
+      }
+      seen.add(repo.canary[field]);
+    }
+  }
+
+  assertPostCutoverAuditFixedActiveCohort(
+    input.repositories,
+    "post-cutover audit manifest.repositories",
+  );
+
+  const legacyOnlyRepository = input.legacy_ruleset.legacy_only_repository;
+  if (
+    seenIds.has(legacyOnlyRepository.id) ||
+    seenSlugs.has(legacyOnlyRepository.slug.toLowerCase()) ||
+    seenNodeIds.has(legacyOnlyRepository.node_id)
+  ) {
+    throw new Error(
+      "post-cutover audit manifest.legacy_ruleset.legacy_only_repository must not overlap an active repository identity.",
+    );
+  }
+  const activeRepositoryIds = input.repositories.map((repo) => repo.id);
+  assertPostCutoverLegacyOrganizationRulesetPolicy(
+    input.legacy_ruleset.expected_after,
+    activeRepositoryIds,
+    legacyOnlyRepository,
+    "post-cutover audit manifest.legacy_ruleset.expected_after",
+  );
+  assertPostCutoverV2OrganizationRulesetPolicy(
+    input.v2_ruleset.expected,
+    activeRepositoryIds,
+    "post-cutover audit manifest.v2_ruleset.expected",
+  );
+  assertJsonData(input, "post-cutover audit manifest");
   return cloneJson(input);
 }
 
@@ -1438,6 +2010,27 @@ async function loadLegacyOnlyRepositoryIdentity(manifest, label) {
       archived: repository.archived,
     },
     label,
+  );
+  return identity;
+}
+
+function postCutoverArchivedLegacyOnlyRepositoryReceiptIdentity() {
+  return cloneJson(POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY);
+}
+
+async function loadPostCutoverArchivedLegacyOnlyRepositoryIdentity(
+  manifest,
+  label,
+) {
+  assertPostCutoverArchivedLegacyOnlyRepositoryIdentity(
+    manifest.legacy_ruleset.legacy_only_repository,
+    "post-cutover audit manifest.legacy_ruleset.legacy_only_repository",
+  );
+  const identity = await loadLegacyOnlyRepositoryIdentity(manifest, label);
+  assertExactSnapshot(
+    identity,
+    postCutoverArchivedLegacyOnlyRepositoryReceiptIdentity(),
+    `${label} fixed historical identity`,
   );
   return identity;
 }
@@ -2136,7 +2729,10 @@ async function loadDefaultBranchHead(repo, { requireCanaryBase = true } = {}) {
   return validateDefaultBranchResponse(response, repo, { requireCanaryBase });
 }
 
-async function loadCanaryPull(repo) {
+async function loadCanaryPull(
+  repo,
+  { requireFreshCreatedAt = false } = {},
+) {
   const [owner, name] = repo.slug.split("/");
   const response = await ghJson("graphql", {
     method: "POST",
@@ -2145,7 +2741,9 @@ async function loadCanaryPull(repo) {
       variables: { owner, name, number: repo.canary.pull_number },
     },
   });
-  const projection = validateCanaryPullGraphqlResponse(response, repo);
+  const projection = validateCanaryPullGraphqlResponse(response, repo, {
+    requireFreshCreatedAt,
+  });
   const pages = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/pulls/${repo.canary.pull_number}/files?per_page=100`,
     { paginate: true },
@@ -2193,7 +2791,14 @@ async function loadCanaryPull(repo) {
   return projection;
 }
 
-export function validateCanaryPullGraphqlResponse(response, repo) {
+export function validateCanaryPullGraphqlResponse(
+  response,
+  repo,
+  { requireFreshCreatedAt = false } = {},
+) {
+  if (typeof requireFreshCreatedAt !== "boolean") {
+    throw new Error("Canary pull freshness configuration must be a boolean.");
+  }
   const pull = response?.data?.repository?.pullRequest;
   assertPlainObject(pull, `${repo.slug} GraphQL canary pull request`);
   const projection = {
@@ -2210,6 +2815,12 @@ export function validateCanaryPullGraphqlResponse(response, repo) {
     test_merge_sha: pull.potentialMergeCommit?.oid,
     changed_files: pull.changedFiles,
   };
+  if (requireFreshCreatedAt) {
+    projection.created_at = assertFreshPostCutoverCanaryCreatedAt(
+      pull.createdAt,
+      `${repo.slug} GraphQL canary pull request.createdAt`,
+    );
+  }
   if (
     projection.number !== repo.canary.pull_number ||
     projection.state !== "OPEN" ||
@@ -3946,6 +4557,233 @@ async function loadCoverageRound(
   return coverage;
 }
 
+function assertPostCutoverOrganizationRulesetSummary(
+  summaries,
+  { id, name, source },
+  label,
+) {
+  const byId = summaries.filter((summary) => summary.id === id);
+  const byName = summaries.filter((summary) => summary.name === name);
+  if (
+    byId.length !== 1 ||
+    byName.length !== 1 ||
+    byId[0] !== byName[0] ||
+    byId[0].source_type !== "Organization" ||
+    byId[0].source !== source ||
+    byId[0].enforcement !== "active"
+  ) {
+    throw new Error(`${label} inventory identity is missing, ambiguous, or inactive.`);
+  }
+}
+
+async function loadPostCutoverAuditOrganizationRound(manifest) {
+  const [organization, legacy, v2, summaries, legacyOnlyRepository] =
+    await Promise.all([
+      loadOrganizationIdentity(manifest),
+      loadOrganizationRuleset(
+        manifest,
+        manifest.legacy_ruleset.id,
+        "Post-cutover legacy organization ruleset",
+      ),
+      loadOrganizationRuleset(
+        manifest,
+        manifest.v2_ruleset.id,
+        "Post-cutover v2 organization ruleset",
+      ),
+      loadOrganizationRulesetSummaries(manifest),
+      loadPostCutoverArchivedLegacyOnlyRepositoryIdentity(
+        manifest,
+        "Post-cutover archived legacy-only repository identity",
+      ),
+    ]);
+  assertPostCutoverOrganizationRulesetSummary(
+    summaries,
+    {
+      id: manifest.legacy_ruleset.id,
+      name: manifest.legacy_ruleset.expected_after.name,
+      source: manifest.organization.login,
+    },
+    "Post-cutover legacy organization ruleset",
+  );
+  assertPostCutoverOrganizationRulesetSummary(
+    summaries,
+    {
+      id: manifest.v2_ruleset.id,
+      name: manifest.v2_ruleset.name,
+      source: manifest.organization.login,
+    },
+    "Post-cutover v2 organization ruleset",
+  );
+  assertExactOrganizationRulesetSnapshot(
+    legacy.writable,
+    manifest.legacy_ruleset.expected_after,
+    "Post-cutover legacy organization ruleset",
+  );
+  assertExactOrganizationRulesetSnapshot(
+    v2.writable,
+    manifest.v2_ruleset.expected,
+    "Post-cutover v2 organization ruleset",
+  );
+  return {
+    organization,
+    legacy,
+    v2,
+    summaries,
+    legacy_only_repository: legacyOnlyRepository,
+  };
+}
+
+function assertPostCutoverNoLegacyContexts(
+  repo,
+  localRulesets,
+  classicStatus,
+  effectiveBranchRules,
+) {
+  for (const ruleset of localRulesets) {
+    if (
+      rulesetLegacyContextCount(
+        ruleset.writable,
+        `${repo.slug} local ruleset ${ruleset.id}`,
+      ) !== 0
+    ) {
+      throw new Error(
+        `${repo.slug} local ruleset ${ruleset.id} still requires ${LEGACY_STATUS_CONTEXT}.`,
+      );
+    }
+  }
+  if (classicLegacyContextCount(classicStatus) !== 0) {
+    throw new Error(
+      `${repo.slug} classic required-status protection still requires ${LEGACY_STATUS_CONTEXT}.`,
+    );
+  }
+  for (const [index, rule] of effectiveBranchRules.entries()) {
+    for (const check of effectiveRuleStatusChecks(rule, repo, index)) {
+      if (!statusContextEquals(check.context, LEGACY_STATUS_CONTEXT)) {
+        continue;
+      }
+      if (check.context !== LEGACY_STATUS_CONTEXT) {
+        throw new Error(
+          `${repo.slug} effective legacy context must use canonical spelling ${LEGACY_STATUS_CONTEXT}.`,
+        );
+      }
+      throw new Error(
+        `${repo.slug} effective default-branch policy still requires ${LEGACY_STATUS_CONTEXT}.`,
+      );
+    }
+  }
+}
+
+function assertPostCutoverEffectiveV2Gate(repo, manifest, effectiveBranchRules) {
+  const organizationRules = effectiveBranchRules.filter(
+    (rule) =>
+      rule.ruleset_id === manifest.v2_ruleset.id &&
+      rule.ruleset_source_type === "Organization" &&
+      rule.ruleset_source === manifest.organization.login,
+  );
+  if (organizationRules.length !== 1) {
+    throw new Error(
+      `${repo.slug} must have exactly one effective manifest-bound v2 organization rule.`,
+    );
+  }
+  const checks = effectiveRuleStatusChecks(
+    organizationRules[0],
+    repo,
+    effectiveBranchRules.indexOf(organizationRules[0]),
+  );
+  if (
+    checks.length !== 1 ||
+    checks[0].context !== V2_STATUS_CONTEXT ||
+    checks[0].integration_id !== GITHUB_ACTIONS_INTEGRATION_ID
+  ) {
+    throw new Error(
+      `${repo.slug} effective manifest-bound v2 organization rule must contain exactly the native GitHub Actions v2 check.`,
+    );
+  }
+}
+
+async function loadPostCutoverAuditRepositoryEvidence(repo, manifest) {
+  const metadataPromise = ghJson(`repos/${encodeEndpointPath(repo.slug)}`);
+  const defaultBranchPromise = loadDefaultBranchHead(repo, {
+    requireCanaryBase: true,
+  });
+  const [metadata, defaultBranch] = await Promise.all([
+    metadataPromise,
+    defaultBranchPromise,
+  ]);
+  const workflowControlPlane = await loadWorkflowInventoryEvidence(
+    { ...repo, scheduler_quiescence: null },
+    defaultBranch.head_sha,
+  );
+  const [canary, v2CanaryEvidence, v2Ruleset, codeowners, actionsWorkflowPermissions,
+    localRulesets, classicStatus, effectiveBranchRules] = await Promise.all([
+    loadCanaryPull(repo, { requireFreshCreatedAt: true }),
+    loadV2CanaryEvidence(repo),
+    loadRepositoryRuleset(repo),
+    loadCodeownersEvidence(repo, defaultBranch.head_sha),
+    loadActionsWorkflowPermissions(repo),
+    loadLocalRepositoryRulesets(repo),
+    loadClassicStatusSurface(repo),
+    loadEffectiveBranchRules(repo),
+  ]);
+  assertPlainObject(metadata, `${repo.slug} repository metadata`);
+  const identity = {
+    full_name: metadata.full_name,
+    id: metadata.id,
+    node_id: metadata.node_id,
+    default_branch: metadata.default_branch,
+  };
+  assertExactSnapshot(
+    identity,
+    {
+      full_name: repo.slug,
+      id: repo.id,
+      node_id: repo.node_id,
+      default_branch: repo.default_branch,
+    },
+    `${repo.slug} repository identity`,
+  );
+  assertPostCutoverNoLegacyContexts(
+    repo,
+    localRulesets,
+    classicStatus,
+    effectiveBranchRules,
+  );
+  assertPostCutoverEffectiveV2Gate(repo, manifest, effectiveBranchRules);
+  return {
+    identity,
+    default_branch: defaultBranch,
+    workflows: workflowControlPlane.canonical,
+    workflow_inventory: workflowControlPlane.inventory,
+    codeowners,
+    actions_workflow_permissions: actionsWorkflowPermissions,
+    v2_ruleset: v2Ruleset,
+    canary,
+    canary_evidence: v2CanaryEvidence,
+    complete_local_legacy_inventory: {
+      rulesets: localRulesets,
+      classic_required_status_checks: classicStatus,
+    },
+    effective_default_branch_rules: effectiveBranchRules,
+  };
+}
+
+async function loadPostCutoverAuditRound(manifest) {
+  const audit = await awaitCoverageEvidence(
+    () => loadPostCutoverAuditOrganizationRound(manifest),
+    (onFirstFailure) =>
+      mapWithConcurrency(
+        manifest.repositories,
+        REPOSITORY_EVIDENCE_CONCURRENCY,
+        (repo) => loadPostCutoverAuditRepositoryEvidence(repo, manifest),
+        { onFirstFailure },
+      ),
+  );
+  if (audit.repositories.length !== REQUIRED_REPOSITORY_COUNT) {
+    throw new Error("Post-cutover audit did not read the complete repository cohort.");
+  }
+  return audit;
+}
+
 function activationCoverageDeadlineError(label, timeoutMs) {
   return new Error(
     `${label} remained unstable for ${timeoutMs}ms; recovery_code=activation-coverage-evidence-unstable. Keep v1 protection active, repair or wait for the named evidence drift, then start a fresh quiesce/activation preview.`,
@@ -4406,7 +5244,19 @@ async function readExactHandleBytes(handle, size, label) {
   return bytes;
 }
 
-async function readManifest(path) {
+function validateManifestForMode(input, mode) {
+  if (mode === "post-cutover-audit") {
+    return validatePostCutoverAuditManifest(input);
+  }
+  if (input?.schema_version === POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION) {
+    throw new Error(
+      "The post-cutover audit manifest is read-only and may be used only with --mode post-cutover-audit.",
+    );
+  }
+  return validateManifest(input);
+}
+
+async function readManifest(path, mode) {
   const absolutePath = resolve(path);
   if (
     !Number.isInteger(fsConstants.O_NOFOLLOW) ||
@@ -4461,7 +5311,10 @@ async function readManifest(path) {
   } catch (error) {
     throw new Error(`--manifest is not valid JSON: ${error.message}`);
   }
-  return { path: absolutePath, manifest: validateManifest(parsed) };
+  return {
+    path: absolutePath,
+    manifest: validateManifestForMode(parsed, mode),
+  };
 }
 
 function readCliOptions(argv = process.argv.slice(2)) {
@@ -4542,6 +5395,7 @@ function printUsage() {
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode derive-cutover
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode apply-repository-cleanup [--apply --expected-plan-sha256 SHA256]
   node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode verify [--apply --expected-plan-sha256 SHA256]
+  node scripts/organization-review-gate-handoff.mjs --manifest PATH --mode post-cutover-audit
 
 Modes:
   plan            Read two complete organization snapshots and report the bound phase.
@@ -4552,6 +5406,7 @@ Modes:
   derive-cutover  Read-only derivation of remaining manifest-bound repository cleanup actions and the later organization cutover.
   apply-repository-cleanup  Preview or apply the remaining repository cleanup actions with per-action exact-before/readback checks.
   verify          Verify external repository cleanup; preview or apply removal of the whole legacy organization status rule, then close with two reads.
+  post-cutover-audit  Read-only fresh audit of the post-cutover v2 canaries and current no-v1-policy state; it cannot authorize legacy handoff mutation.
 
 All mutation modes default to preview. Every --apply requires the exact plan digest emitted by its immediately matching preview. Repository cleanup writes require the documented organization/repository policy-mutation freeze because GitHub does not offer a supported compare-and-swap precondition for these endpoints.
 `);
@@ -4630,6 +5485,278 @@ function finalClosureReceiptOutput(manifest, snapshot) {
   return {
     final_closure_receipt: receipt,
     final_closure_receipt_sha256: sha256Canonical(receipt),
+  };
+}
+
+function canonicalPostCutoverAuditRepositoryIdentities(repositories, label) {
+  return repositories
+    .map((repository, index) => {
+      const identity = {
+        full_name: repository.full_name,
+        id: repository.id,
+        node_id: repository.node_id,
+        default_branch: repository.default_branch,
+      };
+      assertPostCutoverExcludesSourceSelfHostingRepository(
+        identity,
+        `${label}[${index}]`,
+      );
+      return cloneJson(identity);
+    })
+    .sort((left, right) =>
+      Buffer.compare(
+        Buffer.from(left.full_name, "utf8"),
+        Buffer.from(right.full_name, "utf8"),
+      ),
+    );
+}
+
+function postCutoverCanaryReceiptRecord(manifestRepository, observedRepository) {
+  const canary = manifestRepository.canary;
+  const observedCanary = observedRepository.canary;
+  const evidence = observedRepository.canary_evidence;
+  if (
+    observedCanary?.number !== canary.pull_number ||
+    observedCanary?.state !== "OPEN" ||
+    observedCanary?.merged !== false ||
+    observedCanary?.draft !== false ||
+    observedCanary?.mergeable !== "MERGEABLE" ||
+    observedCanary?.head_sha !== canary.head_sha ||
+    observedCanary?.base_ref !== manifestRepository.default_branch ||
+    observedCanary?.base_sha !== canary.base_sha ||
+    observedCanary?.test_merge_sha !== canary.test_merge_sha ||
+    evidence?.check_run?.id !== canary.v2_check_run_id ||
+    evidence?.check_run?.head_sha !== canary.head_sha ||
+    evidence?.run?.id !== canary.v2_run_id ||
+    evidence?.run?.workflow_id !== canary.v2_workflow_id ||
+    evidence?.run?.run_attempt !== canary.v2_run_attempt ||
+    evidence?.run?.head_sha !== canary.head_sha ||
+    evidence?.job?.id !== canary.v2_job_id ||
+    evidence?.job?.check_run_id !== canary.v2_check_run_id
+  ) {
+    throw new Error(
+      `${manifestRepository.slug} post-cutover receipt cannot bind a canary that was not freshly observed as the manifest-bound native v2 success.`,
+    );
+  }
+  const createdAt = assertFreshPostCutoverCanaryCreatedAt(
+    observedCanary.created_at,
+    `${manifestRepository.slug} post-cutover receipt canary created_at`,
+  );
+  if (createdAt !== canary.created_at) {
+    throw new Error(
+      `${manifestRepository.slug} post-cutover receipt cannot bind a canary whose observed created_at does not exactly match the manifest-bound fresh canary.`,
+    );
+  }
+  return {
+    full_name: observedRepository.identity.full_name,
+    id: observedRepository.identity.id,
+    node_id: observedRepository.identity.node_id,
+    default_branch: observedRepository.identity.default_branch,
+    pull_number: canary.pull_number,
+    created_at: createdAt,
+    head_sha: canary.head_sha,
+    base_sha: canary.base_sha,
+    test_merge_sha: canary.test_merge_sha,
+    v2_check_run_id: canary.v2_check_run_id,
+    v2_run_id: canary.v2_run_id,
+    v2_job_id: canary.v2_job_id,
+    v2_workflow_id: canary.v2_workflow_id,
+    v2_run_attempt: canary.v2_run_attempt,
+  };
+}
+
+function assertPostCutoverCanaryReceiptUniqueness(canaries) {
+  for (const key of ["v2_check_run_id", "v2_run_id", "v2_job_id"]) {
+    const seen = new Set();
+    for (const canary of canaries) {
+      if (seen.has(canary[key])) {
+        throw new Error(
+          `Post-cutover receipt requires one-to-one ${key} identities across the active cohort.`,
+        );
+      }
+      seen.add(canary[key]);
+    }
+  }
+}
+
+export function buildPostCutoverAuditReceipt(manifest, snapshot) {
+  manifest = validatePostCutoverAuditManifest(manifest);
+  assertExactSnapshot(
+    snapshot?.organization?.organization,
+    manifest.organization,
+    "Post-cutover audit receipt organization identity",
+  );
+  assertExactSnapshot(
+    snapshot?.organization?.legacy_only_repository,
+    postCutoverArchivedLegacyOnlyRepositoryReceiptIdentity(),
+    "Post-cutover audit receipt fixed historical archived legacy-only repository identity",
+  );
+  if (
+    snapshot?.organization?.legacy?.id !== manifest.legacy_ruleset.id ||
+    snapshot?.organization?.v2?.id !== manifest.v2_ruleset.id
+  ) {
+    throw new Error("Post-cutover audit receipt ruleset identities do not match the manifest.");
+  }
+  if (
+    snapshot.organization.legacy.source_type !== "Organization" ||
+    snapshot.organization.legacy.source !== manifest.organization.login ||
+    snapshot.organization.v2.source_type !== "Organization" ||
+    snapshot.organization.v2.source !== manifest.organization.login
+  ) {
+    throw new Error("Post-cutover audit receipt ruleset source identities do not match the manifest.");
+  }
+  assertExactOrganizationRulesetSnapshot(
+    snapshot.organization.legacy.writable,
+    manifest.legacy_ruleset.expected_after,
+    "Post-cutover receipt legacy organization ruleset",
+  );
+  assertExactOrganizationRulesetSnapshot(
+    snapshot.organization.v2.writable,
+    manifest.v2_ruleset.expected,
+    "Post-cutover receipt v2 organization ruleset",
+  );
+  const manifestRepositories = canonicalPostCutoverAuditRepositoryIdentities(
+    manifest.repositories.map((repository) => ({
+      full_name: repository.slug,
+      id: repository.id,
+      node_id: repository.node_id,
+      default_branch: repository.default_branch,
+    })),
+    "Post-cutover audit receipt manifest_repositories",
+  );
+  const repositories = canonicalPostCutoverAuditRepositoryIdentities(
+    snapshot.repositories.map((repository) => repository.identity),
+    "Post-cutover audit receipt repositories",
+  );
+  assertPostCutoverAuditFixedActiveCohort(
+    manifestRepositories,
+    "Post-cutover audit receipt manifest_repositories",
+  );
+  assertPostCutoverAuditFixedActiveCohort(
+    repositories,
+    "Post-cutover audit receipt repositories",
+  );
+  if (
+    manifestRepositories.length !== REQUIRED_REPOSITORY_COUNT ||
+    repositories.length !== REQUIRED_REPOSITORY_COUNT ||
+    canonicalJson(manifestRepositories) !== canonicalJson(repositories)
+  ) {
+    throw new Error(
+      "Post-cutover audit receipt requires the exact observed ten-repository active cohort.",
+    );
+  }
+  const observedBySlug = new Map(
+    snapshot.repositories.map((repository) => [
+      repository.identity.full_name.toLowerCase(),
+      repository,
+    ]),
+  );
+  const manifestBySlug = new Map(
+    manifest.repositories.map((repository) => [repository.slug.toLowerCase(), repository]),
+  );
+  const v2Canaries = repositories.map((repository) => {
+    const manifestRepository = manifestBySlug.get(repository.full_name.toLowerCase());
+    const observedRepository = observedBySlug.get(repository.full_name.toLowerCase());
+    if (manifestRepository === undefined || observedRepository === undefined) {
+      throw new Error("Post-cutover audit receipt repository/canary binding is incomplete.");
+    }
+    const canary = postCutoverCanaryReceiptRecord(
+      manifestRepository,
+      observedRepository,
+    );
+    assertExactSnapshot(
+      {
+        full_name: canary.full_name,
+        id: canary.id,
+        node_id: canary.node_id,
+        default_branch: canary.default_branch,
+      },
+      repository,
+      `${repository.full_name} post-cutover receipt canary repository identity`,
+    );
+    return canary;
+  });
+  assertPostCutoverCanaryReceiptUniqueness(v2Canaries);
+  return {
+    schema_version: POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION,
+    audit_kind: POST_CUTOVER_AUDIT_KIND,
+    organization: cloneJson(snapshot.organization.organization),
+    manifest_sha256: sha256Canonical(manifest),
+    snapshot_sha256: sha256Canonical(snapshot),
+    legacy: {
+      id: snapshot.organization.legacy.id,
+      enforcement: snapshot.organization.legacy.writable.enforcement,
+      writable_sha256: sha256Canonical(snapshot.organization.legacy.writable),
+      legacy_status_context: "absent",
+    },
+    legacy_only_repository: cloneJson(
+      snapshot.organization.legacy_only_repository,
+    ),
+    v2: {
+      id: snapshot.organization.v2.id,
+      enforcement: snapshot.organization.v2.writable.enforcement,
+      writable_sha256: sha256Canonical(snapshot.organization.v2.writable),
+      required_status: {
+        context: V2_STATUS_CONTEXT,
+        integration_id: GITHUB_ACTIONS_INTEGRATION_ID,
+        strict: true,
+      },
+    },
+    manifest_repositories: manifestRepositories,
+    repositories,
+    v2_canaries: v2Canaries,
+  };
+}
+
+export function postCutoverAuditPlanDigest(plan) {
+  assertExactKeys(
+    plan,
+    ["mode", "audit_kind", "manifest_sha256", "snapshot_sha256", "action"],
+    "Post-cutover audit plan",
+  );
+  if (plan.mode !== "post-cutover-audit") {
+    throw new Error('Post-cutover audit plan mode must be "post-cutover-audit".');
+  }
+  if (plan.audit_kind !== POST_CUTOVER_AUDIT_KIND) {
+    throw new Error(
+      `Post-cutover audit plan audit_kind must be "${POST_CUTOVER_AUDIT_KIND}".`,
+    );
+  }
+  assertHex(plan.manifest_sha256, 64, "Post-cutover audit plan manifest_sha256");
+  assertHex(plan.snapshot_sha256, 64, "Post-cutover audit plan snapshot_sha256");
+  if (plan.action !== null) {
+    throw new Error("Post-cutover audit plan action must be null.");
+  }
+  return sha256Canonical(plan);
+}
+
+async function runPostCutoverAuditMode(manifest, runtime) {
+  const snapshot = await loadStable("Post-cutover fresh v2 audit", () =>
+    loadPostCutoverAuditRound(manifest),
+    runtime.stableSnapshotOptions,
+  );
+  const receipt = buildPostCutoverAuditReceipt(manifest, snapshot);
+  const plan = {
+    mode: "post-cutover-audit",
+    audit_kind: POST_CUTOVER_AUDIT_KIND,
+    manifest_sha256: sha256Canonical(manifest),
+    snapshot_sha256: sha256Canonical(snapshot),
+    action: null,
+  };
+  return {
+    schema_version: POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION,
+    mode: "post-cutover-audit",
+    audit_kind: POST_CUTOVER_AUDIT_KIND,
+    organization: cloneJson(manifest.organization),
+    manifest_sha256: plan.manifest_sha256,
+    snapshot_sha256: plan.snapshot_sha256,
+    status: "fresh-v2-canaries-verified",
+    applied: false,
+    plan_sha256: postCutoverAuditPlanDigest(plan),
+    action: null,
+    repositories_verified: snapshot.repositories.length,
+    post_cutover_audit_receipt: receipt,
+    post_cutover_audit_receipt_sha256: sha256Canonical(receipt),
   };
 }
 
@@ -5579,7 +6706,7 @@ export async function runCli(
     printUsage();
     return null;
   }
-  const { manifest } = await readManifest(options.manifestPath);
+  const { manifest } = await readManifest(options.manifestPath, options.mode);
   let output;
   switch (options.mode) {
     case "plan":
@@ -5605,6 +6732,9 @@ export async function runCli(
       break;
     case "verify":
       output = await runVerifyMode(manifest, options, runtime);
+      break;
+    case "post-cutover-audit":
+      output = await runPostCutoverAuditMode(manifest, runtime);
       break;
     default:
       throw new Error(`Unsupported mode: ${options.mode}`);

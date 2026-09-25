@@ -11,6 +11,16 @@ export const DEFAULT_VERIFIER_RUN_NAME =
   `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/\${{ github.event.pull_request.number }}/\${{ github.sha }}`;
 export const DEFAULT_CONTROLLER_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-controller.yml";
+
+// GitHub status-context matching is case-insensitive.  A legacy spelling
+// variant must therefore remain a legacy blocker rather than being mistaken
+// for proof that the old gate disappeared.
+export function isLegacyStatusContext(value) {
+  return (
+    typeof value === "string" &&
+    value.toLowerCase() === LEGACY_STATUS_CONTEXT.toLowerCase()
+  );
+}
 export const DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH =
   ".github/workflows/codex-review-gate-legacy-bridge.yml";
 export const DEFAULT_RULESET_ENFORCEMENT = "disabled";
@@ -242,6 +252,25 @@ export function parseGitHubRepositoryRemote(value) {
 // deliberately excludes the archived legacy-only repository.
 export const LEGACY_ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 11;
 export const ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 10;
+export const POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION =
+  "organization-review-gate-post-cutover-audit-output/v1";
+export const POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION =
+  "organization-review-gate-post-cutover-audit-receipt/v1";
+export const POST_CUTOVER_AUDIT_KIND = "fresh-v2-canary";
+export const POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE =
+  "2026-09-24T23:38:00Z";
+
+// post-cutover-audit/v1 is deliberately narrower than the generic historical
+// handoff receipts: it can authorize removal only for this already migrated
+// Joey-Tools cohort.  These persistent organization identity signals are an
+// independent consumer trust anchor, not fields supplied by a receipt
+// caller.  A digest-valid self-consistent receipt for another organization is
+// therefore not bridge-removal authority.
+export const POST_CUTOVER_AUDIT_ORGANIZATION = Object.freeze({
+  login: "Joey-Tools",
+  id: 283_943_935,
+  node_id: "O_kgDOEOyj_w",
+});
 
 // This is a rollout-specific hard boundary in addition to schema v2's
 // generic manifest binding. The archived legacy-only repository remains in
@@ -249,10 +278,139 @@ export const ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE = 10;
 // protection and must never receive bridge-removal authorization. The slug
 // catches a same-slug replacement or rename/transfer path; id and node_id
 // bind the persistent GitHub object identity.
-const CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY = Object.freeze({
+export const POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY = Object.freeze({
   full_name: "Joey-Tools/codex-waited-delivery",
   id: 1_242_512_099,
   node_id: "R_kgDOSg864w",
+  default_branch: "master",
+  archived: true,
+});
+
+// A post-cutover audit is a narrow authorization for the already migrated
+// cohort, not a generic ten-repository receipt format. Bind every persistent
+// GitHub identity signal plus the default-branch selector so a digest-valid,
+// self-consistent receipt cannot substitute another Joey-Tools repository.
+// Keep this consumer-side list independent from the producer implementation:
+// the receipt validator is the last local authority before bridge removal.
+export const POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES = Object.freeze([
+  Object.freeze({
+    full_name: "Joey-Tools/codex-apple-notes-toolkit",
+    id: 1_242_512_097,
+    node_id: "R_kgDOSg864Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-debug-triage",
+    id: 1_242_512_092,
+    node_id: "R_kgDOSg863A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-personal-sync",
+    id: 1_242_511_852,
+    node_id: "R_kgDOSg857A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-private-workflows",
+    id: 1_242_512_336,
+    node_id: "R_kgDOSg870A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-project-journal",
+    id: 1_242_511_845,
+    node_id: "R_kgDOSg855Q",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-review-workflows",
+    id: 1_242_511_842,
+    node_id: "R_kgDOSg854g",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-rollout-backup",
+    id: 1_242_512_323,
+    node_id: "R_kgDOSg87ww",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-session-retrospective-history",
+    id: 1_246_526_548,
+    node_id: "R_kgDOSkx8VA",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-toolbox",
+    id: 1_242_511_840,
+    node_id: "R_kgDOSg854A",
+    default_branch: "master",
+  }),
+  Object.freeze({
+    full_name: "Joey-Tools/codex-workflow-hygiene",
+    id: 1_242_512_084,
+    node_id: "R_kgDOSg861A",
+    default_branch: "master",
+  }),
+]);
+
+// This is the exact organization-level v2 policy that protects the fixed
+// active cohort after cutover.  It is intentionally independent from a
+// post-cutover receipt: callers supply both the receipt and its digest, so a
+// receipt-provided writable-policy hash alone cannot establish that live v2
+// remains active or strict.  GitHub may reorder repository selector IDs in a
+// readback; assertPostCutoverAuditOrganizationV2RulesetSemantics normalizes
+// only that unordered collection while preserving every other policy field.
+export const POST_CUTOVER_AUDIT_ORGANIZATION_V2_RULESET = Object.freeze({
+  id: 23_787_657,
+  name: "Must Pass Codex Review v2",
+  source_type: "Organization",
+  source: POST_CUTOVER_AUDIT_ORGANIZATION.login,
+  target: "branch",
+  enforcement: "active",
+  bypass_actors: Object.freeze([]),
+  conditions: Object.freeze({
+    ref_name: Object.freeze({
+      include: Object.freeze(["~DEFAULT_BRANCH"]),
+      exclude: Object.freeze([]),
+    }),
+    repository_id: Object.freeze({
+      repository_ids: Object.freeze(
+        POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES.map(({ id }) => id),
+      ),
+    }),
+  }),
+  rules: Object.freeze([
+    Object.freeze({
+      type: "required_status_checks",
+      parameters: Object.freeze({
+        required_status_checks: Object.freeze([
+          Object.freeze({
+            context: DEFAULT_STATUS_CONTEXT,
+            integration_id: DEFAULT_STATUS_INTEGRATION_ID,
+          }),
+        ]),
+        strict_required_status_checks_policy: true,
+        // The organization rule was created before it was activated.  This
+        // field is still part of its frozen writable policy and must not be
+        // silently weakened or normalized away on consumer readback.
+        do_not_enforce_on_create: true,
+      }),
+    }),
+  ]),
+});
+
+const CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY =
+  POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY;
+
+// The source repository follows a separate source-local cleanup protocol. It
+// must not be smuggled into the organization consumer cohort, even if a proof
+// otherwise has ten self-consistent repository/canary records.
+const SOURCE_SELF_HOSTING_REPOSITORY = Object.freeze({
+  full_name: "Joey-Tools/codex-review-gate",
+  id: 1_238_138_775,
+  node_id: "R_kgDOScx_lw",
 });
 
 function organizationFinalClosureOutputFormat(schemaVersion) {
@@ -398,6 +556,407 @@ export function validateOrganizationFinalClosureOutput(output) {
   };
 }
 
+// This proof is deliberately a distinct schema from organization handoff
+// final-closure evidence. It admits a new, post-cutover read-only audit
+// without retroactively changing the meaning of either historical handoff
+// receipt format.
+export function organizationPostCutoverAuditPlanSha256({
+  mode,
+  audit_kind: auditKind,
+  manifest_sha256: manifestSha256,
+  snapshot_sha256: snapshotSha256,
+  action,
+}) {
+  if (mode !== "post-cutover-audit") {
+    throw new Error(
+      'Post-cutover audit plan mode must be "post-cutover-audit".',
+    );
+  }
+  if (auditKind !== POST_CUTOVER_AUDIT_KIND) {
+    throw new Error(
+      `Post-cutover audit plan audit_kind must be "${POST_CUTOVER_AUDIT_KIND}".`,
+    );
+  }
+  assertReceiptSha256(manifestSha256, "post-cutover audit plan manifest_sha256");
+  assertReceiptSha256(snapshotSha256, "post-cutover audit plan snapshot_sha256");
+  if (action !== null) {
+    throw new Error("Post-cutover audit plan action must be null.");
+  }
+  return createHash("sha256")
+    .update(
+      canonicalJson({
+        mode,
+        audit_kind: auditKind,
+        manifest_sha256: manifestSha256,
+        snapshot_sha256: snapshotSha256,
+        action,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+export function validateOrganizationPostCutoverAuditOutput(output) {
+  assertPlainReceiptObject(output, "Post-cutover audit output");
+  assertExactReceiptKeys(
+    output,
+    [
+      "schema_version",
+      "mode",
+      "audit_kind",
+      "organization",
+      "manifest_sha256",
+      "snapshot_sha256",
+      "status",
+      "applied",
+      "plan_sha256",
+      "action",
+      "repositories_verified",
+      "post_cutover_audit_receipt",
+      "post_cutover_audit_receipt_sha256",
+    ],
+    "Post-cutover audit output",
+  );
+  if (output.schema_version !== POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION) {
+    throw new Error(
+      `Post-cutover audit output schema_version must be "${POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION}".`,
+    );
+  }
+  if (output.mode !== "post-cutover-audit") {
+    throw new Error(
+      'Post-cutover audit output mode must be "post-cutover-audit".',
+    );
+  }
+  if (output.audit_kind !== POST_CUTOVER_AUDIT_KIND) {
+    throw new Error(
+      `Post-cutover audit output audit_kind must be "${POST_CUTOVER_AUDIT_KIND}".`,
+    );
+  }
+  if (output.status !== "fresh-v2-canaries-verified") {
+    throw new Error(
+      'Post-cutover audit output status must be "fresh-v2-canaries-verified".',
+    );
+  }
+  if (output.applied !== false) {
+    throw new Error("Post-cutover audit output must have applied false.");
+  }
+  if (output.action !== null) {
+    throw new Error("Post-cutover audit output action must be null.");
+  }
+  assertReceiptSha256(output.manifest_sha256, "post-cutover audit manifest_sha256");
+  assertReceiptSha256(output.snapshot_sha256, "post-cutover audit snapshot_sha256");
+  assertReceiptSha256(output.plan_sha256, "post-cutover audit plan_sha256");
+  if (
+    output.plan_sha256 !== organizationPostCutoverAuditPlanSha256(output)
+  ) {
+    throw new Error(
+      "Post-cutover audit output plan_sha256 does not bind its read-only audit plan.",
+    );
+  }
+  assertReceiptSha256(
+    output.post_cutover_audit_receipt_sha256,
+    "post_cutover_audit_receipt_sha256",
+  );
+  const receipt = validateOrganizationPostCutoverAuditReceipt(
+    output.post_cutover_audit_receipt,
+  );
+  const canonicalReceipt = canonicalOrganizationPostCutoverAuditReceipt(receipt);
+  const computedReceiptSha256 = createHash("sha256")
+    .update(canonicalReceipt, "utf8")
+    .digest("hex");
+  if (output.post_cutover_audit_receipt_sha256 !== computedReceiptSha256) {
+    throw new Error(
+      "Post-cutover audit output post_cutover_audit_receipt_sha256 does not match the canonical receipt.",
+    );
+  }
+  if (
+    canonicalJson(output.organization) !== canonicalJson(receipt.organization) ||
+    output.manifest_sha256 !== receipt.manifest_sha256 ||
+    output.snapshot_sha256 !== receipt.snapshot_sha256
+  ) {
+    throw new Error(
+      "Post-cutover audit output and receipt disagree on their bound organization or snapshot.",
+    );
+  }
+  if (
+    !Number.isSafeInteger(output.repositories_verified) ||
+    output.repositories_verified !== receipt.repositories.length
+  ) {
+    throw new Error(
+      "Post-cutover audit output repositories_verified does not match the receipt.",
+    );
+  }
+  return {
+    receipt,
+    claimedSha256: output.post_cutover_audit_receipt_sha256,
+    bridgeRemovalRepositories: receipt.manifest_repositories,
+  };
+}
+
+export function canonicalOrganizationPostCutoverAuditReceipt(receipt) {
+  const canonical = validateOrganizationPostCutoverAuditReceipt(receipt);
+  return canonicalJson(canonical);
+}
+
+export function validateOrganizationPostCutoverAuditReceipt(receipt) {
+  assertPlainReceiptObject(receipt, "Post-cutover audit receipt");
+  assertExactReceiptKeys(
+    receipt,
+    [
+      "schema_version",
+      "audit_kind",
+      "organization",
+      "manifest_sha256",
+      "snapshot_sha256",
+      "legacy",
+      "legacy_only_repository",
+      "v2",
+      "manifest_repositories",
+      "repositories",
+      "v2_canaries",
+    ],
+    "Post-cutover audit receipt",
+  );
+  if (receipt.schema_version !== POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION) {
+    throw new Error(
+      `Post-cutover audit receipt schema_version must be "${POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION}".`,
+    );
+  }
+  if (receipt.audit_kind !== POST_CUTOVER_AUDIT_KIND) {
+    throw new Error(
+      `Post-cutover audit receipt audit_kind must be "${POST_CUTOVER_AUDIT_KIND}".`,
+    );
+  }
+  const organization = validateReceiptOrganization(receipt.organization);
+  assertPostCutoverAuditOrganizationIdentity(
+    organization,
+    "Post-cutover audit receipt organization",
+  );
+  assertReceiptSha256(receipt.manifest_sha256, "post-cutover audit receipt manifest_sha256");
+  assertReceiptSha256(receipt.snapshot_sha256, "post-cutover audit receipt snapshot_sha256");
+  const legacyOnlyRepository =
+    validatePostCutoverAuditArchivedLegacyOnlyRepository(
+      receipt.legacy_only_repository,
+      organization,
+    );
+  const legacyRuleset = validatePostCutoverAuditLegacyRuleset(
+    receipt.legacy,
+  );
+  const v2Ruleset = validatePostCutoverAuditV2Ruleset(receipt.v2);
+  if (v2Ruleset.id !== POST_CUTOVER_AUDIT_ORGANIZATION_V2_RULESET.id) {
+    throw new Error(
+      `Post-cutover audit receipt v2 id must bind the fixed Joey-Tools organization ruleset ${POST_CUTOVER_AUDIT_ORGANIZATION_V2_RULESET.id}.`,
+    );
+  }
+  if (legacyRuleset.id === v2Ruleset.id) {
+    throw new Error("Post-cutover audit receipt ruleset IDs must be distinct.");
+  }
+  const manifestRepositories = validatePostCutoverAuditRepositoryCohort(
+    receipt.manifest_repositories,
+    organization,
+    "manifest_repositories",
+  );
+  const repositories = validatePostCutoverAuditRepositoryCohort(
+    receipt.repositories,
+    organization,
+    "repositories",
+  );
+  assertPostCutoverAuditCohortExcludesArchivedLegacyOnlyRepository(
+    manifestRepositories,
+    "manifest_repositories",
+  );
+  assertPostCutoverAuditCohortExcludesArchivedLegacyOnlyRepository(
+    repositories,
+    "repositories",
+  );
+  assertPostCutoverAuditCohortExcludesSourceSelfHostingRepository(
+    manifestRepositories,
+    "manifest_repositories",
+  );
+  assertPostCutoverAuditCohortExcludesSourceSelfHostingRepository(
+    repositories,
+    "repositories",
+  );
+  assertPostCutoverAuditFixedActiveCohort(
+    manifestRepositories,
+    "manifest_repositories",
+  );
+  assertPostCutoverAuditFixedActiveCohort(repositories, "repositories");
+  if (canonicalJson(manifestRepositories) !== canonicalJson(repositories)) {
+    throw new Error(
+      "Post-cutover audit receipt manifest_repositories must exactly match the observed repositories identity cohort.",
+    );
+  }
+  const v2Canaries = validatePostCutoverAuditCanaries(
+    receipt.v2_canaries,
+    organization,
+    repositories,
+  );
+  return {
+    schema_version: receipt.schema_version,
+    audit_kind: receipt.audit_kind,
+    organization,
+    manifest_sha256: receipt.manifest_sha256,
+    snapshot_sha256: receipt.snapshot_sha256,
+    legacy: legacyRuleset,
+    legacy_only_repository: legacyOnlyRepository,
+    v2: v2Ruleset,
+    manifest_repositories: manifestRepositories,
+    repositories,
+    v2_canaries: v2Canaries,
+  };
+}
+
+// This comparison deliberately has a narrower normalization contract than a
+// general ruleset equivalence check.  GitHub materializes organization
+// repository selectors in numeric order, while the fixed cohort is recorded
+// in canonical slug order.  Membership (including multiplicity) is the
+// protected property, so only repository_ids is sorted; every other field,
+// including ref conditions and the complete v2 status rule, remains exact.
+function normalizePostCutoverAuditOrganizationV2RulesetForComparison(ruleset) {
+  const normalized = structuredCloneSafe(ruleset);
+  const repositoryIds = normalized?.conditions?.repository_id?.repository_ids;
+  if (
+    !Array.isArray(repositoryIds) ||
+    repositoryIds.some((id) => !Number.isSafeInteger(id) || id <= 0)
+  ) {
+    throw new Error(
+      "Post-cutover audit organization v2 ruleset has malformed repository selector IDs.",
+    );
+  }
+  normalized.conditions.repository_id.repository_ids = [...repositoryIds].sort(
+    (left, right) => left - right,
+  );
+  return normalized;
+}
+
+export function assertPostCutoverAuditOrganizationIdentity(
+  organization,
+  label = "Post-cutover audit organization",
+) {
+  if (
+    canonicalJson(organization) !==
+    canonicalJson(POST_CUTOVER_AUDIT_ORGANIZATION)
+  ) {
+    throw new Error(
+      `${label} must exactly bind the fixed Joey-Tools organization identity.`,
+    );
+  }
+  return organization;
+}
+
+// Do not derive this security predicate from a receipt.  The caller controls
+// a post-cutover receipt and its expected SHA-256, so matching the live
+// writable fingerprint to the receipt only detects drift relative to the
+// caller's assertion.  This independently anchors the current v2 rule before
+// a consumer can remove its last v1 bridge.
+export function assertPostCutoverAuditOrganizationV2RulesetSemantics(
+  ruleset,
+  label = "Post-cutover audit v2 organization ruleset",
+) {
+  const complete = assertCompleteRulesetApiObject(ruleset);
+  const expected = POST_CUTOVER_AUDIT_ORGANIZATION_V2_RULESET;
+  if (
+    complete.id !== expected.id ||
+    complete.name !== expected.name ||
+    complete.source_type !== expected.source_type ||
+    complete.source !== expected.source ||
+    complete.target !== expected.target ||
+    complete.enforcement !== expected.enforcement
+  ) {
+    throw new Error(
+      `${label} does not retain the fixed Joey-Tools v2 identity, source, branch target, or active enforcement.`,
+    );
+  }
+  const actualFingerprint = rulesetWritableFingerprint(
+    normalizePostCutoverAuditOrganizationV2RulesetForComparison(complete),
+  );
+  const expectedFingerprint = rulesetWritableFingerprint(
+    normalizePostCutoverAuditOrganizationV2RulesetForComparison(expected),
+  );
+  if (actualFingerprint !== expectedFingerprint) {
+    throw new Error(
+      `${label} does not retain the fixed Joey-Tools v2 no-bypass, default-branch selector, and strict ${DEFAULT_STATUS_CONTEXT} integration ${DEFAULT_STATUS_INTEGRATION_ID} policy.`,
+    );
+  }
+  return complete;
+}
+
+function validatePostCutoverAuditArchivedLegacyOnlyRepository(
+  value,
+  organization,
+) {
+  const label = "Post-cutover audit archived legacy-only repository";
+  assertPlainReceiptObject(value, label);
+  assertExactReceiptKeys(
+    value,
+    ["full_name", "id", "node_id", "default_branch", "archived"],
+    label,
+  );
+  const identity = validateReceiptRepository(
+    {
+      full_name: value.full_name,
+      id: value.id,
+      node_id: value.node_id,
+      default_branch: value.default_branch,
+    },
+    organization,
+    0,
+  );
+  if (value.archived !== true) {
+    throw new Error(`${label} archived must be true.`);
+  }
+  if (
+    canonicalJson({ ...identity, archived: value.archived }) !==
+    canonicalJson(POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY)
+  ) {
+    throw new Error(
+      `${label} must bind the fixed historical Joey-Tools/codex-waited-delivery identity by exact slug, id, node_id, default_branch, and archived state.`,
+    );
+  }
+  return { ...identity, archived: true };
+}
+
+// Only these two proof pairs carry current bridge-removal authority. The
+// historical handoff v1 pair remains readable through its dedicated validator
+// but cannot authorize a new mutation.
+export function validateOrganizationBridgeRemovalProofOutput(output) {
+  assertPlainReceiptObject(output, "Organization bridge-removal proof output");
+  switch (output.schema_version) {
+    case "organization-review-gate-handoff-output/v2": {
+      const validated = validateOrganizationFinalClosureOutput(output);
+      return {
+        ...validated,
+        canonicalReceipt: canonicalOrganizationFinalClosureReceipt(
+          validated.receipt,
+        ),
+        proofKind: "organization-handoff-v2",
+      };
+    }
+    case POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION: {
+      const validated = validateOrganizationPostCutoverAuditOutput(output);
+      return {
+        ...validated,
+        canonicalReceipt: canonicalOrganizationPostCutoverAuditReceipt(
+          validated.receipt,
+        ),
+        proofKind: "post-cutover-audit-v1",
+      };
+    }
+    case "organization-review-gate-handoff-output/v1":
+      // Validate this legacy evidence with its original contract first, then
+      // reject it specifically as a bridge-removal authority.
+      validateOrganizationFinalClosureOutput(output);
+      throw new Error(
+        "Organization handoff output/v1 is historical evidence and is not an admitted bridge-removal proof. Allowed schema pairs are organization-review-gate-handoff-output/v2 + final_closure_receipt schema_version 2, and organization-review-gate-post-cutover-audit-output/v1 + organization-review-gate-post-cutover-audit-receipt/v1.",
+      );
+    default:
+      throw new Error(
+        "Organization bridge-removal proof has no admitted output schema. Allowed schema pairs are organization-review-gate-handoff-output/v2 + final_closure_receipt schema_version 2, and organization-review-gate-post-cutover-audit-output/v1 + organization-review-gate-post-cutover-audit-receipt/v1.",
+      );
+  }
+}
+
 export function canonicalOrganizationFinalClosureReceipt(receipt) {
   const canonical = validateOrganizationFinalClosureReceipt(receipt);
   return canonicalJson(canonical);
@@ -464,6 +1023,14 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
       manifestRepositories,
       "manifest_repositories",
     );
+    assertSchemaTwoCohortExcludesSourceSelfHostingRepository(
+      repositories,
+      "repositories",
+    );
+    assertSchemaTwoCohortExcludesSourceSelfHostingRepository(
+      manifestRepositories,
+      "manifest_repositories",
+    );
   }
   if (
     manifestRepositories !== null &&
@@ -488,6 +1055,305 @@ export function validateOrganizationFinalClosureReceipt(receipt) {
   return canonical;
 }
 
+function validatePostCutoverAuditLegacyRuleset(value) {
+  assertPlainReceiptObject(value, "Post-cutover audit legacy");
+  assertExactReceiptKeys(
+    value,
+    ["id", "enforcement", "writable_sha256", "legacy_status_context"],
+    "Post-cutover audit legacy",
+  );
+  assertPositiveReceiptId(value.id, "Post-cutover audit legacy id");
+  if (value.enforcement !== "active") {
+    throw new Error(
+      'Post-cutover audit legacy enforcement must be "active".',
+    );
+  }
+  assertReceiptSha256(
+    value.writable_sha256,
+    "Post-cutover audit legacy writable_sha256",
+  );
+  if (value.legacy_status_context !== "absent") {
+    throw new Error(
+      'Post-cutover audit legacy legacy_status_context must be "absent".',
+    );
+  }
+  return {
+    id: value.id,
+    enforcement: value.enforcement,
+    writable_sha256: value.writable_sha256,
+    legacy_status_context: value.legacy_status_context,
+  };
+}
+
+function validatePostCutoverAuditV2Ruleset(value) {
+  assertPlainReceiptObject(value, "Post-cutover audit v2");
+  assertExactReceiptKeys(
+    value,
+    ["id", "enforcement", "writable_sha256", "required_status"],
+    "Post-cutover audit v2",
+  );
+  assertPositiveReceiptId(value.id, "Post-cutover audit v2 id");
+  if (value.enforcement !== "active") {
+    throw new Error(
+      'Post-cutover audit v2 enforcement must be "active".',
+    );
+  }
+  assertReceiptSha256(
+    value.writable_sha256,
+    "Post-cutover audit v2 writable_sha256",
+  );
+  assertPlainReceiptObject(
+    value.required_status,
+    "Post-cutover audit v2 required_status",
+  );
+  assertExactReceiptKeys(
+    value.required_status,
+    ["context", "integration_id", "strict"],
+    "Post-cutover audit v2 required_status",
+  );
+  if (
+    value.required_status.context !== DEFAULT_STATUS_CONTEXT ||
+    value.required_status.integration_id !== DEFAULT_STATUS_INTEGRATION_ID ||
+    value.required_status.strict !== true
+  ) {
+    throw new Error(
+      `Post-cutover audit v2 required_status must be exact ${DEFAULT_STATUS_CONTEXT} from integration ${DEFAULT_STATUS_INTEGRATION_ID} with strict true.`,
+    );
+  }
+  return {
+    id: value.id,
+    enforcement: value.enforcement,
+    writable_sha256: value.writable_sha256,
+    required_status: {
+      context: value.required_status.context,
+      integration_id: value.required_status.integration_id,
+      strict: value.required_status.strict,
+    },
+  };
+}
+
+function validatePostCutoverAuditRepositoryCohort(value, organization, field) {
+  if (
+    !Array.isArray(value) ||
+    value.length !== ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE
+  ) {
+    throw new Error(
+      `Post-cutover audit receipt ${field} must contain exactly ${ORGANIZATION_FINAL_CLOSURE_COHORT_SIZE} active cohort members.`,
+    );
+  }
+  const repositories = value.map((repository, index) =>
+    validateReceiptRepository(repository, organization, index)
+  );
+  const slugs = new Set();
+  const ids = new Set();
+  const nodeIds = new Set();
+  for (const repository of repositories) {
+    const foldedSlug = repository.full_name.toLowerCase();
+    if (
+      slugs.has(foldedSlug) ||
+      ids.has(repository.id) ||
+      nodeIds.has(repository.node_id)
+    ) {
+      throw new Error(
+        `Post-cutover audit receipt ${field} contains duplicate repository identities.`,
+      );
+    }
+    slugs.add(foldedSlug);
+    ids.add(repository.id);
+    nodeIds.add(repository.node_id);
+  }
+  const canonicalOrder = [...repositories].sort((left, right) =>
+    compareCanonicalText(left.full_name, right.full_name)
+  );
+  if (canonicalJson(repositories) !== canonicalJson(canonicalOrder)) {
+    throw new Error(
+      `Post-cutover audit receipt ${field} must use producer canonical full_name order.`,
+    );
+  }
+  return repositories;
+}
+
+function assertPostCutoverAuditCohortExcludesArchivedLegacyOnlyRepository(
+  repositories,
+  field,
+) {
+  const archived = CURRENT_LEGACY_ONLY_ARCHIVED_REPOSITORY;
+  if (
+    repositories.some(
+      (repository) =>
+        repository.full_name.toLowerCase() === archived.full_name.toLowerCase() ||
+        repository.id === archived.id ||
+        repository.node_id === archived.node_id,
+    )
+  ) {
+    throw new Error(
+      `Post-cutover audit receipt ${field} must not admit the current archived legacy-only repository.`,
+    );
+  }
+}
+
+function assertPostCutoverAuditCohortExcludesSourceSelfHostingRepository(
+  repositories,
+  field,
+) {
+  const source = SOURCE_SELF_HOSTING_REPOSITORY;
+  if (
+    repositories.some(
+      (repository) =>
+        repository.full_name.toLowerCase() === source.full_name.toLowerCase() ||
+        repository.id === source.id ||
+        repository.node_id === source.node_id,
+    )
+  ) {
+    throw new Error(
+      `Post-cutover audit receipt ${field} must not admit the source self-hosting repository; source bridge removal requires its separate source-local proof.`,
+    );
+  }
+}
+
+function assertPostCutoverAuditFixedActiveCohort(repositories, field) {
+  if (
+    canonicalJson(repositories) !==
+    canonicalJson(POST_CUTOVER_AUDIT_ACTIVE_REPOSITORIES)
+  ) {
+    throw new Error(
+      `Post-cutover audit receipt ${field} must exactly match the fixed active ten-member cohort by full_name, id, node_id, and default_branch.`,
+    );
+  }
+}
+
+function validatePostCutoverAuditCanaries(value, organization, repositories) {
+  if (!Array.isArray(value) || value.length !== repositories.length) {
+    throw new Error(
+      "Post-cutover audit receipt v2_canaries must contain one canary for every active cohort repository.",
+    );
+  }
+  const canaries = value.map((canary, index) =>
+    validatePostCutoverAuditCanary(canary, organization, index)
+  );
+  const checkRunIds = new Set();
+  const runIds = new Set();
+  const jobIds = new Set();
+  for (const [index, canary] of canaries.entries()) {
+    const repository = repositories[index];
+    if (
+      canary.full_name !== repository.full_name ||
+      canary.id !== repository.id ||
+      canary.node_id !== repository.node_id ||
+      canary.default_branch !== repository.default_branch
+    ) {
+      throw new Error(
+        "Post-cutover audit receipt v2_canaries must bind each canary to the same-index canonical repository identity.",
+      );
+    }
+    for (const [label, seen] of [
+      ["v2_check_run_id", checkRunIds],
+      ["v2_run_id", runIds],
+      ["v2_job_id", jobIds],
+    ]) {
+      if (seen.has(canary[label])) {
+        throw new Error(
+          `Post-cutover audit receipt v2_canaries must use one-to-one ${label} identities.`,
+        );
+      }
+      seen.add(canary[label]);
+    }
+  }
+  return canaries;
+}
+
+function validatePostCutoverAuditCanary(value, organization, index) {
+  const label = `Post-cutover audit canary ${index + 1}`;
+  assertPlainReceiptObject(value, label);
+  assertExactReceiptKeys(
+    value,
+    [
+      "full_name",
+      "id",
+      "node_id",
+      "default_branch",
+      "pull_number",
+      "created_at",
+      "head_sha",
+      "base_sha",
+      "test_merge_sha",
+      "v2_check_run_id",
+      "v2_run_id",
+      "v2_job_id",
+      "v2_workflow_id",
+      "v2_run_attempt",
+    ],
+    label,
+  );
+  const repository = validateReceiptRepository(
+    {
+      full_name: value.full_name,
+      id: value.id,
+      node_id: value.node_id,
+      default_branch: value.default_branch,
+    },
+    organization,
+    index,
+  );
+  assertPositiveReceiptId(value.pull_number, `${label} pull_number`);
+  const createdAt = assertPostCutoverAuditCanaryCreatedAt(
+    value.created_at,
+    `${label} created_at`,
+  );
+  assertFullCommitSha(value.head_sha, `${label} head_sha`);
+  assertFullCommitSha(value.base_sha, `${label} base_sha`);
+  assertFullCommitSha(value.test_merge_sha, `${label} test_merge_sha`);
+  assertPositiveReceiptId(value.v2_check_run_id, `${label} v2_check_run_id`);
+  assertPositiveReceiptId(value.v2_run_id, `${label} v2_run_id`);
+  assertPositiveReceiptId(value.v2_job_id, `${label} v2_job_id`);
+  assertPositiveReceiptId(value.v2_workflow_id, `${label} v2_workflow_id`);
+  assertPositiveReceiptId(value.v2_run_attempt, `${label} v2_run_attempt`);
+  return {
+    ...repository,
+    pull_number: value.pull_number,
+    created_at: createdAt,
+    head_sha: value.head_sha,
+    base_sha: value.base_sha,
+    test_merge_sha: value.test_merge_sha,
+    v2_check_run_id: value.v2_check_run_id,
+    v2_run_id: value.v2_run_id,
+    v2_job_id: value.v2_job_id,
+    v2_workflow_id: value.v2_workflow_id,
+    v2_run_attempt: value.v2_run_attempt,
+  };
+}
+
+function assertFullCommitSha(value, label) {
+  if (typeof value !== "string" || !/^[0-9a-f]{40}$/u.test(value)) {
+    throw new Error(`${label} must be an exact lowercase 40-hex commit SHA.`);
+  }
+}
+
+function assertPostCutoverAuditCanaryCreatedAt(value, label) {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u.test(value)
+  ) {
+    throw new Error(
+      `${label} must be a canonical GitHub ISO UTC timestamp with second precision.`,
+    );
+  }
+  const milliseconds = Date.parse(value);
+  if (
+    !Number.isSafeInteger(milliseconds) ||
+    new Date(milliseconds).toISOString() !== `${value.slice(0, -1)}.000Z`
+  ) {
+    throw new Error(`${label} is not a valid GitHub ISO UTC timestamp.`);
+  }
+  const cutoffMilliseconds = Date.parse(POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE);
+  if (milliseconds <= cutoffMilliseconds) {
+    throw new Error(
+      `${label} must be strictly later than the post-cutover freshness boundary ${POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE}.`,
+    );
+  }
+  return value;
+}
+
 function assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
   repositories,
   field,
@@ -503,6 +1369,25 @@ function assertSchemaTwoCohortExcludesCurrentLegacyOnlyRepository(
   ) {
     throw new Error(
       `Organization final closure receipt ${field} must not authorize the current archived legacy-only repository.`,
+    );
+  }
+}
+
+function assertSchemaTwoCohortExcludesSourceSelfHostingRepository(
+  repositories,
+  field,
+) {
+  const source = SOURCE_SELF_HOSTING_REPOSITORY;
+  if (
+    repositories.some(
+      (repository) =>
+        repository.full_name.toLowerCase() === source.full_name.toLowerCase() ||
+        repository.id === source.id ||
+        repository.node_id === source.node_id,
+    )
+  ) {
+    throw new Error(
+      `Organization final closure receipt ${field} must not authorize the source self-hosting repository; source bridge removal requires its separate source-local proof.`,
     );
   }
 }
@@ -1100,7 +1985,7 @@ export function buildCanonicalLegacyReviewGateInventory({
     if (
       rule.type === "required_status_checks" &&
       rule.parameters.required_status_checks.some(
-        (check) => check.context === LEGACY_STATUS_CONTEXT,
+        (check) => isLegacyStatusContext(check.context),
       )
     ) {
       effectiveLegacyRules.push(rule);
@@ -1137,7 +2022,7 @@ export function buildCanonicalLegacyReviewGateInventory({
         (rule) =>
           rule.type === "required_status_checks" &&
           rule.parameters.required_status_checks.some(
-            (check) => check.context === LEGACY_STATUS_CONTEXT,
+            (check) => isLegacyStatusContext(check.context),
           ),
       )
     ) {

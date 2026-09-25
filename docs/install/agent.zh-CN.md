@@ -54,6 +54,26 @@ GitHub.com/default-branch PR scope 时停止。
 - 每次调用 bootstrap 都显式保留同一个 `CONTROL_PLANE_OWNER`。默认值是
   `@JoeyTeng`；非 Joey 仓库必须替换成自己的合格 GitHub user。
 
+## 已完成 cutover 的 fresh audit
+
+已经完成 cutover 的 organization cohort 若缺少完整、同时代的 v3 handoff manifest，不得事后回填。
+应遵循独立的 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)：为每个固定活动 member 创建一个**新的**、
+same-repository、open、non-draft 的无害 canary PR；绑定 exact native v2 CheckRun/run/job evidence；
+要求两轮 stable 的 full-cohort snapshot；之后保留完整 receipt output 供 bridge-removal PR 使用。
+固定的已归档 identity `Joey-Tools/codex-waited-delivery`（精确 slug、numeric ID、node ID、`master`
+default branch 及 `archived: true`）和 `Joey-Tools/codex-review-gate` 的 source bridge
+不在 scope 内；不得用任意已归档仓替代该历史例外。已部署的 frozen v3 consumer profile 是 audit subject；bridge-removal PR 会规范化
+workflow/CODEOWNERS，属于需要完整 review 的 control-plane change，而不是 deletion-only edit。只有
+snapshot 与 receipt 成功后，才关闭新的 canary，且保持 unmerged。PR 的 exact GitHub UTC `created_at`
+必须晚于固定 cutoff `2026-09-24T23:38:00Z`；helper 会读取、验证并将它绑定进 receipt，所以即使其他 ID
+自洽，旧 canary 也会被拒绝。
+
+```bash
+node scripts/organization-review-gate-handoff.mjs \
+  --manifest "$POST_CUTOVER_MANIFEST" \
+  --mode post-cutover-audit > "$POST_CUTOVER_OUTPUT"
+```
+
 ## 窄范围 source repository self-hosting 例外
 
 只有 `REPO` 精确等于 `Joey-Tools/codex-review-gate`、且任务就是迁移该 source repository
