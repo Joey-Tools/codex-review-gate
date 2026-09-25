@@ -1768,11 +1768,11 @@ async function loadConsumerSecuritySnapshot({
     const classicLegacyStatusRequired =
       classicBranchProtection.requiredStatusChecks !== null &&
       (
-        classicBranchProtection.requiredStatusChecks.contexts.includes(
-          LEGACY_STATUS_CONTEXT,
+        classicBranchProtection.requiredStatusChecks.contexts.some(
+          isLegacyStatusContext,
         ) ||
         classicBranchProtection.requiredStatusChecks.checks.some(
-          (check) => check.context === LEGACY_STATUS_CONTEXT,
+          (check) => isLegacyStatusContext(check.context),
         )
       );
     return {
@@ -2986,7 +2986,7 @@ function deriveAuthorizedPostCleanupState(closure) {
         return [rule];
       }
       const checks = rule.parameters.required_status_checks.filter(
-        (check) => check.context !== LEGACY_STATUS_CONTEXT,
+        (check) => !isLegacyStatusContext(check.context),
       );
       if (checks.length === rule.parameters.required_status_checks.length) {
         return [rule];
@@ -3024,10 +3024,10 @@ function deriveAuthorizedPostCleanupState(closure) {
 
 function removeLegacyFromClassicStatusPolicy(classic) {
   const contexts = classic.contexts.filter(
-    (context) => context !== LEGACY_STATUS_CONTEXT,
+    (context) => !isLegacyStatusContext(context),
   );
   const checks = classic.checks.filter(
-    (check) => check.context !== LEGACY_STATUS_CONTEXT,
+    (check) => !isLegacyStatusContext(check.context),
   );
   if (contexts.length === 0 && checks.length === 0) {
     return null;

@@ -1181,7 +1181,10 @@ evidence that a prior freeze remains in force.
   GitHub's status-context semantics and the producer's existing audit rule. A
   restored `CODEX/REVIEW-GATE` variant in either effective rules or classic
   branch protection is therefore a legacy blocker, not a clean observation;
-  focused regressions cover both surfaces.
+  focused regressions cover both surfaces. The source-local cleanup derivation
+  uses that same predicate when producing its exact after-state, so a
+  case-variant legacy requirement is removed by the reviewed, plan-bound PUT
+  rather than being recognized but retained indefinitely.
 - The code and protocol record were validated with `npm run check`, the full
   `test/bootstrap.test.mjs` and
   `test/organization-review-gate-handoff.test.mjs` suites, `git diff --check`,

@@ -63,6 +63,7 @@ import {
   findEffectiveRulesetWithProfilePolicy,
   findEffectiveRulesetWithStatusOnlyPolicy,
   findEffectiveRulesetWithStatusContext,
+  isLegacyStatusContext,
   installedWorkflowMatchesCanonical,
   normalizeControlPlaneOwner,
   normalizeRulesetProfile,
@@ -8456,12 +8457,13 @@ test("legacy bridge profile remains exact through cleanup derivation and verific
 test("pre-cleanup derivation authorizes only legacy elision and preserves unrelated protections", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-cleanup-plan-"));
   const repoSlug = "Joey-Tools/consumer";
+  const legacyVariant = LEGACY_STATUS_CONTEXT.toUpperCase();
   const classicPre = {
     strict: true,
-    contexts: ["lint", LEGACY_STATUS_CONTEXT],
+    contexts: ["lint", legacyVariant],
     checks: [
       { context: "build", app_id: 15368 },
-      { context: LEGACY_STATUS_CONTEXT, app_id: null },
+      { context: legacyVariant, app_id: null },
     ],
   };
   const classicPost = {
@@ -8474,7 +8476,7 @@ test("pre-cleanup derivation authorizes only legacy elision and preserves unrela
     activeWithLegacy.rules
       .find((rule) => rule.type === "required_status_checks")
       .parameters.required_status_checks.push({
-        context: LEGACY_STATUS_CONTEXT,
+        context: legacyVariant,
       });
     const activeWithoutLegacy = completeActiveRulesetFixture(7);
     const dedicatedLegacy = activeLegacyRulesetFixture(9);
@@ -8525,6 +8527,11 @@ test("pre-cleanup derivation authorizes only legacy elision and preserves unrela
     assert.equal(derive.status, 0, derive.stderr);
     const plan = JSON.parse(derive.stdout);
     assert.equal(plan.cleanup_actions.classic_required_status_check_removed, true);
+    assert.doesNotMatch(
+      JSON.stringify(plan.expected_post_cleanup_security_state),
+      new RegExp(legacyVariant, "u"),
+      "the planned after-state must remove every case variant that GitHub treats as the legacy context",
+    );
     assert.deepEqual(
       plan.cleanup_actions.rulesets.map(({ id, action }) => ({ id, action })),
       [
@@ -9905,7 +9912,7 @@ function effectiveLegacyRequiredStatusChecksRule(ruleset) {
     (candidate) =>
       candidate.type === "required_status_checks" &&
       candidate.parameters.required_status_checks.some(
-        (check) => check.context === LEGACY_STATUS_CONTEXT,
+        (check) => isLegacyStatusContext(check.context),
       ),
   );
   assert.ok(rule, `ruleset ${ruleset.id} must require ${LEGACY_STATUS_CONTEXT}`);
