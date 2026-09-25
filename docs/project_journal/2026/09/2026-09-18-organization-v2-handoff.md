@@ -31,7 +31,9 @@ superseded_by:
   removed only that independent v1 status requirement after status-only v2
   activation and a separately approved plan. The source remains outside both
   organization rulesets and the eight repository-local cleanup surfaces; its
-  temporary bridge remains a separate future closure-proof concern.
+  temporary bridge was later removed by the separately approved source-only
+  closure receipt and executor. That completed source exception does not alter
+  the active cohort's separate bridge-removal prerequisites.
 - This is not a broad relaxation of the ordinary installer. It adds a separate,
   auditable temporary-bridge profile and a manifest-bound organization handoff
   transaction. The normal completed-installation contract continues to reject
@@ -137,10 +139,11 @@ the global cutover is closed.
   `codex/review-gate` required-status rule has been removed.
 - The completed policy mutation covers only the old organization rule and the
   fixed active cohort: all eight repository-local legacy cleanup surfaces now
-  require only `test`. It did not change the source repository's independent
-  local ruleset `16410326`, which remains a temporary `codex/review-gate` v1
-  self-gate pending a dedicated source bootstrap. The source repository is not
-  a hidden eleventh cohort member or a ninth cleanup surface.
+  require only `test`. The source repository's independent local ruleset
+  `16410326` separately completed its v1 status cleanup, and its source bridge
+  was removed through the independently approved source-only receipt-bound
+  executor. The source repository is not a hidden eleventh cohort member or a
+  ninth cleanup surface.
 - The initial read-only inventory found that all 11 originally selected members
   inherited old organization rule `16590367`; nine additionally retained a
   repository-level legacy `codex/review-gate` requirement. Later bootstrap and
