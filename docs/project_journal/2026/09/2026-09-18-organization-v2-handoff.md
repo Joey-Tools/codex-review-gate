@@ -1264,8 +1264,8 @@ evidence that a prior freeze remains in force.
 - A previously deployed frozen handoff workflow envelope remains admissible
   only by its fixed Git-blob and SHA-256 identities. This supports a safe local
   normalization to current canonical bytes without accepting arbitrary
-  caller-supplied historical workflow content. Validation and merge of #71 are
-  pending; no cohort bridge has been removed by this repair.
+  caller-supplied historical workflow content. PR #71 carries the completed
+  repair into the target branch; it does not remove any cohort bridge.
 - The consumer treats a closed-unmerged canary as valid historical execution
   evidence: GitHub can clear an Actions run's `pull_requests` projection after
   closure, so that transient field is not a proof requirement. Instead it
