@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
-import { validateCanonicalLegacyBridgeWorkflowContent } from "../src/bootstrap.mjs";
 
 const action = readFileSync(
   new URL("../packages/action/action.yml", import.meta.url),
@@ -15,9 +14,9 @@ const sourceController = readFileSync(
   new URL("../.github/workflows/codex-review-gate-controller.yml", import.meta.url),
   "utf8",
 );
-const sourceLegacyBridge = readFileSync(
-  new URL("../.github/workflows/codex-review-gate-legacy-bridge.yml", import.meta.url),
-  "utf8",
+const sourceLegacyBridgePath = new URL(
+  "../.github/workflows/codex-review-gate-legacy-bridge.yml",
+  import.meta.url,
 );
 const sourceCodeowners = readFileSync(
   new URL("../.github/CODEOWNERS", import.meta.url),
@@ -110,18 +109,11 @@ test("v2 Action exposes only the closed operation, request, and limits-profile A
   );
 });
 
-test("source self-installation matches canonical v2 assets while retaining its temporary v1 bridge", () => {
+test("source self-installation matches canonical v2 assets after its temporary v1 bridge is removed", () => {
   assert.equal(sourceConsumer, templateVerifier);
   assert.equal(sourceController, templateController);
   assert.equal(sourceCodeowners, templateCodeowners);
-  assert.equal(
-    validateCanonicalLegacyBridgeWorkflowContent(sourceLegacyBridge),
-    sourceLegacyBridge,
-  );
-  assert.match(
-    sourceLegacyBridge,
-    /uses: JoeyTeng\/codex-review-gate-action\/\.github\/workflows\/codex-review-gate\.yml@v1/u,
-  );
+  assert.equal(existsSync(sourceLegacyBridgePath), false);
   assert.match(sourceConsumer, /uses: JoeyTeng\/codex-review-gate-action@v2/u);
   assert.match(sourceController, /uses: JoeyTeng\/codex-review-gate-action@v2/u);
 });

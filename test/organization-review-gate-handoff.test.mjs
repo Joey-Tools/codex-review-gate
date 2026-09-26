@@ -2072,7 +2072,7 @@ test("frozen organization handoff admission remains distinct from current contro
     ),
     legacyBridge: readFileSync(
       new URL(
-        "../.github/workflows/codex-review-gate-legacy-bridge.yml",
+        "../templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml",
         import.meta.url,
       ),
       "utf8",

@@ -31,7 +31,9 @@ superseded_by:
   removed only that independent v1 status requirement after status-only v2
   activation and a separately approved plan. The source remains outside both
   organization rulesets and the eight repository-local cleanup surfaces; its
-  temporary bridge remains a separate future closure-proof concern.
+  temporary bridge was later removed by the separately approved source-only
+  closure receipt and executor. That completed source exception does not alter
+  the active cohort's separate bridge-removal prerequisites.
 - This is not a broad relaxation of the ordinary installer. It adds a separate,
   auditable temporary-bridge profile and a manifest-bound organization handoff
   transaction. The normal completed-installation contract continues to reject
@@ -137,10 +139,11 @@ the global cutover is closed.
   `codex/review-gate` required-status rule has been removed.
 - The completed policy mutation covers only the old organization rule and the
   fixed active cohort: all eight repository-local legacy cleanup surfaces now
-  require only `test`. It did not change the source repository's independent
-  local ruleset `16410326`, which remains a temporary `codex/review-gate` v1
-  self-gate pending a dedicated source bootstrap. The source repository is not
-  a hidden eleventh cohort member or a ninth cleanup surface.
+  require only `test`. The source repository's independent local ruleset
+  `16410326` separately completed its v1 status cleanup, and its source bridge
+  was removed through the independently approved source-only receipt-bound
+  executor. The source repository is not a hidden eleventh cohort member or a
+  ninth cleanup surface.
 - The initial read-only inventory found that all 11 originally selected members
   inherited old organization rule `16590367`; nine additionally retained a
   repository-level legacy `codex/review-gate` requirement. Later bootstrap and
@@ -1240,6 +1243,28 @@ evidence that a prior freeze remains in force.
   six-minute bounded window while repeatedly invoking its release-script
   fixture; it is recorded as incomplete rather than passed.
 
+## Execution Update — 2026-09-25 (source legacy bridge removal)
+
+- Source closure-proof machinery merged first as PR `#75` at default-branch
+  commit `93b5ca1257f9d2d5d2b338aff203d30fb7a629c4`. The merged helper derived
+  the source-only closure receipt for the closed-unmerged Node 24 canary `#74`;
+  its independently approved canonical receipt SHA-256 was
+  `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`.
+- The constrained executor first completed a dry-run two-round live rebind and
+  then repeated the same binding at every local quarantine/unlink boundary.
+  It removed only
+  `.github/workflows/codex-review-gate-legacy-bridge.yml`, left staging and
+  commits to the ordinary PR workflow, and did not alter a GitHub ruleset.
+- The resulting source bridge-delete PR is reviewed and merged only after its
+  own fresh strict v2 exact-head gate. Its post-merge state is v2-only for the
+  source default branch: no ordinary new v1 bridge dispatch remains, while
+  historical Actions reruns are not claimed impossible.
+- This is a source-only completion. It neither removes the canonical bridge
+  template nor changes the active ten-member cohort's receipt, bridge, or
+  cleanup authorization. The historic source-only runbook is retained for
+  audit, but must not be replayed against the now bridge-free source default
+  branch.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
@@ -1253,22 +1278,21 @@ evidence that a prior freeze remains in force.
    cohort repository. The old organization ruleset intentionally remains Active
    only for deletion and non-fast-forward protection, including the archived
    legacy-only repository.
-3. Treat the source required-status transition as complete: `16410326` no
-   longer requires `codex/review-gate`, while v2 is Active and its non-status
-   protections remain. Keep the source bridge installed until a distinct,
-   separately authorized source-local closure proof exists; the organization
-   closure receipt cannot authorize it.
+3. Treat the source v1 retirement as complete: `16410326` no longer requires
+   `codex/review-gate`, v2 is Active with its non-status protections intact,
+   and the source bridge is absent. The source-only receipt-bound executor
+   used independently approved receipt
+   `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`
+   and a fresh live rebind; do not rerun that historical lifecycle against the
+   current source default branch. The organization closure receipt still cannot
+   authorize a source-local bridge operation.
 4. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.
-5. Complete only the first PR of the source-only closure-proof machinery; this
-   active workstream does not record a transient receipt or bridge-delete PR.
-   After that machinery merges, use its default-branch helper and a
-   ruleset-admin credential to derive and independently approve a fresh source
-   bridge-removal receipt. Only after a live rebind may a separate bridge-delete
-   PR be prepared and merged through its own fresh v2 check; do not treat the
-   historical `#74` result, v2.1 publication, or an organization receipt as
-   deletion authorization.
+5. Treat a future deliberate source bridge reintroduction as a new workstream:
+   it must not reuse this historical receipt, canary, or approval. The canonical
+   template and active-cohort bridge lifecycle remain separate from the completed
+   source exception.
 
 ## Evidence
 

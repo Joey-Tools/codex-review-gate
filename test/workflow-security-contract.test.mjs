@@ -47,6 +47,10 @@ const templateControllerPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
 );
+const templateLegacyBridgePath = join(
+  repoRoot,
+  "templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml",
+);
 const templateCodeownersPath = join(
   repoRoot,
   "templates/codex-gated-repo/.github/CODEOWNERS",
@@ -116,11 +120,11 @@ const ACTIVE_V2_READBACK_PATTERN =
 const action = readFileSync(actionPath, "utf8");
 const sourceConsumer = readFileSync(sourceConsumerPath, "utf8");
 const sourceController = readFileSync(sourceControllerPath, "utf8");
-const sourceLegacyBridge = readFileSync(sourceLegacyBridgePath, "utf8");
 const sourceCodeowners = readFileSync(sourceCodeownersPath, "utf8");
 const sourceStateMachine = readFileSync(sourceStateMachinePath, "utf8");
 const templateConsumer = readFileSync(templateConsumerPath, "utf8");
 const templateController = readFileSync(templateControllerPath, "utf8");
+const templateLegacyBridge = readFileSync(templateLegacyBridgePath, "utf8");
 const templateCodeowners = readFileSync(templateCodeownersPath, "utf8");
 const templateRuleset = JSON.parse(readFileSync(templateRulesetPath, "utf8"));
 const publisherWorkflow = readFileSync(
@@ -149,15 +153,16 @@ const CLOSED_JOB_IF = [
   "}}",
 ].join(" ");
 
-test("source self-installation matches canonical v2 assets and contains its temporary v1 bridge", () => {
+test("source self-installation matches canonical v2 assets after its temporary v1 bridge is removed", () => {
   const verifier = parseVerifierWorkflow(sourceConsumer);
   const controller = parseControllerWorkflow(sourceController);
   assert.equal(sourceConsumer, templateConsumer);
   assert.equal(sourceController, templateController);
   assert.equal(sourceCodeowners, templateCodeowners);
+  assert.equal(existsSync(sourceLegacyBridgePath), false);
   assert.equal(
-    validateCanonicalLegacyBridgeWorkflowContent(sourceLegacyBridge),
-    sourceLegacyBridge,
+    validateCanonicalLegacyBridgeWorkflowContent(templateLegacyBridge),
+    templateLegacyBridge,
   );
   for (const path of retiredPackageWorkflowPaths) {
     assert.equal(existsSync(path), false);
@@ -175,12 +180,9 @@ test("source self-installation matches canonical v2 assets and contains its temp
   const canonicalWorkflows = {
     verifier: templateConsumer,
     controller: templateController,
-    legacyBridge: sourceLegacyBridge,
   };
   assert.equal(
-    validateCanonicalV2WorkflowInventory(inventory, canonicalWorkflows, {
-      legacyBridge: true,
-    }),
+    validateCanonicalV2WorkflowInventory(inventory, canonicalWorkflows),
     canonicalWorkflows,
   );
   for (const [name, content, expected] of [
@@ -208,7 +210,6 @@ test("source self-installation matches canonical v2 assets and contains its temp
             content,
           }],
           canonicalWorkflows,
-          { legacyBridge: true },
         ),
       expected,
       name,

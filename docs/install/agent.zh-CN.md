@@ -60,6 +60,11 @@ GitHub.com/default-branch PR scope 时停止。
 自身时才使用此路径。它不是普通 consumer 或 repository-level cohort 的替代安装模式：其他任何
 位置仍必须使用 importable template 与 bootstrap 默认的 `full` profile。
 
+> **已完成的 source 例外。** 当前 source default branch 已完成其 source-only 的“证明与移除”
+> 生命周期，且不再包含 temporary legacy bridge。以下命令保留为可审计的历史流程；除非未来有已授权的 migration
+> 刻意重新创建 bridge，否则不得针对 `Joey-Tools/codex-review-gate` 重跑。它不改变 canonical
+> bridge template，也不改变普通 consumer/cohort cleanup 流程。
+
 与普通 `full` profile 不同，retained source ruleset 的
 `require_code_owner_review: false` 和 `dismiss_stale_reviews_on_push: false`。
 其 CODEOWNERS 与 named-owner projection 是 control-plane ownership 与 drift detection 的

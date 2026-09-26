@@ -149,21 +149,19 @@ for source control-plane ownership and drift detection, not an enforced Code
 Owner-approval or stale-review policy.
 It is not a general consumer or cohort template. The source repository uses
 the canonical v2 verifier and controller; its repository-local v1 required
-status is retired while the exact temporary legacy bridge intentionally
-remains. Its later physical bridge removal needs a separately derived,
-source-only closure receipt whose exact SHA-256 receives independent approval.
-The published `v2.1.0` payload and closed-unmerged historical canary `#74` are
-evidence inputs only, never bridge-deletion authority; `#74` contributes its
-exact PR/head/base/test-merge/CheckRun/run/job tuple. The receipt also binds a
-fresh two-round live source closure. Before local deletion, the **same**
-independently approved receipt (and exact SHA-256) must rebind equal to fresh
-GitHub evidence. Drift stops the flow: derive a new receipt, review it, and
-obtain a new independent approval before any later deletion attempt. The
-source-only executor is unavailable to ordinary consumers. Deleting the YAML
-stops ordinary new dispatches, but does not promise that GitHub cannot rerun a
-historical Actions run. The receipt cannot be trusted as a standalone file, and
-the organization schema-2 cohort receipt cannot authorize it. A proof-machinery
-PR and the later bridge-delete PR remain deliberately separate. See the
-[human installation guide](docs/install/human.md) for that source-only closure
-flow, and [docs/RELEASING.md](docs/RELEASING.md) for publisher recovery states
+status and temporary legacy bridge are retired. The bridge was removed only by
+the separate source-only executor after the explicitly approved closure receipt
+SHA-256 `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`
+was re-bound to fresh two-round GitHub evidence at every local mutation
+boundary. The published `v2.1.0` payload and closed-unmerged historical canary
+`#74` remain evidence inputs, never standalone deletion authority. The
+source-only executor is unavailable to ordinary consumers and must not be
+re-run against the current source default branch: it requires the exact
+canonical bridge file and rejects its absence. The historic source-only flow in
+the installation guides remains an audit record for a future deliberate bridge
+reintroduction; it does not affect the canonical bridge template or the active
+cohort's separate cleanup. Deleting the YAML stops ordinary new dispatches, but
+does not promise that GitHub cannot rerun a historical Actions run. See the
+[human installation guide](docs/install/human.md) for the archived source-only
+flow and [docs/RELEASING.md](docs/RELEASING.md) for publisher recovery states
 and the release-protection baseline.

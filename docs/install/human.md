@@ -165,6 +165,14 @@ own default branch. It does not weaken the ordinary consumer path: the
 importable ruleset and the bootstrap helper's default `full` profile remain
 required for every ordinary consumer and every repository-level cohort
 installation. Do not copy this profile into a general installation template.
+
+> **Completed source exception.** The current source default branch has
+> completed its source-only proof-and-removal lifecycle and no longer contains
+> the temporary legacy bridge. The commands below are retained as an audited historical procedure;
+> do not rerun them against `Joey-Tools/codex-review-gate` unless a future
+> authorized migration deliberately recreates a bridge. This does not alter the
+> canonical bridge template or ordinary consumer/cohort cleanup procedures.
+
 Unlike the ordinary `full` profile, the retained source ruleset has
 `require_code_owner_review: false` and `dismiss_stale_reviews_on_push: false`.
 Its CODEOWNERS and named-owner projection is closure evidence for control-plane

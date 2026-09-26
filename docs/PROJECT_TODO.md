@@ -41,26 +41,18 @@
   already-cut-over fixed active 10-member cohort with a credential that
   discloses explicit bypass arrays for every manifest-bound ruleset, then use
   it to authorize separate cohort temporary-bridge removal work. Keep every
-  cohort bridge installed until the receipt exists and validates; a source-local
-  bridge requires its own later removal proof.
-- [ ] Complete only the first PR of the separate source-only bridge-removal
-  flow for `Joey-Tools/codex-review-gate`: land closure-proof machinery while
-  retaining the bridge. Do not record a transient receipt or bridge-delete PR
-  as current state.
-- [ ] After the proof-machinery PR merges, use its default-branch helper and a
-  ruleset-admin credential with full bypass-actor visibility to derive a live
-  source closure receipt. The published `v2.1.0` payload and closed-unmerged
-  Node 24 canary `#74` are evidence inputs only; the receipt binds `#74`'s
-  exact PR/head/base/test-merge/CheckRun/run/job tuple together with a fresh
-  two-round current control-plane and effective-merge-policy closure. Obtain
-  independent approval for its exact receipt SHA-256, then create and validate
-  a separate bridge-delete PR. The helper must rebind that same approved receipt
-  against fresh live closure reads before local mutation; if the receipt does
-  not compare equal, stop, derive a new one, and obtain new approval. Neither
-  the receipt file nor the organization schema-2 receipt can authorize source
-  bridge removal by itself; the source-only executor is unavailable to ordinary
-  consumers, and bridge deletion only stops ordinary new dispatches rather than
-  guaranteeing that historical Actions runs cannot be rerun.
+  cohort bridge installed until the receipt exists and validates. This does not
+  reopen the completed, separately authorized source-local bridge removal.
+- [x] Complete the separate source-only bridge-removal flow for
+  `Joey-Tools/codex-review-gate`: proof machinery landed first, then the merged
+  default-branch helper derived the live source closure for historical Node 24
+  canary `#74`. Its exact receipt SHA-256
+  `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`
+  received independent approval and was live-rebound before every local mutation
+  boundary. The separate bridge-delete PR removes only the canonical source
+  bridge; it does not alter rulesets, ordinary consumer templates, cohort scope,
+  or the ability to rerun historical Actions runs. Do not rerun this completed
+  source-only lifecycle against the current source default branch.
 
 ## Later
 

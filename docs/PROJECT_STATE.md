@@ -9,20 +9,20 @@
   active cohort: the old organization rule no longer requires v1, and all eight
   affected repository-local legacy surfaces now require only `test`.
 - The source repository `Joey-Tools/codex-review-gate` is not part of that
-  cohort. Its canonical v2 verifier and controller are installed alongside an
-  exact temporary v1 bridge, and separate status-only v2 ruleset `23927388`
-  is Active. Fresh source canary `#74` proved its exact Node 24
+  cohort. Its canonical v2 verifier and controller are installed without a v1
+  bridge, and separate status-only v2 ruleset `23927388` is Active. Fresh
+  source canary `#74` proved its exact Node 24
   `codex/github-review-gate` CheckRun and was closed unmerged. The separately
   approved source-local cleanup has removed the v1 `codex/review-gate`
   required status from independent repository ruleset `16410326` while
-  retaining its non-status protections; the temporary bridge remains
-  intentionally installed. The source-only closure-proof workstream is active:
-  only its first proof-machinery phase is current. A separate source closure
-  receipt and independently approved receipt SHA-256 are required only after
-  that machinery is merged, before a later local bridge-delete PR. No
-  transient receipt or bridge-delete-PR state is recorded here. The controller
-  admits only exact Codex-bot `issue_comment` `created` events; edited carriers
-  use protected manual reconciliation.
+  retaining its non-status protections. The source-only executor removed the
+  canonical bridge only after receipt
+  `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`
+  was independently approved and live-rebound at every local mutation boundary.
+  This completed source exception does not expand organization receipt scope or
+  change the retained bridge template used by ordinary consumer/cohort flows.
+  The controller admits only exact Codex-bot `issue_comment` `created` events;
+  edited carriers use protected manual reconciliation.
 - Per-workstream details live under `docs/project_journal/`; keep this file as a short repo-wide recovery entrypoint.
 
 ## Recovery Pointers
@@ -43,18 +43,12 @@
 - The source repository's v1 required-status transition is complete: its
   independent local ruleset `16410326` no longer requires
   `codex/review-gate`, while Active status-only v2 ruleset `23927388` and every
-  unrelated protection remain intact. Its temporary bridge is intentionally
-  retained. A later source-local bridge deletion must use a separately derived
-  source-only closure receipt whose exact SHA-256 receives independent approval;
-  the helper re-derives the live closure before local mutation, so a receipt is
-  not trusted as a standalone file. Each closure read selects the unique
-  `source_type: Repository` source v2 ruleset named `Must Pass Codex Review v2`;
-  it does not globally hard-pin historical ID `23927388`. The receipt and
-  rebind instead bind that round's observed ID and full writable-projection
-  fingerprint, together with retained-policy identities, rather than accepting
-  a same-shaped policy snapshot. Source and organization receipts are not
-  interchangeable. This source proof must not broaden the organization receipt
-  scope.
+  unrelated protection remain intact. Its temporary bridge is absent after the
+  separately approved source-only receipt-bound executor completed. Do not
+  rerun that historical source lifecycle against the current default branch:
+  the executor requires the exact canonical bridge and rejects its absence.
+  Source and organization receipts remain non-interchangeable, and the source
+  completion does not broaden the organization receipt scope.
 - The old rule's original 11-repository legacy selector remains intact,
   including archived `Joey-Tools/codex-waited-delivery`. The completed final
   cutover removed only the v1 required-status rule; it retains `deletion` and
