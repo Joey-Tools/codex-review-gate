@@ -3,9 +3,9 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-25
-branch: codex/organization-v2-handoff
-pr:
+updated: 2026-09-26
+branch: codex/post-cutover-fresh-audit-successor
+pr: 78
 supersedes: []
 superseded_by:
 ---
@@ -90,33 +90,22 @@ superseded_by:
   removes its `codex/review-gate` required-status rule. It never deletes the
   ruleset. Two complete, stable cohort snapshots must show that every member is
   covered by v2 and that all old non-v1 policy is unchanged.
-- The mutating `verify --apply` response does not authorize bridge removal.
-  While the final policy-mutation freeze remains active, a separate read-only
-  `verify` must return top-level
-  `schema_version: organization-review-gate-handoff-output/v2`, `mode: verify`,
-  `status: final-verified`, `applied: false`, and `action: null`. Its
-  `final_closure_receipt.schema_version: 2` binds the organization, reviewed
-  manifest digest, final snapshot digest, terminal legacy/v2 ruleset
-  identities/states, and the exact active repository cohort in canonical
-  UTF-8-byte `full_name` order. The receipt is valid only for that complete
-  fixed 10-member active cohort, never a subset or expanded active set; the
-top-level `plan_sha256` must bind its final read-only `verify` plan exactly,
-and the receipt's canonical SHA-256 is the explicit removal proof.
-- Removal of each temporary bridge is a later, separate PR phase. The local
-  bootstrap accepts only the complete final read-only verify JSON, its exact
-  embedded-receipt SHA-256, an unambiguous GitHub `origin`, and live GitHub
-repository metadata that exactly match one receipt entry's `full_name`, `id`,
-`node_id`, and `default_branch`. At the pre-rename boundary it reads `origin`
-before and after the metadata lookup, repeats the local object checks, then
-reads `origin` once more immediately before the atomic bridge quarantine
-rename. After the rename and before unlink, it repeats the complete `origin`
-to live metadata identity/default-branch to `origin` check and revalidates the
-quarantined object's identity and canonical content. Remote-binding failure
-attempts a no-clobber hard-link restoration of that same admitted bridge; an
-occupied canonical path or failed verification stops without overwrite or
-removal success. These are point-in-time checks, not a continuous lock.
-This returns consumers to the ordinary no-v1-caller installation contract after
-the global cutover is closed.
+- The mutating `verify --apply` response never authorizes bridge removal. The
+  former read-only `organization-review-gate-handoff-output/v2` final-closure
+  output remains immutable historical evidence and is still format-validated
+  for audit, but it cannot authorize a new consumer mutation. It lacks a
+  replayable, current policy-and-canary authority after cutover.
+- Removal of each temporary bridge is a later, separate PR phase authorized
+  only by `organization-review-gate-post-cutover-audit-output/v1`. That fresh
+  audit binds the fixed active 10-member cohort, current strict v2 and retained
+  legacy organization policy, and a newly created v2 canary for every member.
+  Before every local destructive boundary, a consumer re-reads its own exact
+  canary PR, CheckRun, Actions run/workflow/job, archive identity, organization
+  rules, default-branch control plane, and `origin` binding. It fails closed on
+  a changed or unreadable selected object. The consumer accepts either current
+  canonical workflow bytes or the single fixed frozen handoff inventory, then
+  normalizes the latter locally; it does not accept caller-supplied historical
+  equivalence.
 
 ## Current State
 
@@ -152,23 +141,16 @@ the global cutover is closed.
 - `codex-waited-delivery` is archived and explicitly outside this cohort. Its
   workspace retirement tombstone is therefore not a migration blocker, and
   the workstream must not restore a mirror or create a migration PR for it.
-- The published historical handoff format is immutable: `manifest/v1`,
-  `output/v1`, and receipt schema `1` mean an exact 11-member closure. The
-  active 10-member contract therefore uses `manifest/v2`, `output/v2`, and
-  receipt schema `2`. Bootstrap accepts only exact same-version pairs.
-  Historical schema-1 receipts retain their published JSON shape and canonical
-  digest validation for auditability, but authorize no new bridge-removal
-  write. A schema-2 receipt instead carries `manifest_repositories`, derived
-  from the reviewed active manifest, and the stable observed `repositories`;
-  both canonical identity lists must match entry by entry before producer or
-  consumer admission. Bridge removal is authorized only from the
-  manifest-derived list, never from the observed list or the old 11-member
-  ruleset selector. This avoids silently redefining published 11-member
-  evidence while keeping the archived repository outside the current mutation
-  scope. A canonical final organization closure receipt has not yet been
-  minted, so temporary bridge removal remains unauthorized even though the v1
-  required status has been removed from the old organization rule and every
-  active-cohort repository-local cleanup surface.
+- The published handoff formats are immutable: `manifest/v1`/`output/v1` and
+  schema-1 record the former 11-member closure; `manifest/v2`/`output/v2` and
+  schema-2 record the historical active-10 final observation. Both remain
+  readable and canonical-digest validated for audit. Neither is an admitted
+  consumer bridge-removal proof: historical schema-2 still validates its
+  manifest-derived and observed identity lists to prevent reinterpretation,
+  but its caller-provided receipt cannot prove that later policy or evidence is
+  live. Replacement PR #78 adds the distinct post-cutover audit proof and leaves every
+  active-cohort bridge installed until that new proof has been produced and
+  revalidated by its consuming deletion PR.
 - The current source hardening makes the retained archive exception explicit in
   the unshipped `manifest/v2`: `legacy_ruleset.legacy_only_repository` binds
   `Joey-Tools/codex-waited-delivery` by `slug`, numeric `id`, `node_id`,
@@ -196,10 +178,10 @@ the global cutover is closed.
   active cohort twice: `manifest_repositories` comes only from the reviewed
   manifest, while `repositories` comes from the stable final observation. Both
   lists contain canonical `{full_name,id,node_id,default_branch}` identities,
-  and are rejected unless they are exactly equal. Consumer bridge removal reads
-  only `manifest_repositories` as its authorization set. This prevents a
-  digest-valid observed list from expanding or replacing the manifest-approved
-  cohort at the consumer boundary.
+  and are rejected unless they are exactly equal. This remains an audit and
+  producer-integrity property; consumer bridge removal now requires the later
+  post-cutover proof rather than treating the historical list as enduring
+  mutation authority.
 - The current rollout adds a defense-in-depth hard rejection in both schema-2
   receipt lists for `Joey-Tools/codex-waited-delivery` by case-insensitive slug,
   numeric ID `1242512099`, or node ID `R_kgDOSg864w`. Slug detects same-slug
@@ -1265,14 +1247,93 @@ evidence that a prior freeze remains in force.
   audit, but must not be replayed against the now bridge-free source default
   branch.
 
+## Execution Update — 2026-09-26 (post-cutover proof repair in replacement PR #78)
+
+- Review of the proposed active-cohort bridge-removal flow found that the
+  historical handoff/schema-2 receipt was self-consistent evidence, not a
+  current mutation authority: it could not independently prove the live
+  organization policy or every receipt-bound fresh canary. The replacement
+  delivery in PR #78 therefore makes every historical handoff output audit-only
+  for consumer deletion. PR #71 is not a usable provider-review lineage because
+  its accumulated bare review-request boundaries cannot be closed on its current
+  head; it must not be used to obtain a gate pass.
+- The replacement PR must obtain its own current-head provider evidence. After
+  its final documented head is pushed, run exactly one canonical default-branch
+  `begin-review` dispatch with `request_review=true` and that full expected
+  head SHA, then wait for the current-head verifier result and normal PR gates.
+  Do not post a bare `@codex review` comment on the replacement: that would add
+  an unnecessary request boundary instead of repairing #71's historical one.
+- The sole admitted consumer proof is the dedicated post-cutover audit/v1.
+  It fixes the active cohort and archive identities, the strict v2 ruleset and
+  the retained legacy `deletion`/`non_fast_forward` ruleset semantics, and the
+  new canary evidence. At each local mutation boundary the consumer re-reads
+  selected remote objects; a mismatch, unreadable response, extra CheckRun
+  generation, restored legacy surface, or altered control plane leaves the
+  bridge in place.
+- A previously deployed frozen handoff workflow envelope remains admissible
+  only by its fixed Git-blob and SHA-256 identities. This supports a safe local
+  normalization to current canonical bytes without accepting arbitrary
+  caller-supplied historical workflow content. PR #78 carries the completed
+  repair into the target branch; it does not remove any cohort bridge.
+- The consumer treats a closed-unmerged canary as valid historical execution
+  evidence: GitHub can clear an Actions run's `pull_requests` projection after
+  closure, so that transient field is not a proof requirement. Instead it
+  rereads the canonical PR head/base/repository tuple and binds the recorded
+  test merge through the immutable, PR-scoped verifier run title, exact native
+  CheckRun, run, workflow, and job. A merged, draft, changed, or unreadable PR
+  still fails closed.
+- GitHub's CheckRuns-by-ref API hides runs from check suites older than its
+  newest-1,000-suite window. Before trusting the fully paginated
+  `filter=all` CheckRun history, the consumer fully paginates the documented
+  check-suite inventory for the exact canary head and rejects only a count
+  greater than 1,000. Exactly 1,000 remains fully visible and is accepted;
+  the guard prevents a hidden older producer generation from being mistaken
+  for absence. This is a selected-evidence stability check, not a claim that
+  unrelated repository activity is frozen.
+- The post-cutover audit producer and bridge-removal consumer now both bind the
+  documented CheckRun visibility boundary to the exact history they read. Each
+  takes a complete per-canary `filter=all` Check Suite projection (pagination,
+  unique IDs, and exact head), reads `filter=all` CheckRuns, then takes the
+  same projection again and requires exact equality plus a count no greater
+  than 1,000. The projection deliberately compares suite identity/head only,
+  not benign mutable status metadata. This is an inter-request fail-closed
+  fence rather than a claim of an atomic GitHub lock: a changed window is
+  inconclusive, while the existing mutation-boundary rereads narrow later
+  exposure. The producer retains the projection in its stable snapshot so the
+  two complete audit snapshots also bind this selected visibility horizon.
+- A subsequent independent Terra Ultra review found that matching the two
+  Check Suite windows was not sufficient by itself: a fabricated or
+  inconsistent API response could place the selected successful CheckRun
+  outside that window (including an empty window) and still pass the earlier
+  checks. The protected property is the exact parent Check Suite identity of
+  the selected CheckRun, not mutable suite status metadata. Both producer and
+  consumer now require a positive `check_suite.id` on the successful CheckRun
+  and require it to be a member of the identical before/after suite window.
+  Missing, mismatched, or empty-window evidence is inconclusive and leaves the
+  bridge in place. Regression tests cover all three cases.
+- The human and agent guides now label the old v2 handoff commands as a
+  non-executable historical transcript and link the current post-cutover audit
+  route, so a valid historical digest cannot be mistaken for enduring mutation
+  authority.
+- The historical handoff-template README now starts with the archive boundary,
+  expressly forbids instantiating its placeholders, and labels its remaining
+  stage/activation/cleanup command blocks as archived transcript. This avoids
+  directing an operator toward old writes that the current consumer would not
+  accept as bridge-removal authority.
+- The human guide, agent guide, and post-cutover-audit template now also state
+  the complete CheckSuite-to-CheckRun binding explicitly: matching nonempty
+  before/after `filter=all` suite windows must contain the selected successful
+  CheckRun's positive `check_suite.id`. Missing, mismatched, or empty-window
+  evidence is documented as inconclusive/fail-closed, matching the repaired
+  producer and consumer rather than leaving an implementation-only guarantee.
+
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
-   bridge-removal PR, use a ruleset-write-capable credential for every
-   manifest-bound detail read, obtain a fresh applicable policy-mutation freeze,
-   and mint the canonical schema-2 final read-only closure receipt against the
-   now-cut-over state. That receipt cannot authorize a source-local bridge
-   outside the frozen cohort.
+   bridge-removal PR, use a ruleset-write-capable credential to mint a fresh
+   post-cutover audit proof against the now-cut-over state using the merged
+   repair. Historical schema-2 output is audit-only and cannot authorize a
+   source-local or active-cohort bridge deletion.
 2. Treat the cohort v1 status transition as complete: do not restore
    `codex/review-gate` in the old organization rule or on any fixed active
    cohort repository. The old organization ruleset intentionally remains Active
@@ -1311,3 +1372,13 @@ evidence that a prior freeze remains in force.
   without a terminal result for 15 minutes, so it was interrupted and is not
   recorded as passing. Earlier dedicated v2 workflow-contract and
   workflow-security validation remain recorded above.
+- Replacement PR #78 repair validation after the CheckRun-to-CheckSuite binding
+  fix: `npm run check` passed; the complete
+  `node --test test/organization-review-gate-handoff.test.mjs` suite passed
+  245/245; and the targeted consumer bridge-removal tests (fresh proof,
+  closed-unmerged 1,000-suite boundary, receipt-bound canary reread, and the
+  exact 1,000-to-1,001 visibility-window race) passed. The direct Action CLI
+  diagnostic regression covers both `GITHUB_TOKEN` and `INPUT_GITHUB_TOKEN`,
+  including a token that enters `reason`, and asserts that complete stderr is
+  redacted. The monolithic bootstrap suite was not rerun because its known
+  no-output hang is unrelated to these exact boundary tests.

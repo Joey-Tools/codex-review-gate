@@ -1,0 +1,1115 @@
+{
+  "schema_version": "organization-review-gate-post-cutover-audit-manifest/v1",
+  "audit_kind": "fresh-v2-canary",
+  "organization": {
+    "login": "Joey-Tools",
+    "id": 283943935,
+    "node_id": "O_kgDOEOyj_w"
+  },
+  "legacy_ruleset": {
+    "id": 16590367,
+    "legacy_only_repository": {
+      "slug": "Joey-Tools/codex-waited-delivery",
+      "id": 1242512099,
+      "node_id": "R_kgDOSg864w",
+      "default_branch": "master",
+      "archived": true
+    },
+    "expected_after": {
+      "name": "Must Pass Codex Review",
+      "target": "branch",
+      "enforcement": "active",
+      "bypass_actors": [],
+      "conditions": {
+        "ref_name": {
+          "exclude": [],
+          "include": [
+            "~DEFAULT_BRANCH"
+          ]
+        },
+        "repository_id": {
+          "repository_ids": [
+            1242512097,
+            1242512092,
+            1242511852,
+            1242512336,
+            1242511845,
+            1242511842,
+            1242512323,
+            1242511840,
+            1242512099,
+            1242512084,
+            1246526548
+          ]
+        }
+      },
+      "rules": [
+        {
+          "type": "deletion"
+        },
+        {
+          "type": "non_fast_forward"
+        }
+      ]
+    }
+  },
+  "v2_ruleset": {
+    "id": 23787657,
+    "name": "Must Pass Codex Review v2",
+    "expected": {
+      "name": "Must Pass Codex Review v2",
+      "target": "branch",
+      "enforcement": "active",
+      "bypass_actors": [],
+      "conditions": {
+        "ref_name": {
+          "include": [
+            "~DEFAULT_BRANCH"
+          ],
+          "exclude": []
+        },
+        "repository_id": {
+          "repository_ids": [
+            1242512097,
+            1242512092,
+            1242511852,
+            1242512336,
+            1242511845,
+            1242511842,
+            1242512323,
+            1242511840,
+            1242512084,
+            1246526548
+          ]
+        }
+      },
+      "rules": [
+        {
+          "type": "required_status_checks",
+          "parameters": {
+            "required_status_checks": [
+              {
+                "context": "codex/github-review-gate",
+                "integration_id": 15368
+              }
+            ],
+            "strict_required_status_checks_policy": true,
+            "do_not_enforce_on_create": true
+          }
+        }
+      ]
+    }
+  },
+  "repositories": [
+    {
+      "slug": "Joey-Tools/codex-apple-notes-toolkit",
+      "id": 1242512097,
+      "node_id": "R_kgDOSg864Q",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_1",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_1",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774341,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_1",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_1",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_1",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_1",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_1",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_1",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_1",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_1",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_1",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_1"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-debug-triage",
+      "id": 1242512092,
+      "node_id": "R_kgDOSg863A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_2",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_2",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774347,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_2",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_2",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_2",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_2",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_2",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_2",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_2",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_2",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_2",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_2"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-personal-sync",
+      "id": 1242511852,
+      "node_id": "R_kgDOSg857A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_3",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_3",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774345,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_3",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_3",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_3",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_3",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_3",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_3",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_3",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_3",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_3",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_3"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-private-workflows",
+      "id": 1242512336,
+      "node_id": "R_kgDOSg870A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_4",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_4",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774352,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_4",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_4",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_4",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_4",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_4",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_4",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_4",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_4",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_4",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_4"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-project-journal",
+      "id": 1242511845,
+      "node_id": "R_kgDOSg855Q",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_5",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_5",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774342,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_5",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_5",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_5",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_5",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_5",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_5",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_5",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_5",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_5",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_5"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-review-workflows",
+      "id": 1242511842,
+      "node_id": "R_kgDOSg854g",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_6",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_6",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774346,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_6",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_6",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_6",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_6",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_6",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_6",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_6",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_6",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_6",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_6"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-rollout-backup",
+      "id": 1242512323,
+      "node_id": "R_kgDOSg87ww",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_7",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_7",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774344,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_7",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_7",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_7",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_7",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_7",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_7",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_7",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_7",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_7",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_7"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-toolbox",
+      "id": 1242511840,
+      "node_id": "R_kgDOSg854A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_8",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_8",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774351,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_8",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_8",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_8",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_8",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_8",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_8",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_8",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_8",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_8",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_8"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-workflow-hygiene",
+      "id": 1242512084,
+      "node_id": "R_kgDOSg861A",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_9",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_9",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774350,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_9",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_9",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_9",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_9",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_9",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_9",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_9",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_9",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_9",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_9"
+      }
+    },
+    {
+      "slug": "Joey-Tools/codex-session-retrospective-history",
+      "id": 1246526548,
+      "node_id": "R_kgDOSkx8VA",
+      "default_branch": "master",
+      "workflows": {
+        "verifier": {
+          "path": ".github/workflows/codex-review-gate.yml",
+          "git_blob_sha": "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
+          "sha256": "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e"
+        },
+        "controller": {
+          "path": ".github/workflows/codex-review-gate-controller.yml",
+          "git_blob_sha": "c994a6861414e1efc1e7ab376470c7709d475ef1",
+          "sha256": "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e"
+        },
+        "legacy_bridge": {
+          "path": ".github/workflows/codex-review-gate-legacy-bridge.yml",
+          "git_blob_sha": "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
+          "sha256": "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef"
+        }
+      },
+      "codeowners": {
+        "path": ".github/CODEOWNERS",
+        "git_blob_sha": "REPLACE_WITH_CURRENT_CODEOWNERS_BLOB_SHA_10",
+        "sha256": "REPLACE_WITH_CURRENT_CODEOWNERS_SHA256_10",
+        "owner": {
+          "login": "JoeyTeng",
+          "id": 12524680,
+          "node_id": "MDQ6VXNlcjEyNTI0Njgw"
+        }
+      },
+      "v2_ruleset": {
+        "id": 23774340,
+        "expected": {
+          "name": "Must Pass Codex Review v2",
+          "target": "branch",
+          "enforcement": "active",
+          "bypass_actors": [],
+          "conditions": {
+            "ref_name": {
+              "include": [
+                "~DEFAULT_BRANCH"
+              ],
+              "exclude": []
+            }
+          },
+          "rules": [
+            {
+              "type": "pull_request",
+              "parameters": {
+                "allowed_merge_methods": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ],
+                "dismiss_stale_reviews_on_push": true,
+                "dismissal_restriction": {
+                  "enabled": false,
+                  "allowed_actors": []
+                },
+                "require_code_owner_review": true,
+                "require_extra_approval_for_unattributed_changes": true,
+                "require_last_push_approval": false,
+                "required_approving_review_count": 0,
+                "required_review_thread_resolution": true,
+                "required_reviewers": []
+              }
+            },
+            {
+              "type": "required_status_checks",
+              "parameters": {
+                "required_status_checks": [
+                  {
+                    "context": "codex/github-review-gate",
+                    "integration_id": 15368
+                  }
+                ],
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false
+              }
+            },
+            {
+              "type": "non_fast_forward"
+            }
+          ]
+        }
+      },
+      "canary": {
+        "pull_number": "REPLACE_WITH_FRESH_OPEN_CANARY_PR_10",
+        "created_at": "REPLACE_WITH_FRESH_CANARY_GITHUB_UTC_CREATED_AT_10",
+        "head_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_HEAD_10",
+        "base_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_BASE_10",
+        "test_merge_sha": "REPLACE_WITH_FRESH_40_HEX_CANARY_TEST_MERGE_10",
+        "v2_check_run_id": "REPLACE_WITH_FRESH_V2_CHECK_RUN_ID_10",
+        "v2_run_id": "REPLACE_WITH_FRESH_V2_RUN_ID_10",
+        "v2_job_id": "REPLACE_WITH_FRESH_V2_JOB_ID_10",
+        "v2_workflow_id": "REPLACE_WITH_FRESH_V2_WORKFLOW_ID_10",
+        "v2_run_attempt": "REPLACE_WITH_FRESH_V2_RUN_ATTEMPT_10"
+      }
+    }
+  ]
+}

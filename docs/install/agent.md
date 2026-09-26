@@ -63,6 +63,42 @@ Maintain these invariants:
   defaults to `@JoeyTeng`, but a non-Joey repository must substitute its own
   eligible GitHub user.
 
+## Completed-cutover fresh audit
+
+When an already-cut-over organization cohort lacks a complete contemporaneous
+v3 handoff manifest, do not backfill it. Follow the independent
+[post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md): create one **new**, same-repository, open,
+non-draft harmless canary PR for every fixed active member; bind exact native
+v2 CheckRun/run/job evidence; require two stable full-cohort snapshots; then
+preserve the complete receipt output for bridge-removal PRs. The fixed archive
+`Joey-Tools/codex-waited-delivery` (exact slug, numeric ID, node ID, `master`
+default branch, and `archived: true`) and `Joey-Tools/codex-review-gate` source
+bridge are outside the scope; an arbitrary archived repository cannot replace
+that historical exception. Accept the deployed frozen v3 consumer profile
+as the audit subject; bridge-removal PRs normalize workflow/CODEOWNERS and are
+full reviewed control-plane changes, not deletion-only edits. Close the fresh
+canaries unmerged only after the snapshots and receipt succeed. The exact
+GitHub UTC PR `created_at` must be later than the fixed cutoff
+`2026-09-24T23:38:00Z`; the helper reads, validates, and receipt-binds it, so
+an older otherwise self-consistent canary is rejected.
+Before treating `filter=all` CheckRun history as complete, it reads the canary
+head's complete `filter=all` Check Suite inventory immediately before and
+after that enumeration. The normalized suite windows must match exactly and
+contain at most 1,000 suites, the documented visibility boundary for GitHub's
+by-ref CheckRun endpoint. The matching before/after windows must be nonempty
+and contain the bound successful v2 CheckRun's positive-integer
+`check_suite.id`; a missing or mismatched ID, or an empty window, is
+inconclusive and fails closed. This prevents a successful CheckRun from being
+paired with a detached visibility snapshot. A larger, malformed, or changing
+inventory is inconclusive rather than a clean history; this is an
+inter-request fail-closed fence, not a claim of an atomic remote lock.
+
+```bash
+node scripts/organization-review-gate-handoff.mjs \
+  --manifest "$POST_CUTOVER_MANIFEST" \
+  --mode post-cutover-audit > "$POST_CUTOVER_OUTPUT"
+```
+
 ## Narrow source-repository self-hosting exception
 
 Use this path only when `REPO` is exactly `Joey-Tools/codex-review-gate` and
@@ -349,15 +385,24 @@ protection.
     must pass a fresh strict v2 exact-head gate before merge. Do not introduce
     a history purge or time-based wait.
 
-## Advanced controlled handoff for an active ten-repository v2 cohort
+## Historical controlled handoff transcript — do not execute
 
-Use this execution path only when the authorized scope is exactly one reviewed
-active ten-repository v2 cohort covered by a shared v1 organization ruleset.
-The old v1 rule retains its original eleven-repository legacy selector. This
-is not a reusable `allow-v1` switch. Outside the separately documented source
-self-hosting exception above, the ordinary phases below continue to reject
-every v1 caller, and the advanced path must return every active member to that
-same final no-v1 contract.
+> **Bridge-removal authority has been superseded.** Treat this section as the
+> completed historical handoff record only. Its
+> `organization-review-gate-handoff-output/v2` may be parsed for audit but is
+> never an input to `--remove-legacy-bridge`. Use the independent
+> [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
+> to obtain the only admitted bridge-removal proof.
+>
+> Do not execute any command or phase in this historical transcript. Its stage,
+> activation, cleanup, and bridge-removal examples describe the completed
+> rollout only; replaying them can mutate an already cut-over cohort. The
+> current executable route starts with the fresh audit above.
+
+The completed rollout's scope was one reviewed active ten-repository v2 cohort
+covered by a shared v1 organization ruleset. The old v1 rule retained its
+original eleven-repository legacy selector. This was not a reusable
+`allow-v1` switch; the ordinary current path rejects every v1 caller.
 
 `Joey-Tools/codex-waited-delivery` is archived and legacy-only. It stays in the
 old rule's original eleven-repository selector so `deletion` and
@@ -408,7 +453,7 @@ The exact `activation` keys are `legacy_evidence_stability_timeout_ms`,
 `coverage_stability_timeout_ms`. They are manifest-bound plan input, never ad
 hoc CLI overrides.
 
-This is the current v2 handoff path. A previously issued v1 output with a
+This is the historical v2 handoff record, not a current execution path. A previously issued v1 output with a
 schema-1 receipt is historical eleven-member closure evidence only; do not use
 it for installation, staging, activation, cleanup, or bridge removal here. Its
 published JSON shape and canonical receipt digest remain strictly validated for
@@ -812,9 +857,18 @@ Execute the following state machine in order.
    after capture but before removal preparation, discard the old proof and
    mint a fresh final read-only output under a new freeze. Never substitute
    the `verify --apply` response or reuse a known-stale receipt.
+
+   > **Historical transcript — do not execute Steps 9 or 10.** Current
+   > bootstrap releases reject `organization-review-gate-handoff-output/v2`
+   > as a bridge-removal input, even when its digest is valid. The only current
+   > route is the [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md),
+   > which mints a new v1 audit output and requires the consumer to reread its
+   > policy and canary evidence before every local deletion boundary.
+
 10. Only after step 9 closes successfully, prepare a separate bridge-removal PR
-   in every active cohort member from a clean worktree. Do not prepare one for
-   the archived legacy-only repository:
+   in every active cohort member from a clean worktree. **This is historical
+   only; do not run these commands.** Do not prepare one for the archived
+   legacy-only repository:
 
    ```bash
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
@@ -834,8 +888,10 @@ Execute the following state machine in order.
      --apply
    ```
 
-   `--final-closure-receipt` takes the complete final read-only verify output,
-   despite the singular option name. The bootstrap validates its terminal
+   Historically, `--final-closure-receipt` took the complete final read-only
+   verify output despite the singular option name. Current bootstrap releases
+   reject this historical output before any local mutation. The bootstrap
+   instead admits only the fresh-audit output described above, then validates its terminal
    top-level fields, recomputes the canonical embedded receipt digest, compares
    the explicit expected SHA-256, parses the target worktree's unambiguous
    GitHub `origin`, and reads live repository metadata from GitHub. It requires

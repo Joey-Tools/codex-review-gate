@@ -54,6 +54,33 @@ GitHub.com/default-branch PR scope 时停止。
 - 每次调用 bootstrap 都显式保留同一个 `CONTROL_PLANE_OWNER`。默认值是
   `@JoeyTeng`；非 Joey 仓库必须替换成自己的合格 GitHub user。
 
+## 已完成 cutover 的 fresh audit
+
+已经完成 cutover 的 organization cohort 若缺少完整、同时代的 v3 handoff manifest，不得事后回填。
+应遵循独立的 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)：为每个固定活动 member 创建一个**新的**、
+same-repository、open、non-draft 的无害 canary PR；绑定 exact native v2 CheckRun/run/job evidence；
+要求两轮 stable 的 full-cohort snapshot；之后保留完整 receipt output 供 bridge-removal PR 使用。
+固定的已归档 identity `Joey-Tools/codex-waited-delivery`（精确 slug、numeric ID、node ID、`master`
+default branch 及 `archived: true`）和 `Joey-Tools/codex-review-gate` 的 source bridge
+不在 scope 内；不得用任意已归档仓替代该历史例外。已部署的 frozen v3 consumer profile 是 audit subject；bridge-removal PR 会规范化
+workflow/CODEOWNERS，属于需要完整 review 的 control-plane change，而不是 deletion-only edit。只有
+snapshot 与 receipt 成功后，才关闭新的 canary，且保持 unmerged。PR 的 exact GitHub UTC `created_at`
+必须晚于固定 cutoff `2026-09-24T23:38:00Z`；helper 会读取、验证并将它绑定进 receipt，所以即使其他 ID
+自洽，旧 canary 也会被拒绝。
+在把 `filter=all` CheckRun history 视为完整之前，helper 会在该枚举的紧前、紧后各读取一次 canary
+head 的完整 `filter=all` Check Suite inventory。两个规范化的 suite window 必须完全一致，且 suite 数
+不超过 1,000——这是 GitHub by-ref CheckRun endpoint 的文档化可见性边界。更大的、malformed 或发生变化的
+inventory 都是 inconclusive，不代表历史干净。这对相同的 before/after window 还必须非空，并包含已绑定的
+successful v2 CheckRun 的正整数 `check_suite.id`；该 ID 缺失或错配、以及 window 为空均为 inconclusive 并
+fail-closed。这个绑定避免把 successful CheckRun 与脱节的可见性 snapshot 配对。这只是跨 API 读取之间的
+fail-closed fence，不声称拥有远端原子锁。
+
+```bash
+node scripts/organization-review-gate-handoff.mjs \
+  --manifest "$POST_CUTOVER_MANIFEST" \
+  --mode post-cutover-audit > "$POST_CUTOVER_OUTPUT"
+```
+
 ## 窄范围 source repository self-hosting 例外
 
 只有 `REPO` 精确等于 `Joey-Tools/codex-review-gate`、且任务就是迁移该 source repository
@@ -300,12 +327,21 @@ closure evidence，而不是 source 的 Code Owner approval 或 stale-review pro
     要求 legacy context，且 bridge-delete PR 自身必须在合并前通过 fresh strict v2 exact-head gate。
     不要引入 history purge 或按时间等待。
 
-## Advanced：活动 v2 10 仓 organization handoff
+## Historical handoff 记录（禁止执行）
 
-只有当授权 scope 精确等于一个经过审阅、受共享 v1 organization ruleset 保护的活动 v2 10 仓
-cohort 时，才使用本执行路径。旧 v1 rule 仍保留其原始 11 仓 legacy selector。它不是可复用的
-`allow-v1` 开关。除了上面单独记录的 source self-hosting 例外，下方普通 phases 仍拒绝所有
-v1 caller；advanced path 最终也必须让每个活动成员回到同一个 no-v1 contract。
+> **bridge removal authority 已被替代。** 本节只是已完成的历史 handoff 记录。
+> `organization-review-gate-handoff-output/v2` 可以为审计而解析，但绝不是
+> `--remove-legacy-bridge` 的输入。请使用独立的
+> [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
+> 取得唯一被接受的 bridge-removal proof。
+>
+> 不得执行本历史记录中的任何命令或 phase。这里的 stage、activation、cleanup 与
+> bridge-removal 示例只描述已完成 rollout；重放它们可能变更已经 cutover 的 cohort。
+> 当前可执行路径从上方的 fresh audit 开始。
+
+已完成 rollout 的 scope 是一个经过审阅、受共享 v1 organization ruleset 保护的活动 v2 10 仓
+cohort。旧 v1 rule 保留其原始 11 仓 legacy selector。这不是可复用的 `allow-v1` 开关；
+当前普通路径拒绝所有 v1 caller。
 
 `Joey-Tools/codex-waited-delivery` 已归档且仅属于 legacy。它留在旧 rule 的原始 11 仓
 selector 中，使 `deletion` 和 `non_fast_forward` 在 cutover 后仍受保护。它不需要 v2
@@ -345,7 +381,7 @@ initial `active` state 与 drain timeout。任意字段不完整、活动成员�
 `organization_evidence_timeout_ms`、`coverage_round_timeout_ms` 与
 `coverage_stability_timeout_ms`。它们是 manifest-bound 的 plan input，绝不是临时 CLI override。
 
-这是当前的 v2 handoff 路径。此前已签发的 v1 output 与 schema-1 receipt 只构成历史 11 仓
+这是历史 v2 handoff 记录，不是当前可执行路径。此前已签发的 v1 output 与 schema-1 receipt 只构成历史 11 仓
 closure evidence；不得用它为本 cohort 执行 installation、staging、activation、cleanup 或
 bridge removal。其已经发布的 JSON shape 与 canonical receipt digest 仍会为历史审计而严格
 验证，但 schema 1 不授权任何新的 bridge removal。
@@ -685,8 +721,16 @@ live `active` state。
    verify。若 capture 之后到 removal preparation 之前发生了已知 organization/repository
    policy mutation，则丢弃旧 proof，在新的 freeze 下生成 fresh final read-only output；绝不
    用 `verify --apply` response 代替，也不复用已知 stale receipt。
+
+   > **以下第 9、10 步仅为历史记录，禁止执行。** 当前 bootstrap release 会在任何本地 mutation
+   > 前拒绝把 `organization-review-gate-handoff-output/v2` 用作 bridge-removal input，即使其
+   > digest 有效。唯一现行路径是 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)：
+   > 它生成新的 v1 audit output，并要求 consumer 在每个本地删除边界前重新读取 policy 与
+   > canary evidence。
+
 10. 只有步骤 9 成功 closure 后，每个活动 cohort member 才从 clean worktree 另开
-   bridge-removal PR。不得为已归档、仅属于 legacy 的 repository 创建此类 PR：
+   bridge-removal PR。**这段只保留作历史记录，禁止执行这些命令。** 不得为已归档、仅属于
+   legacy 的 repository 创建此类 PR：
 
    ```bash
    node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
@@ -706,8 +750,9 @@ live `active` state。
      --apply
    ```
 
-   虽然 option 名称是 singular `--final-closure-receipt`，它接收的是完整的最终只读 verify
-   output。Bootstrap 会验证 terminal top-level fields、重新计算 canonical embedded receipt
+   历史上，虽然 option 名称是 singular `--final-closure-receipt`，它接收的是完整的最终只读
+   verify output。当前 bootstrap release 会在任何本地 mutation 前拒绝这份历史 output；现行
+   bootstrap 只接受上文的 fresh-audit output，然后验证 terminal top-level fields、重新计算 canonical embedded receipt
    digest、比对显式 expected SHA-256、解析 target worktree 中无歧义的 GitHub `origin`，并从
 GitHub 读取 live repository metadata。它要求 `full_name`、`id`、`node_id` 与
 `default_branch` 都和固定 10 仓 manifest-derived `manifest_repositories` cohort 中的一项精确

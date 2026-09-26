@@ -34,12 +34,14 @@
 
 ## Global Blockers
 - Temporary bridge removal for the frozen active 10-member cohort remains
-  blocked until a canonical schema-2 final read-only closure receipt is minted.
-  The receipt must still bind equal manifest-derived and observed identity
-  lists and explicit `bypass_actors` arrays from every manifest-bound ruleset
-  detail read; a redacted/malformed bypass field requires a ruleset-write-capable
+  blocked until the authorized post-cutover fresh-audit repair produces
+  a new receipt from fresh v2 canaries plus current exact policy and workflow
+  readback. It must retain equal manifest-derived and observed identity lists
+  and explicit `bypass_actors` arrays from every manifest-bound ruleset detail
+  read; a redacted/malformed bypass field requires a ruleset-write-capable
   credential and a fresh read under the applicable freeze. It cannot authorize
-  removal of a source-local bridge outside that cohort.
+  removal of a source-local bridge outside that cohort or claim historical
+  activation evidence retroactively.
 - The source repository's v1 required-status transition is complete: its
   independent local ruleset `16410326` no longer requires
   `codex/review-gate`, while Active status-only v2 ruleset `23927388` and every
@@ -59,8 +61,11 @@
   bridge-removal scope.
 - A schema-2 final receipt must carry both the manifest-derived active
   `manifest_repositories` list and the stable observed `repositories` list;
-  canonical entry-by-entry equality is required. Bridge removal authorizes only
-  the manifest-derived list. In this rollout, either list rejects
+  canonical entry-by-entry equality is required. It is immutable historical
+  audit evidence, not a bridge-removal authority. Only a fresh post-cutover
+  audit/v1 receipt may authorize a consumer bridge deletion after its live
+  policy and canary evidence have been re-read at each mutation boundary. In
+  this rollout, either historical list rejects
   `Joey-Tools/codex-waited-delivery` by slug, ID, or node ID. Schema-1 keeps
   its historical exact shape and canonical digest for audit but authorizes no
   new bridge removal.
