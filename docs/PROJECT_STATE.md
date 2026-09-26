@@ -34,11 +34,11 @@
 
 ## Global Blockers
 - Temporary bridge removal for the frozen active 10-member cohort remains
-  blocked until the authorized post-cutover fresh audit is implemented and
-  produces a new receipt from fresh v2 canaries plus current exact policy and
-  workflow readback. It must retain equal manifest-derived and observed identity
-  lists and explicit `bypass_actors` arrays from every manifest-bound ruleset
-  detail read; a redacted/malformed bypass field requires a ruleset-write-capable
+  blocked until the merged authorized post-cutover fresh-audit repair produces
+  a new receipt from fresh v2 canaries plus current exact policy and workflow
+  readback. It must retain equal manifest-derived and observed identity lists
+  and explicit `bypass_actors` arrays from every manifest-bound ruleset detail
+  read; a redacted/malformed bypass field requires a ruleset-write-capable
   credential and a fresh read under the applicable freeze. It cannot authorize
   removal of a source-local bridge outside that cohort or claim historical
   activation evidence retroactively.

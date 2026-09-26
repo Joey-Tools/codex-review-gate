@@ -1321,11 +1321,10 @@ evidence that a prior freeze remains in force.
 ## Next Steps
 
 1. Keep the temporary legacy bridges installed. Before any active-cohort
-   bridge-removal PR, merge and validate the separate post-cutover audit repair,
-   then use a ruleset-write-capable credential to mint a fresh post-cutover
-   audit proof against the now-cut-over state. Historical schema-2 output is
-   audit-only and cannot authorize a source-local or active-cohort bridge
-   deletion.
+   bridge-removal PR, use a ruleset-write-capable credential to mint a fresh
+   post-cutover audit proof against the now-cut-over state using the merged
+   repair. Historical schema-2 output is audit-only and cannot authorize a
+   source-local or active-cohort bridge deletion.
 2. Treat the cohort v1 status transition as complete: do not restore
    `codex/review-gate` in the old organization rule or on any fixed active
    cohort repository. The old organization ruleset intentionally remains Active
