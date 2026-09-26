@@ -1311,6 +1311,12 @@ evidence that a prior freeze remains in force.
   stage/activation/cleanup command blocks as archived transcript. This avoids
   directing an operator toward old writes that the current consumer would not
   accept as bridge-removal authority.
+- The human guide, agent guide, and post-cutover-audit template now also state
+  the complete CheckSuite-to-CheckRun binding explicitly: matching nonempty
+  before/after `filter=all` suite windows must contain the selected successful
+  CheckRun's positive `check_suite.id`. Missing, mismatched, or empty-window
+  evidence is documented as inconclusive/fail-closed, matching the repaired
+  producer and consumer rather than leaving an implementation-only guarantee.
 
 ## Next Steps
 

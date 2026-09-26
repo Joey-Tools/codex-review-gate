@@ -122,7 +122,12 @@ complete `filter=all` Check Suite inventory for that canary head immediately
 before and after the CheckRun enumeration. The normalized suite windows must
 match and contain at most 1,000 suites; a larger, malformed, or changing
 inventory is inconclusive, not evidence that an older producer generation is
-absent. This is an inter-request fail-closed fence, not an atomic remote lock.
+absent. The matching before/after windows must be nonempty and contain the
+bound successful v2 CheckRun's positive-integer `check_suite.id`; a missing or
+mismatched ID, or an empty window, is inconclusive and fails closed. This
+prevents a successful CheckRun from being paired with a detached visibility
+snapshot. This is an inter-request fail-closed fence, not an atomic remote
+lock.
 
 The deployed cohort uses the frozen v3 consumer workflow profile intentionally.
 This audit accepts that deployed profile and proves it as it actually runs; it
@@ -268,3 +273,8 @@ the newest 1,000 check suites, so the consumer brackets its complete
 `filter=all` CheckRun read with two matching complete `filter=all` Check Suite
 inventories at or below that visibility boundary. An excess or changed window
 is inconclusive rather than proof that an older producer generation is absent.
+The matching before/after windows must be nonempty and contain the
+receipt-bound successful v2 CheckRun's positive-integer `check_suite.id`; a
+missing or mismatched ID, or an empty window, is inconclusive and fails closed.
+This prevents a successful CheckRun from being paired with a detached
+visibility snapshot.
