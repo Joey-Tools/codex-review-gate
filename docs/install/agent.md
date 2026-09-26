@@ -81,6 +81,10 @@ canaries unmerged only after the snapshots and receipt succeed. The exact
 GitHub UTC PR `created_at` must be later than the fixed cutoff
 `2026-09-24T23:38:00Z`; the helper reads, validates, and receipt-binds it, so
 an older otherwise self-consistent canary is rejected.
+Before treating `filter=all` CheckRun history as complete, it also reads the
+canary head's complete Check Suite inventory and requires at most 1,000 suites,
+the documented visibility boundary for GitHub's by-ref CheckRun endpoint. A
+larger or malformed inventory is inconclusive rather than a clean history.
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \
@@ -374,7 +378,7 @@ protection.
     must pass a fresh strict v2 exact-head gate before merge. Do not introduce
     a history purge or time-based wait.
 
-## Historical controlled handoff record for an active ten-repository v2 cohort
+## Historical controlled handoff transcript — do not execute
 
 > **Bridge-removal authority has been superseded.** Treat this section as the
 > completed historical handoff record only. Its
@@ -382,14 +386,16 @@ protection.
 > never an input to `--remove-legacy-bridge`. Use the independent
 > [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
 > to obtain the only admitted bridge-removal proof.
+>
+> Do not execute any command or phase in this historical transcript. Its stage,
+> activation, cleanup, and bridge-removal examples describe the completed
+> rollout only; replaying them can mutate an already cut-over cohort. The
+> current executable route starts with the fresh audit above.
 
-Use this execution path only when the authorized scope is exactly one reviewed
-active ten-repository v2 cohort covered by a shared v1 organization ruleset.
-The old v1 rule retains its original eleven-repository legacy selector. This
-is not a reusable `allow-v1` switch. Outside the separately documented source
-self-hosting exception above, the ordinary phases below continue to reject
-every v1 caller, and the advanced path must return every active member to that
-same final no-v1 contract.
+The completed rollout's scope was one reviewed active ten-repository v2 cohort
+covered by a shared v1 organization ruleset. The old v1 rule retained its
+original eleven-repository legacy selector. This was not a reusable
+`allow-v1` switch; the ordinary current path rejects every v1 caller.
 
 `Joey-Tools/codex-waited-delivery` is archived and legacy-only. It stays in the
 old rule's original eleven-repository selector so `deletion` and

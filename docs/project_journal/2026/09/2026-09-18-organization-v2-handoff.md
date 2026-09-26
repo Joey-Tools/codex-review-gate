@@ -1281,6 +1281,13 @@ evidence that a prior freeze remains in force.
   the guard prevents a hidden older producer generation from being mistaken
   for absence. This is a selected-evidence stability check, not a claim that
   unrelated repository activity is frozen.
+- The post-cutover audit producer now enforces the same documented visibility
+  boundary before it mints a receipt. It first validates the complete
+  per-canary Check Suite inventory (including pagination, unique IDs, and the
+  exact canary head), rejects only counts above 1,000, and then treats its
+  `filter=all` CheckRun history as complete. This closes the corresponding
+  producer-side gap: otherwise the receipt could certify a hidden earlier
+  generation that the later consumer would correctly refuse to rely on.
 - The human and agent guides now label the old v2 handoff commands as a
   non-executable historical transcript and link the current post-cutover audit
   route, so a valid historical digest cannot be mistaken for enduring mutation

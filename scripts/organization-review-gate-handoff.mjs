@@ -272,6 +272,10 @@ const MAX_WORKFLOW_INVENTORY_YAML_FILES = 32;
 const MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES = 32;
 const MAX_LOCAL_REPOSITORY_RULESETS = 32;
 const V2_CHECK_RUN_PAGE_SIZE = 100;
+// GitHub's CheckRun-by-ref endpoint exposes only the newest 1,000 Check
+// Suites. A fresh audit must establish that its CheckRun history is inside
+// that documented visibility window before treating filter=all as complete.
+const MAX_COMPLETE_V2_CHECK_SUITES = 1_000;
 const LEGACY_WRITER_RUN_PAGE_SIZE = 100;
 const MAX_LEGACY_WRITER_RUN_ENTRIES = 100_000;
 const MAX_LEGACY_WRITER_RUN_PAGES = 1_000;
@@ -3050,6 +3054,64 @@ export function validateV2CheckRunHistoryPages(pages, repo) {
   );
 }
 
+export function validateV2CheckSuiteHistoryPages(pages, repo) {
+  if (
+    !Array.isArray(pages) ||
+    pages.length === 0 ||
+    pages.some(
+      (page) =>
+        !isPlainObject(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.check_suites),
+    )
+  ) {
+    throw new Error(`${repo.slug} v2 CheckSuite history is incomplete.`);
+  }
+  const totalCount = pages[0].total_count;
+  const expectedPageCount = Math.max(
+    1,
+    Math.ceil(totalCount / V2_CHECK_RUN_PAGE_SIZE),
+  );
+  if (
+    pages.length !== expectedPageCount ||
+    pages.some(
+      (page, pageIndex) =>
+        page.total_count !== totalCount ||
+        page.check_suites.length !==
+          Math.min(
+            V2_CHECK_RUN_PAGE_SIZE,
+            Math.max(0, totalCount - pageIndex * V2_CHECK_RUN_PAGE_SIZE),
+          ),
+    )
+  ) {
+    throw new Error(`${repo.slug} v2 CheckSuite history pagination is incomplete.`);
+  }
+  const checkSuites = pages.flatMap((page) => page.check_suites);
+  const checkSuiteIds = new Set();
+  for (const [index, checkSuite] of checkSuites.entries()) {
+    assertPositiveInteger(checkSuite?.id, `${repo.slug} v2 CheckSuite ${index}.id`);
+    if (checkSuiteIds.has(checkSuite.id)) {
+      throw new Error(`${repo.slug} v2 CheckSuite history contains duplicate IDs.`);
+    }
+    checkSuiteIds.add(checkSuite.id);
+    if (checkSuite.head_sha !== repo.canary.head_sha) {
+      throw new Error(
+        `${repo.slug} v2 CheckSuite history does not match the exact canary head.`,
+      );
+    }
+  }
+  if (checkSuites.length !== totalCount) {
+    throw new Error(`${repo.slug} v2 CheckSuite history pagination is inconsistent.`);
+  }
+  if (checkSuites.length > MAX_COMPLETE_V2_CHECK_SUITES) {
+    throw new Error(
+      `${repo.slug} v2 CheckRun history exceeds GitHub's 1,000-check-suite visibility boundary.`,
+    );
+  }
+  return totalCount;
+}
+
 async function loadV2CanaryEvidence(
   repo,
   { requireUniqueHistory = false } = {},
@@ -3059,6 +3121,15 @@ async function loadV2CanaryEvidence(
   }
   const endpoint =
     `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}`;
+  if (requireUniqueHistory) {
+    validateV2CheckSuiteHistoryPages(
+      await ghJson(
+        `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-suites?per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
+        { paginate: true },
+      ),
+      repo,
+    );
+  }
   const { checkProjection, runId, jobId } = requireUniqueHistory
     ? validateV2CheckRunHistoryPages(
         await ghJson(

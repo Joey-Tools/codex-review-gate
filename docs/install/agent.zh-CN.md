@@ -67,6 +67,9 @@ workflow/CODEOWNERS，属于需要完整 review 的 control-plane change，而�
 snapshot 与 receipt 成功后，才关闭新的 canary，且保持 unmerged。PR 的 exact GitHub UTC `created_at`
 必须晚于固定 cutoff `2026-09-24T23:38:00Z`；helper 会读取、验证并将它绑定进 receipt，所以即使其他 ID
 自洽，旧 canary 也会被拒绝。
+在把 `filter=all` CheckRun history 视为完整之前，helper 还会读取该 canary head 的完整 Check Suite
+inventory，并要求 suite 数不超过 1,000——这是 GitHub by-ref CheckRun endpoint 的文档化可见性边界。
+更大的或 malformed inventory 是 inconclusive，不代表历史干净。
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \
@@ -320,18 +323,21 @@ closure evidence，而不是 source 的 Code Owner approval 或 stale-review pro
     要求 legacy context，且 bridge-delete PR 自身必须在合并前通过 fresh strict v2 exact-head gate。
     不要引入 history purge 或按时间等待。
 
-## Historical：活动 v2 10 仓 organization handoff 记录
+## Historical handoff 记录（禁止执行）
 
 > **bridge removal authority 已被替代。** 本节只是已完成的历史 handoff 记录。
 > `organization-review-gate-handoff-output/v2` 可以为审计而解析，但绝不是
 > `--remove-legacy-bridge` 的输入。请使用独立的
 > [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
 > 取得唯一被接受的 bridge-removal proof。
+>
+> 不得执行本历史记录中的任何命令或 phase。这里的 stage、activation、cleanup 与
+> bridge-removal 示例只描述已完成 rollout；重放它们可能变更已经 cutover 的 cohort。
+> 当前可执行路径从上方的 fresh audit 开始。
 
-只有当授权 scope 精确等于一个经过审阅、受共享 v1 organization ruleset 保护的活动 v2 10 仓
-cohort 时，才使用本执行路径。旧 v1 rule 仍保留其原始 11 仓 legacy selector。它不是可复用的
-`allow-v1` 开关。除了上面单独记录的 source self-hosting 例外，下方普通 phases 仍拒绝所有
-v1 caller；advanced path 最终也必须让每个活动成员回到同一个 no-v1 contract。
+已完成 rollout 的 scope 是一个经过审阅、受共享 v1 organization ruleset 保护的活动 v2 10 仓
+cohort。旧 v1 rule 保留其原始 11 仓 legacy selector。这不是可复用的 `allow-v1` 开关；
+当前普通路径拒绝所有 v1 caller。
 
 `Joey-Tools/codex-waited-delivery` 已归档且仅属于 legacy。它留在旧 rule 的原始 11 仓
 selector 中，使 `deletion` 和 `non_fast_forward` 在 cutover 后仍受保护。它不需要 v2

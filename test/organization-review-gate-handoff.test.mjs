@@ -62,6 +62,7 @@ import {
   validateDefaultBranchResponse,
   validateManifest,
   validatePostCutoverAuditManifest,
+  validateV2CheckSuiteHistoryPages,
   validateV2CheckRunHistoryPages,
   validateV2CheckRunResponse,
 } from "../scripts/organization-review-gate-handoff.mjs";
@@ -540,6 +541,27 @@ function v2CheckRunPages(checkRuns) {
     : pages;
 }
 
+function v2CheckSuitePages(checkSuites) {
+  const totalCount = checkSuites.length;
+  const pages = [];
+  for (let offset = 0; offset < totalCount; offset += 100) {
+    pages.push({
+      total_count: totalCount,
+      check_suites: checkSuites.slice(offset, offset + 100),
+    });
+  }
+  return pages.length === 0
+    ? [{ total_count: 0, check_suites: [] }]
+    : pages;
+}
+
+function v2CheckSuites(repo, count) {
+  return Array.from({ length: count }, (_value, index) => ({
+    id: repo.canary.v2_check_run_id + 10_000 + index,
+    head_sha: repo.canary.head_sha,
+  }));
+}
+
 function legacyStatusPages(
   repo,
   { newerLegacyContext = null, newerLegacyState = "success" } = {},
@@ -899,6 +921,7 @@ function createFakeGhHarness(
     canaryState = "open",
     canaryCreatedAt = "2026-09-25T00:00:00Z",
     mutateV2CheckRunHistory = null,
+    mutateV2CheckSuiteHistory = null,
     defaultWorkflowPermissions = "read",
     newerLegacyStatusContext = null,
     unexpectedWorkflowTree = false,
@@ -959,6 +982,12 @@ function createFakeGhHarness(
     typeof mutateV2CheckRunHistory !== "function"
   ) {
     throw new Error("mutateV2CheckRunHistory must be a function or null.");
+  }
+  if (
+    mutateV2CheckSuiteHistory !== null &&
+    typeof mutateV2CheckSuiteHistory !== "function"
+  ) {
+    throw new Error("mutateV2CheckSuiteHistory must be a function or null.");
   }
   for (const [label, value] of [
     [
@@ -1510,6 +1539,16 @@ function createFakeGhHarness(
     if (!Array.isArray(checkRunHistory)) {
       throw new Error("mutateV2CheckRunHistory must return an array.");
     }
+    const checkSuiteHistory =
+      mutateV2CheckSuiteHistory !== null && repositoryIndex === 0
+        ? mutateV2CheckSuiteHistory(v2CheckSuites(repository, 1), {
+            repository,
+            repositoryIndex,
+          })
+        : v2CheckSuites(repository, 1);
+    if (!Array.isArray(checkSuiteHistory)) {
+      throw new Error("mutateV2CheckSuiteHistory must return an array.");
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=latest&per_page=100`,
@@ -1519,6 +1558,11 @@ function createFakeGhHarness(
       responses,
       `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`,
       v2CheckRunPages(checkRunHistory),
+    );
+    addFakeResponse(
+      responses,
+      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-suites?per_page=100`,
+      v2CheckSuitePages(checkSuiteHistory),
     );
     addFakeResponse(
       responses,
@@ -5590,6 +5634,28 @@ test("fresh v2 canary CheckRun history requires one complete producer generation
   );
 });
 
+test("fresh v2 canary CheckSuite history proves the CheckRun visibility window", () => {
+  const repo = manifestFixture().repositories[0];
+  assert.equal(
+    validateV2CheckSuiteHistoryPages(v2CheckSuitePages(v2CheckSuites(repo, 1_000)), repo),
+    1_000,
+  );
+  assert.throws(
+    () =>
+      validateV2CheckSuiteHistoryPages(
+        v2CheckSuitePages(v2CheckSuites(repo, 1_001)),
+        repo,
+      ),
+    /exceeds GitHub's 1,000-check-suite visibility boundary/u,
+  );
+  const malformed = v2CheckSuitePages(v2CheckSuites(repo, 101));
+  malformed[0].check_suites.pop();
+  assert.throws(
+    () => validateV2CheckSuiteHistoryPages(malformed, repo),
+    /pagination is incomplete/u,
+  );
+});
+
 test("legacy evidence is a latest successful commit status, never a CheckRun substitute", () => {
   const repo = manifestFixture().repositories[0];
   const statusPages = legacyStatusPages(repo);
@@ -6907,6 +6973,14 @@ test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", asy
   const requests = fakeGhRequests(harness.logPath);
   assert.deepEqual(mutationRequests(requests), []);
   for (const repository of harness.manifest.repositories) {
+    const checkSuiteEndpoint =
+      `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
+      `${repository.canary.head_sha}/check-suites?per_page=100`;
+    assert.equal(
+      countRequest(requests, "GET", checkSuiteEndpoint),
+      2,
+      `${repository.slug} must prove the CheckRun visibility window in both stable snapshots`,
+    );
     const checkRunEndpoint =
       `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
       `${repository.canary.head_sha}/check-runs?check_name=` +
@@ -7014,6 +7088,18 @@ test("post-cutover audit rejects hidden failed and extra v2 CheckRun generations
       );
     });
   }
+});
+
+test("post-cutover audit rejects CheckRun history beyond GitHub's check-suite visibility boundary", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t, {
+    mutateV2CheckSuiteHistory: (_history, { repository }) =>
+      v2CheckSuites(repository, 1_001),
+  });
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit"),
+    /exceeds GitHub's 1,000-check-suite visibility boundary/u,
+  );
+  assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 });
 
 test("post-cutover audit rejects stale and malformed observed canary creation times", async (t) => {

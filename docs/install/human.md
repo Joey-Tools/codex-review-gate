@@ -38,6 +38,10 @@ after the snapshots and receipt succeed. Each PR's exact GitHub UTC
 `created_at` must be later than the fixed cutoff `2026-09-24T23:38:00Z`; the
 helper validates and receipt-binds it, so an older otherwise self-consistent
 canary is rejected.
+Before treating `filter=all` CheckRun history as complete, it also reads the
+canary head's complete Check Suite inventory and requires at most 1,000 suites,
+the documented visibility boundary for GitHub's by-ref CheckRun endpoint. A
+larger or malformed inventory is inconclusive rather than a clean history.
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \
@@ -491,7 +495,7 @@ ruleset or classic surfaces, and because the bridge-delete PR itself must have
 a fresh strict v2 exact-head gate success before merge. Do not add a history
 purge or a time-based wait to this flow.
 
-## Historical controlled handoff record for one active ten-repository v2 cohort
+## Historical controlled handoff transcript — do not execute
 
 > **Bridge-removal authority has been superseded.** This section records the
 > completed historical handoff. Its `organization-review-gate-handoff-output/v2`
@@ -499,12 +503,16 @@ purge or a time-based wait to this flow.
 > the [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
 > to mint the only admitted proof, then use that proof for the separate
 > bridge-removal PRs.
+>
+> Do not execute any command or phase in this historical transcript. Its stage,
+> activation, cleanup, and bridge-removal examples describe the completed
+> rollout only; replaying them can mutate an already cut-over cohort. The
+> current executable route starts with the fresh audit above.
 
-Use this path only for an explicitly approved active ten-repository v2 cohort
-whose default branches are covered by one shared v1 organization ruleset. Its
-original eleven-repository legacy selector remains separate. This is not a
-general `allow-v1` installation mode. The ordinary path in the numbered
-sections below, and the final state of every active cohort member, still reject
+The completed rollout covered one approved active ten-repository v2 cohort
+whose default branches were protected by one shared v1 organization ruleset.
+Its original eleven-repository legacy selector remained separate. This was not
+a general `allow-v1` installation mode; the ordinary current path rejects
 every v1 caller.
 
 `Joey-Tools/codex-waited-delivery` is archived and legacy-only. It remains in

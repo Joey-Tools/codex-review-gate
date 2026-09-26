@@ -116,6 +116,11 @@ attempt. Findings, ambiguous provider evidence, a stale base, an edited or
 extra request generation, an incomplete API read, or a changed head/base/test
 merge are inconclusive; repair the named condition or use a new replacement PR
 instead of treating historical evidence as current.
+GitHub lists CheckRuns by ref only across the newest 1,000 Check Suites. Before
+the audit treats `filter=all` CheckRun history as complete, it first reads the
+complete Check Suite inventory for that canary head and requires at most 1,000
+suites; a larger or malformed inventory is inconclusive, not evidence that an
+older producer generation is absent.
 
 The deployed cohort uses the frozen v3 consumer workflow profile intentionally.
 This audit accepts that deployed profile and proves it as it actually runs; it
