@@ -1257,6 +1257,12 @@ evidence that a prior freeze remains in force.
   for consumer deletion. PR #71 is not a usable provider-review lineage because
   its accumulated bare review-request boundaries cannot be closed on its current
   head; it must not be used to obtain a gate pass.
+- The replacement PR must obtain its own current-head provider evidence. After
+  its final documented head is pushed, run exactly one canonical default-branch
+  `begin-review` dispatch with `request_review=true` and that full expected
+  head SHA, then wait for the current-head verifier result and normal PR gates.
+  Do not post a bare `@codex review` comment on the replacement: that would add
+  an unnecessary request boundary instead of repairing #71's historical one.
 - The sole admitted consumer proof is the dedicated post-cutover audit/v1.
   It fixes the active cohort and archive identities, the strict v2 ruleset and
   the retained legacy `deletion`/`non_fast_forward` ruleset semantics, and the
