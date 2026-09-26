@@ -2664,6 +2664,14 @@ test("post-cutover bridge removal fails closed when CheckSuite history crosses t
       `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`;
     const checkRunsEndpoint =
       `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+    const beforeCheckRunSuites = postCutoverAuditCheckSuitePages(canary, 1_000);
+    const afterCheckRunSuites = postCutoverAuditCheckSuitePages(canary, 1_001);
+    assert.equal(beforeCheckRunSuites.length, 10);
+    assert.equal(beforeCheckRunSuites[0].total_count, 1_000);
+    assert.equal(beforeCheckRunSuites.at(-1).check_suites.length, 100);
+    assert.equal(afterCheckRunSuites.length, 11);
+    assert.equal(afterCheckRunSuites[0].total_count, 1_001);
+    assert.equal(afterCheckRunSuites.at(-1).check_suites.length, 1);
     const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
       output: auditFixture.output,
     });
@@ -2672,12 +2680,19 @@ test("post-cutover bridge removal fails closed when CheckSuite history crosses t
       repositoryControlPlaneResponseOverrides: {
         [checkSuitesEndpoint]: {
           __fake_sequence: [
-            postCutoverAuditCheckSuitePages(canary),
-            postCutoverAuditCheckSuitePages(canary, 1_001),
+            beforeCheckRunSuites,
+            afterCheckRunSuites,
           ],
         },
       },
     });
+    const responsesPath = join(
+      targetRoot,
+      ".post-cutover-audit-gh-responses.json",
+    );
+    writeFileSync(responsesPath, auditProofEnv.FAKE_GH_RESPONSES, "utf8");
+    delete auditProofEnv.FAKE_GH_RESPONSES;
+    auditProofEnv.FAKE_GH_RESPONSES_FILE = responsesPath;
     mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
     writeFileSync(
       join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
@@ -14199,7 +14214,10 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const responses = JSON.parse(process.env.FAKE_GH_RESPONSES);
+const responsesSource = process.env.FAKE_GH_RESPONSES_FILE === undefined
+  ? process.env.FAKE_GH_RESPONSES
+  : readFileSync(process.env.FAKE_GH_RESPONSES_FILE, "utf8");
+const responses = JSON.parse(responsesSource);
 if (
   process.argv[2] !== "api" ||
   process.argv[3] !== "--hostname" ||

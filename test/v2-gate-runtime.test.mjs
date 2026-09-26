@@ -8804,34 +8804,47 @@ test("invalid configuration still emits exactly the public unhealthy output sche
   assert.deepEqual(Object.keys(readOutputs(environment.GITHUB_OUTPUT)), V2_OUTPUT_KEYS);
 });
 
-test("direct Action CLI always emits a compact secret-safe gate report", (context) => {
-  const environment = runtimeEnvironment(context, { operation: "invalid" });
-  environment.GITHUB_TOKEN = "cli-report-secret";
-  const child = spawnSync(process.execPath, [V2_RUNTIME_PATH], {
-    encoding: "utf8",
-    env: { ...process.env, ...environment },
-  });
+test("direct Action CLI redacts configured token and Bearer values from its report", (context) => {
+  for (const [tokenName, token] of [
+    ["GITHUB_TOKEN", "cli-github-token-secret"],
+    ["INPUT_GITHUB_TOKEN", "cli-input-token-secret"],
+  ]) {
+    const environment = runtimeEnvironment(context, { suffix: tokenName });
+    delete environment.GITHUB_TOKEN;
+    delete environment.INPUT_GITHUB_TOKEN;
+    environment[tokenName] = token;
+    environment.GITHUB_EVENT_NAME = `invalid-token=${token} Bearer ${token}`;
+    const childEnvironment = { ...process.env, ...environment };
+    delete childEnvironment.GITHUB_TOKEN;
+    delete childEnvironment.INPUT_GITHUB_TOKEN;
+    childEnvironment[tokenName] = token;
+    const child = spawnSync(process.execPath, [V2_RUNTIME_PATH], {
+      encoding: "utf8",
+      env: childEnvironment,
+    });
 
-  assert.equal(child.status, 1, child.stderr);
-  const reports = child.stderr
-    .split("\n")
-    .filter((line) => line.startsWith("[codex-review-gate] "));
-  assert.equal(reports.length, 1, child.stderr);
-  const report = JSON.parse(reports[0].slice("[codex-review-gate] ".length));
-  assert.deepEqual(report, {
-    execution_health: "unhealthy",
-    gate_outcome: "unknown",
-    recovery_code: "unsupported_target",
-    retry_safe: false,
-    findings: {
-      unresolved: "unknown",
-      resolved: "unknown",
-      historical: "unknown",
-      indeterminate: "unknown",
-    },
-    reason: "OPERATION_INPUT must be exactly reconcile or begin-review",
-  });
-  assert.doesNotMatch(child.stderr, /cli-report-secret/u);
+    assert.equal(child.status, 1, child.stderr);
+    const reports = child.stderr
+      .split("\n")
+      .filter((line) => line.startsWith("[codex-review-gate] "));
+    assert.equal(reports.length, 1, child.stderr);
+    const report = JSON.parse(reports[0].slice("[codex-review-gate] ".length));
+    assert.deepEqual(report, {
+      execution_health: "unhealthy",
+      gate_outcome: "not_applicable",
+      recovery_code: "unsupported_target",
+      retry_safe: false,
+      findings: {
+        unresolved: "unknown",
+        resolved: "unknown",
+        historical: "unknown",
+        indeterminate: "unknown",
+      },
+      reason: "Unsupported v2 runtime event: invalid-token=[REDACTED] Bearer [REDACTED]",
+    });
+    assert.equal(child.stderr.includes(token), false, child.stderr);
+    assert.match(child.stderr, /\[REDACTED\]/u);
+  }
 });
 
 function snapshot(fingerprint) {

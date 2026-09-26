@@ -744,11 +744,23 @@ function reportOutputValues(report) {
   };
 }
 
+function redactV2GateCliText(value, environment) {
+  let text = String(value ?? "");
+  const tokens = new Set([
+    String(environment?.GITHUB_TOKEN ?? "").trim(),
+    String(environment?.INPUT_GITHUB_TOKEN ?? "").trim(),
+  ]);
+  for (const token of tokens) {
+    if (token) text = text.replaceAll(token, "[REDACTED]");
+  }
+  return text.replace(/\bBearer\s+\S+/giu, "Bearer [REDACTED]");
+}
+
 function writeV2GateCliReport(report, environment) {
-  const token = String(environment?.GITHUB_TOKEN ?? "");
-  let reason = oneLine(report.reason, "No reason was reported");
-  if (token) reason = reason.replaceAll(token, "[REDACTED]");
-  reason = reason.replace(/\bBearer\s+\S+/giu, "Bearer [REDACTED]").slice(0, 1_000);
+  const reason = redactV2GateCliText(
+    oneLine(report.reason, "No reason was reported"),
+    environment,
+  ).slice(0, 1_000);
   console.error(`[codex-review-gate] ${JSON.stringify({
     execution_health: report.executionHealth,
     gate_outcome: report.gateOutcome,
@@ -1413,7 +1425,6 @@ export async function runV2GateCli({
           !stale,
       });
     } catch (reportError) {
-      console.error(`failed to finalize v2 gate report: ${reportError.message}`);
       const preserveFindingFailure =
         error?.gateOutcome === "failure" &&
         error?.recoveryCode === "fix_findings" &&
@@ -1436,16 +1447,9 @@ export async function runV2GateCli({
           outputPath: environment.GITHUB_OUTPUT || "",
           summaryPath: environment.GITHUB_STEP_SUMMARY || "",
         }, report, context, { allowSummaryAfterOutputFailure: true });
-      } catch (finalReportError) {
-        console.error(
-          `failed to persist final unhealthy v2 gate report: ${finalReportError.message}`,
-        );
+      } catch {
+        // The direct CLI reporter emits the final structured diagnostic.
       }
-    }
-    if (report.executionHealth === "unhealthy") {
-      console.error(error?.stack || error?.message || String(error));
-    } else {
-      console.warn(error?.message || String(error));
     }
     return {
       report,
