@@ -82,16 +82,21 @@ GitHub UTC PR `created_at` must be later than the fixed cutoff
 `2026-09-24T23:38:00Z`; the helper reads, validates, and receipt-binds it, so
 an older otherwise self-consistent canary is rejected.
 Before treating `filter=all` CheckRun history as complete, it reads the canary
-head's complete `filter=all` Check Suite inventory immediately before and
-after that enumeration. The normalized suite windows must match exactly and
+head's complete documented Check Suite inventory immediately before and after
+that enumeration. The normalized suite windows must match exactly and
 contain at most 1,000 suites, the documented visibility boundary for GitHub's
 by-ref CheckRun endpoint. The matching before/after windows must be nonempty
 and contain the bound successful v2 CheckRun's positive-integer
 `check_suite.id`; a missing or mismatched ID, or an empty window, is
 inconclusive and fails closed. This prevents a successful CheckRun from being
-paired with a detached visibility snapshot. A larger, malformed, or changing
-inventory is inconclusive rather than a clean history; this is an
-inter-request fail-closed fence, not a claim of an atomic remote lock.
+paired with a detached visibility snapshot. Within the receipt-bound workflow
+run, every terminal CheckRun must map one-to-one to the canonical job from an
+attempt up to the receipt-bound current attempt. Earlier failed or cancelled
+controller recovery attempts are normal only when that mapping is complete;
+the current attempt must be the receipt-bound success. A larger, malformed,
+changing, or unmapped inventory is inconclusive rather than a clean history;
+this is an inter-request fail-closed fence, not a claim of an atomic remote
+lock.
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \

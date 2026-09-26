@@ -3,9 +3,9 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-26
-branch: codex/post-cutover-fresh-audit-successor
-pr: 78
+updated: 2026-09-27
+branch: wip/postcutover-audit-contract-repair
+pr:
 supersedes: []
 superseded_by:
 ---
@@ -1292,7 +1292,7 @@ evidence that a prior freeze remains in force.
   unrelated repository activity is frozen.
 - The post-cutover audit producer and bridge-removal consumer now both bind the
   documented CheckRun visibility boundary to the exact history they read. Each
-  takes a complete per-canary `filter=all` Check Suite projection (pagination,
+  takes a complete per-canary documented Check Suite projection (pagination,
   unique IDs, and exact head), reads `filter=all` CheckRuns, then takes the
   same projection again and requires exact equality plus a count no greater
   than 1,000. The projection deliberately compares suite identity/head only,
@@ -1322,10 +1322,46 @@ evidence that a prior freeze remains in force.
   accept as bridge-removal authority.
 - The human guide, agent guide, and post-cutover-audit template now also state
   the complete CheckSuite-to-CheckRun binding explicitly: matching nonempty
-  before/after `filter=all` suite windows must contain the selected successful
+  before/after suite windows must contain the selected successful
   CheckRun's positive `check_suite.id`. Missing, mismatched, or empty-window
   evidence is documented as inconclusive/fail-closed, matching the repaired
   producer and consumer rather than leaving an implementation-only guarantee.
+
+## Execution Update (2026-09-27)
+
+- A live canary exposed an implementation-contract mismatch in the merged
+  post-cutover audit: the normal controller recovery re-runs the same Actions
+  workflow run, creating a distinct job and CheckRun for each `run_attempt`.
+  The prior audit and consumer incorrectly treated every raw `filter=all`
+  CheckRun as a separate producer generation and therefore rejected the
+  expected attempt-1 failure / attempt-2 success shape.
+- The replacement repair defines one logical verifier lineage as the exact
+  receipt-bound workflow `run_id` and Check Suite, with attempt-scoped jobs as
+  the replay discriminator. It fully paginates the CheckRun history, validates
+  every entry's native app/head/context/terminal state and canonical Actions
+  URL, then maps it one-to-one to the canonical job from every attempt through
+  the receipt-bound current attempt. The current maximum attempt must still
+  bind the receipt's success; a different run or suite, duplicate/unmapped
+  job, missing attempt, incomplete page, or later failure remains fail-closed.
+- The repair caps untrusted receipt/manifest enumeration at 51 attempts: one
+  initial Actions run plus GitHub's documented maximum 50 workflow reruns.
+  This is a read-capacity bound only, not a policy that permits replaying an
+  older clean result.
+- The repair also removes the unsupported `filter=all` parameter from Check
+  Suite requests. `filter=all` remains required for CheckRun history; Check
+  Suite before/after snapshots use the documented paginated endpoint and still
+  compare only suite identity plus exact head, not mutable status metadata.
+- Human and agent installation guides now distinguish the valid same-run
+  recovery shape from a second producer generation, so an operator does not
+  mistake an earlier failed attempt for either a clean result or a reason to
+  create another review request.
+- Repair-head validation passed `npm run check`, `git diff --check`, project
+  journal validation, and the complete producer suite
+  (`node --test test/organization-review-gate-handoff.test.mjs`, 247/247).
+  Targeted bootstrap coverage passed for the fresh-proof, same-run retry,
+  receipt-bound reread, 1,000-suite race, and closed-unmerged cases. The
+  monolithic bootstrap suite produced no report before its bounded 300-second
+  timeout, so it is explicitly not recorded as passing.
 
 ## Next Steps
 
