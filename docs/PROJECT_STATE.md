@@ -34,7 +34,8 @@
 
 ## Global Blockers
 - Temporary bridge removal for the frozen active 10-member cohort remains
-  blocked until the merged authorized post-cutover fresh-audit repair produces
+  blocked until replacement PR #78, the authorized post-cutover fresh-audit
+  repair, merges and produces
   a new receipt from fresh v2 canaries plus current exact policy and workflow
   readback. It must retain equal manifest-derived and observed identity lists
   and explicit `bypass_actors` arrays from every manifest-bound ruleset detail

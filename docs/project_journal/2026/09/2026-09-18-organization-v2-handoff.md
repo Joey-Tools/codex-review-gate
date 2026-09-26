@@ -4,8 +4,8 @@ title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
 updated: 2026-09-26
-branch: wip/pr71-post-cutover-audit-repair
-pr: 71
+branch: codex/post-cutover-fresh-audit-successor
+pr: 78
 supersedes: []
 superseded_by:
 ---
@@ -148,7 +148,7 @@ superseded_by:
   consumer bridge-removal proof: historical schema-2 still validates its
   manifest-derived and observed identity lists to prevent reinterpretation,
   but its caller-provided receipt cannot prove that later policy or evidence is
-  live. PR #71 adds the distinct post-cutover audit proof and leaves every
+  live. Replacement PR #78 adds the distinct post-cutover audit proof and leaves every
   active-cohort bridge installed until that new proof has been produced and
   revalidated by its consuming deletion PR.
 - The current source hardening makes the retained archive exception explicit in
@@ -1247,13 +1247,16 @@ evidence that a prior freeze remains in force.
   audit, but must not be replayed against the now bridge-free source default
   branch.
 
-## Execution Update — 2026-09-26 (post-cutover proof repair in PR #71)
+## Execution Update — 2026-09-26 (post-cutover proof repair in replacement PR #78)
 
 - Review of the proposed active-cohort bridge-removal flow found that the
   historical handoff/schema-2 receipt was self-consistent evidence, not a
   current mutation authority: it could not independently prove the live
-  organization policy or every receipt-bound fresh canary. PR #71 therefore
-  makes every historical handoff output audit-only for consumer deletion.
+  organization policy or every receipt-bound fresh canary. The replacement
+  delivery in PR #78 therefore makes every historical handoff output audit-only
+  for consumer deletion. PR #71 is not a usable provider-review lineage because
+  its accumulated bare review-request boundaries cannot be closed on its current
+  head; it must not be used to obtain a gate pass.
 - The sole admitted consumer proof is the dedicated post-cutover audit/v1.
   It fixes the active cohort and archive identities, the strict v2 ruleset and
   the retained legacy `deletion`/`non_fast_forward` ruleset semantics, and the
@@ -1264,7 +1267,7 @@ evidence that a prior freeze remains in force.
 - A previously deployed frozen handoff workflow envelope remains admissible
   only by its fixed Git-blob and SHA-256 identities. This supports a safe local
   normalization to current canonical bytes without accepting arbitrary
-  caller-supplied historical workflow content. PR #71 carries the completed
+  caller-supplied historical workflow content. PR #78 carries the completed
   repair into the target branch; it does not remove any cohort bridge.
 - The consumer treats a closed-unmerged canary as valid historical execution
   evidence: GitHub can clear an Actions run's `pull_requests` projection after
@@ -1363,10 +1366,13 @@ evidence that a prior freeze remains in force.
   without a terminal result for 15 minutes, so it was interrupted and is not
   recorded as passing. Earlier dedicated v2 workflow-contract and
   workflow-security validation remain recorded above.
-- Current PR #71 repair validation after the CheckRun-to-CheckSuite binding
+- Replacement PR #78 repair validation after the CheckRun-to-CheckSuite binding
   fix: `npm run check` passed; the complete
   `node --test test/organization-review-gate-handoff.test.mjs` suite passed
-  245/245; and the three targeted consumer bridge-removal tests (fresh proof,
-  closed-unmerged 1,000-suite boundary, and receipt-bound canary reread)
-  passed 3/3. The monolithic bootstrap suite was not rerun because its known
+  245/245; and the targeted consumer bridge-removal tests (fresh proof,
+  closed-unmerged 1,000-suite boundary, receipt-bound canary reread, and the
+  exact 1,000-to-1,001 visibility-window race) passed. The direct Action CLI
+  diagnostic regression covers both `GITHUB_TOKEN` and `INPUT_GITHUB_TOKEN`,
+  including a token that enters `reason`, and asserts that complete stderr is
+  redacted. The monolithic bootstrap suite was not rerun because its known
   no-output hang is unrelated to these exact boundary tests.

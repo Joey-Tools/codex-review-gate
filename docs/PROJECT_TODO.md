@@ -38,7 +38,7 @@
   protection. This source-local exception did not expand organization receipt
   or bridge-removal scope.
 - [ ] Run a fresh post-cutover audit for the already-cut-over fixed active
-  10-member cohort using the merged PR #71 repair. Historical schema-2 handoff
+  10-member cohort using the merged replacement PR #78 repair. Historical schema-2 handoff
   output stays readable for audit but cannot authorize a consumer bridge
   deletion. The new audit must bind fresh canaries and live organization
   policy; its consumer re-reads that evidence before every destructive
