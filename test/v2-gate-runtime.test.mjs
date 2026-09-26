@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -9,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   V2_HARD_LIMITS,
@@ -49,6 +51,9 @@ const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
 const HUMAN = { login: "joey", type: "User" };
 const READER = { login: "reader", type: "User" };
 const CODEX_APP = { slug: "chatgpt-codex-connector" };
+const V2_RUNTIME_PATH = fileURLToPath(
+  new URL("../packages/action/src/v2/gate-runtime.mjs", import.meta.url),
+);
 
 test("normalizers, profiles, result vocabulary, and production constants are closed", () => {
   assert.equal(normalizeV2Operation(undefined), "reconcile");
@@ -8797,6 +8802,36 @@ test("invalid configuration still emits exactly the public unhealthy output sche
   assert.equal(result.report.recoveryCode, "unsupported_target");
   assert.equal(result.report.retrySafe, false);
   assert.deepEqual(Object.keys(readOutputs(environment.GITHUB_OUTPUT)), V2_OUTPUT_KEYS);
+});
+
+test("direct Action CLI always emits a compact secret-safe gate report", (context) => {
+  const environment = runtimeEnvironment(context, { operation: "invalid" });
+  environment.GITHUB_TOKEN = "cli-report-secret";
+  const child = spawnSync(process.execPath, [V2_RUNTIME_PATH], {
+    encoding: "utf8",
+    env: { ...process.env, ...environment },
+  });
+
+  assert.equal(child.status, 1, child.stderr);
+  const reports = child.stderr
+    .split("\n")
+    .filter((line) => line.startsWith("[codex-review-gate] "));
+  assert.equal(reports.length, 1, child.stderr);
+  const report = JSON.parse(reports[0].slice("[codex-review-gate] ".length));
+  assert.deepEqual(report, {
+    execution_health: "unhealthy",
+    gate_outcome: "unknown",
+    recovery_code: "unsupported_target",
+    retry_safe: false,
+    findings: {
+      unresolved: "unknown",
+      resolved: "unknown",
+      historical: "unknown",
+      indeterminate: "unknown",
+    },
+    reason: "OPERATION_INPUT must be exactly reconcile or begin-review",
+  });
+  assert.doesNotMatch(child.stderr, /cli-report-secret/u);
 });
 
 function snapshot(fingerprint) {

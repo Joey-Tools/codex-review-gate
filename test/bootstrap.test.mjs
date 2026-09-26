@@ -2672,7 +2672,7 @@ test("post-cutover bridge removal fails closed when CheckSuite history crosses t
       repositoryControlPlaneResponseOverrides: {
         [checkSuitesEndpoint]: {
           __fake_sequence: [
-            postCutoverAuditCheckSuitePages(canary, 1_000),
+            postCutoverAuditCheckSuitePages(canary),
             postCutoverAuditCheckSuitePages(canary, 1_001),
           ],
         },
@@ -3478,7 +3478,7 @@ test("post-cutover audit proof revalidates restored v1, v2 drift, and unreadable
           },
         };
       },
-      /restored codex\/review-gate after the audit/u,
+      /legacy organization ruleset does not retain the fixed Joey-Tools legacy no-bypass, default-branch selector, deletion, and non-fast-forward policy/u,
       /Post-cutover audit organization policy is unreadable or drifted during immediately before legacy bridge removal/u,
     ],
     [

@@ -744,6 +744,21 @@ function reportOutputValues(report) {
   };
 }
 
+function writeV2GateCliReport(report, environment) {
+  const token = String(environment?.GITHUB_TOKEN ?? "");
+  let reason = oneLine(report.reason, "No reason was reported");
+  if (token) reason = reason.replaceAll(token, "[REDACTED]");
+  reason = reason.replace(/\bBearer\s+\S+/giu, "Bearer [REDACTED]").slice(0, 1_000);
+  console.error(`[codex-review-gate] ${JSON.stringify({
+    execution_health: report.executionHealth,
+    gate_outcome: report.gateOutcome,
+    recovery_code: report.recoveryCode,
+    retry_safe: report.retrySafe,
+    findings: report.counts,
+    reason,
+  })}`);
+}
+
 function recoveryInstruction(
   code,
   prNumber,
@@ -7189,5 +7204,6 @@ if (
   pathToFileURL(process.argv[1]).href === import.meta.url
 ) {
   const result = await runV2GateCli();
+  writeV2GateCliReport(result.report, process.env);
   process.exitCode = result.exitCode;
 }
