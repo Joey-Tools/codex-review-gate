@@ -191,16 +191,16 @@ The consumer independently enforces the same fixed ten-member identity cohort
 from the receipt's `full_name`, numeric `id`, `node_id`, and `default_branch`;
 a digest-valid receipt with a substituted but otherwise self-consistent cohort
 is not authority. For this post-cutover receipt format only, it also re-reads
-the receipt-bound organization identity plus the exact legacy and v2 ruleset
-details at proof admission and before every local mutation/removal-quarantine
-boundary. The receipt is complete historical/integrity evidence, but it is not
-a cryptographic authorization: both its file and expected digest are supplied
-by the bridge-removal caller. Before trusting its v2 writable-policy hash as a
-drift detector, the consumer independently anchors the live fixed Joey-Tools
-organization identity and known organization-v2 semantics: ruleset ID/name,
-organization source, branch target, Active enforcement, no bypass actors, the
-exact ten-member default-branch selector (normalizing only GitHub's unordered
-repository-ID selector order), and one strict
+the receipt-bound organization identity, archive identity, exact retained
+legacy ruleset, and exact v2 ruleset details at proof admission and before
+every local mutation/removal-quarantine boundary. The receipt is complete
+historical/integrity evidence, but it is not a cryptographic authorization:
+both its file and expected digest are supplied by the bridge-removal caller.
+Before trusting its writable-policy hashes as drift detectors, the consumer
+independently anchors the live fixed Joey-Tools organization identity and both
+known organization-policy shapes: active enforcement, no bypass actors, the
+exact selector, the retained legacy `deletion` and `non_fast_forward` rules,
+and one strict
 `codex/github-review-gate` status requirement from GitHub Actions integration
 `15368`, including the materialized `do_not_enforce_on_create: true` field. An
 unreadable detail, restored `codex/review-gate`, disabled or weakened v2, or
@@ -225,5 +225,17 @@ does not invent an unbound complete repository-policy hash comparison. It does
   idempotent); an arbitrary file occupying the bridge path is rejected. A
   changed head during the observation, same-slug repository replacement,
   archived/malformed/unreadable GraphQL object, or any workflow/CODEOWNERS
-  mismatch leaves the bridge installed. Historical handoff-v2 proofs remain
-  identity-only compatible because they contain no writable-policy fingerprints.
+mismatch leaves the bridge installed. Historical handoff-v2 proofs remain
+readable for audit only and are rejected as bridge-removal inputs because they
+contain no replayable current policy-and-canary authority.
+
+At the same boundary the consumer re-reads every receipt-bound canary PR, its
+protected-file inventory, CheckRun history, workflow run, workflow, and job.
+The PR may still be open or may be closed unmerged after the audit; a merged,
+draft, mismatched head/base/repository, or changed evidence fails closed. It
+does not rely on `run.pull_requests`, which GitHub may clear after a
+PR closes. The verifier run's fixed PR-scoped title, exact head, workflow, and
+job bind the recorded test-merge. GitHub exposes CheckRuns by ref only across
+the newest 1,000 check suites, so the consumer first requires a complete
+check-suite inventory at or below that visibility boundary; exceeding it is
+inconclusive rather than proof that an older producer generation is absent.

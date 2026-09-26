@@ -37,17 +37,23 @@
   the two-round closure passed while preserving the bridge and every non-status
   protection. This source-local exception did not expand organization receipt
   or bridge-removal scope.
-- [ ] Implement and execute the authorized post-cutover fresh audit for the
-  already-cut-over fixed active 10-member cohort: collect newly created v2
-  canaries, bind current exact policy/workflow state with explicit bypass arrays,
-  mint a distinct current-state receipt, and use it only to authorize separate
-  cohort temporary-bridge removal work. Do not reconstruct historical activation
-  evidence; keep every cohort bridge installed until the new receipt validates.
-  A source-local bridge requires its own later removal proof.
-- [ ] Define and authorize a separate source-local closure proof before
-  removing `.github/workflows/codex-review-gate-legacy-bridge.yml` from
-  `Joey-Tools/codex-review-gate`. The organization schema-2 receipt cannot
-  authorize this source-local bridge removal.
+- [ ] Merge PR #71's post-cutover bridge-removal repair, then run a fresh
+  post-cutover audit for the already-cut-over fixed active 10-member cohort.
+  Historical schema-2 handoff output stays readable for audit but cannot
+  authorize a consumer bridge deletion. The new audit must bind fresh canaries
+  and live organization policy; its consumer re-reads that evidence before
+  every destructive boundary. Keep every cohort bridge installed until the
+  fresh audit proof validates.
+- [x] Complete the separate source-only bridge-removal flow for
+  `Joey-Tools/codex-review-gate`: proof machinery landed first, then the merged
+  default-branch helper derived the live source closure for historical Node 24
+  canary `#74`. Its exact receipt SHA-256
+  `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`
+  received independent approval and was live-rebound before every local mutation
+  boundary. The separate bridge-delete PR removes only the canonical source
+  bridge; it does not alter rulesets, ordinary consumer templates, cohort scope,
+  or the ability to rerun historical Actions runs. Do not rerun this completed
+  source-only lifecycle against the current source default branch.
 
 ## Later
 

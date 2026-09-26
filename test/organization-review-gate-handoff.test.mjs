@@ -62,6 +62,7 @@ import {
   validateDefaultBranchResponse,
   validateManifest,
   validatePostCutoverAuditManifest,
+  validateV2CheckRunHistoryPages,
   validateV2CheckRunResponse,
 } from "../scripts/organization-review-gate-handoff.mjs";
 
@@ -525,6 +526,20 @@ function v2CheckRunResponse(repo) {
   };
 }
 
+function v2CheckRunPages(checkRuns) {
+  const totalCount = checkRuns.length;
+  const pages = [];
+  for (let offset = 0; offset < totalCount; offset += 100) {
+    pages.push({
+      total_count: totalCount,
+      check_runs: checkRuns.slice(offset, offset + 100),
+    });
+  }
+  return pages.length === 0
+    ? [{ total_count: 0, check_runs: [] }]
+    : pages;
+}
+
 function legacyStatusPages(
   repo,
   { newerLegacyContext = null, newerLegacyState = "success" } = {},
@@ -883,6 +898,7 @@ function createFakeGhHarness(
     additionalLocalRulesetIds = [],
     canaryState = "open",
     canaryCreatedAt = "2026-09-25T00:00:00Z",
+    mutateV2CheckRunHistory = null,
     defaultWorkflowPermissions = "read",
     newerLegacyStatusContext = null,
     unexpectedWorkflowTree = false,
@@ -937,6 +953,12 @@ function createFakeGhHarness(
     typeof manifestFixtureTransform !== "function"
   ) {
     throw new Error("manifestFixtureTransform must be a function or null.");
+  }
+  if (
+    mutateV2CheckRunHistory !== null &&
+    typeof mutateV2CheckRunHistory !== "function"
+  ) {
+    throw new Error("mutateV2CheckRunHistory must be a function or null.");
   }
   for (const [label, value] of [
     [
@@ -1477,10 +1499,26 @@ function createFakeGhHarness(
       `repos/${encodedSlug}/pulls/${repository.canary.pull_number}/files?per_page=100`,
       [[{ filename: "README.md" }]],
     );
+    const latestCheckRunResponse = v2CheckRunResponse(repository);
+    const checkRunHistory =
+      mutateV2CheckRunHistory !== null && repositoryIndex === 0
+        ? mutateV2CheckRunHistory(clone(latestCheckRunResponse.check_runs), {
+            repository,
+            repositoryIndex,
+          })
+        : latestCheckRunResponse.check_runs;
+    if (!Array.isArray(checkRunHistory)) {
+      throw new Error("mutateV2CheckRunHistory must return an array.");
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=latest&per_page=100`,
-      v2CheckRunResponse(repository),
+      latestCheckRunResponse,
+    );
+    addFakeResponse(
+      responses,
+      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`,
+      v2CheckRunPages(checkRunHistory),
     );
     addFakeResponse(
       responses,
@@ -2343,7 +2381,7 @@ test("frozen organization handoff admission remains distinct from current contro
     ),
     legacyBridge: readFileSync(
       new URL(
-        "../.github/workflows/codex-review-gate-legacy-bridge.yml",
+        "../templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml",
         import.meta.url,
       ),
       "utf8",
@@ -2952,8 +2990,8 @@ test("CLI wire path uses fake gh for fail-closed stage, activation, and cutover"
   assert.deepEqual(
     validateOrganizationFinalClosureOutput(verifyCompletePreview)
       .bridgeRemovalRepositories,
-    expectedFinalClosureRepositories,
-    "the consumer must admit only the source producer's manifest-bound active cohort",
+    [],
+    "historical handoff/v2 output is audit-only and must not authorize bridge removal",
   );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
 
@@ -5448,7 +5486,7 @@ test("v2 evidence requires one native Actions CheckRun with canonical run/job id
     () => validateV2CheckRunResponse(null, repo),
     (error) => {
       assert.equal(error instanceof TypeError, false, "malformed evidence must fail controllably");
-      assert.match(error.message, /must have exactly one latest CheckRun/u);
+      assert.match(error.message, /must have exactly one CheckRun/u);
       return true;
     },
   );
@@ -5474,6 +5512,82 @@ test("v2 evidence requires one native Actions CheckRun with canonical run/job id
       assert.throws(() => validateV2CheckRunResponse(candidate, repo));
     });
   }
+});
+
+test("fresh v2 canary CheckRun history requires one complete producer generation", () => {
+  const repo = manifestFixture().repositories[0];
+  const successfulCheckRun = v2CheckRunResponse(repo).check_runs[0];
+  assert.deepEqual(
+    validateV2CheckRunHistoryPages(v2CheckRunPages([successfulCheckRun]), repo),
+    validateV2CheckRunResponse(v2CheckRunResponse(repo), repo),
+  );
+  assert.throws(
+    () =>
+      validateV2CheckRunHistoryPages([
+        { total_count: 2, check_runs: [successfulCheckRun] },
+      ], repo),
+    /pagination is incomplete/u,
+  );
+  assert.throws(
+    () =>
+      validateV2CheckRunHistoryPages([
+        {
+          total_count: 2,
+          check_runs: [successfulCheckRun, clone(successfulCheckRun)],
+        },
+      ], repo),
+    /contains duplicate IDs/u,
+  );
+
+  const multiPageHistory = Array.from({ length: 101 }, (_value, index) => ({
+    ...clone(successfulCheckRun),
+    id: successfulCheckRun.id + index,
+  }));
+  const shortFirstPage = v2CheckRunPages(multiPageHistory);
+  shortFirstPage[0].check_runs.pop();
+  assert.throws(
+    () => validateV2CheckRunHistoryPages(shortFirstPage, repo),
+    /pagination is incomplete/u,
+  );
+  const driftingTotalCount = v2CheckRunPages(multiPageHistory);
+  driftingTotalCount[1].total_count -= 1;
+  assert.throws(
+    () => validateV2CheckRunHistoryPages(driftingTotalCount, repo),
+    /pagination is incomplete/u,
+  );
+  const duplicateAcrossPages = v2CheckRunPages(multiPageHistory);
+  duplicateAcrossPages[1].check_runs[0].id =
+    duplicateAcrossPages[0].check_runs[0].id;
+  assert.throws(
+    () => validateV2CheckRunHistoryPages(duplicateAcrossPages, repo),
+    /contains duplicate IDs/u,
+  );
+
+  const earlierFailedGeneration = {
+    ...clone(successfulCheckRun),
+    id: successfulCheckRun.id + 1,
+    conclusion: "failure",
+  };
+  assert.throws(
+    () =>
+      validateV2CheckRunHistoryPages(
+        v2CheckRunPages([successfulCheckRun, earlierFailedGeneration]),
+        repo,
+      ),
+    /exactly one producer generation/u,
+  );
+  const extraSuccessfulGeneration = {
+    ...clone(successfulCheckRun),
+    id: successfulCheckRun.id + 2,
+  };
+  assert.throws(
+    () =>
+      validateV2CheckRunHistoryPages(
+        v2CheckRunPages([successfulCheckRun, extraSuccessfulGeneration]),
+        repo,
+      ),
+    /exactly one producer generation/u,
+  );
 });
 
 test("legacy evidence is a latest successful commit status, never a CheckRun substitute", () => {
@@ -6796,7 +6910,7 @@ test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", asy
     const checkRunEndpoint =
       `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
       `${repository.canary.head_sha}/check-runs?check_name=` +
-      `${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=latest&per_page=100`;
+      `${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`;
     assert.equal(
       countRequest(requests, "GET", checkRunEndpoint),
       2,
@@ -6837,7 +6951,68 @@ test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", asy
     );
     for (const request of canaryPullRequests) {
       assert.match(request.body?.query ?? "", /\bcreatedAt\b/u);
+      assert.doesNotMatch(request.body?.query ?? "", /\bmutation\b/u);
     }
+  }
+});
+
+test("post-cutover audit rejects hidden failed and extra v2 CheckRun generations", async (t) => {
+  const cases = [
+    [
+      "earlier failure followed by manifest-bound latest success",
+      (history, { repository }) => {
+        const latest = history[0];
+        return [
+          latest,
+          {
+            ...clone(latest),
+            id: latest.id + 1,
+            conclusion: "failure",
+            details_url:
+              `https://github.com/${repository.slug}/actions/runs/` +
+              `${repository.canary.v2_run_id + 1}/job/${repository.canary.v2_job_id + 1}`,
+          },
+        ];
+      },
+    ],
+    [
+      "additional successful producer generation",
+      (history, { repository }) => {
+        const latest = history[0];
+        return [
+          latest,
+          {
+            ...clone(latest),
+            id: latest.id + 2,
+            details_url:
+              `https://github.com/${repository.slug}/actions/runs/` +
+              `${repository.canary.v2_run_id + 2}/job/${repository.canary.v2_job_id + 2}`,
+          },
+        ];
+      },
+    ],
+  ];
+  for (const [name, mutateHistory] of cases) {
+    await t.test(name, async (t) => {
+      const harness = createFakePostCutoverAuditHarness(t, {
+        mutateV2CheckRunHistory: mutateHistory,
+      });
+      await assert.rejects(
+        runFakeCli(harness, "post-cutover-audit"),
+        /exactly one producer generation/u,
+      );
+      const requests = fakeGhRequests(harness.logPath);
+      assert.deepEqual(mutationRequests(requests), []);
+      const repository = harness.manifest.repositories[0];
+      const checkRunEndpoint =
+        `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
+        `${repository.canary.head_sha}/check-runs?check_name=` +
+        `${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`;
+      assert.ok(
+        countRequest(requests, "GET", checkRunEndpoint) >= 1,
+        "fresh audit must inspect complete CheckRun history before rejecting it",
+      );
+    });
   }
 });
 

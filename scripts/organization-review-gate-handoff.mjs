@@ -13,6 +13,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   decodeGitHubBlobContent,
+  FROZEN_HANDOFF_V2_WORKFLOW_IDENTITIES,
   POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY as POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_RECEIPT_IDENTITY,
   POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
   rulesetCoversDefaultBranch,
@@ -222,22 +223,14 @@ function assertFreshPostCutoverCanaryCreatedAt(value, label) {
   }
   return value;
 }
+// The post-cutover producer and consumer must agree on this one frozen
+// deployment envelope.  Derive the producer's historical manifest identities
+// from the consumer's fixed admission constants, rather than duplicating three
+// hashes that could silently drift apart during a later maintenance edit.
 export const CANONICAL_WORKFLOW_IDENTITIES = Object.freeze({
-  verifier: Object.freeze({
-    path: ".github/workflows/codex-review-gate.yml",
-    git_blob_sha: "ac3aa30e5ae489ee81fbe8eb303bc06ecbf2b5af",
-    sha256: "e3cb79b20483524303b84543921e6734de0dea13b1e37833bb0bf2b29dc6c74e",
-  }),
-  controller: Object.freeze({
-    path: ".github/workflows/codex-review-gate-controller.yml",
-    git_blob_sha: "c994a6861414e1efc1e7ab376470c7709d475ef1",
-    sha256: "e4135ae8a7e2c41b2f354f5955795c67e61aa10acb4953724e631d93f863907e",
-  }),
-  legacy_bridge: Object.freeze({
-    path: ".github/workflows/codex-review-gate-legacy-bridge.yml",
-    git_blob_sha: "8a4e7af48dc50a33325185f7a0f35dbe22f788ba",
-    sha256: "e2266e3ed116139f4272d0bf47188776455ea3be026225328bfb654ef74f02ef",
-  }),
+  verifier: FROZEN_HANDOFF_V2_WORKFLOW_IDENTITIES.verifier,
+  controller: FROZEN_HANDOFF_V2_WORKFLOW_IDENTITIES.controller,
+  legacy_bridge: FROZEN_HANDOFF_V2_WORKFLOW_IDENTITIES.legacyBridge,
 });
 
 const GITHUB_API_VERSION = "2026-03-10";
@@ -278,6 +271,7 @@ const MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS =
 const MAX_WORKFLOW_INVENTORY_YAML_FILES = 32;
 const MAX_ACTIONS_WORKFLOW_INVENTORY_ENTRIES = 32;
 const MAX_LOCAL_REPOSITORY_RULESETS = 32;
+const V2_CHECK_RUN_PAGE_SIZE = 100;
 const LEGACY_WRITER_RUN_PAGE_SIZE = 100;
 const MAX_LEGACY_WRITER_RUN_ENTRIES = 100_000;
 const MAX_LEGACY_WRITER_RUN_PAGES = 1_000;
@@ -2955,7 +2949,7 @@ export function validateV2CheckRunResponse(response, repo) {
     response.check_runs.length !== 1
   ) {
     throw new Error(
-      `${repo.slug} ${V2_STATUS_CONTEXT} must have exactly one latest CheckRun.`,
+      `${repo.slug} ${V2_STATUS_CONTEXT} must have exactly one CheckRun.`,
     );
   }
   const check = response.check_runs[0];
@@ -2992,13 +2986,93 @@ export function validateV2CheckRunResponse(response, repo) {
   return { checkProjection, runId, jobId };
 }
 
-async function loadV2CanaryEvidence(repo) {
-  const endpoint = `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=latest&per_page=100`;
-  const response = await ghJson(endpoint);
-  const { checkProjection, runId, jobId } = validateV2CheckRunResponse(
-    response,
+export function validateV2CheckRunHistoryPages(pages, repo) {
+  if (
+    !Array.isArray(pages) ||
+    pages.length === 0 ||
+    pages.some(
+      (page) =>
+        !isPlainObject(page) ||
+        !Number.isSafeInteger(page.total_count) ||
+        page.total_count < 0 ||
+        !Array.isArray(page.check_runs),
+    )
+  ) {
+    throw new Error(`${repo.slug} v2 CheckRun history is incomplete.`);
+  }
+  const totalCount = pages[0].total_count;
+  const expectedPageCount = Math.max(
+    1,
+    Math.ceil(totalCount / V2_CHECK_RUN_PAGE_SIZE),
+  );
+  if (
+    pages.length !== expectedPageCount ||
+    pages.some(
+      (page, pageIndex) =>
+        page.total_count !== totalCount ||
+        page.check_runs.length !==
+          Math.min(
+            V2_CHECK_RUN_PAGE_SIZE,
+            Math.max(0, totalCount - pageIndex * V2_CHECK_RUN_PAGE_SIZE),
+          ),
+    )
+  ) {
+    throw new Error(`${repo.slug} v2 CheckRun history pagination is incomplete.`);
+  }
+  const checkRuns = pages.flatMap((page) => page.check_runs);
+  const checkRunIds = new Set();
+  for (const [index, checkRun] of checkRuns.entries()) {
+    assertPositiveInteger(checkRun?.id, `${repo.slug} v2 CheckRun ${index}.id`);
+    if (checkRunIds.has(checkRun.id)) {
+      throw new Error(`${repo.slug} v2 CheckRun history contains duplicate IDs.`);
+    }
+    checkRunIds.add(checkRun.id);
+    if (
+      checkRun.name !== V2_STATUS_CONTEXT ||
+      checkRun.head_sha !== repo.canary.head_sha
+    ) {
+      throw new Error(
+        `${repo.slug} v2 CheckRun history does not match the exact canary context and head.`,
+      );
+    }
+  }
+  if (checkRuns.length !== totalCount) {
+    throw new Error(`${repo.slug} v2 CheckRun history pagination is inconsistent.`);
+  }
+  if (checkRuns.length !== 1) {
+    throw new Error(
+      `${repo.slug} v2 CheckRun history must contain exactly one producer generation.`,
+    );
+  }
+  return validateV2CheckRunResponse(
+    { total_count: totalCount, check_runs: checkRuns },
     repo,
   );
+}
+
+async function loadV2CanaryEvidence(
+  repo,
+  { requireUniqueHistory = false } = {},
+) {
+  if (typeof requireUniqueHistory !== "boolean") {
+    throw new Error("v2 canary CheckRun history configuration must be a boolean.");
+  }
+  const endpoint =
+    `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}`;
+  const { checkProjection, runId, jobId } = requireUniqueHistory
+    ? validateV2CheckRunHistoryPages(
+        await ghJson(
+          `${endpoint}&filter=all&per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
+          { paginate: true },
+        ),
+        repo,
+      )
+    : validateV2CheckRunResponse(
+        await ghJson(
+          `${endpoint}&filter=latest&per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
+        ),
+        repo,
+      );
   const run = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/actions/runs/${runId}`,
   );
@@ -4717,7 +4791,7 @@ async function loadPostCutoverAuditRepositoryEvidence(repo, manifest) {
   const [canary, v2CanaryEvidence, v2Ruleset, codeowners, actionsWorkflowPermissions,
     localRulesets, classicStatus, effectiveBranchRules] = await Promise.all([
     loadCanaryPull(repo, { requireFreshCreatedAt: true }),
-    loadV2CanaryEvidence(repo),
+    loadV2CanaryEvidence(repo, { requireUniqueHistory: true }),
     loadRepositoryRuleset(repo),
     loadCodeownersEvidence(repo, defaultBranch.head_sha),
     loadActionsWorkflowPermissions(repo),

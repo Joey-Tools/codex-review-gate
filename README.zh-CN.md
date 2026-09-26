@@ -119,14 +119,27 @@ major 的第一个 stable release 手工 out-of-band 执行一次（从 `v2.0.0`
 patch release 只推进 `@v2`，不再操作 Marketplace。现有 v1 tags 与 consumers 保持有效且
 冻结，直到各 consumer 主动 migration。
 
+已发布的 `v2.1.0` payload 声明 `runs.using: node24`，floating `v2` alias 也解析到这份
+immutable release。它不会追溯改变冻结的 v2.0 release contract，也不会自行授权删除 v1
+bridge。
+
 Importable template 与 helper 默认的 `full` ruleset profile 仍是普通 consumer 的
 contract。只有 `Joey-Tools/codex-review-gate` 自身迁移可以显式在 remote 阶段使用
 `--ruleset-profile status-only`，并搭配 `--legacy-bridge` 与独立的
 `Must Pass Codex Review v2` rule。该新 rule 只增加 strict v2 status context；现有
-source rule 继续保留 deletion、non-fast-forward 与 pull-request/conversation policy。
+source rule 继续保留 deletion、non-fast-forward、pull-request conditions 与 required
+review-thread resolution。其 CODEOWNERS/owner projection 是 source control-plane ownership
+与 drift detection 的 receipt material，不是实际强制的 Code Owner approval 或 stale-review
+policy。
 它不是通用 consumer 或 cohort template。source repository 使用 canonical v2 verifier 和
-controller；其 repository-local v1 required status 已退休，精确的 temporary legacy
-bridge 则有意保留。之后物理删除该 bridge 必须有单独记录的 source-local closure proof，
-organization schema-2 cohort receipt 不能授权此操作。
-完整 staged flow、recovery states 与 protection baseline 见
-[docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。
+controller；其 repository-local v1 required status 和 temporary legacy bridge 均已退休。
+该 bridge 已由独立的 source-only executor 使用已明确批准的 closure receipt SHA-256
+`d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`，并在每个本地 mutation
+boundary 对 fresh two-round GitHub evidence 重新绑定成功后删除。已发布的 `v2.1.0` payload
+与 closed-unmerged 历史 canary `#74` 仍只是证据输入，绝不是可独立使用的删除授权。source-only
+executor 不可用于普通 consumer，也不得对当前 source default branch 重跑：它要求 exact
+canonical bridge file，缺失即拒绝。安装指南中保留的历史 source-only flow 仅供审计和未来刻意
+重新引入 bridge 时参考；它不影响 canonical bridge template 或 active cohort 的独立 cleanup。
+删除 YAML 只能阻止普通的新 dispatch，不能承诺 GitHub 无法 rerun 历史 Actions run。历史
+source-only flow 见 [人类安装指南](docs/install/human.zh-CN.md)；publisher recovery states 与
+release-protection baseline 见 [docs/RELEASING.zh-CN.md](docs/RELEASING.zh-CN.md)。

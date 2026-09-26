@@ -107,6 +107,24 @@ publication-plan 与 published provenance schemas 依次是
 provenance 会选择这套 frozen contract 执行 historical verification；publisher 后续演进
 不得用 newer schema 重新解释 v2.0 artifacts。
 
+### Runtime contract 演进
+
+v2.0 contract 是历史且不可变的，其中包括 `runs.using: node20` Action entrypoint。
+它继续被注册的唯一目的，是让已发布 v2.0 的 plan、candidate、publication plan 与
+provenance 仍按产生它们时的 policy 完成验证。
+
+后续 v2.1 release intent 会选择自己的 append-only contract：
+`release_contract=codex-review-gate-action-v2.1-contract-v1`、manifest schema
+`urn:joey-tools:codex-review-gate:release-manifest:3`，以及 version-3 的 plan、
+candidate、publication-plan 与 provenance schemas。该 contract 声明
+`runs.using: node24`，但保留 `main: src/v2/gate-runtime.mjs`。每次 construction
+和 historical verification 都由 manifest/provenance selector 选择 contract，绝不由
+publisher 当前默认值决定。因此 Node 24 migration 不得追溯性地重新解释 v2.0 artifact，
+v2.0 manifest 也不能授权 Node 24 payload。
+
+这里仅指 GitHub Action execution runtime policy；它本身不改变 source publisher 的
+runner toolchain，也不改变仓库现有的 dual-runtime CI coverage。
+
 ## Workflow stages 与权限边界
 
 专用 publisher 在 source repository 中运行，包含以下 logical stages：

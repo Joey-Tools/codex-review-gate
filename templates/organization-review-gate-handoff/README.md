@@ -333,20 +333,10 @@ captured and validated. A known policy mutation before bridge-removal
 preparation invalidates the old operational proof; obtain a fresh output under
 a new freeze.
 
-Bridge removal is a later, separate repository-PR phase. Pass the full verify
-output to `bootstrap-codex-review-gate.mjs --remove-legacy-bridge` as
-`--final-closure-receipt PATH`, plus the output's exact canonical receipt
-digest as `--expected-final-closure-receipt-sha256 SHA256`. The bootstrap
-parses the worktree's unambiguous GitHub `origin`, reads current repository
-metadata from GitHub, and requires exact `full_name`, `id`, `node_id`, and
-`default_branch` equality with one entry in the fixed 10-member
-manifest-derived `manifest_repositories` cohort. The observed `repositories`
-list is independently validated for exact equality but is not an authorization
-source. `codex-waited-delivery` is intentionally absent and therefore cannot
-authorize bridge removal. At the pre-rename boundary it reads `origin` before
-and after the live metadata query, repeats the local object checks, then reads
-`origin` once more immediately before the atomic bridge quarantine rename. An
-observed same-name re-creation, repository transfer, default-branch drift,
-unreadable metadata, or mismatch fails closed and leaves the bridge installed.
-It also rejects an apply result, an extracted receipt object, a stale or changed
-digest, and a receipt for another repository.
+Historical handoff output is not a bridge-removal authority. Do not pass this
+template's `organization-review-gate-handoff-output/v2` verify output to
+`bootstrap-codex-review-gate.mjs --remove-legacy-bridge`; the consumer now
+rejects it before any local or GitHub mutation. After a completed cutover, use
+the separate [post-cutover fresh-audit template](../organization-review-gate-post-cutover-audit/README.md)
+to create the only admitted proof. That proof rebinds current organization
+policy and receipt-bound canary evidence at each consumer deletion boundary.

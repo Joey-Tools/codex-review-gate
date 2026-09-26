@@ -3,18 +3,25 @@
 ## Current State
 - The source workspace keeps the publishable GitHub Action package under `packages/action`.
 - The v2 runtime, installation, and manifest-driven publisher infrastructure
-  are released as immutable stable `v2.0.4` with the floating `v2` alias. The
+  are released as immutable stable `v2.1.0` with the floating `v2` alias. The
+  published payload declares Node 24. The
   controlled organization-wide v2 handoff is complete for its fixed 10-member
   active cohort: the old organization rule no longer requires v1, and all eight
   affected repository-local legacy surfaces now require only `test`.
 - The source repository `Joey-Tools/codex-review-gate` is not part of that
-  cohort. Its canonical v2 verifier and controller are installed alongside an
-  exact temporary v1 bridge, and separate status-only v2 ruleset `23927388`
-  is Active after source canary `#67`. The separately approved source-local
-  cleanup has removed the v1 `codex/review-gate` required status from
-  independent repository ruleset `16410326` while retaining its non-status
-  protections; the temporary bridge remains intentionally installed. The
-  controller admits only exact Codex-bot `issue_comment` `created` events;
+  cohort. Its canonical v2 verifier and controller are installed without a v1
+  bridge, and separate status-only v2 ruleset `23927388` is Active. Fresh
+  source canary `#74` proved its exact Node 24
+  `codex/github-review-gate` CheckRun and was closed unmerged. The separately
+  approved source-local cleanup has removed the v1 `codex/review-gate`
+  required status from independent repository ruleset `16410326` while
+  retaining its non-status protections. The source-only executor removed the
+  canonical bridge only after receipt
+  `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`
+  was independently approved and live-rebound at every local mutation boundary.
+  This completed source exception does not expand organization receipt scope or
+  change the retained bridge template used by ordinary consumer/cohort flows.
+  The controller admits only exact Codex-bot `issue_comment` `created` events;
   edited carriers use protected manual reconciliation.
 - Per-workstream details live under `docs/project_journal/`; keep this file as a short repo-wide recovery entrypoint.
 
@@ -38,9 +45,12 @@
 - The source repository's v1 required-status transition is complete: its
   independent local ruleset `16410326` no longer requires
   `codex/review-gate`, while Active status-only v2 ruleset `23927388` and every
-  unrelated protection remain intact. Its temporary bridge is intentionally
-  retained. Any later source-local bridge removal needs its own separately
-  authorized closure proof and must not broaden the organization receipt scope.
+  unrelated protection remain intact. Its temporary bridge is absent after the
+  separately approved source-only receipt-bound executor completed. Do not
+  rerun that historical source lifecycle against the current default branch:
+  the executor requires the exact canonical bridge and rejects its absence.
+  Source and organization receipts remain non-interchangeable, and the source
+  completion does not broaden the organization receipt scope.
 - The old rule's original 11-repository legacy selector remains intact,
   including archived `Joey-Tools/codex-waited-delivery`. The completed final
   cutover removed only the v1 required-status rule; it retains `deletion` and
@@ -51,8 +61,11 @@
   bridge-removal scope.
 - A schema-2 final receipt must carry both the manifest-derived active
   `manifest_repositories` list and the stable observed `repositories` list;
-  canonical entry-by-entry equality is required. Bridge removal authorizes only
-  the manifest-derived list. In this rollout, either list rejects
+  canonical entry-by-entry equality is required. It is immutable historical
+  audit evidence, not a bridge-removal authority. Only a fresh post-cutover
+  audit/v1 receipt may authorize a consumer bridge deletion after its live
+  policy and canary evidence have been re-read at each mutation boundary. In
+  this rollout, either historical list rejects
   `Joey-Tools/codex-waited-delivery` by slug, ID, or node ID. Schema-1 keeps
   its historical exact shape and canonical digest for audit but authorizes no
   new bridge removal.

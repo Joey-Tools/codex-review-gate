@@ -191,6 +191,19 @@ importable ruleset and the bootstrap helper's default `full` profile remain
 required for every ordinary consumer and every repository-level cohort
 installation. Do not copy this profile into a general installation template.
 
+> **Completed source exception.** The current source default branch has
+> completed its source-only proof-and-removal lifecycle and no longer contains
+> the temporary legacy bridge. The commands below are retained as an audited historical procedure;
+> do not rerun them against `Joey-Tools/codex-review-gate` unless a future
+> authorized migration deliberately recreates a bridge. This does not alter the
+> canonical bridge template or ordinary consumer/cohort cleanup procedures.
+
+Unlike the ordinary `full` profile, the retained source ruleset has
+`require_code_owner_review: false` and `dismiss_stale_reviews_on_push: false`.
+Its CODEOWNERS and named-owner projection is closure evidence for control-plane
+ownership and drift detection, not a source Code Owner-approval or stale-review
+protection.
+
 First merge the source migration PR that installs the exact canonical v2
 verifier and controller together with the exact temporary legacy bridge. Keep
 the source's existing legacy rule active. Then stage the separate source-only
@@ -231,12 +244,14 @@ source-only profile without `--legacy-bridge`, so a drifted bridge cannot strand
 
 The new rule contains only the strict, GitHub-Actions-bound
 `codex/github-review-gate` requirement. It is a second rule: the existing
-source rule continues to own deletion, non-fast-forward, pull-request, and
-the associated CODEOWNERS protection. Once the source-specific rule is Active,
-both the legacy v1 status and the new v2 CheckRun protect the source. Do not
-remove or broaden any legacy protection during this stage; follow the separate
-canary and owner-approved cleanup process before removing only the legacy
-status requirement.
+source rule retains deletion, non-fast-forward, pull-request conditions, and
+required review-thread resolution. It does **not** impose Code Owner approval
+or stale-review dismissal; its CODEOWNERS/owner projection remains a
+control-plane ownership and drift-detection input to closure. Once the
+source-specific rule is Active, both the legacy v1 status and the new v2
+CheckRun protect the source. Do not remove or broaden any legacy protection
+during this stage; follow the separate canary and owner-approved cleanup
+process before removing only the legacy status requirement.
 
 Do not use an organization schema-2 final-closure receipt to remove the
 source's temporary bridge. That bridge needs a separately recorded,
@@ -325,7 +340,165 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   "$EXPECTED_POST_CLEANUP_SECURITY_SHA256"
 ```
 
-## Advanced controlled handoff for one active ten-repository v2 cohort
+### Source-only closure receipt and later bridge-delete PR
+
+The completed source status cleanup does **not** authorize deleting
+`.github/workflows/codex-review-gate-legacy-bridge.yml`. The published Node 24
+`v2.1.0` Action and the closed-unmerged source canary `#74` are evidence inputs
+only, never bridge-deletion authority; neither an immutable release nor a
+historical successful check substitutes for a newly approved receipt. `#74`
+contributes an exact binding tuple: its v2 CheckRun passed at head
+`fb40b3c4152f288fdde810d5f4cd32c273ff061e`, against base
+`1d598106b5ce206ecd75e05a79d42964ec954a91`, with test merge
+`7e0db2f05a785bc2a88b4e0f2844911315c646c1`, and the receipt also binds its
+CheckRun/run/job identities. An organization schema-2 receipt is not a
+substitute either.
+
+Use a credential that can read the complete source ruleset details, including
+explicit `bypass_actors` arrays. GitHub may redact that field for a caller
+without sufficient ruleset access; a missing, `null`, or non-array field is
+inconclusive, not an empty list. Stop and obtain an eligible administrator
+credential rather than deriving or approving a partial proof.
+
+This source-only flow intentionally uses two PRs:
+
+1. Merge the proof-machinery PR while retaining the bridge unchanged.
+2. Derive and independently approve one source closure receipt, then use it to
+   prepare a separate bridge-delete PR whose only intended production change is
+   removal of the canonical bridge. That PR receives its own fresh v2 gate
+   result before merge.
+
+Merging the proof-machinery PR advances the default-branch head. Therefore do
+not derive or approve the bridge-delete receipt before that PR merges. Run the
+derive command from the merged helper on the current default branch, then
+review and independently approve that newly derived receipt SHA-256 before
+preparing the bridge-delete PR. A receipt generated against the pre-merge
+default branch is not reusable.
+
+The derive result is a candidate receipt, not a portable authority token. It
+binds the source repository identity, current default-branch control plane,
+both source ruleset projections, all legacy required-status surfaces, canonical
+workflow/CODEOWNERS inventory, and the historical `#74` PR/head/base/test-merge
+and v2 CheckRun/run/job tuple. At each closure read, the v2 rule is selected
+afresh as the unique `source_type: Repository` ruleset named `Must Pass Codex
+Review v2`; a historical numeric ruleset ID is not globally hard-pinned. The
+candidate receipt and every rebind instead bind that round's observed ruleset
+ID and complete writable-projection SHA-256 fingerprint. `#74`'s base need only
+be a confirmed ancestor of the current default branch: the receipt separately
+verifies the current live control plane and v2 policy, so merging proof
+machinery need not recreate the old canary base. The workflow/CODEOWNERS/owner
+projection detects source control-plane drift; it is not evidence that this
+retained source ruleset requires Code Owner approval or stale-review dismissal.
+The helper emits the candidate only after two complete live snapshots, with a
+five-second wait between them, canonically compare equal. One stability attempt
+includes both complete snapshots and that wait under one 60-second total cap;
+if it cannot finish within that budget, no receipt is emitted: the attempt
+remains pending/inconclusive and fails closed. The same per-attempt cap applies
+to derive, the read-only rebind, and the mutation-bound local executor rebind.
+A later rebind performs the same fresh two-round read and requires equality
+with the **same independently approved** receipt and SHA-256. Do not derive a
+replacement receipt and continue silently: any identity, policy, workflow,
+ancestry, or canary-evidence drift stops the flow until a newly derived receipt
+is reviewed and receives new independent approval.
+
+```bash
+SOURCE_BRIDGE_REMOVAL_PROOF="$(mktemp)"
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --derive-source-bridge-removal-proof \
+  --canary-pr 74 \
+  --canary-head fb40b3c4152f288fdde810d5f4cd32c273ff061e \
+  > "$SOURCE_BRIDGE_REMOVAL_PROOF"
+jq . "$SOURCE_BRIDGE_REMOVAL_PROOF"
+SOURCE_BRIDGE_REMOVAL_PROOF_SHA256="$(jq -er \
+  '.source_bridge_removal_receipt_sha256 | select(test("^[0-9a-f]{64}$"))' \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF")"
+```
+
+Review the complete canonical JSON and independently approve
+`$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256`; approving only a filename, the canary
+number, or an old terminal message is insufficient. Before preparing the
+separate local deletion worktree, require a fresh read-only rebind of exactly
+the approved proof:
+
+```bash
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --repo "$REPO" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --ruleset-name "$V2_RULESET_NAME" \
+  --ruleset-profile status-only \
+  --legacy-bridge \
+  --rebind-source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+```
+
+This rebind does not mint a replacement receipt or refresh an approval. It
+requires a fresh two-round live closure to equal the exact approved canonical
+receipt. The later local deletion command repeats that comparison at the
+mutation boundary. It must reject a changed receipt, source identity, current
+security projection, canonical bridge bytes, or historical-canary binding. This
+executor is limited to the source self-hosting repository; do not use the
+organization receipt executor, the ordinary consumer cleanup executor, or an
+ad hoc file deletion for this source-only operation.
+
+Run the only permitted local deletion executor in the clean, checked-out
+default-branch source worktree used to prepare the new bridge-delete PR. Its
+HEAD must still equal the approved receipt's default-branch head. First make a
+dry run; after the separate deletion authorization, repeat the exact command
+with `--apply`:
+
+```bash
+DEFAULT_BRANCH_WORKTREE=/absolute/path/to/clean-source-default-branch-worktree
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --remove-source-legacy-bridge \
+  --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"
+
+node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
+  --prepare-worktree "$DEFAULT_BRANCH_WORKTREE" \
+  --control-plane-owner "$CONTROL_PLANE_OWNER" \
+  --remove-source-legacy-bridge \
+  --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" \
+  --expected-source-bridge-removal-proof-sha256 \
+  "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256" \
+  --apply
+```
+
+The required option shape is
+`--prepare-worktree <default-branch-worktree> --remove-source-legacy-bridge --source-bridge-removal-proof "$SOURCE_BRIDGE_REMOVAL_PROOF" --expected-source-bridge-removal-proof-sha256 "$SOURCE_BRIDGE_REMOVAL_PROOF_SHA256"`.
+It has no `--repo`, `--ruleset-profile`, `--legacy-bridge`,
+`--derive-source-bridge-removal-proof`,
+`--rebind-source-bridge-removal-proof`, `--canary-pr`, or `--canary-head`
+parameter. Do not combine it with any remote phase or use it from an arbitrary
+checkout; it is the constrained way to produce and inspect the one-file bridge
+deletion diff before opening that PR, not permission for an ad hoc deletion.
+
+Deleting the tracked bridge YAML blocks ordinary new dispatches, but GitHub
+does not promise that a historical Actions run cannot be rerun. This flow makes
+no claim of a permanent absence of v1 side effects. It is safe to proceed only
+because the live proof establishes that the current default-branch control
+plane and effective merge policy no longer require the legacy context on
+ruleset or classic surfaces, and because the bridge-delete PR itself must have
+a fresh strict v2 exact-head gate success before merge. Do not add a history
+purge or a time-based wait to this flow.
+
+## Historical controlled handoff record for one active ten-repository v2 cohort
+
+> **Bridge-removal authority has been superseded.** This section records the
+> completed historical handoff. Its `organization-review-gate-handoff-output/v2`
+> is readable for audit but cannot authorize a consumer bridge deletion. Use
+> the [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
+> to mint the only admitted proof, then use that proof for the separate
+> bridge-removal PRs.
 
 Use this path only for an explicitly approved active ten-repository v2 cohort
 whose default branches are covered by one shared v1 organization ruleset. Its
@@ -409,7 +582,7 @@ The exact `activation` fields are
 `coverage_round_timeout_ms`, and `coverage_stability_timeout_ms`; they are
 manifest-bound plan input, not ad hoc CLI overrides.
 
-This is the current v2 handoff path. A previously issued v1 output with a
+This is the historical v2 handoff record, not a current execution path. A previously issued v1 output with a
 schema-1 receipt is historical eleven-member closure evidence only; do not use
 it to install, stage, activate, clean up, or remove a bridge for this cohort.
 Its published JSON shape and canonical receipt digest remain strictly validated
@@ -783,6 +956,13 @@ before bridge removal is prepared, keep every bridge, resolve the drift, and
 produce a fresh final read-only verify output under a new freeze. Never use the
 `verify --apply` response or an older receipt as a substitute.
 
+> **Historical transcript — do not execute the following bridge-removal
+> commands.** Current bootstrap releases reject
+> `organization-review-gate-handoff-output/v2` as a bridge-removal input. Use
+> the [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
+> instead: it produces the only admitted proof and makes the consumer reread
+> current policy and canary evidence before every deletion boundary.
+
 Every ordinary authoritative success boundary reads one complete snapshot,
 waits five seconds, and reads it again. If selected evidence or policy differs,
 the pair restarts. Activation uses the manifest-bound capacity contract instead
@@ -824,9 +1004,9 @@ None permits partial pagination or a changed execution epoch. When one expires
 or evidence changes, the result is inconclusive and no next write is allowed;
 read its `recovery_code` and start a fresh relevant preview.
 
-After that closure, open a separate PR in every active cohort member to remove
-the canonical bridge. Do not prepare one for the archived legacy-only
-repository:
+Historically, that closure was followed by a separate PR in every active cohort
+member to remove the canonical bridge. **Do not run this retired procedure.**
+Do not prepare one for the archived legacy-only repository:
 
 ```bash
 node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
@@ -846,8 +1026,9 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
   --apply
 ```
 
-Despite its option name, `--final-closure-receipt` takes the complete final
-read-only verify JSON file. The bootstrap validates the terminal top-level
+Historically, `--final-closure-receipt` took the complete final read-only
+verify JSON file. Current releases reject it before any local mutation. The
+current bootstrap instead admits only the fresh-audit output above and validates its terminal top-level
 fields, recomputes the canonical embedded receipt digest, compares the explicit
 expected SHA-256, parses the worktree's unambiguous GitHub `origin`, and reads
 the current repository metadata from GitHub. It requires exact equality of

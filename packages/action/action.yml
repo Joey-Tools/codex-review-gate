@@ -44,5 +44,5 @@ outputs:
     description: Whether an immediate identical-input retry is a valid recovery action.
 
 runs:
-  using: node20
+  using: node24
   main: src/v2/gate-runtime.mjs

@@ -134,17 +134,34 @@ major (beginning with `v2.0.0`); minor and patch releases advance `@v2` without
 another Marketplace operation. Existing v1 tags and consumers remain valid and
 frozen until each consumer is deliberately migrated.
 
+The published `v2.1.0` payload declares `runs.using: node24`, and the floating
+`v2` alias resolves to that immutable release. It does not retroactively change
+the frozen v2.0 release contract or make a v1 bridge removable by itself.
+
 The importable template and the helper's default `full` ruleset profile remain
 the ordinary consumer contract. Only the `Joey-Tools/codex-review-gate` source
 self-migration may explicitly stage remote `--ruleset-profile status-only`
 with `--legacy-bridge` and the distinct `Must Pass Codex Review v2` rule. That
 new rule adds only the strict v2 status context while the existing source rule
-retains deletion, non-fast-forward, and pull-request/conversation policy.
+retains deletion, non-fast-forward, pull-request conditions, and required
+review-thread resolution. Its CODEOWNERS/owner projection is receipt material
+for source control-plane ownership and drift detection, not an enforced Code
+Owner-approval or stale-review policy.
 It is not a general consumer or cohort template. The source repository uses
 the canonical v2 verifier and controller; its repository-local v1 required
-status is retired while the exact temporary legacy bridge intentionally
-remains. Its later physical bridge removal needs a separately recorded
-source-local closure proof; an organization schema-2 cohort receipt cannot
-authorize it. See
-[docs/RELEASING.md](docs/RELEASING.md) for the complete staged flow, recovery
-states and protection baseline.
+status and temporary legacy bridge are retired. The bridge was removed only by
+the separate source-only executor after the explicitly approved closure receipt
+SHA-256 `d7c3faee465b6af7325252fe70c2462be6c9e908885c976055e8d608ccb2c963`
+was re-bound to fresh two-round GitHub evidence at every local mutation
+boundary. The published `v2.1.0` payload and closed-unmerged historical canary
+`#74` remain evidence inputs, never standalone deletion authority. The
+source-only executor is unavailable to ordinary consumers and must not be
+re-run against the current source default branch: it requires the exact
+canonical bridge file and rejects its absence. The historic source-only flow in
+the installation guides remains an audit record for a future deliberate bridge
+reintroduction; it does not affect the canonical bridge template or the active
+cohort's separate cleanup. Deleting the YAML stops ordinary new dispatches, but
+does not promise that GitHub cannot rerun a historical Actions run. See the
+[human installation guide](docs/install/human.md) for the archived source-only
+flow and [docs/RELEASING.md](docs/RELEASING.md) for publisher recovery states
+and the release-protection baseline.
