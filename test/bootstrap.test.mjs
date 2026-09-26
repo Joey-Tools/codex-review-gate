@@ -2937,6 +2937,37 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
       expected: /CheckSuite inventory changed around the complete CheckRun read/u,
     },
     {
+      name: "missing-check-suite-binding",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        delete responses[endpoint][0].check_runs[0].check_suite;
+        return { [endpoint]: responses[endpoint] };
+      },
+      expected: /CheckRun does not bind an exact CheckSuite in the stable visibility window/u,
+    },
+    {
+      name: "mismatched-check-suite-binding",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        responses[endpoint][0].check_runs[0].check_suite.id =
+          postCutoverAuditCheckSuiteId(canary) + 10_000;
+        return { [endpoint]: responses[endpoint] };
+      },
+      expected: /CheckRun does not bind an exact CheckSuite in the stable visibility window/u,
+    },
+    {
+      name: "empty-check-suite-window",
+      overrides: (_receipt, canary) => ({
+        [`repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`]:
+          postCutoverAuditCheckSuitePages(canary, 0),
+      }),
+      expected: /CheckRun does not bind an exact CheckSuite in the stable visibility window/u,
+    },
+    {
       name: "extra-checkrun-generation",
       overrides: (receipt, canary) => {
         const responses = postCutoverAuditCanaryResponses(receipt);
@@ -14034,6 +14065,7 @@ function postCutoverAuditCanaryResponses(
             conclusion: "success",
             app: { id: DEFAULT_STATUS_INTEGRATION_ID, slug: "github-actions" },
             head_sha: canary.head_sha,
+            check_suite: { id: postCutoverAuditCheckSuiteId(canary) },
             details_url:
               `https://github.com/${repoSlug}/actions/runs/${canary.v2_run_id}/job/${canary.v2_job_id}`,
           }],
@@ -14110,12 +14142,16 @@ function postCutoverAuditCheckSuitePages(canary, totalCount = 1) {
       check_suites: Array.from(
         { length: Math.min(100, Math.max(0, totalCount - pageIndex * 100)) },
         (_, index) => ({
-          id: canary.v2_run_id * 1_000 + pageIndex * 100 + index + 1,
+          id: postCutoverAuditCheckSuiteId(canary) + pageIndex * 100 + index,
           head_sha: canary.head_sha,
         }),
       ),
     }),
   );
+}
+
+function postCutoverAuditCheckSuiteId(canary) {
+  return canary.v2_run_id * 1_000 + 1;
 }
 
 function postCutoverAuditGraphqlRepositoryResponse(

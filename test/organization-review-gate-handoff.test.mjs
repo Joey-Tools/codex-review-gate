@@ -521,6 +521,9 @@ function v2CheckRunResponse(repo) {
         slug: "github-actions",
       },
       head_sha: repo.canary.head_sha,
+      check_suite: {
+        id: repo.canary.v2_check_run_id + 10_000,
+      },
       details_url:
         `https://github.com/${repo.slug}/actions/runs/${repo.canary.v2_run_id}/job/${repo.canary.v2_job_id}`,
     }],
@@ -5613,6 +5616,8 @@ test("v2 evidence requires one native Actions CheckRun with canonical run/job id
     ["wrong app slug", (value) => { value.check_runs[0].app.slug = "other"; }],
     ["wrong head", (value) => { value.check_runs[0].head_sha = "f".repeat(40); }],
     ["not successful", (value) => { value.check_runs[0].conclusion = "failure"; }],
+    ["missing check suite", (value) => { delete value.check_runs[0].check_suite; }],
+    ["invalid check suite ID", (value) => { value.check_runs[0].check_suite.id = 0; }],
     ["foreign details URL", (value) => {
       value.check_runs[0].details_url =
         `https://example.com/${repo.slug}/actions/runs/${repo.canary.v2_run_id}/job/${repo.canary.v2_job_id}`;
@@ -7216,6 +7221,47 @@ test("post-cutover audit rejects a CheckSuite visibility-window change while rea
   assert.ok(checkRunRead > firstSuiteRead);
   assert.ok(secondSuiteRead > checkRunRead);
   assert.deepEqual(mutationRequests(requests), []);
+});
+
+test("post-cutover audit binds the successful CheckRun to its stable CheckSuite window", async (t) => {
+  const cases = [
+    [
+      "missing CheckRun check_suite ID",
+      {
+        mutateV2CheckRunHistory: (history) => {
+          delete history[0].check_suite;
+          return history;
+        },
+      },
+      /CheckRun 0\.check_suite\.id must be a positive safe integer/u,
+    ],
+    [
+      "CheckRun suite absent from the stable window",
+      {
+        mutateV2CheckRunHistory: (history, { repository }) => {
+          history[0].check_suite = {
+            id: repository.canary.v2_check_run_id + 10_001,
+          };
+          return history;
+        },
+      },
+      /successful CheckRun check_suite is not in the stable CheckSuite visibility window/u,
+    ],
+    [
+      "empty stable window",
+      {
+        mutateV2CheckSuiteHistory: () => [],
+      },
+      /CheckSuite visibility window is empty and cannot bind the successful CheckRun/u,
+    ],
+  ];
+  for (const [name, options, error] of cases) {
+    await t.test(name, async (t) => {
+      const harness = createFakePostCutoverAuditHarness(t, options);
+      await assert.rejects(runFakeCli(harness, "post-cutover-audit"), error);
+      assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+    });
+  }
 });
 
 test("post-cutover audit rejects stale and malformed observed canary creation times", async (t) => {

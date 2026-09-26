@@ -2945,7 +2945,7 @@ export function parseWorkflowRunPath(value, defaultBranch = undefined) {
   };
 }
 
-export function validateV2CheckRunResponse(response, repo) {
+function validateV2CheckRunResponseWithSuite(response, repo) {
   if (
     !isPlainObject(response) ||
     response.total_count !== 1 ||
@@ -2957,6 +2957,11 @@ export function validateV2CheckRunResponse(response, repo) {
     );
   }
   const check = response.check_runs[0];
+  const checkSuiteId = check?.check_suite?.id;
+  assertPositiveInteger(
+    checkSuiteId,
+    `${repo.slug} v2 CheckRun check_suite.id`,
+  );
   const checkProjection = {
     id: check.id,
     name: check.name,
@@ -2987,10 +2992,16 @@ export function validateV2CheckRunResponse(response, repo) {
   if (runId !== repo.canary.v2_run_id || jobId !== repo.canary.v2_job_id) {
     throw new Error(`${repo.slug} v2 CheckRun run/job identity drifted.`);
   }
+  return { checkProjection, runId, jobId, checkSuiteId };
+}
+
+export function validateV2CheckRunResponse(response, repo) {
+  const { checkProjection, runId, jobId } =
+    validateV2CheckRunResponseWithSuite(response, repo);
   return { checkProjection, runId, jobId };
 }
 
-export function validateV2CheckRunHistoryPages(pages, repo) {
+function validateV2CheckRunHistoryPagesWithSuite(pages, repo) {
   if (
     !Array.isArray(pages) ||
     pages.length === 0 ||
@@ -3027,6 +3038,10 @@ export function validateV2CheckRunHistoryPages(pages, repo) {
   const checkRunIds = new Set();
   for (const [index, checkRun] of checkRuns.entries()) {
     assertPositiveInteger(checkRun?.id, `${repo.slug} v2 CheckRun ${index}.id`);
+    assertPositiveInteger(
+      checkRun?.check_suite?.id,
+      `${repo.slug} v2 CheckRun ${index}.check_suite.id`,
+    );
     if (checkRunIds.has(checkRun.id)) {
       throw new Error(`${repo.slug} v2 CheckRun history contains duplicate IDs.`);
     }
@@ -3048,10 +3063,16 @@ export function validateV2CheckRunHistoryPages(pages, repo) {
       `${repo.slug} v2 CheckRun history must contain exactly one producer generation.`,
     );
   }
-  return validateV2CheckRunResponse(
+  return validateV2CheckRunResponseWithSuite(
     { total_count: totalCount, check_runs: checkRuns },
     repo,
   );
+}
+
+export function validateV2CheckRunHistoryPages(pages, repo) {
+  const { checkProjection, runId, jobId } =
+    validateV2CheckRunHistoryPagesWithSuite(pages, repo);
+  return { checkProjection, runId, jobId };
 }
 
 export function validateV2CheckSuiteHistoryPages(pages, repo) {
@@ -3133,6 +3154,27 @@ function assertV2CheckSuiteVisibilityWindowStable(before, after, repo) {
   }
 }
 
+function assertV2CheckRunSuiteInVisibilityWindow(
+  checkSuiteId,
+  checkSuiteVisibilityWindow,
+  repo,
+) {
+  if (checkSuiteVisibilityWindow.suites.length === 0) {
+    throw new Error(
+      `${repo.slug} v2 CheckSuite visibility window is empty and cannot bind the successful CheckRun.`,
+    );
+  }
+  if (
+    !checkSuiteVisibilityWindow.suites.some(
+      (checkSuite) => checkSuite.id === checkSuiteId,
+    )
+  ) {
+    throw new Error(
+      `${repo.slug} v2 successful CheckRun check_suite is not in the stable CheckSuite visibility window.`,
+    );
+  }
+}
+
 async function loadV2CheckSuiteVisibilityWindow(repo) {
   return validateV2CheckSuiteHistoryPages(
     await ghJson(
@@ -3155,15 +3197,15 @@ async function loadV2CanaryEvidence(
   const checkSuiteVisibilityWindow = requireUniqueHistory
     ? await loadV2CheckSuiteVisibilityWindow(repo)
     : null;
-  const { checkProjection, runId, jobId } = requireUniqueHistory
-    ? validateV2CheckRunHistoryPages(
+  const { checkProjection, runId, jobId, checkSuiteId } = requireUniqueHistory
+    ? validateV2CheckRunHistoryPagesWithSuite(
         await ghJson(
           `${endpoint}&filter=all&per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
           { paginate: true },
         ),
         repo,
       )
-    : validateV2CheckRunResponse(
+    : validateV2CheckRunResponseWithSuite(
         await ghJson(
           `${endpoint}&filter=latest&per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
         ),
@@ -3173,6 +3215,11 @@ async function loadV2CanaryEvidence(
     assertV2CheckSuiteVisibilityWindowStable(
       checkSuiteVisibilityWindow,
       await loadV2CheckSuiteVisibilityWindow(repo),
+      repo,
+    );
+    assertV2CheckRunSuiteInVisibilityWindow(
+      checkSuiteId,
+      checkSuiteVisibilityWindow,
       repo,
     );
   }

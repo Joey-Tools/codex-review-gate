@@ -1,10 +1,18 @@
-# Organization review-gate handoff manifest
+# Historical organization review-gate handoff manifest
 
-`joey-tools-10-member-manifest.template.json` is the reviewed starting point
-for the active Joey-Tools v2 cohort. It records the 2026-09-18 organization
-identity, the exact ordered 10 active repository identities, the complete old
-organization ruleset writable state, the canonical workflow byte identities,
-and the eight exact active repository-local legacy cleanup transformations.
+> **Historical archive — do not execute or instantiate this template.** It
+> records the completed 2026-09-18 handoff, including historical writes and
+> activation steps. The only current executable route for this cohort's
+> bridge-removal authorization is the independent
+> [`organization-review-gate-post-cutover-audit`](../organization-review-gate-post-cutover-audit/README.md)
+> protocol. It produces the sole receipt that the current consumer admits.
+
+`joey-tools-10-member-manifest.template.json` records the reviewed historical
+handoff boundary for the active Joey-Tools v2 cohort. It captures the 2026-09-18
+organization identity, the exact ordered 10 active repository identities, the
+complete old organization ruleset writable state, the canonical workflow byte
+identities, and the eight exact active repository-local legacy cleanup
+transformations.
 The old ruleset's fixed 11-ID selector intentionally still includes archived
 `Joey-Tools/codex-waited-delivery`: it retains that repository's `deletion` and
 `non_fast_forward` protection, but it does not make it an active v2 member.
@@ -16,64 +24,66 @@ that overlaps an active member is rejected. This prevents a superficially
 valid selector from silently moving the archived repository's protection to an
 unrelated repository.
 The template uses `organization-review-gate-handoff-manifest/v3`; historical
-v1 and v2 manifests must not be reused for this cutover. Version 3 binds the
-activation timing and the one temporary scheduler boundary described below, so
-an older manifest cannot silently omit either control.
+v1 and v2 manifests were not safe substitutes for that completed cutover.
+Version 3 recorded its activation timing and the one temporary scheduler
+boundary, so an older manifest could not silently omit either control.
 
-## Completed-cutover alternative
-
-> **Historical handoff transcript — do not execute.** The remaining stage,
-> activation, cleanup, and verification material records the completed 2026-09
-> rollout only. Replaying it can mutate an already cut-over cohort, and the
-> current consumer rejects every `organization-review-gate-handoff-output/v2`
-> result as bridge-removal authority. Start the current executable route with
-> the independent post-cutover audit linked below.
+## Current executable route
 
 This v3 template is historical-handoff evidence, not a form to backfill after
-the cutover. If its contemporaneous canary, scheduler, legacy-status, or
-cleanup evidence was never retained, do not fill those placeholders from a
-later observation. Use the independent
+the cutover. Do not replace any `REPLACE_WITH_...` value, including when a
+later API read appears to match the old shape. If its contemporaneous canary,
+scheduler, legacy-status, or cleanup evidence was never retained, it cannot be
+reconstructed from a later observation. Use the independent
 [`organization-review-gate-post-cutover-audit`](../organization-review-gate-post-cutover-audit/README.md)
 protocol instead. It creates fresh v2 canaries for the fixed active cohort and
-emits a new receipt whose scope is explicitly current-state proof rather than
-a claim about the historical handoff.
+emits a new receipt whose scope is current-state proof rather than a claim
+about the historical handoff.
 
-The template is intentionally not executable as checked in. Replace every
-`REPLACE_WITH_...` value with an API-read identity after the corresponding
-repository migration and canary are complete. Do not replace placeholders with
-guesses. The helper's strict manifest validator rejects the template until all
-repository ruleset IDs, exact CODEOWNERS bytes/owner identities, open current-base
-canary identities, exact head/test-merge receipts, native v2 CheckRun/run/job
-identities, and temporary-bridge legacy commit-status IDs are complete. A
-legacy CheckRun is not a substitute for the required commit status. The v1
+## Archived protocol details
+
+The remainder of this file, including its command transcript, is preserved
+only to explain the completed rollout. It is not a present-day runbook: do not
+run its `stage`, `quiesce-scheduler`, `activate`, `restore-scheduler`,
+`apply-repository-cleanup`, or `verify --apply` commands. Statements using
+imperative language below describe the historical protocol and its safety
+requirements; they do not direct a new mutation of the already cut-over
+cohort.
+
+The historical helper's strict manifest validator rejected the template until
+all repository ruleset IDs, exact CODEOWNERS bytes/owner identities, open
+current-base canary identities, exact head/test-merge receipts, native v2
+CheckRun/run/job identities, and temporary-bridge legacy commit-status IDs
+were complete. A legacy CheckRun is not a substitute for the required commit
+status. The v1
 commit-status API has no integration binding, and its writer-controlled
 `target_url` is not provenance evidence; treat it only as temporary
 compatibility/availability evidence. Its commit binding comes from querying
 the exact manifest-bound head SHA in the statuses endpoint; individual status
 items do not carry a `sha` field. The authoritative producer proof is the native
 v2 CheckRun bound to GitHub Actions integration `15368`, together with the
-closed workflow inventory and default-read Actions policy. After staging
-the organization v2 ruleset, record its returned ID in
-`v2_ruleset.id` before activation. Every activation snapshot also walks the
+closed workflow inventory and default-read Actions policy. During historical
+staging, the rollout recorded the organization v2 ruleset's returned ID in
+`v2_ruleset.id` before activation. Every historical activation snapshot walked the
 complete default-branch `.github/workflows` Git tree: the three canonical
-files must have exact bytes, the bridge is the sole temporary v1 exception,
-and no additional v1/v2 caller or reserved-status producer may remain. Each
-direct workflow-directory entry must be a regular Git blob; nested trees and
-other unsupported entry types make the inventory inconclusive. Each
-repository must also expose a complete Actions policy with default workflow
-permissions set to `read`; that policy is included in every cohort snapshot.
+files had exact bytes, the bridge was the sole temporary v1 exception, and no
+additional v1/v2 caller or reserved-status producer could remain. Each direct
+workflow-directory entry had to be a regular Git blob; nested trees and other
+unsupported entry types made the inventory inconclusive. Each repository also
+exposed a complete Actions policy with default workflow permissions set to
+`read`; that policy was included in every cohort snapshot.
 
 ### Ruleset-detail visibility and materialized policy
 
-Every manifest-bound ruleset detail read must use a credential that GitHub
-recognizes as having write access to that exact ruleset: both organization
+Every historical manifest-bound ruleset detail read used a credential that
+GitHub recognized as having write access to that exact ruleset: both organization
 rulesets, all ten repository v2 rulesets, and every repository-local cleanup
 surface. GitHub intentionally omits `bypass_actors` from a detail response for
 an identity without that access. An omitted property is redacted evidence, not
-an empty list; `null` or any non-array value is malformed. Stop without a
-receipt, change to an eligible credential, and restart the read-only preview
-under the applicable freeze. Never infer an empty bypass list from a redacted
-response.
+an empty list; `null` or any non-array value is malformed. On that condition,
+the historical protocol stopped without a receipt, changed to an eligible
+credential, and restarted the read-only preview under the applicable freeze.
+It never inferred an empty bypass list from a redacted response.
 
 The ten checked-in repository-v2 snapshots also explicitly bind GitHub's
 currently materialized pull-request and status parameters. They are frozen
@@ -156,23 +166,25 @@ repository evidence read, and organization evidence read also has its own
 deadline, so a single slow control-plane phase cannot silently consume the
 whole round.
 
-Before the initial stage, literal JSON `null` at `v2_ruleset.id` is the only
-permitted incomplete manifest value. If `stage --apply` may have created the
-rule but fails, it first attempts one read-only reconciliation; returned
-`applied-recovered` plus `next_manifest_update` is verified success. If the
-process is interrupted or remains unknown, do not replay the POST. Run the
-read-only `--mode stage --recover-created-v2` entry without `--apply` or a plan
-digest. It returns a manifest update only for one unique same-name rule whose
-source and full writable state exactly equal canonical Disabled v2 while the
-old rule remains at its exact before-state. Absent, multiple, Active or
-drifted candidates fail closed. Hold an external organization-admin
-policy-mutation freeze for the complete recovery read.
+At the historical initial stage, literal JSON `null` at `v2_ruleset.id` was the
+only permitted incomplete manifest value. If `stage --apply` may have created
+the rule but failed, it first attempted one read-only reconciliation; returned
+`applied-recovered` plus `next_manifest_update` was verified success. If the
+process was interrupted or remained unknown, the protocol did not replay the
+POST. It used the read-only `--mode stage --recover-created-v2` entry without
+`--apply` or a plan digest. That entry returned a manifest update only for one
+unique same-name rule whose
+source and full writable state exactly equalled canonical Disabled v2 while
+the old rule remained at its exact before-state. Absent, multiple, Active or
+drifted candidates failed closed. The historical recovery read held an external
+organization-admin policy-mutation freeze for its complete duration.
 
-Before organization activation, use the explicit scheduler lifecycle in this
-order: `quiesce-scheduler` preview/apply, a **fresh** `activate` preview/apply,
-then `restore-scheduler` preview/apply after the successful dual-enforcement
-readback. Each mutating invocation takes only the `plan_sha256` emitted by its
-own immediately preceding preview:
+For the completed organization activation, the scheduler lifecycle was:
+`quiesce-scheduler` preview/apply, a **fresh** `activate` preview/apply, then
+`restore-scheduler` preview/apply after the successful dual-enforcement
+readback. Each historical mutating invocation took only the `plan_sha256`
+emitted by its own immediately preceding preview. The following is an archival
+command transcript, not a command sequence to run:
 
 ```bash
 HANDOFF_QUIESCE_PREVIEW="$(mktemp)"
@@ -215,89 +227,93 @@ node "$SOURCE_ROOT/scripts/organization-review-gate-handoff.mjs" \
   --expected-plan-sha256 "$HANDOFF_RESTORE_PLAN_SHA256"
 ```
 
-`activate` refuses to use a pre-quiesce coverage snapshot. It reads the
-manifest-bound scheduler in `disabled_manually` state, proves the scheduler's
-drained execution epoch, and then establishes a new stable coverage snapshot.
-If `quiesce-scheduler` or `activate` fails after disable, the deliberately
-durable `disabled_manually` state is recovery evidence, not a signal to replay
-a PUT. Read the reported `recovery_code`, determine whether dual enforcement
-was reached, then take a new preview. Use `restore-scheduler` only after that
-decision; it is also the explicit recovery operation when activation did not
-proceed. An unknown disable/enable outcome must be reconciled by its exact
-manifest-bound state before another mutation. The helper never restores the
-scheduler automatically after a failed quiesce or activation.
+The historical `activate` step refused to use a pre-quiesce coverage snapshot.
+It read the manifest-bound scheduler in `disabled_manually` state, proved the
+scheduler's drained execution epoch, and then established a new stable coverage
+snapshot. If `quiesce-scheduler` or `activate` failed after disable, the
+deliberately durable `disabled_manually` state was recovery evidence, not a
+signal to replay a PUT. The recovery path read the reported `recovery_code`,
+determined whether dual enforcement had been reached, then took a new preview.
+It used `restore-scheduler` only after that decision; it was also the explicit
+recovery operation when activation did not proceed. An unknown disable/enable
+outcome had to be reconciled by its exact manifest-bound state before another
+mutation. The helper never restored the scheduler automatically after a failed
+quiesce or activation.
 
-Keep every manifest-bound canary open, non-draft, unmerged, and on the exact
-current default-branch base through the Active organization-rule write and its
-stable dual-enforcement readback. Only after that activation proof succeeds,
-restore the scheduler, then close the canaries unmerged. `derive-cutover`,
-`apply-repository-cleanup`, and
-`verify` intentionally do not depend on live canary PR/run/status evidence
-after this boundary; they continue to read each repository's live default
-branch and do not require its head to remain equal to the historical canary
-base. Their authority is the current control-plane/ruleset closure: exact
+The completed rollout kept every manifest-bound canary open, non-draft,
+unmerged, and on the exact current default-branch base through the Active
+organization-rule write and its stable dual-enforcement readback. Only after
+that activation proof succeeded did it restore the scheduler and close the
+canaries unmerged. Its `derive-cutover`, `apply-repository-cleanup`, and
+`verify` phases intentionally did not depend on live canary PR/run/status
+evidence after this boundary; they continued to read each repository's live
+default branch and did not require its head to remain equal to the historical
+canary base. Their authority was the current control-plane/ruleset closure:
+exact
 repository identity, complete regular-blob workflow inventory and bridge,
 exact CODEOWNERS, default-read Actions policy with an explicit boolean
 `can_approve_pull_request_reviews`, Active repository and organization v2
 rules, and manifest-bound cleanup state.
 
-Run every mutation as a preview first and pass its emitted `plan_sha256` back
-to the matching `--apply` invocation. `derive-cutover` is always read-only and
-emits the repository-level transformations for review. Execute them only with
-`--mode apply-repository-cleanup`: each item is GET, exact-before comparison,
+The completed rollout ran every mutation as a preview first and passed its
+emitted `plan_sha256` only to the matching `--apply` invocation.
+`derive-cutover` was read-only and emitted the repository-level
+transformations for review. The historical executor performed them only with
+`--mode apply-repository-cleanup`: each item was GET, exact-before comparison,
 surface-specific mutation, then exact-after readback. A stable mixture of
-before/after items is resumable; already-after items are no-ops and a fresh
-preview includes only still-before items. After a mutation error or unknown
-response, the executor first performs a narrow read-only reconciliation. Exact
-after-state is complete; before-state, drift, or an unreadable result stops the
-batch for a fresh reviewed preview. Never blindly replay the request or its old
-digest.
+before/after items was resumable; already-after items were no-ops and a fresh
+preview included only still-before items. After a mutation error or unknown
+response, the executor first performed a narrow read-only reconciliation.
+Exact after-state was complete; before-state, drift, or an unreadable result
+stopped the batch for a fresh reviewed preview. It never blindly replayed the
+request or its old digest.
 
-Hold an external organization-admin policy-mutation freeze from the `stage`
-preview through apply, readback, and any recovery. Establish an organization-
-and repository-admin freeze again before the `quiesce-scheduler` preview and
-hold it through the fresh `activate` preview/apply, stable post-write
-dual-enforcement readback, and `restore-scheduler` readback. The scheduler
-remains `disabled_manually` between the explicit quiesce and restore commands;
-do not allow a separate scheduler enable/disable during that boundary. Start a
-third freeze before the
-`apply-repository-cleanup` preview and hold it continuously through cleanup
-apply/readback, final `verify` preview/apply, and a separate final read-only
-`verify` receipt capture and validation. During these freezes, do not change
-any organization/repository ruleset, classic branch protection, condition,
-required check, or bypass actor. During the third freeze, the restored
-manifest-bound scheduler must remain `active`; no administrator may separately
-enable or disable it. The helper validates the exact manifest-bound
+The completed rollout held an external organization-admin policy-mutation
+freeze from the `stage` preview through apply, readback, and any recovery. It
+established an organization- and repository-admin freeze again before the
+`quiesce-scheduler` preview and held it through the fresh `activate`
+preview/apply, stable post-write dual-enforcement readback, and
+`restore-scheduler` readback. The scheduler remained `disabled_manually`
+between the explicit quiesce and restore commands; the historical protocol did
+not allow a separate scheduler enable/disable during that boundary. It started
+a third freeze before the `apply-repository-cleanup` preview and held it
+continuously through cleanup apply/readback, final `verify` preview/apply, and
+a separate final read-only `verify` receipt capture and validation. During
+those freezes, the protocol did not change any organization/repository
+ruleset, classic branch protection, condition, required check, or bypass
+actor. During the third freeze, the restored manifest-bound scheduler remained
+`active`; no administrator separately enabled or disabled it. The helper
+validated the exact manifest-bound
 bypass lists; it cannot
 automatically discover or preserve an actor concurrently added outside that
 snapshot. GitHub provides no documented conditional/CAS update for the
 ruleset endpoint. Plan digests and adjacent rereads detect observed drift but
 cannot make the final GET-to-PUT interval atomic.
 
-`verify --apply` removes the whole legacy `required_status_checks` rule from
-the old organization ruleset only after all repository actions read back at
-their exact expected post-state. Each post-activation/cutover stable snapshot
-also rereads the manifest-bound scheduler and requires its live Actions
-workflow state to be `active`, then reads the legacy-only repository from
-GitHub and requires its returned
-`full_name`, `id`, `node_id`, `default_branch`, and `archived` flag to match the
-manifest. The final apply performs the stable full-cohort read, an immediate
-complete cohort revalidation, and then direct rereads of the old organization
-ruleset, the legacy-only repository, and the manifest-bound scheduler as
-`active` and unchanged from the stable snapshot immediately before its PUT. An
-unreadable response, identity mismatch, or `archived: false` is
-inconclusive and sends no cutover write.
+`verify --apply` historically removed the whole legacy `required_status_checks`
+rule from the old organization ruleset only after all repository actions read
+back at their exact expected post-state. Each post-activation/cutover stable
+snapshot also reread the manifest-bound scheduler and required its live Actions
+workflow state to be `active`, then read the legacy-only repository from GitHub
+and required its returned `full_name`, `id`, `node_id`, `default_branch`, and
+`archived` flag to match the manifest. The final apply performed the stable
+full-cohort read, an immediate complete cohort revalidation, and then direct
+rereads of the old organization ruleset, the legacy-only repository, and the
+manifest-bound scheduler as `active` and unchanged from the stable snapshot
+immediately before its PUT. An unreadable response, identity mismatch, or
+`archived: false` was inconclusive and sent no cutover write.
 
-If scheduler restoration was skipped or failed, `derive-cutover`,
-`apply-repository-cleanup`, and `verify` fail closed before their next write
-with `recovery_code=activation-scheduler-restore-required`. Run a fresh
-`restore-scheduler` preview/apply, confirm its manifest-bound active readback,
-then restart the blocked post-activation preview.
+In the historical process, if scheduler restoration was skipped or failed,
+`derive-cutover`, `apply-repository-cleanup`, and `verify` failed closed before
+their next write with `recovery_code=activation-scheduler-restore-required`.
+The recovery sequence took a fresh `restore-scheduler` preview/apply,
+confirmed its manifest-bound active readback, then restarted the blocked
+post-activation preview.
 
-Do not use the `verify --apply` response to authorize bridge removal. Even
-after its write/readback, the control plane may drift. While the third freeze
-is still active, run `verify` again without `--apply` and save its **complete
-JSON output**. It must have top-level
+The historical `verify --apply` response was not bridge-removal authority.
+Even after its write/readback, the control plane could drift. While the third
+freeze was still active, the rollout ran `verify` again without `--apply` and
+saved its **complete JSON output**. That output had top-level
 `schema_version: "organization-review-gate-handoff-output/v2"`,
 `mode: "verify"`, `status: "final-verified"`, `applied: false`, and
 `action: null`; contain a
@@ -326,16 +342,16 @@ versions retain their published exact JSON shape and canonical digest for audit
 only. Neither authorizes a new bridge removal: the current consumer rejects
 this template's output before any local or GitHub mutation.
 
-Keep all temporary legacy bridge workflows installed until that read-only
-verify reports the final two-snapshot closure: the new organization v2 rule is
-active, every repository v2 policy and complete workflow inventory remains
-exact, every repository-local legacy cleanup is complete, and the old
-organization status rule is absent. If this read is inconclusive or finds
-drift, keep the bridges, repair the control-plane closure, and rerun the final
-read-only verify under the freeze. The freeze may end after the full output is
-captured and validated. A known policy mutation before bridge-removal
-preparation invalidates the old operational proof; obtain a fresh output under
-a new freeze.
+The historical protocol retained all temporary legacy bridge workflows until
+that read-only verify reported the final two-snapshot closure: the new
+organization v2 rule was active, every repository v2 policy and complete
+workflow inventory remained exact, every repository-local legacy cleanup was
+complete, and the old organization status rule was absent. An inconclusive or
+drifting read retained the bridges, repaired the control-plane closure, and
+reran the final read-only verify under the freeze. The freeze could end after
+the full output was captured and validated. A known policy mutation before
+bridge-removal preparation invalidated the old operational proof and required
+a fresh output under a new freeze.
 
 Historical handoff output is not a bridge-removal authority. Do not pass this
 template's `organization-review-gate-handoff-output/v2` verify output to

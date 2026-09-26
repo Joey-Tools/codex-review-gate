@@ -1292,10 +1292,25 @@ evidence that a prior freeze remains in force.
   inconclusive, while the existing mutation-boundary rereads narrow later
   exposure. The producer retains the projection in its stable snapshot so the
   two complete audit snapshots also bind this selected visibility horizon.
+- A subsequent independent Terra Ultra review found that matching the two
+  Check Suite windows was not sufficient by itself: a fabricated or
+  inconsistent API response could place the selected successful CheckRun
+  outside that window (including an empty window) and still pass the earlier
+  checks. The protected property is the exact parent Check Suite identity of
+  the selected CheckRun, not mutable suite status metadata. Both producer and
+  consumer now require a positive `check_suite.id` on the successful CheckRun
+  and require it to be a member of the identical before/after suite window.
+  Missing, mismatched, or empty-window evidence is inconclusive and leaves the
+  bridge in place. Regression tests cover all three cases.
 - The human and agent guides now label the old v2 handoff commands as a
   non-executable historical transcript and link the current post-cutover audit
   route, so a valid historical digest cannot be mistaken for enduring mutation
   authority.
+- The historical handoff-template README now starts with the archive boundary,
+  expressly forbids instantiating its placeholders, and labels its remaining
+  stage/activation/cleanup command blocks as archived transcript. This avoids
+  directing an operator toward old writes that the current consumer would not
+  accept as bridge-removal authority.
 
 ## Next Steps
 
@@ -1343,3 +1358,10 @@ evidence that a prior freeze remains in force.
   without a terminal result for 15 minutes, so it was interrupted and is not
   recorded as passing. Earlier dedicated v2 workflow-contract and
   workflow-security validation remain recorded above.
+- Current PR #71 repair validation after the CheckRun-to-CheckSuite binding
+  fix: `npm run check` passed; the complete
+  `node --test test/organization-review-gate-handoff.test.mjs` suite passed
+  245/245; and the three targeted consumer bridge-removal tests (fresh proof,
+  closed-unmerged 1,000-suite boundary, and receipt-bound canary reread)
+  passed 3/3. The monolithic bootstrap suite was not rerun because its known
+  no-output hang is unrelated to these exact boundary tests.

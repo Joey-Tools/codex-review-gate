@@ -4815,7 +4815,7 @@ async function assertPostCutoverAuditCanaryStable(canary) {
     encodedRepo,
     headSha: canary.head_sha,
   });
-  assertPostCutoverAuditCheckSuiteInventoryStable({
+  const stableCheckSuites = assertPostCutoverAuditCheckSuiteInventoryStable({
     before: checkSuitesBefore,
     after: checkSuitesAfter,
     repoSlug,
@@ -4837,6 +4837,20 @@ async function assertPostCutoverAuditCanaryStable(canary) {
   ) {
     throw new Error(
       `${repoSlug} fresh canary CheckRun is not the receipt-bound successful native v2 check.`,
+    );
+  }
+  // The CheckRun listing is bounded by GitHub's CheckSuite visibility window.
+  // Bind the selected successful CheckRun back to the identical before/after
+  // suite inventory, rather than treating an otherwise valid CheckRun from an
+  // empty or unrelated window as evidence for this canary head.
+  const checkSuiteId = checkRun?.check_suite?.id;
+  if (
+    !Number.isSafeInteger(checkSuiteId) ||
+    checkSuiteId <= 0 ||
+    !stableCheckSuites.has(checkSuiteId)
+  ) {
+    throw new Error(
+      `${repoSlug} fresh canary CheckRun does not bind an exact CheckSuite in the stable visibility window.`,
     );
   }
   const { runId, jobId } = parsePostCutoverAuditActionsJobDetailsUrl(
@@ -5062,6 +5076,7 @@ function assertPostCutoverAuditCheckSuiteInventoryStable({
       `${repoSlug} fresh canary CheckSuite inventory changed around the complete CheckRun read.`,
     );
   }
+  return beforeById;
 }
 
 function parsePostCutoverAuditActionsJobDetailsUrl(value, repoSlug) {
