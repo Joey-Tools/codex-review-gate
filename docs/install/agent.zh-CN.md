@@ -67,9 +67,10 @@ workflow/CODEOWNERS，属于需要完整 review 的 control-plane change，而�
 snapshot 与 receipt 成功后，才关闭新的 canary，且保持 unmerged。PR 的 exact GitHub UTC `created_at`
 必须晚于固定 cutoff `2026-09-24T23:38:00Z`；helper 会读取、验证并将它绑定进 receipt，所以即使其他 ID
 自洽，旧 canary 也会被拒绝。
-在把 `filter=all` CheckRun history 视为完整之前，helper 还会读取该 canary head 的完整 Check Suite
-inventory，并要求 suite 数不超过 1,000——这是 GitHub by-ref CheckRun endpoint 的文档化可见性边界。
-更大的或 malformed inventory 是 inconclusive，不代表历史干净。
+在把 `filter=all` CheckRun history 视为完整之前，helper 会在该枚举的紧前、紧后各读取一次 canary
+head 的完整 `filter=all` Check Suite inventory。两个规范化的 suite window 必须完全一致，且 suite 数
+不超过 1,000——这是 GitHub by-ref CheckRun endpoint 的文档化可见性边界。更大的、malformed 或发生变化的
+inventory 都是 inconclusive，不代表历史干净；这只是跨 API 读取之间的 fail-closed fence，不声称拥有远端原子锁。
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \

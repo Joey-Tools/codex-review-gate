@@ -2647,6 +2647,90 @@ test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
   }
 });
 
+test("post-cutover bridge removal fails closed when CheckSuite history crosses the visibility boundary during the CheckRun read", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-suite-window-race-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const receipt = auditFixture.output.post_cutover_audit_receipt;
+    const canary = receipt.v2_canaries[0];
+    const checkSuitesEndpoint =
+      `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`;
+    const checkRunsEndpoint =
+      `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      repositoryControlPlaneResponseOverrides: {
+        [checkSuitesEndpoint]: {
+          __fake_sequence: [
+            postCutoverAuditCheckSuitePages(canary, 1_000),
+            postCutoverAuditCheckSuitePages(canary, 1_001),
+          ],
+        },
+      },
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], { env: auditProofEnv });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /CheckRun history exceeds GitHub's 1,000-check-suite visibility boundary/u,
+    );
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+    const relevantCalls = readFileSync(
+      join(targetRoot, ".post-cutover-audit-gh-calls.log"),
+      "utf8",
+    )
+      .trim()
+      .split("\n")
+      .filter(
+        (call) =>
+          call === `GET ${checkSuitesEndpoint}` ||
+          call === `GET ${checkRunsEndpoint}`,
+      );
+    assert.deepEqual(relevantCalls, [
+      `GET ${checkSuitesEndpoint}`,
+      `GET ${checkRunsEndpoint}`,
+      `GET ${checkSuitesEndpoint}`,
+    ]);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
 test("post-cutover bridge removal accepts closed-unmerged canaries without Actions run pull_requests at the 1,000-suite boundary", () => {
   const targetRoot = mkdtempSync(
     join(tmpdir(), "codex-review-gate-post-cutover-closed-canary-removal-"),
@@ -2663,7 +2747,7 @@ test("post-cutover bridge removal accepts closed-unmerged canaries without Actio
     });
     const canary = auditFixture.output.post_cutover_audit_receipt.v2_canaries[0];
     const checkSuitesEndpoint =
-      `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`;
+      `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`;
     const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
       ...auditFixture,
       canaryResponseOptions: {
@@ -2832,10 +2916,25 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
     {
       name: "check-suite-history-exceeds-visibility-boundary",
       overrides: (_receipt, canary) => ({
-        [`repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`]:
+        [`repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`]:
           postCutoverAuditCheckSuitePages(canary, 1_001),
       }),
       expected: /CheckRun history exceeds GitHub's 1,000-check-suite visibility boundary/u,
+    },
+    {
+      name: "check-suite-inventory-changed-during-checkrun-read",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`;
+        const before = structuredClone(responses[endpoint]);
+        const after = structuredClone(before);
+        after[0].check_suites[0].id += 10_000;
+        return {
+          [endpoint]: { __fake_sequence: [before, after] },
+        };
+      },
+      expected: /CheckSuite inventory changed around the complete CheckRun read/u,
     },
     {
       name: "extra-checkrun-generation",
@@ -13939,7 +14038,7 @@ function postCutoverAuditCanaryResponses(
               `https://github.com/${repoSlug}/actions/runs/${canary.v2_run_id}/job/${canary.v2_job_id}`,
           }],
         }],
-        [`repos/${repoSlug}/commits/${canary.head_sha}/check-suites?per_page=100`]:
+        [`repos/${repoSlug}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`]:
           postCutoverAuditCheckSuitePages(canary),
         [`repos/${repoSlug}/pulls/${canary.pull_number}/files?per_page=100`]: [[]],
         [`repos/${repoSlug}/actions/runs/${canary.v2_run_id}`]: {

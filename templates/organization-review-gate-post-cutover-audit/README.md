@@ -117,10 +117,12 @@ extra request generation, an incomplete API read, or a changed head/base/test
 merge are inconclusive; repair the named condition or use a new replacement PR
 instead of treating historical evidence as current.
 GitHub lists CheckRuns by ref only across the newest 1,000 Check Suites. Before
-the audit treats `filter=all` CheckRun history as complete, it first reads the
-complete Check Suite inventory for that canary head and requires at most 1,000
-suites; a larger or malformed inventory is inconclusive, not evidence that an
-older producer generation is absent.
+the audit treats `filter=all` CheckRun history as complete, it reads the
+complete `filter=all` Check Suite inventory for that canary head immediately
+before and after the CheckRun enumeration. The normalized suite windows must
+match and contain at most 1,000 suites; a larger, malformed, or changing
+inventory is inconclusive, not evidence that an older producer generation is
+absent. This is an inter-request fail-closed fence, not an atomic remote lock.
 
 The deployed cohort uses the frozen v3 consumer workflow profile intentionally.
 This audit accepts that deployed profile and proves it as it actually runs; it
@@ -166,6 +168,22 @@ Read and validate the complete output before using its exact
 installed, correct only the reported live condition, and repeat with a fresh
 audited scope. Do not replay a receipt after a known control-plane change.
 
+After that review, extract the exact top-level value from the saved JSON
+output. Do not derive a replacement value from a partial receipt or reformatted
+fragment.
+
+```bash
+POST_CUTOVER_AUDIT_RECEIPT_SHA256="$(
+  node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    const output = JSON.parse(readFileSync(process.argv[1], "utf8"));
+    const value = output.post_cutover_audit_receipt_sha256;
+    if (!/^[0-9a-f]{64}$/u.test(value ?? "")) process.exit(1);
+    process.stdout.write(value);
+  ' "$POST_CUTOVER_OUTPUT"
+)"
+```
+
 ## Agent execution boundary
 
 An agent must first prove the selected worktree/repository is one exact active
@@ -174,7 +192,8 @@ It must not create a canary for the archived repository or source repository,
 and it must not use an old canary or an old v3 placeholder as a shortcut.
 
 After the receipt succeeds, prepare one separate bridge-removal PR per active
-cohort member with the existing receipt flags:
+cohort member with the existing receipt flags. The first command is a
+non-writing preview:
 
 ```bash
 node scripts/bootstrap-codex-review-gate.mjs \
@@ -185,6 +204,10 @@ node scripts/bootstrap-codex-review-gate.mjs \
   "$POST_CUTOVER_AUDIT_RECEIPT_SHA256" \
   --control-plane-owner "$CONTROL_PLANE_OWNER"
 ```
+
+After reviewing that exact preview and only for the selected target worktree,
+repeat the same command with `--apply` to write the bridge-removal change that
+the PR will contain. The receipt alone does not merge or publish anything.
 
 The bootstrap boundary admits the receipt only for the bound active member.
 It does not authorize a source-local bridge, `codex-waited-delivery`, a subset,
@@ -241,6 +264,7 @@ draft, mismatched head/base/repository, or changed evidence fails closed. It
 does not rely on `run.pull_requests`, which GitHub may clear after a
 PR closes. The verifier run's fixed PR-scoped title, exact head, workflow, and
 job bind the recorded test-merge. GitHub exposes CheckRuns by ref only across
-the newest 1,000 check suites, so the consumer first requires a complete
-check-suite inventory at or below that visibility boundary; exceeding it is
-inconclusive rather than proof that an older producer generation is absent.
+the newest 1,000 check suites, so the consumer brackets its complete
+`filter=all` CheckRun read with two matching complete `filter=all` Check Suite
+inventories at or below that visibility boundary. An excess or changed window
+is inconclusive rather than proof that an older producer generation is absent.

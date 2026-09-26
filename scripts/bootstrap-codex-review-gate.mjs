@@ -4790,24 +4790,15 @@ async function assertPostCutoverAuditCanaryStable(canary) {
     changedFiles: pull.changed_files,
   });
 
-  const checkSuitePages = await ghJson(
-    `repos/${encodedRepo}/commits/${canary.head_sha}/check-suites?per_page=100`,
-    { paginate: true },
-  );
-  const checkSuites = assertCompletePostCutoverAuditPages({
-    pages: checkSuitePages,
-    collection: "check_suites",
+  // CheckRun-by-ref exposes only the newest 1,000 Check Suites. Pair the
+  // complete `filter=all` suite inventory immediately before and after the
+  // complete CheckRun read: a 1,000 -> 1,001 transition could otherwise push
+  // an earlier failing CheckRun outside that visibility window mid-read.
+  const checkSuitesBefore = await loadCompletePostCutoverAuditCheckSuites({
     repoSlug,
-    label: "Check suite",
+    encodedRepo,
+    headSha: canary.head_sha,
   });
-  if (
-    checkSuites.length > POST_CUTOVER_AUDIT_MAX_COMPLETE_CHECK_SUITES ||
-    checkSuites.some((suite) => suite?.head_sha !== canary.head_sha)
-  ) {
-    throw new Error(
-      `${repoSlug} fresh canary CheckRun history exceeds GitHub's 1,000-check-suite visibility boundary or does not bind the exact head.`,
-    );
-  }
 
   const checkPages = await ghJson(
     `repos/${encodedRepo}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`,
@@ -4818,6 +4809,16 @@ async function assertPostCutoverAuditCanaryStable(canary) {
     collection: "check_runs",
     repoSlug,
     label: "CheckRun",
+  });
+  const checkSuitesAfter = await loadCompletePostCutoverAuditCheckSuites({
+    repoSlug,
+    encodedRepo,
+    headSha: canary.head_sha,
+  });
+  assertPostCutoverAuditCheckSuiteInventoryStable({
+    before: checkSuitesBefore,
+    after: checkSuitesAfter,
+    repoSlug,
   });
   if (checkRuns.length !== 1) {
     throw new Error(
@@ -5012,6 +5013,55 @@ function assertCompletePostCutoverAuditPages({
     throw new Error(`${repoSlug} ${label} pagination is incomplete or has duplicate identities.`);
   }
   return values;
+}
+
+async function loadCompletePostCutoverAuditCheckSuites({
+  repoSlug,
+  encodedRepo,
+  headSha,
+}) {
+  const pages = await ghJson(
+    `repos/${encodedRepo}/commits/${headSha}/check-suites?filter=all&per_page=100`,
+    { paginate: true },
+  );
+  const checkSuites = assertCompletePostCutoverAuditPages({
+    pages,
+    collection: "check_suites",
+    repoSlug,
+    label: "Check suite",
+  });
+  if (
+    checkSuites.length > POST_CUTOVER_AUDIT_MAX_COMPLETE_CHECK_SUITES ||
+    checkSuites.some((suite) => suite?.head_sha !== headSha)
+  ) {
+    throw new Error(
+      `${repoSlug} fresh canary CheckRun history exceeds GitHub's 1,000-check-suite visibility boundary or does not bind the exact head.`,
+    );
+  }
+  return checkSuites;
+}
+
+function assertPostCutoverAuditCheckSuiteInventoryStable({
+  before,
+  after,
+  repoSlug,
+}) {
+  const beforeById = new Map(
+    before.map((suite) => [suite.id, suite.head_sha]),
+  );
+  const afterById = new Map(
+    after.map((suite) => [suite.id, suite.head_sha]),
+  );
+  if (
+    beforeById.size !== afterById.size ||
+    [...beforeById].some(
+      ([id, headSha]) => afterById.get(id) !== headSha,
+    )
+  ) {
+    throw new Error(
+      `${repoSlug} fresh canary CheckSuite inventory changed around the complete CheckRun read.`,
+    );
+  }
 }
 
 function parsePostCutoverAuditActionsJobDetailsUrl(value, repoSlug) {

@@ -3109,7 +3109,38 @@ export function validateV2CheckSuiteHistoryPages(pages, repo) {
       `${repo.slug} v2 CheckRun history exceeds GitHub's 1,000-check-suite visibility boundary.`,
     );
   }
-  return totalCount;
+  // This purpose-built projection protects the CheckRun endpoint's visibility
+  // horizon: the suite identities and their exact head binding.  It
+  // intentionally excludes mutable suite metadata such as status or update
+  // time, which cannot change which historical CheckRuns the endpoint can
+  // expose.
+  return {
+    total_count: totalCount,
+    suites: checkSuites
+      .map((checkSuite) => ({
+        id: checkSuite.id,
+        head_sha: checkSuite.head_sha,
+      }))
+      .sort((left, right) => left.id - right.id),
+  };
+}
+
+function assertV2CheckSuiteVisibilityWindowStable(before, after, repo) {
+  if (canonicalJson(before) !== canonicalJson(after)) {
+    throw new Error(
+      `${repo.slug} v2 CheckSuite visibility window changed while complete CheckRun history was read.`,
+    );
+  }
+}
+
+async function loadV2CheckSuiteVisibilityWindow(repo) {
+  return validateV2CheckSuiteHistoryPages(
+    await ghJson(
+      `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-suites?filter=all&per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
+      { paginate: true },
+    ),
+    repo,
+  );
 }
 
 async function loadV2CanaryEvidence(
@@ -3121,15 +3152,9 @@ async function loadV2CanaryEvidence(
   }
   const endpoint =
     `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}`;
-  if (requireUniqueHistory) {
-    validateV2CheckSuiteHistoryPages(
-      await ghJson(
-        `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-suites?per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
-        { paginate: true },
-      ),
-      repo,
-    );
-  }
+  const checkSuiteVisibilityWindow = requireUniqueHistory
+    ? await loadV2CheckSuiteVisibilityWindow(repo)
+    : null;
   const { checkProjection, runId, jobId } = requireUniqueHistory
     ? validateV2CheckRunHistoryPages(
         await ghJson(
@@ -3144,6 +3169,13 @@ async function loadV2CanaryEvidence(
         ),
         repo,
       );
+  if (checkSuiteVisibilityWindow !== null) {
+    assertV2CheckSuiteVisibilityWindowStable(
+      checkSuiteVisibilityWindow,
+      await loadV2CheckSuiteVisibilityWindow(repo),
+      repo,
+    );
+  }
   const run = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/actions/runs/${runId}`,
   );
@@ -3221,6 +3253,9 @@ async function loadV2CanaryEvidence(
     throw new Error(`${repo.slug} v2 run lacks one exact successful canonical job.`);
   }
   return {
+    ...(checkSuiteVisibilityWindow === null
+      ? {}
+      : { check_suite_visibility_window: checkSuiteVisibilityWindow }),
     check_run: checkProjection,
     run: {
       id: run.id,

@@ -922,6 +922,7 @@ function createFakeGhHarness(
     canaryCreatedAt = "2026-09-25T00:00:00Z",
     mutateV2CheckRunHistory = null,
     mutateV2CheckSuiteHistory = null,
+    v2CheckSuiteHistorySequence = null,
     defaultWorkflowPermissions = "read",
     newerLegacyStatusContext = null,
     unexpectedWorkflowTree = false,
@@ -988,6 +989,20 @@ function createFakeGhHarness(
     typeof mutateV2CheckSuiteHistory !== "function"
   ) {
     throw new Error("mutateV2CheckSuiteHistory must be a function or null.");
+  }
+  if (
+    v2CheckSuiteHistorySequence !== null &&
+    typeof v2CheckSuiteHistorySequence !== "function"
+  ) {
+    throw new Error("v2CheckSuiteHistorySequence must be a function or null.");
+  }
+  if (
+    mutateV2CheckSuiteHistory !== null &&
+    v2CheckSuiteHistorySequence !== null
+  ) {
+    throw new Error(
+      "mutateV2CheckSuiteHistory and v2CheckSuiteHistorySequence cannot overlap.",
+    );
   }
   for (const [label, value] of [
     [
@@ -1067,6 +1082,10 @@ function createFakeGhHarness(
   );
   const legacyWriterRaceStatePath = join(directory, "legacy-writer-race-state");
   const schedulerStatePath = join(directory, "scheduler-state");
+  const v2CheckSuiteHistorySequenceStatePath =
+    v2CheckSuiteHistorySequence === null
+      ? null
+      : join(directory, "v2-check-suite-history-read-count");
   const repositoryIdentityDelayCompletionPath =
     repositoryIdentityDelayCompletionMarker
       ? join(directory, "repository-identity-delay-complete")
@@ -1080,6 +1099,7 @@ function createFakeGhHarness(
   const responses = new Map();
   const delayedRequests = [];
   const forcedFailureRequests = [];
+  const v2CheckSuiteHistorySequenceResponses = [];
   const legacyWriterRaceResponses = [];
   const schedulerWorkflowResponses = [];
   const cleanupResponses = [];
@@ -1539,15 +1559,48 @@ function createFakeGhHarness(
     if (!Array.isArray(checkRunHistory)) {
       throw new Error("mutateV2CheckRunHistory must return an array.");
     }
-    const checkSuiteHistory =
-      mutateV2CheckSuiteHistory !== null && repositoryIndex === 0
-        ? mutateV2CheckSuiteHistory(v2CheckSuites(repository, 1), {
+    const checkSuiteEndpoint =
+      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-suites?filter=all&per_page=100`;
+    const checkSuiteHistorySequence =
+      v2CheckSuiteHistorySequence !== null && repositoryIndex === 0
+        ? v2CheckSuiteHistorySequence(v2CheckSuites(repository, 1), {
             repository,
             repositoryIndex,
           })
-        : v2CheckSuites(repository, 1);
-    if (!Array.isArray(checkSuiteHistory)) {
-      throw new Error("mutateV2CheckSuiteHistory must return an array.");
+        : null;
+    if (checkSuiteHistorySequence !== null) {
+      if (
+        !Array.isArray(checkSuiteHistorySequence) ||
+        checkSuiteHistorySequence.length < 2 ||
+        checkSuiteHistorySequence.some((history) => !Array.isArray(history))
+      ) {
+        throw new Error(
+          "v2CheckSuiteHistorySequence must return at least two CheckSuite histories.",
+        );
+      }
+      v2CheckSuiteHistorySequenceResponses.push({
+        request: `GET:${checkSuiteEndpoint}`,
+        statePath: v2CheckSuiteHistorySequenceStatePath,
+        responses: checkSuiteHistorySequence.map((history) =>
+          JSON.stringify(v2CheckSuitePages(history)),
+        ),
+      });
+    } else {
+      const checkSuiteHistory =
+        mutateV2CheckSuiteHistory !== null && repositoryIndex === 0
+          ? mutateV2CheckSuiteHistory(v2CheckSuites(repository, 1), {
+              repository,
+              repositoryIndex,
+            })
+          : v2CheckSuites(repository, 1);
+      if (!Array.isArray(checkSuiteHistory)) {
+        throw new Error("mutateV2CheckSuiteHistory must return an array.");
+      }
+      addFakeResponse(
+        responses,
+        checkSuiteEndpoint,
+        v2CheckSuitePages(checkSuiteHistory),
+      );
     }
     addFakeResponse(
       responses,
@@ -1558,11 +1611,6 @@ function createFakeGhHarness(
       responses,
       `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`,
       v2CheckRunPages(checkRunHistory),
-    );
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-suites?per_page=100`,
-      v2CheckSuitePages(checkSuiteHistory),
     );
     addFakeResponse(
       responses,
@@ -2115,6 +2163,28 @@ function createFakeGhHarness(
     }
     scriptLines.push("esac");
   }
+  if (v2CheckSuiteHistorySequenceResponses.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const response of v2CheckSuiteHistorySequenceResponses) {
+      scriptLines.push(
+        `  ${shellQuote(response.request)})`,
+        `    count="$(cat ${shellQuote(response.statePath)})"`,
+        "    count=$((count + 1))",
+        `    printf '%s\\n' "$count" > ${shellQuote(response.statePath)}`,
+        "    case \"$count\" in",
+      );
+      for (const [index, payload] of response.responses.entries()) {
+        scriptLines.push(
+          `      ${index + 1}) respond ${shellQuote(payload)} ;;`,
+        );
+      }
+      scriptLines.push(
+        `      *) respond ${shellQuote(response.responses.at(-1))} ;;`,
+        "    esac ;;",
+      );
+    }
+    scriptLines.push("esac");
+  }
   if (forcedFailureRequests.length > 0) {
     scriptLines.push('case "$request" in');
     for (const failure of forcedFailureRequests) {
@@ -2169,6 +2239,9 @@ function createFakeGhHarness(
   writeFileSync(cleanupIdentityReadCountPath, "0\n");
   writeFileSync(legacyWriterRaceStatePath, "before\n");
   writeFileSync(schedulerStatePath, `${schedulerWorkflowState}\n`);
+  if (v2CheckSuiteHistorySequenceStatePath !== null) {
+    writeFileSync(v2CheckSuiteHistorySequenceStatePath, "0\n");
+  }
   if (repositoryIdentityDelayCompletionPath !== null) {
     writeFileSync(repositoryIdentityDelayCompletionPath, "pending\n");
   }
@@ -5636,9 +5709,15 @@ test("fresh v2 canary CheckRun history requires one complete producer generation
 
 test("fresh v2 canary CheckSuite history proves the CheckRun visibility window", () => {
   const repo = manifestFixture().repositories[0];
-  assert.equal(
-    validateV2CheckSuiteHistoryPages(v2CheckSuitePages(v2CheckSuites(repo, 1_000)), repo),
-    1_000,
+  assert.deepEqual(
+    validateV2CheckSuiteHistoryPages(
+      v2CheckSuitePages(v2CheckSuites(repo, 1_000)),
+      repo,
+    ),
+    {
+      total_count: 1_000,
+      suites: v2CheckSuites(repo, 1_000),
+    },
   );
   assert.throws(
     () =>
@@ -6975,11 +7054,11 @@ test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", asy
   for (const repository of harness.manifest.repositories) {
     const checkSuiteEndpoint =
       `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
-      `${repository.canary.head_sha}/check-suites?per_page=100`;
+      `${repository.canary.head_sha}/check-suites?filter=all&per_page=100`;
     assert.equal(
       countRequest(requests, "GET", checkSuiteEndpoint),
-      2,
-      `${repository.slug} must prove the CheckRun visibility window in both stable snapshots`,
+      4,
+      `${repository.slug} must bracket the CheckRun history in both stable snapshots`,
     );
     const checkRunEndpoint =
       `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
@@ -7100,6 +7179,43 @@ test("post-cutover audit rejects CheckRun history beyond GitHub's check-suite vi
     /exceeds GitHub's 1,000-check-suite visibility boundary/u,
   );
   assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+});
+
+test("post-cutover audit rejects a CheckSuite visibility-window change while reading CheckRuns", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t, {
+    v2CheckSuiteHistorySequence: (_history, { repository }) => [
+      v2CheckSuites(repository, 1_000),
+      v2CheckSuites(repository, 1_001),
+    ],
+  });
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit"),
+    /CheckSuite visibility window changed while complete CheckRun history was read|exceeds GitHub's 1,000-check-suite visibility boundary/u,
+  );
+  const requests = fakeGhRequests(harness.logPath);
+  const checkSuiteEndpoint =
+    `repos/${encodeEndpointPathForTest(harness.manifest.repositories[0].slug)}/commits/` +
+    `${harness.manifest.repositories[0].canary.head_sha}/check-suites?filter=all&per_page=100`;
+  const checkRunEndpoint =
+    `repos/${encodeEndpointPathForTest(harness.manifest.repositories[0].slug)}/commits/` +
+    `${harness.manifest.repositories[0].canary.head_sha}/check-runs?check_name=` +
+    `${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`;
+  const firstSuiteRead = requests.findIndex(
+    (request) => request.method === "GET" && request.endpoint === checkSuiteEndpoint,
+  );
+  const checkRunRead = requests.findIndex(
+    (request) => request.method === "GET" && request.endpoint === checkRunEndpoint,
+  );
+  const secondSuiteRead = requests.findIndex(
+    (request, index) =>
+      index > firstSuiteRead &&
+      request.method === "GET" &&
+      request.endpoint === checkSuiteEndpoint,
+  );
+  assert.ok(firstSuiteRead >= 0);
+  assert.ok(checkRunRead > firstSuiteRead);
+  assert.ok(secondSuiteRead > checkRunRead);
+  assert.deepEqual(mutationRequests(requests), []);
 });
 
 test("post-cutover audit rejects stale and malformed observed canary creation times", async (t) => {

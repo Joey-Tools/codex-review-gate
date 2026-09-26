@@ -22,6 +22,13 @@ an older manifest cannot silently omit either control.
 
 ## Completed-cutover alternative
 
+> **Historical handoff transcript — do not execute.** The remaining stage,
+> activation, cleanup, and verification material records the completed 2026-09
+> rollout only. Replaying it can mutate an already cut-over cohort, and the
+> current consumer rejects every `organization-review-gate-handoff-output/v2`
+> result as bridge-removal authority. Start the current executable route with
+> the independent post-cutover audit linked below.
+
 This v3 template is historical-handoff evidence, not a form to backfill after
 the cutover. If its contemporaneous canary, scheduler, legacy-status, or
 cleanup evidence was never retained, do not fill those placeholders from a
@@ -312,15 +319,12 @@ removal. Its top-level `plan_sha256` binds the final read-only `verify` plan
 (`mode`, manifest digest, snapshot digest, and `action: null`). The receipt
 SHA-256 binds the canonical embedded receipt, not the file's formatting.
 
-Bootstrap accepts historical final receipts only as the strict pair
-`output/v1` plus receipt schema `1` plus 11 members, and current receipts only
-as the strict pair `output/v2` plus receipt schema `2` plus 10 active members.
-It rejects mixed versions. Schema-1 receipts retain their published exact JSON
-shape and canonical digest for historical audit, but authorize no new bridge
-removal. For schema 2, the consumer validates both lists and authorizes a
-bridge removal only by looking up `origin` in the manifest-derived
-`manifest_repositories` list; it never authorizes from the observed list or
-the legacy selector.
+Bootstrap retains the strict historical parsing distinction between `output/v1`
+with receipt schema `1` plus 11 members and `output/v2` with receipt schema
+`2` plus 10 active members; it rejects mixed versions. Both historical output
+versions retain their published exact JSON shape and canonical digest for audit
+only. Neither authorizes a new bridge removal: the current consumer rejects
+this template's output before any local or GitHub mutation.
 
 Keep all temporary legacy bridge workflows installed until that read-only
 verify reports the final two-snapshot closure: the new organization v2 rule is

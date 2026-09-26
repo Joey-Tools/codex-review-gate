@@ -81,10 +81,13 @@ canaries unmerged only after the snapshots and receipt succeed. The exact
 GitHub UTC PR `created_at` must be later than the fixed cutoff
 `2026-09-24T23:38:00Z`; the helper reads, validates, and receipt-binds it, so
 an older otherwise self-consistent canary is rejected.
-Before treating `filter=all` CheckRun history as complete, it also reads the
-canary head's complete Check Suite inventory and requires at most 1,000 suites,
-the documented visibility boundary for GitHub's by-ref CheckRun endpoint. A
-larger or malformed inventory is inconclusive rather than a clean history.
+Before treating `filter=all` CheckRun history as complete, it reads the canary
+head's complete `filter=all` Check Suite inventory immediately before and
+after that enumeration. The normalized suite windows must match exactly and
+contain at most 1,000 suites, the documented visibility boundary for GitHub's
+by-ref CheckRun endpoint. A larger, malformed, or changing inventory is
+inconclusive rather than a clean history; this is an inter-request
+fail-closed fence, not a claim of an atomic remote lock.
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \

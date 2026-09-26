@@ -1281,13 +1281,17 @@ evidence that a prior freeze remains in force.
   the guard prevents a hidden older producer generation from being mistaken
   for absence. This is a selected-evidence stability check, not a claim that
   unrelated repository activity is frozen.
-- The post-cutover audit producer now enforces the same documented visibility
-  boundary before it mints a receipt. It first validates the complete
-  per-canary Check Suite inventory (including pagination, unique IDs, and the
-  exact canary head), rejects only counts above 1,000, and then treats its
-  `filter=all` CheckRun history as complete. This closes the corresponding
-  producer-side gap: otherwise the receipt could certify a hidden earlier
-  generation that the later consumer would correctly refuse to rely on.
+- The post-cutover audit producer and bridge-removal consumer now both bind the
+  documented CheckRun visibility boundary to the exact history they read. Each
+  takes a complete per-canary `filter=all` Check Suite projection (pagination,
+  unique IDs, and exact head), reads `filter=all` CheckRuns, then takes the
+  same projection again and requires exact equality plus a count no greater
+  than 1,000. The projection deliberately compares suite identity/head only,
+  not benign mutable status metadata. This is an inter-request fail-closed
+  fence rather than a claim of an atomic GitHub lock: a changed window is
+  inconclusive, while the existing mutation-boundary rereads narrow later
+  exposure. The producer retains the projection in its stable snapshot so the
+  two complete audit snapshots also bind this selected visibility horizon.
 - The human and agent guides now label the old v2 handoff commands as a
   non-executable historical transcript and link the current post-cutover audit
   route, so a valid historical digest cannot be mistaken for enduring mutation
