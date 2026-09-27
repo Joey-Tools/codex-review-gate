@@ -3325,6 +3325,8 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
     },
     {
       name: "current-run-changes-after-attempt-job-mapping",
+      finalReadEndpoint: (canary) =>
+        `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`,
       overrides: (receipt, canary) => {
         const responses = postCutoverAuditCanaryResponses(receipt);
         const endpoint = `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`;
@@ -3341,6 +3343,8 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
     },
     {
       name: "current-run-read-fails-after-attempt-job-mapping",
+      finalReadEndpoint: (canary) =>
+        `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`,
       overrides: (receipt, canary) => {
         const responses = postCutoverAuditCanaryResponses(receipt);
         const endpoint = `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`;
@@ -3360,6 +3364,8 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
     },
     {
       name: "checkrun-history-read-fails-after-attempt-job-mapping",
+      finalReadEndpoint: (canary) =>
+        `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`,
       overrides: (receipt, canary) => {
         const responses = postCutoverAuditCanaryResponses(receipt);
         const endpoint =
@@ -3473,6 +3479,34 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
         `${scenario.name}: canary drift must reject before local mutations`,
       );
       assert.doesNotMatch(result.stdout, /Admitted bridge-removal proof|Applied:/u);
+      if (scenario.finalReadEndpoint !== undefined) {
+        const calls = readFileSync(
+          join(targetRoot, ".post-cutover-audit-gh-calls.log"),
+          "utf8",
+        )
+          .trim()
+          .split("\n");
+        const encodedRepo = encodeURIComponent(canary.full_name).replace(/%2F/gu, "/");
+        const mappedAttemptJobCall =
+          `GET repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/` +
+          `${canary.v2_run_attempt}/jobs?per_page=100`;
+        const finalReadCall = `GET ${scenario.finalReadEndpoint(canary)}`;
+        const initialReadIndex = calls.indexOf(finalReadCall);
+        const mappedAttemptJobIndex = calls.indexOf(mappedAttemptJobCall);
+        const finalReadIndex = calls.lastIndexOf(finalReadCall);
+        assert.ok(
+          initialReadIndex >= 0,
+          `${scenario.name}: initial selected evidence read must occur`,
+        );
+        assert.ok(
+          mappedAttemptJobIndex > initialReadIndex,
+          `${scenario.name}: receipt-bound attempt job must map after the initial read`,
+        );
+        assert.ok(
+          finalReadIndex > mappedAttemptJobIndex,
+          `${scenario.name}: final read must fence the completed attempt-job mapping`,
+        );
+      }
     } finally {
       rmSync(targetRoot, { recursive: true, force: true });
     }

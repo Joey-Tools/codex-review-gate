@@ -1400,6 +1400,13 @@ evidence that a prior freeze remains in force.
   exited 0 in 154.43 seconds without failure output. The monolithic bootstrap
   suite remains intentionally unclaimed because its prior bounded no-output
   timeout is unrelated to this focused coverage patch.
+- The final independent Terra review found that the three consumer fixtures
+  still needed to prove *order*, not merely consume a second fake response.
+  Each now declares its selected final-read endpoint and checks the durable
+  fake-GitHub request log for `initial read < receipt-bound attempt-job mapping
+  < final read`. This covers final-run drift plus final Actions-run and
+  CheckRun-history 503s, so moving the fence ahead of job mapping fails the
+  test rather than accidentally preserving its apparent coverage.
 
 ## Next Steps
 
