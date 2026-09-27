@@ -39,6 +39,7 @@ import {
   POST_CUTOVER_AUDIT_ARCHIVED_LEGACY_ONLY_REPOSITORY,
   POST_CUTOVER_AUDIT_FRESHNESS_NOT_BEFORE,
   POST_CUTOVER_AUDIT_KIND,
+  POST_CUTOVER_AUDIT_MAX_RUN_ATTEMPTS,
   POST_CUTOVER_AUDIT_ORGANIZATION,
   POST_CUTOVER_AUDIT_ORGANIZATION_LEGACY_RULESET,
   POST_CUTOVER_AUDIT_ORGANIZATION_V2_RULESET,
@@ -2288,6 +2289,30 @@ test("admits a strict post-cutover fresh v2 audit bridge-removal proof", () => {
     "2026-09-25T00:00:00.000Z";
   refreshPostCutoverAuditReceiptDigest(malformedCanaryTimestamp);
 
+  const maximumGitHubRerunCanaries = structuredClone(output);
+  for (const canary of maximumGitHubRerunCanaries.post_cutover_audit_receipt
+    .v2_canaries) {
+    canary.v2_run_attempt = POST_CUTOVER_AUDIT_MAX_RUN_ATTEMPTS;
+  }
+  refreshPostCutoverAuditReceiptDigest(maximumGitHubRerunCanaries);
+  assert.doesNotThrow(
+    () => validateOrganizationPostCutoverAuditOutput(maximumGitHubRerunCanaries),
+    "the receipt schema accepts GitHub's maximum fifty reruns plus the initial attempt",
+  );
+
+  const excessiveGitHubRerunCanary = structuredClone(output);
+  excessiveGitHubRerunCanary.post_cutover_audit_receipt.v2_canaries[0]
+    .v2_run_attempt = POST_CUTOVER_AUDIT_MAX_RUN_ATTEMPTS + 1;
+  refreshPostCutoverAuditReceiptDigest(excessiveGitHubRerunCanary);
+  assert.throws(
+    () => validateOrganizationPostCutoverAuditOutput(excessiveGitHubRerunCanary),
+    new RegExp(
+      `v2_run_attempt exceeds the ${POST_CUTOVER_AUDIT_MAX_RUN_ATTEMPTS}-attempt GitHub rerun bound`,
+      "u",
+    ),
+    "the receipt schema rejects a run attempt beyond GitHub's rerun capacity",
+  );
+
   const wrongReceiptDigest = structuredClone(output);
   wrongReceiptDigest.post_cutover_audit_receipt_sha256 = "f".repeat(64);
 
@@ -2647,6 +2672,219 @@ test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
   }
 });
 
+test("post-cutover bridge removal accepts a receipt-bound same-run rerun recovery", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-rerun-recovery-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const receipt = auditFixture.output.post_cutover_audit_receipt;
+    const canary = receipt.v2_canaries[0];
+    const failedFirstAttempt = {
+      attempt: 1,
+      checkRunId: canary.v2_check_run_id,
+      jobId: canary.v2_job_id,
+      conclusion: "failure",
+    };
+    canary.v2_check_run_id += 100_000;
+    canary.v2_job_id += 100_000;
+    canary.v2_run_attempt = 2;
+    refreshPostCutoverAuditReceiptDigest(auditFixture.output);
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      canaryResponseOptions: {
+        attemptsByCanary: {
+          [canary.full_name]: [
+            failedFirstAttempt,
+            {
+              attempt: canary.v2_run_attempt,
+              checkRunId: canary.v2_check_run_id,
+              jobId: canary.v2_job_id,
+              conclusion: "success",
+            },
+          ],
+        },
+      },
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], { env: auditProofEnv });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Admitted bridge-removal proof/u);
+    assert.equal(existsSync(bridgePath), false);
+    const calls = readFileSync(
+      join(targetRoot, ".post-cutover-audit-gh-calls.log"),
+      "utf8",
+    )
+      .trim()
+      .split("\n");
+    const encodedRepo = encodeURIComponent(canary.full_name).replace(/%2F/gu, "/");
+    assert.ok(
+      calls.includes(
+        `GET repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/1/jobs?per_page=100`,
+      ),
+      "the audit must map the failed first attempt rather than ignoring it",
+    );
+    assert.ok(
+      calls.includes(
+        `GET repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/2/jobs?per_page=100`,
+      ),
+      "the receipt-bound successful attempt must be read directly",
+    );
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("post-cutover bridge removal fails closed when a same-run retry appears during attempt-job mapping", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-rerun-mapping-race-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const receipt = auditFixture.output.post_cutover_audit_receipt;
+    const canary = receipt.v2_canaries[0];
+    const beforeResponses = postCutoverAuditCanaryResponses(receipt);
+    const afterResponses = postCutoverAuditCanaryResponses(receipt, {
+      attemptsByCanary: {
+        [canary.full_name]: [
+          {
+            attempt: canary.v2_run_attempt,
+            checkRunId: canary.v2_check_run_id,
+            jobId: canary.v2_job_id,
+            conclusion: "success",
+          },
+          {
+            attempt: canary.v2_run_attempt + 1,
+            checkRunId: canary.v2_check_run_id + 1,
+            jobId: canary.v2_job_id + 1,
+            conclusion: "failure",
+          },
+        ],
+      },
+    });
+    const encodedRepo = encodeURIComponent(canary.full_name).replace(/%2F/gu, "/");
+    const checkRunsEndpoint =
+      `repos/${encodedRepo}/commits/${canary.head_sha}/check-runs?check_name=` +
+      `${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+    const runEndpoint = `repos/${encodedRepo}/actions/runs/${canary.v2_run_id}`;
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      repositoryControlPlaneResponseOverrides: {
+        // The retry remains within the same run and CheckSuite. Keep the run
+        // response at attempt N to prove that the final full CheckRun-history
+        // fence, rather than only the run-attempt read, rejects the race.
+        [checkRunsEndpoint]: {
+          __fake_sequence: [
+            beforeResponses[checkRunsEndpoint],
+            afterResponses[checkRunsEndpoint],
+          ],
+        },
+        [runEndpoint]: {
+          __fake_sequence: [
+            beforeResponses[runEndpoint],
+            beforeResponses[runEndpoint],
+          ],
+        },
+      },
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+    ], { env: auditProofEnv });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /fresh canary CheckRun history or current Actions run changed while attempt-scoped verifier jobs were mapped/u,
+    );
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+    const calls = readFileSync(
+      join(targetRoot, ".post-cutover-audit-gh-calls.log"),
+      "utf8",
+    )
+      .trim()
+      .split("\n");
+    const attemptJobsCall =
+      `GET repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/` +
+      `${canary.v2_run_attempt}/jobs?per_page=100`;
+    const checkRunsCall = `GET ${checkRunsEndpoint}`;
+    assert.ok(calls.indexOf(attemptJobsCall) >= 0);
+    assert.ok(calls.lastIndexOf(checkRunsCall) > calls.indexOf(attemptJobsCall));
+    assert.equal(
+      calls.filter((call) => call === checkRunsCall).length,
+      2,
+      "the final fence must re-read complete CheckRun history",
+    );
+    assert.equal(
+      calls.filter((call) => call === `GET ${runEndpoint}`).length,
+      2,
+      "the final fence must re-read the current Actions run",
+    );
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
 test("post-cutover bridge removal fails closed when CheckSuite history crosses the visibility boundary during the CheckRun read", () => {
   const targetRoot = mkdtempSync(
     join(tmpdir(), "codex-review-gate-post-cutover-suite-window-race-"),
@@ -2661,7 +2899,7 @@ test("post-cutover bridge removal fails closed when CheckSuite history crosses t
     const receipt = auditFixture.output.post_cutover_audit_receipt;
     const canary = receipt.v2_canaries[0];
     const checkSuitesEndpoint =
-      `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`;
+      `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`;
     const checkRunsEndpoint =
       `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
     const beforeCheckRunSuites = postCutoverAuditCheckSuitePages(canary, 1_000);
@@ -2762,7 +3000,7 @@ test("post-cutover bridge removal accepts closed-unmerged canaries without Actio
     });
     const canary = auditFixture.output.post_cutover_audit_receipt.v2_canaries[0];
     const checkSuitesEndpoint =
-      `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`;
+      `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`;
     const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
       ...auditFixture,
       canaryResponseOptions: {
@@ -2931,7 +3169,7 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
     {
       name: "check-suite-history-exceeds-visibility-boundary",
       overrides: (_receipt, canary) => ({
-        [`repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`]:
+        [`repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`]:
           postCutoverAuditCheckSuitePages(canary, 1_001),
       }),
       expected: /CheckRun history exceeds GitHub's 1,000-check-suite visibility boundary/u,
@@ -2941,7 +3179,7 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
       overrides: (receipt, canary) => {
         const responses = postCutoverAuditCanaryResponses(receipt);
         const endpoint =
-          `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`;
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`;
         const before = structuredClone(responses[endpoint]);
         const after = structuredClone(before);
         after[0].check_suites[0].id += 10_000;
@@ -2960,7 +3198,7 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
         delete responses[endpoint][0].check_runs[0].check_suite;
         return { [endpoint]: responses[endpoint] };
       },
-      expected: /CheckRun does not bind an exact CheckSuite in the stable visibility window/u,
+      expected: /CheckRun history entry 0 does not bind one completed native verifier context/u,
     },
     {
       name: "mismatched-check-suite-binding",
@@ -2977,13 +3215,76 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
     {
       name: "empty-check-suite-window",
       overrides: (_receipt, canary) => ({
-        [`repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`]:
+        [`repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`]:
           postCutoverAuditCheckSuitePages(canary, 0),
       }),
       expected: /CheckRun does not bind an exact CheckSuite in the stable visibility window/u,
     },
     {
-      name: "extra-checkrun-generation",
+      name: "checkrun-history-crosses-actions-run-lineage",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        const page = structuredClone(responses[endpoint][0]);
+        page.total_count = 2;
+        page.check_runs.push({
+          ...page.check_runs[0],
+          id: canary.v2_check_run_id + 1,
+          conclusion: "failure",
+          details_url:
+            `https://github.com/${canary.full_name}/actions/runs/${canary.v2_run_id + 1}/job/${canary.v2_job_id + 1}`,
+        });
+        return { [endpoint]: [page] };
+      },
+      expected: /CheckRun history contains more than one verifier run or CheckSuite lineage/u,
+    },
+    {
+      name: "checkrun-history-crosses-check-suite-lineage",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const checkRunsEndpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        const checkSuitesEndpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`;
+        const page = structuredClone(responses[checkRunsEndpoint][0]);
+        page.total_count = 2;
+        page.check_runs.push({
+          ...page.check_runs[0],
+          id: canary.v2_check_run_id + 1,
+          conclusion: "failure",
+          check_suite: { id: postCutoverAuditCheckSuiteId(canary) + 1 },
+          details_url:
+            `https://github.com/${canary.full_name}/actions/runs/${canary.v2_run_id}/job/${canary.v2_job_id + 1}`,
+        });
+        return {
+          [checkRunsEndpoint]: [page],
+          [checkSuitesEndpoint]: postCutoverAuditCheckSuitePages(canary, 2),
+        };
+      },
+      expected: /CheckRun history contains more than one verifier run or CheckSuite lineage/u,
+    },
+    {
+      name: "checkrun-history-has-unmapped-verifier-job",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        const page = structuredClone(responses[endpoint][0]);
+        page.total_count = 2;
+        page.check_runs.push({
+          ...page.check_runs[0],
+          id: canary.v2_check_run_id + 1,
+          conclusion: "failure",
+          details_url:
+            `https://github.com/${canary.full_name}/actions/runs/${canary.v2_run_id}/job/${canary.v2_job_id + 1}`,
+        });
+        return { [endpoint]: [page] };
+      },
+      expected: /CheckRun history contains an unmapped verifier job or attempt/u,
+    },
+    {
+      name: "checkrun-history-duplicates-verifier-job",
       overrides: (receipt, canary) => {
         const responses = postCutoverAuditCanaryResponses(receipt);
         const endpoint =
@@ -2997,7 +3298,91 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
         });
         return { [endpoint]: [page] };
       },
-      expected: /exactly one codex\/github-review-gate CheckRun generation/u,
+      expected: /CheckRun history does not map uniquely to verifier jobs/u,
+    },
+    {
+      name: "later-failed-run-attempt",
+      overrides: (receipt, canary) =>
+        postCutoverAuditCanaryResponses(receipt, {
+          attemptsByCanary: {
+            [canary.full_name]: [
+              {
+                attempt: canary.v2_run_attempt,
+                checkRunId: canary.v2_check_run_id,
+                jobId: canary.v2_job_id,
+                conclusion: "success",
+              },
+              {
+                attempt: canary.v2_run_attempt + 1,
+                checkRunId: canary.v2_check_run_id + 1,
+                jobId: canary.v2_job_id + 1,
+                conclusion: "failure",
+              },
+            ],
+          },
+        }),
+      expected: /fresh canary Actions run is not bound/u,
+    },
+    {
+      name: "current-run-changes-after-attempt-job-mapping",
+      finalReadEndpoint: (canary) =>
+        `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`,
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint = `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`;
+        const laterAttempt = structuredClone(responses[endpoint]);
+        laterAttempt.run_attempt += 1;
+        laterAttempt.conclusion = "failure";
+        return {
+          [endpoint]: {
+            __fake_sequence: [responses[endpoint], laterAttempt],
+          },
+        };
+      },
+      expected: /fresh canary Actions run is not bound to the receipt-bound verifier head\/test-merge execution/u,
+    },
+    {
+      name: "current-run-read-fails-after-attempt-job-mapping",
+      finalReadEndpoint: (canary) =>
+        `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`,
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint = `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`;
+        return {
+          [endpoint]: {
+            __fake_sequence: [
+              responses[endpoint],
+              {
+                __fake_http_error: 503,
+                message: "post-mapping Actions run read failed",
+              },
+            ],
+          },
+        };
+      },
+      expected: /post-mapping Actions run read failed/u,
+    },
+    {
+      name: "checkrun-history-read-fails-after-attempt-job-mapping",
+      finalReadEndpoint: (canary) =>
+        `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`,
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        return {
+          [endpoint]: {
+            __fake_sequence: [
+              responses[endpoint],
+              {
+                __fake_http_error: 503,
+                message: "post-mapping CheckRun read failed",
+              },
+            ],
+          },
+        };
+      },
+      expected: /post-mapping CheckRun read failed/u,
     },
     {
       name: "protected-control-plane-file",
@@ -3094,6 +3479,34 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
         `${scenario.name}: canary drift must reject before local mutations`,
       );
       assert.doesNotMatch(result.stdout, /Admitted bridge-removal proof|Applied:/u);
+      if (scenario.finalReadEndpoint !== undefined) {
+        const calls = readFileSync(
+          join(targetRoot, ".post-cutover-audit-gh-calls.log"),
+          "utf8",
+        )
+          .trim()
+          .split("\n");
+        const encodedRepo = encodeURIComponent(canary.full_name).replace(/%2F/gu, "/");
+        const mappedAttemptJobCall =
+          `GET repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/` +
+          `${canary.v2_run_attempt}/jobs?per_page=100`;
+        const finalReadCall = `GET ${scenario.finalReadEndpoint(canary)}`;
+        const initialReadIndex = calls.indexOf(finalReadCall);
+        const mappedAttemptJobIndex = calls.indexOf(mappedAttemptJobCall);
+        const finalReadIndex = calls.lastIndexOf(finalReadCall);
+        assert.ok(
+          initialReadIndex >= 0,
+          `${scenario.name}: initial selected evidence read must occur`,
+        );
+        assert.ok(
+          mappedAttemptJobIndex > initialReadIndex,
+          `${scenario.name}: receipt-bound attempt job must map after the initial read`,
+        );
+        assert.ok(
+          finalReadIndex > mappedAttemptJobIndex,
+          `${scenario.name}: final read must fence the completed attempt-job mapping`,
+        );
+      }
     } finally {
       rmSync(targetRoot, { recursive: true, force: true });
     }
@@ -14030,6 +14443,7 @@ function postCutoverAuditCanaryResponses(
     pullMerged = false,
     pullDraft = false,
     includeRunPullRequests = true,
+    attemptsByCanary = {},
   } = {},
 ) {
   return Object.assign(
@@ -14039,8 +14453,54 @@ function postCutoverAuditCanaryResponses(
       const encodedRepo = encodeURIComponent(repoSlug).replace(/%2F/gu, "/");
       const checkEndpoint =
         `repos/${encodedRepo}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
-      const jobsEndpoint =
-        `repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/${canary.v2_run_attempt}/jobs?per_page=100`;
+      // A native workflow rerun creates another CheckRun and attempt-scoped
+      // verifier job under the same Actions run and CheckSuite.  Keep this
+      // fixture shape explicit so positive and fail-closed lineage cases use
+      // the same REST identities that production consumes.
+      const attempts = attemptsByCanary[repoSlug] ?? [{
+        attempt: canary.v2_run_attempt,
+        checkRunId: canary.v2_check_run_id,
+        jobId: canary.v2_job_id,
+        conclusion: "success",
+      }];
+      if (
+        !Array.isArray(attempts) ||
+        attempts.length === 0 ||
+        attempts.some(
+          (attempt) =>
+            !Number.isSafeInteger(attempt?.attempt) ||
+            attempt.attempt <= 0 ||
+            !Number.isSafeInteger(attempt?.checkRunId) ||
+            attempt.checkRunId <= 0 ||
+            !Number.isSafeInteger(attempt?.jobId) ||
+            attempt.jobId <= 0 ||
+            typeof attempt?.conclusion !== "string" ||
+            attempt.conclusion === "",
+        )
+      ) {
+        throw new Error(`Invalid post-cutover attempt fixture for ${repoSlug}.`);
+      }
+      const liveAttempt = attempts.reduce(
+        (latest, attempt) => attempt.attempt > latest.attempt ? attempt : latest,
+      );
+      const attemptJobResponses = Object.fromEntries(
+        attempts.map((attempt) => [
+          `repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/${attempt.attempt}/jobs?per_page=100`,
+          [{
+            total_count: 1,
+            jobs: [{
+              id: attempt.jobId,
+              name: DEFAULT_STATUS_CONTEXT,
+              run_id: canary.v2_run_id,
+              head_sha: canary.head_sha,
+              status: "completed",
+              conclusion: attempt.conclusion,
+              check_run_url:
+                `https://api.github.com/repos/${repoSlug}/check-runs/${attempt.checkRunId}`,
+            }],
+          }],
+        ]),
+      );
       return {
         [`repos/${repoSlug}/pulls/${canary.pull_number}`]: {
           number: canary.pull_number,
@@ -14072,26 +14532,26 @@ function postCutoverAuditCanaryResponses(
           merge_commit_sha: canary.test_merge_sha,
         },
         [checkEndpoint]: [{
-          total_count: 1,
-          check_runs: [{
-            id: canary.v2_check_run_id,
+          total_count: attempts.length,
+          check_runs: attempts.map((attempt) => ({
+            id: attempt.checkRunId,
             name: DEFAULT_STATUS_CONTEXT,
             status: "completed",
-            conclusion: "success",
+            conclusion: attempt.conclusion,
             app: { id: DEFAULT_STATUS_INTEGRATION_ID, slug: "github-actions" },
             head_sha: canary.head_sha,
             check_suite: { id: postCutoverAuditCheckSuiteId(canary) },
             details_url:
-              `https://github.com/${repoSlug}/actions/runs/${canary.v2_run_id}/job/${canary.v2_job_id}`,
-          }],
+              `https://github.com/${repoSlug}/actions/runs/${canary.v2_run_id}/job/${attempt.jobId}`,
+          })),
         }],
-        [`repos/${repoSlug}/commits/${canary.head_sha}/check-suites?filter=all&per_page=100`]:
+        [`repos/${repoSlug}/commits/${canary.head_sha}/check-suites?per_page=100`]:
           postCutoverAuditCheckSuitePages(canary),
         [`repos/${repoSlug}/pulls/${canary.pull_number}/files?per_page=100`]: [[]],
         [`repos/${repoSlug}/actions/runs/${canary.v2_run_id}`]: {
           id: canary.v2_run_id,
           workflow_id: canary.v2_workflow_id,
-          run_attempt: canary.v2_run_attempt,
+          run_attempt: liveAttempt.attempt,
           display_title:
             `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/${canary.pull_number}/${canary.test_merge_sha}`,
           repository: {
@@ -14108,7 +14568,7 @@ function postCutoverAuditCanaryResponses(
           head_sha: canary.head_sha,
           event: "pull_request",
           status: "completed",
-          conclusion: "success",
+          conclusion: liveAttempt.conclusion,
           ...(includeRunPullRequests
             ? {
                 pull_requests: [{
@@ -14131,19 +14591,7 @@ function postCutoverAuditCanaryResponses(
           path: DEFAULT_WORKFLOW_PATH,
           state: "active",
         },
-        [jobsEndpoint]: [{
-          total_count: 1,
-          jobs: [{
-            id: canary.v2_job_id,
-            name: DEFAULT_STATUS_CONTEXT,
-            run_id: canary.v2_run_id,
-            head_sha: canary.head_sha,
-            status: "completed",
-            conclusion: "success",
-            check_run_url:
-              `https://api.github.com/repos/${repoSlug}/check-runs/${canary.v2_check_run_id}`,
-          }],
-        }],
+        ...attemptJobResponses,
       };
     }),
   );

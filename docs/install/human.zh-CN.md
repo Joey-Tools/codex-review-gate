@@ -29,12 +29,17 @@ canary，且保持 unmerged。每个 PR 的 GitHub exact UTC `created_at` 必须
 `2026-09-24T23:38:00Z`；helper 会读取并验证它、将它绑定进 receipt，所以即使其他 ID 自洽，旧 canary
 仍会被拒绝。
 在把 `filter=all` CheckRun history 视为完整之前，helper 会在该枚举的紧前、紧后各读取一次 canary
-head 的完整 `filter=all` Check Suite inventory。两个规范化的 suite window 必须完全一致，且 suite 数
+head 的完整、文档化 Check Suite inventory。两个规范化的 suite window 必须完全一致，且 suite 数
 不超过 1,000——这是 GitHub by-ref CheckRun endpoint 的文档化可见性边界。更大的、malformed 或发生变化的
 inventory 都是 inconclusive，不代表历史干净。这对相同的 before/after window 还必须非空，并包含已绑定的
 successful v2 CheckRun 的正整数 `check_suite.id`；该 ID 缺失或错配、以及 window 为空均为 inconclusive 并
-fail-closed。这个绑定避免把 successful CheckRun 与脱节的可见性 snapshot 配对。这只是跨 API 读取之间的
-fail-closed fence，不声称拥有远端原子锁。
+fail-closed。这个绑定避免把 successful CheckRun 与脱节的可见性 snapshot 配对。在 receipt 绑定的同一
+workflow run 内，每一个 terminal CheckRun 都必须与从 attempt 1 到 receipt 当前 attempt 的 canonical job
+一一对应；较早的 failed/cancelled controller recovery attempt 只有在该映射完整时才正常，当前 attempt 必须
+是 receipt 绑定的 success。更大、malformed、变化或无法映射的 inventory 都是 inconclusive。这只是跨 API
+读取之间的 fail-closed fence，不声称拥有远端原子锁。attempt job 映射完成后，helper 还会重新读取完整、
+有界的 CheckRun history 与当前 run；若同一 run 的新 retry 在此期间出现，则为 inconclusive，不能复用先前
+的 successful attempt。
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \
