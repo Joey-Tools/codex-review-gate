@@ -1429,6 +1429,18 @@ evidence that a prior freeze remains in force.
   requirement rather than becoming a v2 terminal carrier, the next canonical
   request must be bound to a new head rather than create a second request
   generation for the same head.
+- The replacement PR's live CI then confirmed a liveness cost in the old
+  source matrix: both all-in-one non-Release `core` legs passed, but took
+  roughly fifteen and sixteen minutes on Node 20 and Node 24 respectively.
+  The slow path was the serialized 163-case bootstrap suite. Per Joey's
+  approved multi-runner strategy, each Node version now has four bootstrap
+  shards with a sealed 41/41/41/40 registration partition, one explicit
+  non-Release core inventory, and the existing four sealed Release shards.
+  Every leg has a fourteen-minute timeout and there is no aggregate result
+  that could hide a failed matrix member. The workflow contract proves that
+  every discoverable test file is assigned exactly once; local Node 24
+  validation passed all four bootstrap shards, the complete explicit core
+  inventory, `npm run check`, and `actionlint`.
 
 ## Next Steps
 

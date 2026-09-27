@@ -17,8 +17,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 import { fileURLToPath } from "node:url";
+import { createShardedTest } from "./support/ci-test-shard.mjs";
+
+const test = createShardedTest(
+  nodeTest,
+  process.env.CODEX_REVIEW_GATE_BOOTSTRAP_TEST_SHARD,
+  "bootstrap",
+);
 
 import {
   CANONICAL_V2_WORKFLOW_USES,
@@ -13564,6 +13571,12 @@ fs.promises.rename = async function patchedRename(from, to) {
 syncBuiltinESMExports();
 `;
 }
+
+assert.equal(
+  test.registeredCount,
+  163,
+  "bootstrap test shard registration inventory drift",
+);
 
 function sourceBridgeRemovalWorktreeDiffRacePreloadSource() {
   return `
