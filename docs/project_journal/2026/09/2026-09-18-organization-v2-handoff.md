@@ -1351,6 +1351,24 @@ evidence that a prior freeze remains in force.
   Suite requests. `filter=all` remains required for CheckRun history; Check
   Suite before/after snapshots use the documented paginated endpoint and still
   compare only suite identity plus exact head, not mutable status metadata.
+- A fresh user-requested generic GPT-5.6 Terra Ultra review found a further
+  retry race: an `N+1` controller retry can retain the same workflow `run_id`
+  and Check Suite while it creates a new job/CheckRun after the `1..N`
+  attempt-job mapping has finished. Both the producer and bridge-removal
+  consumer now fence that mapping with another complete CheckRun-history and
+  current-run read. They compare only the protected execution identity
+  (suite/head window, history identities and conclusions, run attempt, head,
+  workflow, and terminal result), not incidental response timestamps. A newly
+  visible same-run retry therefore stays inconclusive and preserves the bridge;
+  this is a point-in-time fail-closed fence, not a claim of an atomic GitHub
+  lock after the final read.
+- Validation after that fence passed `npm run check`, `git diff --check`, and
+  project-journal validation. The complete producer suite exited `0` in
+  199.708 seconds with 248 dot-reporter success markers and no failure output.
+  The focused consumer bridge-removal suite passed 8/8, including normal
+  same-run recovery, the newly added post-mapping retry race, visibility-window
+  drift, closed-unmerged canaries, and deletion-boundary rereads. The known
+  monolithic bootstrap timeout remains unclaimed as a passing result.
 - Human and agent installation guides now distinguish the valid same-run
   recovery shape from a second producer generation, so an operator does not
   mistake an earlier failed attempt for either a clean result or a reason to

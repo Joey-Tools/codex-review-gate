@@ -963,6 +963,7 @@ function createFakeGhHarness(
     canaryState = "open",
     canaryCreatedAt = "2026-09-25T00:00:00Z",
     mutateV2CheckRunHistory = null,
+    v2CheckRunHistorySequence = null,
     v2AttemptJobInventories = null,
     mutateV2CheckSuiteHistory = null,
     v2CheckSuiteHistorySequence = null,
@@ -1026,6 +1027,20 @@ function createFakeGhHarness(
     typeof mutateV2CheckRunHistory !== "function"
   ) {
     throw new Error("mutateV2CheckRunHistory must be a function or null.");
+  }
+  if (
+    v2CheckRunHistorySequence !== null &&
+    typeof v2CheckRunHistorySequence !== "function"
+  ) {
+    throw new Error("v2CheckRunHistorySequence must be a function or null.");
+  }
+  if (
+    mutateV2CheckRunHistory !== null &&
+    v2CheckRunHistorySequence !== null
+  ) {
+    throw new Error(
+      "mutateV2CheckRunHistory and v2CheckRunHistorySequence cannot overlap.",
+    );
   }
   if (
     v2AttemptJobInventories !== null &&
@@ -1139,6 +1154,10 @@ function createFakeGhHarness(
     repositoryIdentityDelayCompletionMarker
       ? join(directory, "repository-identity-delay-complete")
       : null;
+  const v2CheckRunHistorySequenceStatePath =
+    v2CheckRunHistorySequence === null
+      ? null
+      : join(directory, "v2-check-run-history-read-count");
   const legacyProducerRunDelayCompletionPath =
     legacyProducerRunDelayCompletionMarker
       ? join(directory, "legacy-producer-run-delay-complete")
@@ -1149,6 +1168,7 @@ function createFakeGhHarness(
   const delayedRequests = [];
   const forcedFailureRequests = [];
   const v2CheckSuiteHistorySequenceResponses = [];
+  const v2CheckRunHistorySequenceResponses = [];
   const legacyWriterRaceResponses = [];
   const schedulerWorkflowResponses = [];
   const cleanupResponses = [];
@@ -1656,11 +1676,39 @@ function createFakeGhHarness(
       `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=latest&per_page=100`,
       latestCheckRunResponse,
     );
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`,
-      v2CheckRunPages(checkRunHistory),
-    );
+    const checkRunHistoryEndpoint =
+      `repos/${encodedSlug}/commits/${repository.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`;
+    const checkRunHistorySequence =
+      v2CheckRunHistorySequence !== null && repositoryIndex === 0
+        ? v2CheckRunHistorySequence(clone(checkRunHistory), {
+            repository,
+            repositoryIndex,
+          })
+        : null;
+    if (checkRunHistorySequence !== null) {
+      if (
+        !Array.isArray(checkRunHistorySequence) ||
+        checkRunHistorySequence.length < 2 ||
+        checkRunHistorySequence.some((history) => !Array.isArray(history))
+      ) {
+        throw new Error(
+          "v2CheckRunHistorySequence must return at least two CheckRun histories.",
+        );
+      }
+      v2CheckRunHistorySequenceResponses.push({
+        request: `GET:${checkRunHistoryEndpoint}`,
+        statePath: v2CheckRunHistorySequenceStatePath,
+        responses: checkRunHistorySequence.map((history) =>
+          JSON.stringify(v2CheckRunPages(history)),
+        ),
+      });
+    } else {
+      addFakeResponse(
+        responses,
+        checkRunHistoryEndpoint,
+        v2CheckRunPages(checkRunHistory),
+      );
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/actions/runs/${repository.canary.v2_run_id}`,
@@ -2254,6 +2302,28 @@ function createFakeGhHarness(
     }
     scriptLines.push("esac");
   }
+  if (v2CheckRunHistorySequenceResponses.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const response of v2CheckRunHistorySequenceResponses) {
+      scriptLines.push(
+        `  ${shellQuote(response.request)})`,
+        `    count="$(cat ${shellQuote(response.statePath)})"`,
+        "    count=$((count + 1))",
+        `    printf '%s\\n' "$count" > ${shellQuote(response.statePath)}`,
+        "    case \"$count\" in",
+      );
+      for (const [index, payload] of response.responses.entries()) {
+        scriptLines.push(
+          `      ${index + 1}) respond ${shellQuote(payload)} ;;`,
+        );
+      }
+      scriptLines.push(
+        `      *) respond ${shellQuote(response.responses.at(-1))} ;;`,
+        "    esac ;;",
+      );
+    }
+    scriptLines.push("esac");
+  }
   if (forcedFailureRequests.length > 0) {
     scriptLines.push('case "$request" in');
     for (const failure of forcedFailureRequests) {
@@ -2310,6 +2380,9 @@ function createFakeGhHarness(
   writeFileSync(schedulerStatePath, `${schedulerWorkflowState}\n`);
   if (v2CheckSuiteHistorySequenceStatePath !== null) {
     writeFileSync(v2CheckSuiteHistorySequenceStatePath, "0\n");
+  }
+  if (v2CheckRunHistorySequenceStatePath !== null) {
+    writeFileSync(v2CheckRunHistorySequenceStatePath, "0\n");
   }
   if (repositoryIdentityDelayCompletionPath !== null) {
     writeFileSync(repositoryIdentityDelayCompletionPath, "pending\n");
@@ -7161,8 +7234,8 @@ test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", asy
       `${repository.canary.head_sha}/check-suites?per_page=100`;
     assert.equal(
       countRequest(requests, "GET", checkSuiteEndpoint),
-      4,
-      `${repository.slug} must bracket the CheckRun history in both stable snapshots`,
+      8,
+      `${repository.slug} must bracket both CheckRun-history stability fences in both stable snapshots`,
     );
     const checkRunEndpoint =
       `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
@@ -7170,27 +7243,30 @@ test("post-cutover audit mints a read-only, fresh native-v2 canary receipt", asy
       `${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`;
     assert.equal(
       countRequest(requests, "GET", checkRunEndpoint),
-      2,
-      `${repository.slug} must re-read the native v2 CheckRun in both stable snapshots`,
+      4,
+      `${repository.slug} must re-read complete native v2 CheckRun history after each attempt-job mapping`,
     );
-    for (const [label, endpoint] of [
+    for (const [label, endpoint, expectedReads] of [
       [
         "Actions run",
         `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/${repository.canary.v2_run_id}`,
+        4,
       ],
       [
         "Actions workflow",
         `repos/${encodeEndpointPathForTest(repository.slug)}/actions/workflows/${repository.canary.v2_workflow_id}`,
+        2,
       ],
       [
         "Actions job attempt",
         `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`,
+        2,
       ],
     ]) {
       assert.equal(
         countRequest(requests, "GET", endpoint),
-        2,
-        `${repository.slug} must re-read the native v2 ${label} in both stable snapshots`,
+        expectedReads,
+        `${repository.slug} must perform the expected native v2 ${label} reads across both stable snapshots`,
       );
     }
     const canaryPullRequests = requests.filter(
@@ -7274,6 +7350,61 @@ test("post-cutover audit accepts a mapped retry lineage within one native workfl
       `${repository.slug} must map attempt ${runAttempt} in both stable snapshots`,
     );
   }
+});
+
+test("post-cutover audit fails closed when a retry appears after attempt-job mapping", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t, {
+    v2CheckRunHistorySequence(history, { repository }) {
+      const laterFailedAttempt = {
+        ...clone(history[0]),
+        id: repository.canary.v2_check_run_id + 1_000,
+        conclusion: "failure",
+        details_url:
+          `https://github.com/${repository.slug}/actions/runs/` +
+          `${repository.canary.v2_run_id}/job/${repository.canary.v2_job_id + 1_000}`,
+      };
+      // The first whole audit round and the initial read of the second round
+      // are stable. The later failure becomes visible only after that second
+      // round has mapped the receipt-bound attempt's job.
+      return [
+        history,
+        history,
+        history,
+        [...history, laterFailedAttempt],
+      ];
+    },
+  });
+
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit"),
+    /v2 CheckRun history or current run changed while attempt-scoped verifier jobs were mapped/u,
+  );
+  const requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(mutationRequests(requests), []);
+  const repository = harness.manifest.repositories[0];
+  const checkRunEndpoint =
+    `repos/${encodeEndpointPathForTest(repository.slug)}/commits/` +
+    `${repository.canary.head_sha}/check-runs?check_name=` +
+    `${encodeURIComponent(V2_STATUS_CONTEXT)}&filter=all&per_page=100`;
+  const attemptJobsEndpoint =
+    `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/` +
+    `${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`;
+  const fourthHistoryRead = requests.findIndex(
+    (request, index) =>
+      index > 0 &&
+      request.method === "GET" &&
+      request.endpoint === checkRunEndpoint &&
+      countRequest(requests.slice(0, index + 1), "GET", checkRunEndpoint) === 4,
+  );
+  const secondAttemptJobRead = requests.findIndex(
+    (request, index) =>
+      index > 0 &&
+      request.method === "GET" &&
+      request.endpoint === attemptJobsEndpoint &&
+      countRequest(requests.slice(0, index + 1), "GET", attemptJobsEndpoint) === 2,
+  );
+  assert.ok(secondAttemptJobRead >= 0, "second round must map the receipt-bound attempt job");
+  assert.ok(fourthHistoryRead > secondAttemptJobRead, "final history fence must follow attempt-job mapping");
 });
 
 test("post-cutover audit fails closed for divergent or unmapped v2 retry lineage", async (t) => {

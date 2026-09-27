@@ -76,7 +76,9 @@ fail-closed。这个绑定避免把 successful CheckRun 与脱节的可见性 sn
 workflow run 内，每一个 terminal CheckRun 都必须与从 attempt 1 到 receipt 当前 attempt 的 canonical job
 一一对应；较早的 failed/cancelled controller recovery attempt 只有在该映射完整时才正常，当前 attempt 必须
 是 receipt 绑定的 success。更大、malformed、变化或无法映射的 inventory 都是 inconclusive。这只是跨 API
-读取之间的 fail-closed fence，不声称拥有远端原子锁。
+读取之间的 fail-closed fence，不声称拥有远端原子锁。attempt job 映射完成后，helper 还会重新读取完整、
+有界的 CheckRun history 与当前 run；若同一 run 的新 retry 在此期间出现，则为 inconclusive，不能复用先前
+的 successful attempt。
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \

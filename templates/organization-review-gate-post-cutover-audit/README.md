@@ -122,6 +122,11 @@ is inconclusive. Findings, ambiguous provider evidence, a stale base, an
 edited or extra request generation, an incomplete API read, or a changed
 head/base/test merge are likewise inconclusive; repair the named condition or
 use a new replacement PR instead of treating historical evidence as current.
+After the attempt-job mapping, the audit repeats the complete bounded
+CheckRun-history and current-run reads and compares the protected execution
+identity (suite/history, run attempt, head, workflow, and terminal result).
+A same-run retry that becomes visible in that interval is inconclusive; it
+cannot reuse the prior successful attempt.
 GitHub lists CheckRuns by ref only across the newest 1,000 Check Suites. Before
 the audit treats `filter=all` CheckRun history as complete, it reads the
 complete documented Check Suite inventory for that canary head immediately
@@ -289,4 +294,8 @@ visibility snapshot. For the exact receipt-bound workflow run, it also maps
 every CheckRun in the complete history to one canonical job in every attempt
 through the receipt-bound current attempt. Earlier terminal recovery attempts
 are accepted only through that exact mapping; the current attempt alone must
-be the bound success.
+be the bound success. Before deleting the bridge, the consumer repeats the
+complete bounded CheckRun-history and current-run reads after the mapping. A
+same-run retry observed in that interval is inconclusive and leaves the bridge
+installed; this is a stability fence, not an assertion of an atomic remote
+lock.

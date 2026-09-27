@@ -96,7 +96,9 @@ controller recovery attempts are normal only when that mapping is complete;
 the current attempt must be the receipt-bound success. A larger, malformed,
 changing, or unmapped inventory is inconclusive rather than a clean history;
 this is an inter-request fail-closed fence, not a claim of an atomic remote
-lock.
+lock. After mapping the attempt jobs, the helper repeats the complete bounded
+CheckRun-history and current-run reads. A same-run retry that appears in that
+interval is inconclusive; it cannot reuse the prior successful attempt.
 
 ```bash
 node scripts/organization-review-gate-handoff.mjs \

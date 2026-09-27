@@ -2767,6 +2767,124 @@ test("post-cutover bridge removal accepts a receipt-bound same-run rerun recover
   }
 });
 
+test("post-cutover bridge removal fails closed when a same-run retry appears during attempt-job mapping", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-post-cutover-rerun-mapping-race-"),
+  );
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
+    const receipt = auditFixture.output.post_cutover_audit_receipt;
+    const canary = receipt.v2_canaries[0];
+    const beforeResponses = postCutoverAuditCanaryResponses(receipt);
+    const afterResponses = postCutoverAuditCanaryResponses(receipt, {
+      attemptsByCanary: {
+        [canary.full_name]: [
+          {
+            attempt: canary.v2_run_attempt,
+            checkRunId: canary.v2_check_run_id,
+            jobId: canary.v2_job_id,
+            conclusion: "success",
+          },
+          {
+            attempt: canary.v2_run_attempt + 1,
+            checkRunId: canary.v2_check_run_id + 1,
+            jobId: canary.v2_job_id + 1,
+            conclusion: "failure",
+          },
+        ],
+      },
+    });
+    const encodedRepo = encodeURIComponent(canary.full_name).replace(/%2F/gu, "/");
+    const checkRunsEndpoint =
+      `repos/${encodedRepo}/commits/${canary.head_sha}/check-runs?check_name=` +
+      `${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+    const runEndpoint = `repos/${encodedRepo}/actions/runs/${canary.v2_run_id}`;
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
+      output: auditFixture.output,
+    });
+    const auditProofEnv = postCutoverAuditGhEnvironment(targetRoot, {
+      ...auditFixture,
+      repositoryControlPlaneResponseOverrides: {
+        // The retry remains within the same run and CheckSuite. Keep the run
+        // response at attempt N to prove that the final full CheckRun-history
+        // fence, rather than only the run-attempt read, rejects the race.
+        [checkRunsEndpoint]: {
+          __fake_sequence: [
+            beforeResponses[checkRunsEndpoint],
+            afterResponses[checkRunsEndpoint],
+          ],
+        },
+        [runEndpoint]: {
+          __fake_sequence: [
+            beforeResponses[runEndpoint],
+            beforeResponses[runEndpoint],
+          ],
+        },
+      },
+    });
+    mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+    ], { env: auditProofEnv });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /fresh canary CheckRun history or current Actions run changed while attempt-scoped verifier jobs were mapped/u,
+    );
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+    const calls = readFileSync(
+      join(targetRoot, ".post-cutover-audit-gh-calls.log"),
+      "utf8",
+    )
+      .trim()
+      .split("\n");
+    const attemptJobsCall =
+      `GET repos/${encodedRepo}/actions/runs/${canary.v2_run_id}/attempts/` +
+      `${canary.v2_run_attempt}/jobs?per_page=100`;
+    const checkRunsCall = `GET ${checkRunsEndpoint}`;
+    assert.ok(calls.indexOf(attemptJobsCall) >= 0);
+    assert.ok(calls.lastIndexOf(checkRunsCall) > calls.indexOf(attemptJobsCall));
+    assert.equal(
+      calls.filter((call) => call === checkRunsCall).length,
+      2,
+      "the final fence must re-read complete CheckRun history",
+    );
+    assert.equal(
+      calls.filter((call) => call === `GET ${runEndpoint}`).length,
+      2,
+      "the final fence must re-read the current Actions run",
+    );
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
 test("post-cutover bridge removal fails closed when CheckSuite history crosses the visibility boundary during the CheckRun read", () => {
   const targetRoot = mkdtempSync(
     join(tmpdir(), "codex-review-gate-post-cutover-suite-window-race-"),

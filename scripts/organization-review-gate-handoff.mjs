@@ -3132,6 +3132,50 @@ export function validateV2CheckRunHistoryPages(pages, repo) {
   return { checkProjection, runId, jobId };
 }
 
+function validateV2CanaryActionsRun(run, repo) {
+  const workflowPath = parseWorkflowRunPath(run?.path, repo.default_branch);
+  const expectedTitle = `${V2_VERIFIER_RUN_NAME_PREFIX}/${repo.canary.pull_number}/${repo.canary.test_merge_sha}`;
+  const matchingPull = Array.isArray(run?.pull_requests)
+    ? run.pull_requests.filter(
+        (pull) =>
+          pull?.number === repo.canary.pull_number &&
+          pull?.head?.sha === repo.canary.head_sha &&
+          pull?.base?.ref === repo.default_branch,
+      )
+    : [];
+  if (
+    run?.id !== repo.canary.v2_run_id ||
+    run?.workflow_id !== repo.canary.v2_workflow_id ||
+    run?.run_attempt !== repo.canary.v2_run_attempt ||
+    run?.display_title !== expectedTitle ||
+    run?.repository?.full_name !== repo.slug ||
+    run?.head_repository?.full_name !== repo.slug ||
+    workflowPath.workflow_path !== CANONICAL_WORKFLOW_IDENTITIES.verifier.path ||
+    run?.head_sha !== repo.canary.head_sha ||
+    run?.event !== "pull_request" ||
+    run?.status !== "completed" ||
+    run?.conclusion !== "success" ||
+    matchingPull.length !== 1
+  ) {
+    throw new Error(`${repo.slug} v2 CheckRun is not bound to the exact canonical test-merge run.`);
+  }
+  // This is an object-identity and terminal-execution projection, not a raw
+  // run-object comparison.  GitHub may change unrelated metadata, whereas a
+  // changed attempt, selected PR/head, workflow, or terminal result means the
+  // evidence selected for this cutover is no longer stable.
+  return {
+    id: run.id,
+    workflow_id: run.workflow_id,
+    run_attempt: run.run_attempt,
+    display_title: run.display_title,
+    workflow_path: workflowPath.workflow_path,
+    workflow_ref: workflowPath.workflow_ref,
+    head_sha: run.head_sha,
+    status: run.status,
+    conclusion: run.conclusion,
+  };
+}
+
 export function validateV2CheckSuiteHistoryPages(pages, repo) {
   if (
     !Array.isArray(pages) ||
@@ -3242,6 +3286,42 @@ async function loadV2CheckSuiteVisibilityWindow(repo) {
   );
 }
 
+function v2CompleteHistoryEvidenceFingerprint({
+  checkSuiteVisibilityWindow,
+  historyEvidence,
+}) {
+  return canonicalJson({
+    check_suite_visibility_window: checkSuiteVisibilityWindow,
+    check_run_history: [...historyEvidence.history].sort(
+      (left, right) => left.id - right.id,
+    ),
+  });
+}
+
+async function loadCompleteV2HistoryEvidence(repo) {
+  const checkSuiteVisibilityWindow = await loadV2CheckSuiteVisibilityWindow(repo);
+  const endpoint =
+    `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}`;
+  const historyEvidence = validateV2CheckRunHistoryPagesWithSuite(
+    await ghJson(
+      `${endpoint}&filter=all&per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
+      { paginate: true },
+    ),
+    repo,
+  );
+  assertV2CheckSuiteVisibilityWindowStable(
+    checkSuiteVisibilityWindow,
+    await loadV2CheckSuiteVisibilityWindow(repo),
+    repo,
+  );
+  assertV2CheckRunSuiteInVisibilityWindow(
+    historyEvidence.checkSuiteId,
+    checkSuiteVisibilityWindow,
+    repo,
+  );
+  return { checkSuiteVisibilityWindow, historyEvidence };
+}
+
 async function loadV2CanaryEvidence(
   repo,
   { requireCompleteHistory = false } = {},
@@ -3251,18 +3331,12 @@ async function loadV2CanaryEvidence(
   }
   const endpoint =
     `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-runs?check_name=${encodeURIComponent(V2_STATUS_CONTEXT)}`;
-  const checkSuiteVisibilityWindow = requireCompleteHistory
-    ? await loadV2CheckSuiteVisibilityWindow(repo)
+  const completeHistoryEvidence = requireCompleteHistory
+    ? await loadCompleteV2HistoryEvidence(repo)
     : null;
-  const historyEvidence = requireCompleteHistory
-    ? validateV2CheckRunHistoryPagesWithSuite(
-        await ghJson(
-          `${endpoint}&filter=all&per_page=${V2_CHECK_RUN_PAGE_SIZE}`,
-          { paginate: true },
-        ),
-        repo,
-      )
-    : null;
+  const checkSuiteVisibilityWindow =
+    completeHistoryEvidence?.checkSuiteVisibilityWindow ?? null;
+  const historyEvidence = completeHistoryEvidence?.historyEvidence ?? null;
   const { checkProjection, runId, jobId, checkSuiteId } =
     historyEvidence ??
     validateV2CheckRunResponseWithSuite(
@@ -3271,47 +3345,9 @@ async function loadV2CanaryEvidence(
       ),
       repo,
     );
-  if (checkSuiteVisibilityWindow !== null) {
-    assertV2CheckSuiteVisibilityWindowStable(
-      checkSuiteVisibilityWindow,
-      await loadV2CheckSuiteVisibilityWindow(repo),
-      repo,
-    );
-    assertV2CheckRunSuiteInVisibilityWindow(
-      checkSuiteId,
-      checkSuiteVisibilityWindow,
-      repo,
-    );
-  }
-  const run = await ghJson(
+  const run = validateV2CanaryActionsRun(await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/actions/runs/${runId}`,
-  );
-  const workflowPath = parseWorkflowRunPath(run?.path, repo.default_branch);
-  const expectedTitle = `${V2_VERIFIER_RUN_NAME_PREFIX}/${repo.canary.pull_number}/${repo.canary.test_merge_sha}`;
-  const matchingPull = Array.isArray(run?.pull_requests)
-    ? run.pull_requests.filter(
-        (pull) =>
-          pull?.number === repo.canary.pull_number &&
-          pull?.head?.sha === repo.canary.head_sha &&
-          pull?.base?.ref === repo.default_branch,
-      )
-    : [];
-  if (
-    run?.id !== repo.canary.v2_run_id ||
-    run?.workflow_id !== repo.canary.v2_workflow_id ||
-    run?.run_attempt !== repo.canary.v2_run_attempt ||
-    run?.display_title !== expectedTitle ||
-    run?.repository?.full_name !== repo.slug ||
-    run?.head_repository?.full_name !== repo.slug ||
-    workflowPath.workflow_path !== CANONICAL_WORKFLOW_IDENTITIES.verifier.path ||
-    run?.head_sha !== repo.canary.head_sha ||
-    run?.event !== "pull_request" ||
-    run?.status !== "completed" ||
-    run?.conclusion !== "success" ||
-    matchingPull.length !== 1
-  ) {
-    throw new Error(`${repo.slug} v2 CheckRun is not bound to the exact canonical test-merge run.`);
-  }
+  ), repo);
   const workflow = await ghJson(
     `repos/${encodeEndpointPath(repo.slug)}/actions/workflows/${repo.canary.v2_workflow_id}`,
   );
@@ -3348,6 +3384,28 @@ async function loadV2CanaryEvidence(
       currentAttemptJobs: jobs,
       history: historyEvidence.history,
     });
+    // A rerun keeps the same workflow-run and CheckSuite identities while it
+    // creates a new attempt/job/CheckRun.  Re-read the complete bounded
+    // history and current run after mapping jobs, so a retry that begins in
+    // that interval is a fail-closed instability rather than an old success.
+    const finalHistoryEvidence = await loadCompleteV2HistoryEvidence(repo);
+    const finalRun = validateV2CanaryActionsRun(
+      await ghJson(
+        `repos/${encodeEndpointPath(repo.slug)}/actions/runs/${runId}`,
+      ),
+      repo,
+    );
+    if (
+      v2CompleteHistoryEvidenceFingerprint({
+        checkSuiteVisibilityWindow,
+        historyEvidence,
+      }) !== v2CompleteHistoryEvidenceFingerprint(finalHistoryEvidence) ||
+      canonicalJson(run) !== canonicalJson(finalRun)
+    ) {
+      throw new Error(
+        `${repo.slug} v2 CheckRun history or current run changed while attempt-scoped verifier jobs were mapped.`,
+      );
+    }
   }
   return {
     ...(checkSuiteVisibilityWindow === null
@@ -3359,8 +3417,8 @@ async function loadV2CanaryEvidence(
       workflow_id: run.workflow_id,
       run_attempt: run.run_attempt,
       display_title: run.display_title,
-      workflow_path: workflowPath.workflow_path,
-      workflow_ref: workflowPath.workflow_ref,
+      workflow_path: run.workflow_path,
+      workflow_ref: run.workflow_ref,
       head_sha: run.head_sha,
     },
     job: {
