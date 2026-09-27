@@ -267,6 +267,14 @@ const ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS = 18_005_000;
 const MAX_ACTIVATION_COVERAGE_STABILITY_TIMEOUT_MS =
   2 * MAX_ACTIVATION_COVERAGE_ROUND_TIMEOUT_MS +
   ACTIVATION_STABILITY_INTERVAL_MS;
+// The post-cutover reader takes two *whole* active-10 cohort snapshots. Each
+// round includes complete CheckSuite/CheckRun histories plus attempt-job
+// mapping in five repository waves. The observed stable pair exceeded the
+// single-PR runtime's 60-second default without any protected-object change.
+// This remains a finite operational budget only: every successful result still
+// requires canonical equality of both complete snapshots.
+export const POST_CUTOVER_AUDIT_STABILITY_INTERVAL_MS = 5_000;
+export const POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS = 300_000;
 // These inventories feed bounded fan-out reads. Keep their cardinalities small
 // enough that a single evidence phase remains operationally inspectable.
 const MAX_WORKFLOW_INVENTORY_YAML_FILES = 32;
@@ -6204,7 +6212,7 @@ export function postCutoverAuditPlanDigest(plan) {
 async function runPostCutoverAuditMode(manifest, runtime) {
   const snapshot = await loadStable("Post-cutover fresh v2 audit", () =>
     loadPostCutoverAuditRound(manifest),
-    runtime.stableSnapshotOptions,
+    postCutoverAuditStableSnapshotOptions(runtime.stableSnapshotOptions),
   );
   const receipt = buildPostCutoverAuditReceipt(manifest, snapshot);
   const plan = {
@@ -6228,6 +6236,27 @@ async function runPostCutoverAuditMode(manifest, runtime) {
     repositories_verified: snapshot.repositories.length,
     post_cutover_audit_receipt: receipt,
     post_cutover_audit_receipt_sha256: sha256Canonical(receipt),
+  };
+}
+
+export function postCutoverAuditStableSnapshotOptions(options = undefined) {
+  if (options === undefined) {
+    return {
+      intervalMs: POST_CUTOVER_AUDIT_STABILITY_INTERVAL_MS,
+      timeoutMs: POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS,
+    };
+  }
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    return options;
+  }
+  return {
+    ...options,
+    ...(options.intervalMs === undefined
+      ? { intervalMs: POST_CUTOVER_AUDIT_STABILITY_INTERVAL_MS }
+      : {}),
+    ...(options.timeoutMs === undefined
+      ? { timeoutMs: POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS }
+      : {}),
   };
 }
 

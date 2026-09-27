@@ -37,6 +37,8 @@ import {
   POST_CUTOVER_AUDIT_MANIFEST_SCHEMA_VERSION,
   POST_CUTOVER_AUDIT_OUTPUT_SCHEMA_VERSION,
   POST_CUTOVER_AUDIT_RECEIPT_SCHEMA_VERSION,
+  POST_CUTOVER_AUDIT_STABILITY_INTERVAL_MS,
+  POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS,
   REQUIRED_REPOSITORY_COUNT,
   RetryableHandoffEvidenceUnstableError,
   SOURCE_SELF_HOSTING_REPOSITORY,
@@ -53,6 +55,7 @@ import {
   loadStableSnapshots,
   mapWithConcurrency,
   parseWorkflowRunPath,
+  postCutoverAuditStableSnapshotOptions,
   postCutoverAuditPlanDigest,
   runCli,
   scanLegacyWriterRuns,
@@ -7897,6 +7900,29 @@ test("post-cutover stable-pair contract fails closed when fresh canary state kee
     /remained unstable for 10ms/u,
   );
   assert.equal(loads, 4, "a drifting audit must read full pairs before timing out");
+});
+
+test("post-cutover audit has a bounded cohort-specific stability budget", () => {
+  assert.equal(POST_CUTOVER_AUDIT_STABILITY_INTERVAL_MS, 5_000);
+  assert.equal(POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS, 300_000);
+  assert.deepEqual(postCutoverAuditStableSnapshotOptions(), {
+    intervalMs: POST_CUTOVER_AUDIT_STABILITY_INTERVAL_MS,
+    timeoutMs: POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS,
+  });
+
+  const explicit = { intervalMs: 5, timeoutMs: 10 };
+  assert.deepEqual(
+    postCutoverAuditStableSnapshotOptions(explicit),
+    explicit,
+    "an injected bounded timeout remains authoritative for tests and embeddings",
+  );
+  assert.deepEqual(
+    postCutoverAuditStableSnapshotOptions({ intervalMs: 5 }),
+    {
+      intervalMs: 5,
+      timeoutMs: POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS,
+    },
+  );
 });
 
 test("post-cutover audit rejects missing bypass disclosure, residual legacy policy, and org mismatch", async (t) => {

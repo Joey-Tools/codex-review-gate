@@ -163,6 +163,12 @@ comparison; a changed or unreadable item restarts or fails the audit rather
 than being treated as absence. Only then does the helper emit the post-cutover
 receipt.
 
+The fixed active-10 audit uses a five-minute total stability budget and a
+five-second inter-read delay. This is an operational bound for two complete
+cohort reads, not a relaxation of the equality requirement: an audit that
+cannot finish its complete stable pair within that budget remains inconclusive
+and permits no bridge-removal write.
+
 Keep the new canaries open until the two-snapshot audit is complete. Close each
 one unmerged afterwards. Closing an old or new canary does not itself prove
 v2; the preserved complete output and its digest do.
