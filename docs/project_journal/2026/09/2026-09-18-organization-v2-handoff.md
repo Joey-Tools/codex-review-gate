@@ -1418,6 +1418,17 @@ evidence that a prior freeze remains in force.
   evidence; deliver the already-validated repair through one replacement PR
   with exactly one canonical `begin-review` request and no bare
   `@codex review` comment.
+- Replacement PR #80 received one current-head inline P2 about the retry
+  bound. The claim that GitHub permits only three reruns was rejected with
+  the current GitHub Actions documentation: a workflow run may be rerun at
+  most fifty times, so the initial attempt plus those reruns gives the
+  receipt bound of fifty-one. The adjacent source comment and schema tests
+  already encode that contract; the review thread was answered with the
+  official source and resolved without changing the bound. Because the
+  inline-only finding is intentionally left to the ruleset's conversation
+  requirement rather than becoming a v2 terminal carrier, the next canonical
+  request must be bound to a new head rather than create a second request
+  generation for the same head.
 
 ## Next Steps
 
