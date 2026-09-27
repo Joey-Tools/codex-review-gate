@@ -52,6 +52,7 @@ import {
   deriveLegacyOrganizationCutoverPayload,
   deriveRepositoryCleanupAction,
   loadLegacyStatusEvidence,
+  loadStablePostCutoverAuditSnapshots,
   loadStableSnapshots,
   mapWithConcurrency,
   parseWorkflowRunPath,
@@ -7922,6 +7923,70 @@ test("post-cutover audit has a bounded cohort-specific stability budget", () => 
       intervalMs: 5,
       timeoutMs: POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS,
     },
+  );
+});
+
+test("post-cutover audit total budget stops a slow first round before a second round", async () => {
+  const timeoutMs = 10_000;
+  let clock = 0;
+  let loads = 0;
+  let sleeps = 0;
+  await assert.rejects(
+    loadStablePostCutoverAuditSnapshots(
+      async () => {
+        loads += 1;
+        clock += timeoutMs + 1;
+        return { round: loads };
+      },
+      {
+        intervalMs: 5,
+        timeoutMs,
+        now: () => clock,
+        sleep: async () => {
+          sleeps += 1;
+        },
+      },
+    ),
+    new RegExp(`could not complete a stable pair within ${timeoutMs}ms`, "u"),
+  );
+  assert.equal(loads, 1, "a budget-exhausted first round must not begin a second round");
+  assert.equal(sleeps, 0, "a budget-exhausted first round must not enter the delay");
+});
+
+test("post-cutover audit propagates its total budget into a live gh request", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t, {
+    repositoryIdentityDelayIndex: 0,
+    repositoryIdentityDelaySeconds: 5,
+    repositoryIdentityDelayCompletionMarker: true,
+  });
+  assert.ok(harness.repositoryIdentityDelayCompletionPath);
+  const firstRepository = harness.manifest.repositories[0];
+  const delayedEndpoint = `repos/${encodeEndpointPathForTest(firstRepository.slug)}`;
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit", [], {
+      stableSnapshotOptions: {
+        intervalMs: 5,
+        timeoutMs: 2_500,
+        now: performance.now.bind(performance),
+        sleep: async (milliseconds) => new Promise((resolvePromise) => {
+          setTimeout(resolvePromise, milliseconds);
+        }),
+      },
+      writeOutput: () => {},
+    }),
+    /could not complete a stable pair within 2500ms/u,
+  );
+  assert.equal(
+    readFileSync(harness.repositoryIdentityDelayCompletionPath, "utf8").trim(),
+    "pending",
+    "the delayed gh child must be stopped by the shared audit deadline",
+  );
+  assert.equal(
+    fakeGhRequests(harness.logPath).some(
+      ({ method, endpoint }) => method === "GET" && endpoint === delayedEndpoint,
+    ),
+    true,
+    "the bound request must have been issued before its shared deadline expired",
   );
 });
 

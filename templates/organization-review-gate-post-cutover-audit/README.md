@@ -168,6 +168,9 @@ five-second inter-read delay. This is an operational bound for two complete
 cohort reads, not a relaxation of the equality requirement: an audit that
 cannot finish its complete stable pair within that budget remains inconclusive
 and permits no bridge-removal write.
+The same deadline is inherited by every GitHub request during both rounds, so a
+slow first round cannot spend the budget and then start the delay or a second
+round.
 
 Keep the new canaries open until the two-snapshot audit is complete. Close each
 one unmerged afterwards. Closing an old or new canary does not itself prove

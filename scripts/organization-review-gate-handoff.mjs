@@ -6210,9 +6210,9 @@ export function postCutoverAuditPlanDigest(plan) {
 }
 
 async function runPostCutoverAuditMode(manifest, runtime) {
-  const snapshot = await loadStable("Post-cutover fresh v2 audit", () =>
-    loadPostCutoverAuditRound(manifest),
-    postCutoverAuditStableSnapshotOptions(runtime.stableSnapshotOptions),
+  const snapshot = await loadStablePostCutoverAuditSnapshots(
+    () => loadPostCutoverAuditRound(manifest),
+    runtime.stableSnapshotOptions,
   );
   const receipt = buildPostCutoverAuditReceipt(manifest, snapshot);
   const plan = {
@@ -6258,6 +6258,102 @@ export function postCutoverAuditStableSnapshotOptions(options = undefined) {
       ? { timeoutMs: POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS }
       : {}),
   };
+}
+
+function postCutoverAuditStabilityDeadlineError(timeoutMs) {
+  return new Error(
+    `Post-cutover fresh v2 audit could not complete a stable pair within ${timeoutMs}ms; the result is inconclusive and no bridge-removal write is allowed.`,
+  );
+}
+
+// This is intentionally narrower than the generic stable reader. The
+// post-cutover audit is a whole-cohort operation, so its total pair budget must
+// bound both the snapshot comparison and every GitHub request made while either
+// round is loading. Otherwise one slow first round could consume the budget and
+// still begin the delay or a second round.
+export async function loadStablePostCutoverAuditSnapshots(
+  loader,
+  options = undefined,
+) {
+  const effectiveOptions = postCutoverAuditStableSnapshotOptions(options);
+  if (
+    effectiveOptions === null ||
+    typeof effectiveOptions !== "object" ||
+    Array.isArray(effectiveOptions)
+  ) {
+    return loadStable("Post-cutover fresh v2 audit", loader, effectiveOptions);
+  }
+  const {
+    sleep = delay,
+    now = performance.now.bind(performance),
+    intervalMs = POST_CUTOVER_AUDIT_STABILITY_INTERVAL_MS,
+    timeoutMs = POST_CUTOVER_AUDIT_STABILITY_TIMEOUT_MS,
+  } = effectiveOptions;
+  if (
+    typeof loader !== "function" ||
+    typeof sleep !== "function" ||
+    typeof now !== "function" ||
+    !Number.isSafeInteger(intervalMs) ||
+    intervalMs < 0 ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < intervalMs
+  ) {
+    return loadStable("Post-cutover fresh v2 audit", loader, effectiveOptions);
+  }
+
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error("Post-cutover audit stability clock returned an invalid start time.");
+  }
+  const stableDeadlineAt = startedAt + timeoutMs;
+  const ghDeadlineAt = performance.now() + timeoutMs;
+  if (!Number.isFinite(stableDeadlineAt) || !Number.isFinite(ghDeadlineAt)) {
+    throw new Error("Post-cutover audit stability deadline is invalid.");
+  }
+  let lastObservedAt = startedAt;
+  const ensureRemaining = () => {
+    const observedAt = now();
+    if (!Number.isFinite(observedAt) || observedAt < lastObservedAt) {
+      throw new Error("Post-cutover audit stability clock is invalid or moved backwards.");
+    }
+    lastObservedAt = observedAt;
+    if (observedAt >= stableDeadlineAt) {
+      throw postCutoverAuditStabilityDeadlineError(timeoutMs);
+    }
+  };
+  const boundedLoader = async () => {
+    ensureRemaining();
+    const snapshot = await loader();
+    ensureRemaining();
+    return snapshot;
+  };
+  const boundedSleep = async (milliseconds) => {
+    ensureRemaining();
+    await sleep(Math.min(milliseconds, stableDeadlineAt - lastObservedAt));
+    ensureRemaining();
+  };
+
+  try {
+    const snapshot = await withGhDeadline(
+      ghDeadlineAt,
+      "Post-cutover fresh v2 audit",
+      () =>
+        loadStable("Post-cutover fresh v2 audit", boundedLoader, {
+          ...effectiveOptions,
+          now,
+          sleep: boundedSleep,
+        }),
+    );
+    if (performance.now() >= ghDeadlineAt) {
+      throw new DeadlineExceededError("Post-cutover fresh v2 audit");
+    }
+    return snapshot;
+  } catch (error) {
+    if (error instanceof DeadlineExceededError) {
+      throw postCutoverAuditStabilityDeadlineError(timeoutMs);
+    }
+    throw error;
+  }
 }
 
 function assertExpectedPlan(options, digest) {

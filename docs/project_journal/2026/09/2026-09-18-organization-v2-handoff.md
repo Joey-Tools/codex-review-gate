@@ -120,6 +120,10 @@ superseded_by:
   retaining the five-second delay and exact canonical equality requirement. A
   changed, unreadable, or over-budget cohort remains inconclusive and permits
   no bridge-removal write; the longer budget changes observation capacity only.
+- That budget is also propagated as one shared GitHub request deadline. A slow
+  first cohort round cannot consume it and then begin the inter-read delay or a
+  second round; this keeps the documented total bound real rather than a
+  post-pair observation only.
 
 - Source tooling implements the temporary bridge, cohort handoff transaction,
   receipt-bound bridge removal, and their operator-facing guides. Source PR
