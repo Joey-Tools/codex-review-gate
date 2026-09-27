@@ -1440,7 +1440,9 @@ evidence that a prior freeze remains in force.
   that could hide a failed matrix member. The workflow contract proves that
   every discoverable test file is assigned exactly once; local Node 24
   validation passed all four bootstrap shards, the complete explicit core
-  inventory, `npm run check`, and `actionlint`.
+  inventory, `npm run check`, and `actionlint`. The sealed bootstrap contract
+  also forbids direct `nodeTest` registrations, so a future test cannot run
+  outside the four-way partition while leaving the ordinal count unchanged.
 
 ## Next Steps
 

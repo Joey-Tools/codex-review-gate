@@ -372,6 +372,14 @@ function assertBootstrapRegistrationContract(source) {
     ['import nodeTest from "node:test";'],
     "bootstrap suite must use exactly one canonical node:test import",
   );
+  assert.equal([...source.matchAll(/\bnodeTest\b/gu)].length, 2);
+  assert.equal(
+    [...source.matchAll(new RegExp(
+      `\\b${escapeRegExp(shardAdapterIdentifier)}\\b`,
+      "gu",
+    ))].length,
+    2,
+  );
   assert.match(
     source,
     new RegExp(
@@ -387,7 +395,7 @@ function assertBootstrapRegistrationContract(source) {
   );
   assert.doesNotMatch(
     source,
-    /^\s*(?:describe|it|suite)\s*(?:\(|\.|\[)|\b(?:nodeTest|test)\s*(?:\.(?:only|skip|todo)|\[)|\bt\.test\s*\(/mu,
+    /^\s*(?:describe|it|suite)\s*(?:\(|\.|\[)|\b(?:nodeTest|test)\s*(?:\.(?:only|skip|todo)|\[)|\b(?:nodeTest|test)\s*\([^\n]*\b(?:only|skip|todo)\s*:|\bt\.test\s*\(/mu,
     "bootstrap suite contains an unsupported registration form",
   );
   assert.doesNotMatch(
@@ -706,5 +714,36 @@ test("release registration contract rejects alternate or suppressed tests", () =
     aliasedFactorySource,
   ]) {
     assert.throws(() => assertReleaseRegistrationContract(mutatedSource));
+  }
+});
+
+test("bootstrap registration contract rejects alternate or suppressed tests", () => {
+  const canonicalImport = `import { ${shardAdapterIdentifier} } from "./support/ci-test-shard.mjs";`;
+  const aliasedFactorySource = bootstrapTestSource
+    .replace(
+      canonicalImport,
+      `import { ${shardAdapterIdentifier} as buildShardedTest } from "./support/ci-test-shard.mjs";`,
+    )
+    .replace(
+      `const test = ${shardAdapterIdentifier}(`,
+      "const test = buildShardedTest(",
+    );
+  for (const [fixtureIndex, mutatedSource] of [
+    bootstrapTestSource.replace(
+      'import nodeTest from "node:test";',
+      'import nodeTest, { it } from "node:test";',
+    ),
+    `${bootstrapTestSource}\nnodeTest("unsharded", () => {});\n`,
+    `${bootstrapTestSource}\ndescribe("unsharded", () => {});\n`,
+    bootstrapTestSource.replace(/^test\(/mu, "test.skip("),
+    bootstrapTestSource.replace(/^test\(([^,\n]+), /mu, "test($1, { skip: true }, "),
+    `${bootstrapTestSource}\nconst alternateTest = test;\n`,
+    aliasedFactorySource,
+  ].entries()) {
+    assert.throws(
+      () => assertBootstrapRegistrationContract(mutatedSource),
+      undefined,
+      `bootstrap registration fixture ${fixtureIndex}`,
+    );
   }
 });
