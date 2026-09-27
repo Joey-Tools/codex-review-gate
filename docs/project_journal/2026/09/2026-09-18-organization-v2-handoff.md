@@ -1407,6 +1407,17 @@ evidence that a prior freeze remains in force.
   < final read`. This covers final-run drift plus final Actions-run and
   CheckRun-history 503s, so moving the fence ahead of job mapping fails the
   test rather than accidentally preserving its apparent coverage.
+- Live gate exercise then established that source PR #79 cannot recover on
+  its existing pull-request lineage: ordinary review requests `5851381116`
+  and `5851468516` precede the canonical workflow request `5851498135`, but
+  the later ordinary request has no directly attributable settled closure.
+  Both official terminal-clean comments have correct Codex App provenance and
+  the exact current short commit binding, yet accepting either would risk
+  binding delayed evidence to the wrong request generation. The v2 verifier
+  therefore remains fail-closed by design. Preserve #79 as diagnostic
+  evidence; deliver the already-validated repair through one replacement PR
+  with exactly one canonical `begin-review` request and no bare
+  `@codex review` comment.
 
 ## Next Steps
 
