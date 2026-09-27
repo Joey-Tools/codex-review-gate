@@ -109,6 +109,22 @@ superseded_by:
 
 ## Current State
 
+### Post-cutover audit timing repair — 2026-09-27
+
+- A live, read-only active-10 audit confirmed that the first full pair of
+  snapshots can exceed the single-PR runtime's inherited 60-second budget even
+  when the two canonical snapshot digests are identical. The resulting
+  `remained unstable` outcome was therefore an insufficient operational budget,
+  not evidence of control-plane or canary drift.
+- The post-cutover-only reader now has a bounded five-minute pair budget while
+  retaining the five-second delay and exact canonical equality requirement. A
+  changed, unreadable, or over-budget cohort remains inconclusive and permits
+  no bridge-removal write; the longer budget changes observation capacity only.
+- That budget is also propagated as one shared GitHub request deadline. A slow
+  first cohort round cannot consume it and then begin the inter-read delay or a
+  second round; this keeps the documented total bound real rather than a
+  post-pair observation only.
+
 - Source tooling implements the temporary bridge, cohort handoff transaction,
   receipt-bound bridge removal, and their operator-facing guides. Source PR
   `#54` merged as `5442b851200b6dd1fc85f88f0e2861f64d043906`: it corrects the
