@@ -3277,6 +3277,9 @@ function assertV2CheckRunSuiteInVisibilityWindow(
 }
 
 async function loadV2CheckSuiteVisibilityWindow(repo) {
+  // GitHub documents no `filter` parameter for Check Suites. This paginated
+  // endpoint is the complete suite inventory that fences the subsequent
+  // Check Runs `filter=all` visibility window.
   return validateV2CheckSuiteHistoryPages(
     await ghJson(
       `repos/${encodeEndpointPath(repo.slug)}/commits/${repo.canary.head_sha}/check-suites?per_page=${V2_CHECK_RUN_PAGE_SIZE}`,

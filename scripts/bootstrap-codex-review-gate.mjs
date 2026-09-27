@@ -5275,6 +5275,9 @@ async function loadCompletePostCutoverAuditCheckSuites({
   encodedRepo,
   headSha,
 }) {
+  // GitHub documents no `filter` parameter for Check Suites. This paginated
+  // endpoint is the complete suite inventory that fences the subsequent
+  // Check Runs `filter=all` visibility window.
   const pages = await ghJson(
     `repos/${encodedRepo}/commits/${headSha}/check-suites?per_page=100`,
     { paginate: true },
