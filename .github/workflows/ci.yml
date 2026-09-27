@@ -14,69 +14,129 @@ jobs:
   test-node-20:
     name: CI shard / Node.js / ${{ matrix.suite.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 14
     strategy:
       fail-fast: false
       matrix:
         suite:
+          - name: bootstrap 1/4
+            kind: bootstrap
+            bootstrap_test_shard: "1/4"
+            release_test_shard: "off"
+          - name: bootstrap 2/4
+            kind: bootstrap
+            bootstrap_test_shard: "2/4"
+            release_test_shard: "off"
+          - name: bootstrap 3/4
+            kind: bootstrap
+            bootstrap_test_shard: "3/4"
+            release_test_shard: "off"
+          - name: bootstrap 4/4
+            kind: bootstrap
+            bootstrap_test_shard: "4/4"
+            release_test_shard: "off"
           - name: core
-            release-test-shard: "off"
+            kind: core
+            bootstrap_test_shard: "off"
+            release_test_shard: "off"
           - name: release 1/4
-            release-test-shard: "1/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "1/4"
           - name: release 2/4
-            release-test-shard: "2/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "2/4"
           - name: release 3/4
-            release-test-shard: "3/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "3/4"
           - name: release 4/4
-            release-test-shard: "4/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "4/4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
-      - name: Run checks and non-release tests
-        if: ${{ matrix.suite.release-test-shard == 'off' }}
+      - name: Run bootstrap test shard
+        if: ${{ matrix.suite.kind == 'bootstrap' }}
         env:
-          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+          CODEX_REVIEW_GATE_BOOTSTRAP_TEST_SHARD: ${{ matrix.suite.bootstrap_test_shard }}
+        run: node --test --test-concurrency=1 test/bootstrap.test.mjs
+      - name: Run syntax and core tests
+        if: ${{ matrix.suite.kind == 'core' }}
         run: |
           npm run check
-          npm test -- --test-concurrency=1
+          node --test --test-concurrency=1 test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs
       - name: Run release pipeline shard
-        if: ${{ matrix.suite.release-test-shard != 'off' }}
+        if: ${{ matrix.suite.kind == 'release' }}
         env:
-          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release-test-shard }}
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release_test_shard }}
         run: node --test test/v2-release-pipeline.test.mjs
 
   test-node-24:
     name: CI shard / Node.js 24 / ${{ matrix.suite.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 14
     strategy:
       fail-fast: false
       matrix:
         suite:
+          - name: bootstrap 1/4
+            kind: bootstrap
+            bootstrap_test_shard: "1/4"
+            release_test_shard: "off"
+          - name: bootstrap 2/4
+            kind: bootstrap
+            bootstrap_test_shard: "2/4"
+            release_test_shard: "off"
+          - name: bootstrap 3/4
+            kind: bootstrap
+            bootstrap_test_shard: "3/4"
+            release_test_shard: "off"
+          - name: bootstrap 4/4
+            kind: bootstrap
+            bootstrap_test_shard: "4/4"
+            release_test_shard: "off"
           - name: core
-            release-test-shard: "off"
+            kind: core
+            bootstrap_test_shard: "off"
+            release_test_shard: "off"
           - name: release 1/4
-            release-test-shard: "1/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "1/4"
           - name: release 2/4
-            release-test-shard: "2/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "2/4"
           - name: release 3/4
-            release-test-shard: "3/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "3/4"
           - name: release 4/4
-            release-test-shard: "4/4"
+            kind: release
+            bootstrap_test_shard: "off"
+            release_test_shard: "4/4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
-      - name: Run checks and non-release tests
-        if: ${{ matrix.suite.release-test-shard == 'off' }}
+      - name: Run bootstrap test shard
+        if: ${{ matrix.suite.kind == 'bootstrap' }}
         env:
-          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+          CODEX_REVIEW_GATE_BOOTSTRAP_TEST_SHARD: ${{ matrix.suite.bootstrap_test_shard }}
+        run: node --test --test-concurrency=1 test/bootstrap.test.mjs
+      - name: Run syntax and core tests
+        if: ${{ matrix.suite.kind == 'core' }}
         run: |
           npm run check
-          npm test -- --test-concurrency=1
+          node --test --test-concurrency=1 test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs
       - name: Run release pipeline shard
-        if: ${{ matrix.suite.release-test-shard != 'off' }}
+        if: ${{ matrix.suite.kind == 'release' }}
         env:
-          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release-test-shard }}
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release_test_shard }}
         run: node --test test/v2-release-pipeline.test.mjs

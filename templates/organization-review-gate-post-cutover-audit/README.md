@@ -105,20 +105,31 @@ The helper reads that live value, validates it against the manifest and cutoff,
 and binds it into the receipt. The old September canary PRs are rejected even
 if all other IDs are self-consistent or their old check is green: their runs
 resolved an earlier floating `@v2` action target and their review history is
-not a new single generation.
+not a new, receipt-bound verifier lineage.
 
 Use exactly one review-request producer for a canary head. Normally that is a
 single exact `@codex review` request, followed by the normal controller
 reconciliation if the summary calls for it. Bind the native
 `codex/github-review-gate` CheckRun to the exact current feature head and its
 current test merge, plus the unique workflow run, job, workflow ID, and run
-attempt. Findings, ambiguous provider evidence, a stale base, an edited or
-extra request generation, an incomplete API read, or a changed head/base/test
-merge are inconclusive; repair the named condition or use a new replacement PR
-instead of treating historical evidence as current.
+attempt. A reconciliation can legitimately create earlier failed or cancelled
+attempts in that same workflow run. The audit enumerates every attempt up to
+the receipt-bound current attempt and requires a one-to-one match between each
+attempt's canonical job and the fully paginated `filter=all` CheckRun history.
+Only the current attempt may satisfy the receipt-bound success; a different
+run/suite, an unmapped CheckRun, a missing attempt, or a later failed attempt
+is inconclusive. Findings, ambiguous provider evidence, a stale base, an
+edited or extra request generation, an incomplete API read, or a changed
+head/base/test merge are likewise inconclusive; repair the named condition or
+use a new replacement PR instead of treating historical evidence as current.
+After the attempt-job mapping, the audit repeats the complete bounded
+CheckRun-history and current-run reads and compares the protected execution
+identity (suite/history, run attempt, head, workflow, and terminal result).
+A same-run retry that becomes visible in that interval is inconclusive; it
+cannot reuse the prior successful attempt.
 GitHub lists CheckRuns by ref only across the newest 1,000 Check Suites. Before
 the audit treats `filter=all` CheckRun history as complete, it reads the
-complete `filter=all` Check Suite inventory for that canary head immediately
+complete documented Check Suite inventory for that canary head immediately
 before and after the CheckRun enumeration. The normalized suite windows must
 match and contain at most 1,000 suites; a larger, malformed, or changing
 inventory is inconclusive, not evidence that an older producer generation is
@@ -127,7 +138,9 @@ bound successful v2 CheckRun's positive-integer `check_suite.id`; a missing or
 mismatched ID, or an empty window, is inconclusive and fails closed. This
 prevents a successful CheckRun from being paired with a detached visibility
 snapshot. This is an inter-request fail-closed fence, not an atomic remote
-lock.
+lock. The attempt enumeration is capped at 51 because GitHub permits at most
+50 workflow reruns in addition to the initial attempt; this is a bounded-read
+limit, not permission to accept an old success.
 
 The deployed cohort uses the frozen v3 consumer workflow profile intentionally.
 This audit accepts that deployed profile and proves it as it actually runs; it
@@ -270,11 +283,19 @@ does not rely on `run.pull_requests`, which GitHub may clear after a
 PR closes. The verifier run's fixed PR-scoped title, exact head, workflow, and
 job bind the recorded test-merge. GitHub exposes CheckRuns by ref only across
 the newest 1,000 check suites, so the consumer brackets its complete
-`filter=all` CheckRun read with two matching complete `filter=all` Check Suite
+`filter=all` CheckRun read with two matching complete documented Check Suite
 inventories at or below that visibility boundary. An excess or changed window
 is inconclusive rather than proof that an older producer generation is absent.
 The matching before/after windows must be nonempty and contain the
 receipt-bound successful v2 CheckRun's positive-integer `check_suite.id`; a
 missing or mismatched ID, or an empty window, is inconclusive and fails closed.
 This prevents a successful CheckRun from being paired with a detached
-visibility snapshot.
+visibility snapshot. For the exact receipt-bound workflow run, it also maps
+every CheckRun in the complete history to one canonical job in every attempt
+through the receipt-bound current attempt. Earlier terminal recovery attempts
+are accepted only through that exact mapping; the current attempt alone must
+be the bound success. Before deleting the bridge, the consumer repeats the
+complete bounded CheckRun-history and current-run reads after the mapping. A
+same-run retry observed in that interval is inconclusive and leaves the bridge
+installed; this is a stability fence, not an assertion of an atomic remote
+lock.

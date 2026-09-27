@@ -37,13 +37,16 @@
   the two-round closure passed while preserving the bridge and every non-status
   protection. This source-local exception did not expand organization receipt
   or bridge-removal scope.
-- [ ] Run a fresh post-cutover audit for the already-cut-over fixed active
-  10-member cohort using the merged replacement PR #78 repair. Historical schema-2 handoff
-  output stays readable for audit but cannot authorize a consumer bridge
-  deletion. The new audit must bind fresh canaries and live organization
-  policy; its consumer re-reads that evidence before every destructive
-  boundary. Keep every cohort bridge installed until the fresh audit proof
-  validates.
+- [ ] Merge the follow-up post-cutover audit contract repair, then run a fresh
+  audit for the already-cut-over fixed active 10-member cohort. Historical
+  schema-2 handoff output stays readable for audit but cannot authorize a
+  consumer bridge deletion. The new audit must bind fresh canaries and live
+  organization policy; its consumer re-reads that evidence before every
+  destructive boundary, including a final same-run retry stability fence after
+  attempt-job mapping. The repair's focused producer/consumer coverage also
+  locks final-run drift, same-run/different-CheckSuite history, and
+  post-mapping API-read failures to fail closed. Keep every cohort bridge
+  installed until the fresh audit proof validates.
 - [x] Complete the separate source-only bridge-removal flow for
   `Joey-Tools/codex-review-gate`: proof machinery landed first, then the merged
   default-branch helper derived the live source closure for historical Node 24

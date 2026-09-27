@@ -3,9 +3,9 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-26
-branch: codex/post-cutover-fresh-audit-successor
-pr: 78
+updated: 2026-09-27
+branch: wip/postcutover-audit-contract-repair
+pr:
 supersedes: []
 superseded_by:
 ---
@@ -1292,7 +1292,7 @@ evidence that a prior freeze remains in force.
   unrelated repository activity is frozen.
 - The post-cutover audit producer and bridge-removal consumer now both bind the
   documented CheckRun visibility boundary to the exact history they read. Each
-  takes a complete per-canary `filter=all` Check Suite projection (pagination,
+  takes a complete per-canary documented Check Suite projection (pagination,
   unique IDs, and exact head), reads `filter=all` CheckRuns, then takes the
   same projection again and requires exact equality plus a count no greater
   than 1,000. The projection deliberately compares suite identity/head only,
@@ -1322,10 +1322,127 @@ evidence that a prior freeze remains in force.
   accept as bridge-removal authority.
 - The human guide, agent guide, and post-cutover-audit template now also state
   the complete CheckSuite-to-CheckRun binding explicitly: matching nonempty
-  before/after `filter=all` suite windows must contain the selected successful
+  before/after suite windows must contain the selected successful
   CheckRun's positive `check_suite.id`. Missing, mismatched, or empty-window
   evidence is documented as inconclusive/fail-closed, matching the repaired
   producer and consumer rather than leaving an implementation-only guarantee.
+
+## Execution Update (2026-09-27)
+
+- A live canary exposed an implementation-contract mismatch in the merged
+  post-cutover audit: the normal controller recovery re-runs the same Actions
+  workflow run, creating a distinct job and CheckRun for each `run_attempt`.
+  The prior audit and consumer incorrectly treated every raw `filter=all`
+  CheckRun as a separate producer generation and therefore rejected the
+  expected attempt-1 failure / attempt-2 success shape.
+- The replacement repair defines one logical verifier lineage as the exact
+  receipt-bound workflow `run_id` and Check Suite, with attempt-scoped jobs as
+  the replay discriminator. It fully paginates the CheckRun history, validates
+  every entry's native app/head/context/terminal state and canonical Actions
+  URL, then maps it one-to-one to the canonical job from every attempt through
+  the receipt-bound current attempt. The current maximum attempt must still
+  bind the receipt's success; a different run or suite, duplicate/unmapped
+  job, missing attempt, incomplete page, or later failure remains fail-closed.
+- The repair caps untrusted receipt/manifest enumeration at 51 attempts: one
+  initial Actions run plus GitHub's documented maximum 50 workflow reruns.
+  This is a read-capacity bound only, not a policy that permits replaying an
+  older clean result.
+- The repair also removes the unsupported `filter=all` parameter from Check
+  Suite requests. `filter=all` remains required for CheckRun history; Check
+  Suite before/after snapshots use the documented paginated endpoint and still
+  compare only suite identity plus exact head, not mutable status metadata.
+- A fresh user-requested generic GPT-5.6 Terra Ultra review found a further
+  retry race: an `N+1` controller retry can retain the same workflow `run_id`
+  and Check Suite while it creates a new job/CheckRun after the `1..N`
+  attempt-job mapping has finished. Both the producer and bridge-removal
+  consumer now fence that mapping with another complete CheckRun-history and
+  current-run read. They compare only the protected execution identity
+  (suite/head window, history identities and conclusions, run attempt, head,
+  workflow, and terminal result), not incidental response timestamps. A newly
+  visible same-run retry therefore stays inconclusive and preserves the bridge;
+  this is a point-in-time fail-closed fence, not a claim of an atomic GitHub
+  lock after the final read.
+- Validation after that fence passed `npm run check`, `git diff --check`, and
+  project-journal validation. The complete producer suite exited `0` in
+  199.708 seconds with 248 dot-reporter success markers and no failure output.
+  The focused consumer bridge-removal suite passed 8/8, including normal
+  same-run recovery, the newly added post-mapping retry race, visibility-window
+  drift, closed-unmerged canaries, and deletion-boundary rereads. The known
+  monolithic bootstrap timeout remains unclaimed as a passing result.
+- Human and agent installation guides now distinguish the valid same-run
+  recovery shape from a second producer generation, so an operator does not
+  mistake an earlier failed attempt for either a clean result or a reason to
+  create another review request.
+- Repair-head validation passed `npm run check`, `git diff --check`, project
+  journal validation, and the complete producer suite
+  (`node --test test/organization-review-gate-handoff.test.mjs`, 247/247).
+  Targeted bootstrap coverage passed for the fresh-proof, same-run retry,
+  receipt-bound reread, 1,000-suite race, and closed-unmerged cases. The
+  monolithic bootstrap suite produced no report before its bounded 300-second
+  timeout, so it is explicitly not recorded as passing.
+- A follow-up generic Terra Ultra review found three test-only coverage gaps in
+  the retry fence, not a new production-code defect: the final current-run
+  reread was not independently made to drift, a same-run/different-CheckSuite
+  history fork was not exercised, and a post-mapping API-read failure lacked a
+  direct fail-closed fixture. The repaired tests now keep complete history
+  unchanged while the final run advances to `N+1`, inject a second CheckRun in
+  the same Actions run but in a second stable-visible CheckSuite, and inject
+  post-mapping 503/current-run read failures. Producer and consumer assertions
+  require rejection with no mutation; consumer assertions additionally retain
+  the legacy bridge and the pre-mutation CODEOWNERS sentinel. This records the
+  reason for the expanded fixture controls: they protect the retry fence's
+  execution-order and unavailable-read semantics rather than treating any
+  incidental API field change as evidence drift.
+- The coverage follow-up passed `npm run check`, `git diff --check`, and
+  project-journal validation. Its targeted consumer group passed 3/3 in
+  32.049 seconds; the complete producer suite
+  (`node --test --test-reporter=dot test/organization-review-gate-handoff.test.mjs`)
+  exited 0 in 154.43 seconds without failure output. The monolithic bootstrap
+  suite remains intentionally unclaimed because its prior bounded no-output
+  timeout is unrelated to this focused coverage patch.
+- The final independent Terra review found that the three consumer fixtures
+  still needed to prove *order*, not merely consume a second fake response.
+  Each now declares its selected final-read endpoint and checks the durable
+  fake-GitHub request log for `initial read < receipt-bound attempt-job mapping
+  < final read`. This covers final-run drift plus final Actions-run and
+  CheckRun-history 503s, so moving the fence ahead of job mapping fails the
+  test rather than accidentally preserving its apparent coverage.
+- Live gate exercise then established that source PR #79 cannot recover on
+  its existing pull-request lineage: ordinary review requests `5851381116`
+  and `5851468516` precede the canonical workflow request `5851498135`, but
+  the later ordinary request has no directly attributable settled closure.
+  Both official terminal-clean comments have correct Codex App provenance and
+  the exact current short commit binding, yet accepting either would risk
+  binding delayed evidence to the wrong request generation. The v2 verifier
+  therefore remains fail-closed by design. Preserve #79 as diagnostic
+  evidence; deliver the already-validated repair through one replacement PR
+  with exactly one canonical `begin-review` request and no bare
+  `@codex review` comment.
+- Replacement PR #80 received one current-head inline P2 about the retry
+  bound. The claim that GitHub permits only three reruns was rejected with
+  the current GitHub Actions documentation: a workflow run may be rerun at
+  most fifty times, so the initial attempt plus those reruns gives the
+  receipt bound of fifty-one. The adjacent source comment and schema tests
+  already encode that contract; the review thread was answered with the
+  official source and resolved without changing the bound. Because the
+  inline-only finding is intentionally left to the ruleset's conversation
+  requirement rather than becoming a v2 terminal carrier, the next canonical
+  request must be bound to a new head rather than create a second request
+  generation for the same head.
+- The replacement PR's live CI then confirmed a liveness cost in the old
+  source matrix: both all-in-one non-Release `core` legs passed, but took
+  roughly fifteen and sixteen minutes on Node 20 and Node 24 respectively.
+  The slow path was the serialized 163-case bootstrap suite. Per Joey's
+  approved multi-runner strategy, each Node version now has four bootstrap
+  shards with a sealed 41/41/41/40 registration partition, one explicit
+  non-Release core inventory, and the existing four sealed Release shards.
+  Every leg has a fourteen-minute timeout and there is no aggregate result
+  that could hide a failed matrix member. The workflow contract proves that
+  every discoverable test file is assigned exactly once; local Node 24
+  validation passed all four bootstrap shards, the complete explicit core
+  inventory, `npm run check`, and `actionlint`. The sealed bootstrap contract
+  also forbids direct `nodeTest` registrations, so a future test cannot run
+  outside the four-way partition while leaving the ordinal count unchanged.
 
 ## Next Steps
 

@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import * as shardTestSupport from "./support/ci-test-shard.mjs";
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const bootstrapTestRelativePath = "test/bootstrap.test.mjs";
 const releaseTestRelativePath = "test/v2-release-pipeline.test.mjs";
 const shardAdapterIdentifier = ["create", "Sharded", "Test"].join("");
 const removedTestAliasIdentifier = [
@@ -32,6 +33,14 @@ const shardEnvironmentIdentifier = [
   "TEST",
   "SHARD",
 ].join("_");
+const bootstrapShardEnvironmentIdentifier = [
+  "CODEX",
+  "REVIEW",
+  "GATE",
+  "BOOTSTRAP",
+  "TEST",
+  "SHARD",
+].join("_");
 const createShardAdapterForContractTests = (
   shardTestSupport[shardAdapterIdentifier]
 );
@@ -41,22 +50,48 @@ const ciWorkflow = readFileSync(
   "utf8",
 );
 const testFileSources = readTestFileSources(repositoryRoot);
+const bootstrapTestSource = testFileSources.get(bootstrapTestRelativePath);
 const releaseTestSource = testFileSources.get(releaseTestRelativePath);
+assert.equal(
+  typeof bootstrapTestSource,
+  "string",
+  `${bootstrapTestRelativePath} must exist in the test inventory`,
+);
 assert.equal(
   typeof releaseTestSource,
   "string",
   `${releaseTestRelativePath} must exist in the test inventory`,
 );
+const coreTestRelativePaths = [
+  "test/ci-test-shard.test.mjs",
+  "test/core.test.mjs",
+  "test/evidence-budget.test.mjs",
+  "test/gate-runner.test.mjs",
+  "test/organization-review-gate-handoff.test.mjs",
+  "test/producer-receipt.test.mjs",
+  "test/release-provenance.test.mjs",
+  "test/required-ci-workflow.test.mjs",
+  "test/v2-action.test.mjs",
+  "test/v2-gate-runtime.test.mjs",
+  "test/v2-workflow-contract.test.mjs",
+  "test/workflow-security-contract.test.mjs",
+];
 const expectedSuites = [
-  ["core", "off"],
-  ["release 1/4", "1/4"],
-  ["release 2/4", "2/4"],
-  ["release 3/4", "3/4"],
-  ["release 4/4", "4/4"],
+  ["bootstrap 1/4", "bootstrap", "1/4", "off"],
+  ["bootstrap 2/4", "bootstrap", "2/4", "off"],
+  ["bootstrap 3/4", "bootstrap", "3/4", "off"],
+  ["bootstrap 4/4", "bootstrap", "4/4", "off"],
+  ["core", "core", "off", "off"],
+  ["release 1/4", "release", "off", "1/4"],
+  ["release 2/4", "release", "off", "2/4"],
+  ["release 3/4", "release", "off", "3/4"],
+  ["release 4/4", "release", "off", "4/4"],
 ];
 const expectedReleaseSynchronousTestCalls = 103;
 const expectedReleaseRegistrationCount = 159;
 const expectedReleaseShardDistribution = [40, 40, 40, 39];
+const expectedBootstrapSynchronousTestCalls = 163;
+const expectedBootstrapShardDistribution = [41, 41, 41, 40];
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -90,8 +125,9 @@ function readTestFileSources(root) {
 
 function assertShardIdentifierOwnership(sources) {
   for (const [identifier, expectedOwners] of [
-    [shardAdapterIdentifier, [releaseTestRelativePath]],
+    [shardAdapterIdentifier, [bootstrapTestRelativePath, releaseTestRelativePath]],
     [shardEnvironmentIdentifier, [releaseTestRelativePath]],
+    [bootstrapShardEnvironmentIdentifier, [bootstrapTestRelativePath]],
     [removedTestAliasIdentifier, []],
   ]) {
     const owners = [...sources]
@@ -164,6 +200,13 @@ function assertCiJobContract(jobId, jobSource, nodeVersion, displayVersion) {
     `${jobId} must run on ubuntu-latest`,
   );
   assert.equal(
+    [...jobSource.matchAll(/^    timeout-minutes: (.+)$/gmu)]
+      .map((match) => match[1])
+      .join(),
+    "14",
+    `${jobId} must bound every test shard`,
+  );
+  assert.equal(
     [...jobSource.matchAll(/^      fail-fast: (.+)$/gmu)].map((match) => match[1]).join(),
     "false",
     `${jobId} must preserve all matrix results`,
@@ -175,10 +218,10 @@ function assertCiJobContract(jobId, jobSource, nodeVersion, displayVersion) {
   );
   assert.deepEqual(
     [...jobSource.matchAll(
-      /^          - name: (.+)\n            release-test-shard: "([^"]+)"$/gmu,
-    )].map((match) => [match[1], match[2]]),
+      /^          - name: (.+)\n            kind: (bootstrap|core|release)\n            bootstrap_test_shard: "([^"]+)"\n            release_test_shard: "([^"]+)"$/gmu,
+    )].map((match) => [match[1], match[2], match[3], match[4]]),
     expectedSuites,
-    `${jobId} must contain one core cell and all four release shards`,
+    `${jobId} must contain every bounded bootstrap, core, and release shard`,
   );
   assert.deepEqual(
     [...jobSource.matchAll(/^          node-version: "([^"]+)"$/gmu)].map(
@@ -189,26 +232,36 @@ function assertCiJobContract(jobId, jobSource, nodeVersion, displayVersion) {
   );
 
   assert.equal(
-    namedStep(jobSource, "Run checks and non-release tests"),
+    namedStep(jobSource, "Run bootstrap test shard"),
     [
-      "      - name: Run checks and non-release tests",
-      "        if: ${{ matrix.suite.release-test-shard == 'off' }}",
+      "      - name: Run bootstrap test shard",
+      "        if: ${{ matrix.suite.kind == 'bootstrap' }}",
       "        env:",
-      `          ${shardEnvironmentIdentifier}: "off"`,
+      `          ${bootstrapShardEnvironmentIdentifier}: `
+        + "${{ matrix.suite.bootstrap_test_shard }}",
+      "        run: node --test --test-concurrency=1 test/bootstrap.test.mjs",
+    ].join("\n"),
+    `${jobId} bootstrap shard contract drifted`,
+  );
+  assert.equal(
+    namedStep(jobSource, "Run syntax and core tests"),
+    [
+      "      - name: Run syntax and core tests",
+      "        if: ${{ matrix.suite.kind == 'core' }}",
       "        run: |",
       "          npm run check",
-      "          npm test -- --test-concurrency=1",
+      `          node --test --test-concurrency=1 ${coreTestRelativePaths.join(" ")}`,
     ].join("\n"),
-    `${jobId} core cell contract drifted`,
+    `${jobId} non-bootstrap core contract drifted`,
   );
   assert.equal(
     namedStep(jobSource, "Run release pipeline shard"),
     [
       "      - name: Run release pipeline shard",
-      "        if: ${{ matrix.suite.release-test-shard != 'off' }}",
+      "        if: ${{ matrix.suite.kind == 'release' }}",
       "        env:",
       `          ${shardEnvironmentIdentifier}: `
-        + "${{ matrix.suite.release-test-shard }}",
+        + "${{ matrix.suite.release_test_shard }}",
       "        run: node --test test/v2-release-pipeline.test.mjs",
     ].join("\n"),
     `${jobId} release cell contract drifted`,
@@ -224,6 +277,15 @@ function assertCiWorkflowContract(source) {
   );
   assertCiJobContract("test-node-20", jobs.get("test-node-20").source, "20", "");
   assertCiJobContract("test-node-24", jobs.get("test-node-24").source, "24", " 24");
+  assert.deepEqual(
+    [...testFileSources.keys()].sort(),
+    [
+      bootstrapTestRelativePath,
+      ...coreTestRelativePaths,
+      releaseTestRelativePath,
+    ].sort(),
+    "the CI test inventory must assign every discoverable test file exactly once",
+  );
   assert.doesNotMatch(source, /\bneeds:|\balways\(\)|aggregate/u);
 }
 
@@ -295,6 +357,62 @@ function assertReleaseRegistrationContract(source) {
   );
 }
 
+function assertBootstrapRegistrationContract(source) {
+  assert.deepEqual(
+    source.split("\n").filter((line) => (
+      line.includes("./support/ci-test-shard.mjs")
+    )),
+    [
+      `import { ${shardAdapterIdentifier} } from "./support/ci-test-shard.mjs";`,
+    ],
+    "bootstrap suite must import the canonical shard adapter without an alias",
+  );
+  assert.deepEqual(
+    source.split("\n").filter((line) => line.includes("node:test")),
+    ['import nodeTest from "node:test";'],
+    "bootstrap suite must use exactly one canonical node:test import",
+  );
+  assert.equal([...source.matchAll(/\bnodeTest\b/gu)].length, 2);
+  assert.equal(
+    [...source.matchAll(new RegExp(
+      `\\b${escapeRegExp(shardAdapterIdentifier)}\\b`,
+      "gu",
+    ))].length,
+    2,
+  );
+  assert.match(
+    source,
+    new RegExp(
+      `const test = ${escapeRegExp(shardAdapterIdentifier)}\\(`
+        + `\\s*nodeTest,\\s*process\\.env\\.${escapeRegExp(bootstrapShardEnvironmentIdentifier)},`
+        + "\\s*\"bootstrap\",\\s*\\);",
+      "u",
+    ),
+  );
+  assert.equal(
+    [...source.matchAll(/^\s*test\(/gmu)].length,
+    expectedBootstrapSynchronousTestCalls,
+  );
+  assert.doesNotMatch(
+    source,
+    /^\s*(?:describe|it|suite)\s*(?:\(|\.|\[)|\b(?:nodeTest|test)\s*(?:\.(?:only|skip|todo)|\[)|\b(?:nodeTest|test)\s*\([^\n]*\b(?:only|skip|todo)\s*:|\bt\.test\s*\(/mu,
+    "bootstrap suite contains an unsupported registration form",
+  );
+  assert.doesNotMatch(
+    source,
+    /(?:^|[;\n])\s*(?:(?:const|let|var)\s+)?[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*test\s*(?:;|$)/mu,
+    "bootstrap suite must not alias the canonical test adapter",
+  );
+  assert.match(
+    source,
+    new RegExp(
+      `assert\\.equal\\(\\s*test\\.registeredCount,\\s*${expectedBootstrapSynchronousTestCalls},`
+        + '\\s*"bootstrap test shard registration inventory drift",?\\s*\\)',
+      "u",
+    ),
+  );
+}
+
 test("release test shards partition every ordinal exactly once", () => {
   const shards = ["1/4", "2/4", "3/4", "4/4"].map(parseTestShard);
   assert.deepEqual(
@@ -314,6 +432,25 @@ test("release test shards partition every ordinal exactly once", () => {
   }
   assert.equal(testShardSelects(parseTestShard(undefined), 0), true);
   assert.equal(testShardSelects(parseTestShard("off"), 0), false);
+});
+
+test("bootstrap test shards partition every ordinal exactly once", () => {
+  const shards = ["1/4", "2/4", "3/4", "4/4"].map(parseTestShard);
+  assert.deepEqual(
+    shards.map((shard) => (
+      Array.from({ length: expectedBootstrapSynchronousTestCalls }, (_, ordinal) => ordinal)
+        .filter((ordinal) => testShardSelects(shard, ordinal))
+        .length
+    )),
+    expectedBootstrapShardDistribution,
+  );
+  for (let ordinal = 0; ordinal < expectedBootstrapSynchronousTestCalls; ordinal += 1) {
+    assert.equal(
+      shards.filter((shard) => testShardSelects(shard, ordinal)).length,
+      1,
+      `bootstrap ordinal ${ordinal}`,
+    );
+  }
 });
 
 test("release test shard parsing rejects malformed or unsafe partitions", () => {
@@ -435,26 +572,38 @@ test("the release suite exposes one closed synchronous shard inventory", () => {
   assertReleaseRegistrationContract(releaseTestSource);
 });
 
-test("only the release suite owns shard adapter and environment identifiers", () => {
+test("the bootstrap suite exposes one closed synchronous shard inventory", () => {
+  assert.equal(
+    [...bootstrapTestSource.matchAll(new RegExp(
+      escapeRegExp(bootstrapShardEnvironmentIdentifier),
+      "gu",
+    ))].length,
+    1,
+  );
+  assertBootstrapRegistrationContract(bootstrapTestSource);
+});
+
+test("only declared suites own shard adapter and environment identifiers", () => {
   assertShardIdentifierOwnership(testFileSources);
-  const secondPath = [...testFileSources.keys()].find((path) => (
-    path !== releaseTestRelativePath
+  const disallowedPath = [...testFileSources.keys()].find((path) => (
+    path !== releaseTestRelativePath && path !== bootstrapTestRelativePath
   ));
-  assert.ok(secondPath, "test inventory must contain a second test file");
+  assert.ok(disallowedPath, "test inventory must contain an unsharded test file");
 
   for (const identifier of [
     shardAdapterIdentifier,
     shardEnvironmentIdentifier,
+    bootstrapShardEnvironmentIdentifier,
     removedTestAliasIdentifier,
   ]) {
     const mutatedSources = new Map(testFileSources);
     mutatedSources.set(
-      secondPath,
-      `${mutatedSources.get(secondPath)}\nvoid ${identifier};\n`,
+      disallowedPath,
+      `${mutatedSources.get(disallowedPath)}\nvoid ${identifier};\n`,
     );
     assert.throws(
       () => assertShardIdentifierOwnership(mutatedSources),
-      new RegExp(escapeRegExp(secondPath), "u"),
+      new RegExp(escapeRegExp(disallowedPath), "u"),
       identifier,
     );
   }
@@ -475,7 +624,7 @@ test("test inventory fails closed on discoverable symbolic-link test files", (t)
   );
 });
 
-test("CI validates every core and release matrix cell per Node job", () => {
+test("CI validates every bootstrap, core, and release matrix cell per Node job", () => {
   assertCiWorkflowContract(ciWorkflow);
 });
 
@@ -483,22 +632,30 @@ test("CI contract rejects per-job condition, matrix, environment, or command dri
   for (const jobId of ["test-node-20", "test-node-24"]) {
     for (const [original, replacement] of [
       [
-        "if: ${{ matrix.suite.release-test-shard != 'off' }}",
-        "if: ${{ matrix.suite.release-test-shard == 'off' }}",
+        "if: ${{ matrix.suite.kind == 'release' }}",
+        "if: ${{ matrix.suite.kind == 'core' }}",
       ],
       [
         `${shardEnvironmentIdentifier}: `
-          + "${{ matrix.suite.release-test-shard }}",
+          + "${{ matrix.suite.release_test_shard }}",
         `${shardEnvironmentIdentifier}: "off"`,
       ],
       [
         "run: node --test test/v2-release-pipeline.test.mjs",
-        "run: npm test -- --test-concurrency=1",
+        "run: node --test --test-concurrency=1 test/bootstrap.test.mjs",
       ],
-      ['release-test-shard: "4/4"', 'release-test-shard: "off"'],
       [
-        "if: ${{ matrix.suite.release-test-shard == 'off' }}",
-        "if: ${{ matrix.suite.release-test-shard != 'off' }}",
+        "bootstrap_test_shard: \"4/4\"",
+        "bootstrap_test_shard: \"off\"",
+      ],
+      [
+        "if: ${{ matrix.suite.kind == 'bootstrap' }}",
+        "if: ${{ matrix.suite.kind == 'release' }}",
+      ],
+      [
+        `${bootstrapShardEnvironmentIdentifier}: `
+          + "${{ matrix.suite.bootstrap_test_shard }}",
+        `${bootstrapShardEnvironmentIdentifier}: "off"`,
       ],
     ]) {
       assert.throws(
@@ -557,5 +714,36 @@ test("release registration contract rejects alternate or suppressed tests", () =
     aliasedFactorySource,
   ]) {
     assert.throws(() => assertReleaseRegistrationContract(mutatedSource));
+  }
+});
+
+test("bootstrap registration contract rejects alternate or suppressed tests", () => {
+  const canonicalImport = `import { ${shardAdapterIdentifier} } from "./support/ci-test-shard.mjs";`;
+  const aliasedFactorySource = bootstrapTestSource
+    .replace(
+      canonicalImport,
+      `import { ${shardAdapterIdentifier} as buildShardedTest } from "./support/ci-test-shard.mjs";`,
+    )
+    .replace(
+      `const test = ${shardAdapterIdentifier}(`,
+      "const test = buildShardedTest(",
+    );
+  for (const [fixtureIndex, mutatedSource] of [
+    bootstrapTestSource.replace(
+      'import nodeTest from "node:test";',
+      'import nodeTest, { it } from "node:test";',
+    ),
+    `${bootstrapTestSource}\nnodeTest("unsharded", () => {});\n`,
+    `${bootstrapTestSource}\ndescribe("unsharded", () => {});\n`,
+    bootstrapTestSource.replace(/^test\(/mu, "test.skip("),
+    bootstrapTestSource.replace(/^test\(([^,\n]+), /mu, "test($1, { skip: true }, "),
+    `${bootstrapTestSource}\nconst alternateTest = test;\n`,
+    aliasedFactorySource,
+  ].entries()) {
+    assert.throws(
+      () => assertBootstrapRegistrationContract(mutatedSource),
+      undefined,
+      `bootstrap registration fixture ${fixtureIndex}`,
+    );
   }
 });

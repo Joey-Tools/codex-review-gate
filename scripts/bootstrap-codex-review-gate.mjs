@@ -4790,109 +4790,20 @@ async function assertPostCutoverAuditCanaryStable(canary) {
     changedFiles: pull.changed_files,
   });
 
-  // CheckRun-by-ref exposes only the newest 1,000 Check Suites. Pair the
-  // complete `filter=all` suite inventory immediately before and after the
-  // complete CheckRun read: a 1,000 -> 1,001 transition could otherwise push
-  // an earlier failing CheckRun outside that visibility window mid-read.
-  const checkSuitesBefore = await loadCompletePostCutoverAuditCheckSuites({
+  const initialCheckRunSnapshot = await loadPostCutoverAuditCheckRunSnapshot({
+    canary,
     repoSlug,
     encodedRepo,
-    headSha: canary.head_sha,
   });
-
-  const checkPages = await ghJson(
-    `repos/${encodedRepo}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`,
-    { paginate: true },
-  );
-  const checkRuns = assertCompletePostCutoverAuditPages({
-    pages: checkPages,
-    collection: "check_runs",
-    repoSlug,
-    label: "CheckRun",
-  });
-  const checkSuitesAfter = await loadCompletePostCutoverAuditCheckSuites({
-    repoSlug,
-    encodedRepo,
-    headSha: canary.head_sha,
-  });
-  const stableCheckSuites = assertPostCutoverAuditCheckSuiteInventoryStable({
-    before: checkSuitesBefore,
-    after: checkSuitesAfter,
+  const {
+    history: checkRunHistory,
+    runId,
+  } = initialCheckRunSnapshot;
+  const run = validatePostCutoverAuditCanaryRun({
+    run: await ghJson(`repos/${encodedRepo}/actions/runs/${runId}`),
+    canary,
     repoSlug,
   });
-  if (checkRuns.length !== 1) {
-    throw new Error(
-      `${repoSlug} fresh canary must retain exactly one ${DEFAULT_STATUS_CONTEXT} CheckRun generation.`,
-    );
-  }
-  const checkRun = checkRuns[0];
-  if (
-    checkRun?.id !== canary.v2_check_run_id ||
-    checkRun?.name !== DEFAULT_STATUS_CONTEXT ||
-    checkRun?.status !== "completed" ||
-    checkRun?.conclusion !== "success" ||
-    checkRun?.app?.id !== DEFAULT_STATUS_INTEGRATION_ID ||
-    checkRun?.app?.slug !== "github-actions" ||
-    checkRun?.head_sha !== canary.head_sha
-  ) {
-    throw new Error(
-      `${repoSlug} fresh canary CheckRun is not the receipt-bound successful native v2 check.`,
-    );
-  }
-  // The CheckRun listing is bounded by GitHub's CheckSuite visibility window.
-  // Bind the selected successful CheckRun back to the identical before/after
-  // suite inventory, rather than treating an otherwise valid CheckRun from an
-  // empty or unrelated window as evidence for this canary head.
-  const checkSuiteId = checkRun?.check_suite?.id;
-  if (
-    !Number.isSafeInteger(checkSuiteId) ||
-    checkSuiteId <= 0 ||
-    !stableCheckSuites.has(checkSuiteId)
-  ) {
-    throw new Error(
-      `${repoSlug} fresh canary CheckRun does not bind an exact CheckSuite in the stable visibility window.`,
-    );
-  }
-  const { runId, jobId } = parsePostCutoverAuditActionsJobDetailsUrl(
-    checkRun.details_url,
-    repoSlug,
-  );
-  if (runId !== canary.v2_run_id || jobId !== canary.v2_job_id) {
-    throw new Error(`${repoSlug} fresh canary CheckRun run/job binding drifted.`);
-  }
-
-  const run = await ghJson(`repos/${encodedRepo}/actions/runs/${runId}`);
-  const expectedTitle =
-    `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/${canary.pull_number}/${canary.test_merge_sha}`;
-  const workflowPath = parsePostCutoverAuditWorkflowPath(
-    run?.path,
-    canary.default_branch,
-  );
-  // GitHub can clear run.pull_requests after a PR closes. Do not turn that
-  // ephemeral projection into a deletion precondition: the independently
-  // re-read PR tuple plus the fixed workflow's PR-scoped display title bind the
-  // same run to this receipt's PR/head/base/test-merge evidence.
-  if (
-    run?.id !== canary.v2_run_id ||
-    run?.workflow_id !== canary.v2_workflow_id ||
-    run?.run_attempt !== canary.v2_run_attempt ||
-    run?.display_title !== expectedTitle ||
-    run?.repository?.full_name !== repoSlug ||
-    run?.repository?.id !== canary.id ||
-    run?.repository?.node_id !== canary.node_id ||
-    run?.head_repository?.full_name !== repoSlug ||
-    run?.head_repository?.id !== canary.id ||
-    run?.head_repository?.node_id !== canary.node_id ||
-    workflowPath !== DEFAULT_WORKFLOW_PATH ||
-    run?.head_sha !== canary.head_sha ||
-    run?.event !== "pull_request" ||
-    run?.status !== "completed" ||
-    run?.conclusion !== "success"
-  ) {
-    throw new Error(
-      `${repoSlug} fresh canary Actions run is not bound to the receipt-bound verifier head/test-merge execution.`,
-    );
-  }
 
   const workflow = await ghJson(
     `repos/${encodedRepo}/actions/workflows/${canary.v2_workflow_id}`,
@@ -4905,32 +4816,58 @@ async function assertPostCutoverAuditCanaryStable(canary) {
     throw new Error(`${repoSlug} fresh canary workflow is not the active canonical verifier.`);
   }
 
-  const jobPages = await ghJson(
-    `repos/${encodedRepo}/actions/runs/${runId}/attempts/${canary.v2_run_attempt}/jobs?per_page=100`,
-    { paginate: true },
-  );
-  const jobs = assertCompletePostCutoverAuditPages({
-    pages: jobPages,
-    collection: "jobs",
+  const jobs = await loadCompletePostCutoverAuditAttemptJobs({
     repoSlug,
-    label: "Actions job",
+    encodedRepo,
+    runId,
+    runAttempt: canary.v2_run_attempt,
   });
-  const matchingJobs = jobs.filter(
-    (job) => job?.name === DEFAULT_STATUS_CONTEXT,
-  );
-  if (
-    matchingJobs.length !== 1 ||
-    matchingJobs[0]?.id !== canary.v2_job_id ||
-    matchingJobs[0]?.run_id !== canary.v2_run_id ||
-    matchingJobs[0]?.head_sha !== canary.head_sha ||
-    matchingJobs[0]?.status !== "completed" ||
-    matchingJobs[0]?.conclusion !== "success" ||
-    parsePostCutoverAuditCheckRunApiUrl(
-      matchingJobs[0]?.check_run_url,
+  const { job: selectedJob, checkRunId: selectedJobCheckRunId } =
+    selectPostCutoverAuditVerifierAttemptJob({
+      jobs,
+      canary,
       repoSlug,
-    ) !== canary.v2_check_run_id
+      runId,
+      runAttempt: canary.v2_run_attempt,
+    });
+  if (
+    selectedJob.id !== canary.v2_job_id ||
+    selectedJob.conclusion !== "success" ||
+    selectedJobCheckRunId !== canary.v2_check_run_id
   ) {
     throw new Error(`${repoSlug} fresh canary run lacks one exact successful verifier job.`);
+  }
+  await assertPostCutoverAuditCheckRunHistoryMatchesAttempts({
+    canary,
+    repoSlug,
+    encodedRepo,
+    runId,
+    currentAttemptJobs: jobs,
+    history: checkRunHistory,
+  });
+
+  // A controller retry retains the same run and CheckSuite identity but adds
+  // an attempt-scoped job and CheckRun.  Fence the completed job mapping with
+  // another complete history/run read so a retry that starts during mapping
+  // is unstable evidence, rather than permission to remove the v1 bridge.
+  const finalCheckRunSnapshot = await loadPostCutoverAuditCheckRunSnapshot({
+    canary,
+    repoSlug,
+    encodedRepo,
+  });
+  const finalRun = validatePostCutoverAuditCanaryRun({
+    run: await ghJson(`repos/${encodedRepo}/actions/runs/${runId}`),
+    canary,
+    repoSlug,
+  });
+  if (
+    postCutoverAuditCheckRunSnapshotFingerprint(initialCheckRunSnapshot) !==
+      postCutoverAuditCheckRunSnapshotFingerprint(finalCheckRunSnapshot) ||
+    canonicalSecurityJson(run) !== canonicalSecurityJson(finalRun)
+  ) {
+    throw new Error(
+      `${repoSlug} fresh canary CheckRun history or current Actions run changed while attempt-scoped verifier jobs were mapped.`,
+    );
   }
 }
 
@@ -5029,13 +4966,320 @@ function assertCompletePostCutoverAuditPages({
   return values;
 }
 
+function assertPostCutoverAuditCheckRunHistory({
+  checkRuns,
+  canary,
+  repoSlug,
+}) {
+  const checkRunIds = new Set();
+  const history = checkRuns.map((checkRun, index) => {
+    if (
+      !Number.isSafeInteger(checkRun?.id) ||
+      checkRun.id <= 0 ||
+      !Number.isSafeInteger(checkRun?.check_suite?.id) ||
+      checkRun.check_suite.id <= 0 ||
+      checkRun.name !== DEFAULT_STATUS_CONTEXT ||
+      checkRun.status !== "completed" ||
+      typeof checkRun.conclusion !== "string" ||
+      checkRun.conclusion === "" ||
+      checkRun.app?.id !== DEFAULT_STATUS_INTEGRATION_ID ||
+      checkRun.app?.slug !== "github-actions" ||
+      checkRun.head_sha !== canary.head_sha
+    ) {
+      throw new Error(
+        `${repoSlug} fresh canary CheckRun history entry ${index} does not bind one completed native verifier context on the exact canary head.`,
+      );
+    }
+    if (checkRunIds.has(checkRun.id)) {
+      throw new Error(
+        `${repoSlug} fresh canary CheckRun history contains duplicate identities.`,
+      );
+    }
+    checkRunIds.add(checkRun.id);
+    const { runId, jobId } = parsePostCutoverAuditActionsJobDetailsUrl(
+      checkRun.details_url,
+      repoSlug,
+    );
+    return {
+      id: checkRun.id,
+      check_suite_id: checkRun.check_suite.id,
+      run_id: runId,
+      job_id: jobId,
+      conclusion: checkRun.conclusion,
+      checkRun,
+    };
+  });
+  const selected = history.find(({ id }) => id === canary.v2_check_run_id);
+  if (
+    selected === undefined ||
+    selected.checkRun.conclusion !== "success" ||
+    selected.run_id !== canary.v2_run_id ||
+    selected.job_id !== canary.v2_job_id
+  ) {
+    throw new Error(
+      `${repoSlug} fresh canary CheckRun history does not contain the receipt-bound successful native v2 check.`,
+    );
+  }
+  const jobIds = new Set();
+  for (const entry of history) {
+    if (
+      entry.check_suite_id !== selected.check_suite_id ||
+      entry.run_id !== selected.run_id
+    ) {
+      throw new Error(
+        `${repoSlug} fresh canary CheckRun history contains more than one verifier run or CheckSuite lineage.`,
+      );
+    }
+    if (jobIds.has(entry.job_id)) {
+      throw new Error(
+        `${repoSlug} fresh canary CheckRun history does not map uniquely to verifier jobs.`,
+      );
+    }
+    jobIds.add(entry.job_id);
+  }
+  return {
+    checkSuiteId: selected.check_suite_id,
+    history: history.map(
+      ({ id, check_suite_id, run_id, job_id, conclusion }) => ({
+        id,
+        check_suite_id,
+        run_id,
+        job_id,
+        conclusion,
+      }),
+    ),
+    runId: selected.run_id,
+  };
+}
+
+function validatePostCutoverAuditCanaryRun({ run, canary, repoSlug }) {
+  const expectedTitle =
+    `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/${canary.pull_number}/${canary.test_merge_sha}`;
+  const workflowPath = parsePostCutoverAuditWorkflowPath(
+    run?.path,
+    canary.default_branch,
+  );
+  // GitHub can clear run.pull_requests after a PR closes. The independently
+  // re-read PR tuple plus this fixed PR-scoped display title bind the durable
+  // PR/head/base/test-merge object identity instead of that ephemeral field.
+  if (
+    run?.id !== canary.v2_run_id ||
+    run?.workflow_id !== canary.v2_workflow_id ||
+    run?.run_attempt !== canary.v2_run_attempt ||
+    run?.display_title !== expectedTitle ||
+    run?.repository?.full_name !== repoSlug ||
+    run?.repository?.id !== canary.id ||
+    run?.repository?.node_id !== canary.node_id ||
+    run?.head_repository?.full_name !== repoSlug ||
+    run?.head_repository?.id !== canary.id ||
+    run?.head_repository?.node_id !== canary.node_id ||
+    workflowPath !== DEFAULT_WORKFLOW_PATH ||
+    run?.head_sha !== canary.head_sha ||
+    run?.event !== "pull_request" ||
+    run?.status !== "completed" ||
+    run?.conclusion !== "success"
+  ) {
+    throw new Error(
+      `${repoSlug} fresh canary Actions run is not bound to the receipt-bound verifier head/test-merge execution.`,
+    );
+  }
+  // Compare the protected execution identity and terminal state, not the raw
+  // response: timestamps and unrelated API metadata do not alter the selected
+  // verifier object, while an attempt, result, workflow, or head change does.
+  return {
+    id: run.id,
+    workflow_id: run.workflow_id,
+    run_attempt: run.run_attempt,
+    display_title: run.display_title,
+    workflow_path: workflowPath,
+    head_sha: run.head_sha,
+    status: run.status,
+    conclusion: run.conclusion,
+  };
+}
+
+function postCutoverAuditCheckRunSnapshotFingerprint(snapshot) {
+  return canonicalSecurityJson({
+    check_suite_inventory: snapshot.check_suite_inventory,
+    check_run_history: [...snapshot.history].sort(
+      (left, right) => left.id - right.id,
+    ),
+    run_id: snapshot.runId,
+  });
+}
+
+async function loadPostCutoverAuditCheckRunSnapshot({
+  canary,
+  repoSlug,
+  encodedRepo,
+}) {
+  // CheckRun-by-ref exposes only the newest 1,000 Check Suites. Pair the
+  // complete documented suite inventory immediately before and after the
+  // complete CheckRun read: a 1,000 -> 1,001 transition could otherwise push
+  // an earlier failing CheckRun outside that visibility window mid-read.
+  const checkSuitesBefore = await loadCompletePostCutoverAuditCheckSuites({
+    repoSlug,
+    encodedRepo,
+    headSha: canary.head_sha,
+  });
+  const checkPages = await ghJson(
+    `repos/${encodedRepo}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`,
+    { paginate: true },
+  );
+  const checkRuns = assertCompletePostCutoverAuditPages({
+    pages: checkPages,
+    collection: "check_runs",
+    repoSlug,
+    label: "CheckRun",
+  });
+  const checkSuitesAfter = await loadCompletePostCutoverAuditCheckSuites({
+    repoSlug,
+    encodedRepo,
+    headSha: canary.head_sha,
+  });
+  const stableCheckSuites = assertPostCutoverAuditCheckSuiteInventoryStable({
+    before: checkSuitesBefore,
+    after: checkSuitesAfter,
+    repoSlug,
+  });
+  const {
+    checkSuiteId,
+    history,
+    runId,
+  } = assertPostCutoverAuditCheckRunHistory({
+    checkRuns,
+    canary,
+    repoSlug,
+  });
+  // Bind the selected successful CheckRun back to the identical before/after
+  // visibility window, rather than accepting a valid-looking CheckRun from an
+  // empty or unrelated horizon.
+  if (!stableCheckSuites.has(checkSuiteId)) {
+    throw new Error(
+      `${repoSlug} fresh canary CheckRun does not bind an exact CheckSuite in the stable visibility window.`,
+    );
+  }
+  return {
+    check_suite_inventory: [...stableCheckSuites]
+      .map(([id, head_sha]) => ({ id, head_sha }))
+      .sort((left, right) => left.id - right.id),
+    history,
+    runId,
+  };
+}
+
+async function loadCompletePostCutoverAuditAttemptJobs({
+  repoSlug,
+  encodedRepo,
+  runId,
+  runAttempt,
+}) {
+  const pages = await ghJson(
+    `repos/${encodedRepo}/actions/runs/${runId}/attempts/${runAttempt}/jobs?per_page=100`,
+    { paginate: true },
+  );
+  return assertCompletePostCutoverAuditPages({
+    pages,
+    collection: "jobs",
+    repoSlug,
+    label: `Actions job attempt ${runAttempt}`,
+  });
+}
+
+function selectPostCutoverAuditVerifierAttemptJob({
+  jobs,
+  canary,
+  repoSlug,
+  runId,
+  runAttempt,
+}) {
+  const matchingJobs = jobs.filter((job) => job?.name === DEFAULT_STATUS_CONTEXT);
+  if (matchingJobs.length !== 1) {
+    throw new Error(
+      `${repoSlug} fresh canary run attempt ${runAttempt} lacks one exact canonical verifier job.`,
+    );
+  }
+  const job = matchingJobs[0];
+  if (
+    job.run_id !== runId ||
+    job.head_sha !== canary.head_sha ||
+    job.status !== "completed" ||
+    typeof job.conclusion !== "string" ||
+    job.conclusion === ""
+  ) {
+    throw new Error(
+      `${repoSlug} fresh canary run attempt ${runAttempt} is not a completed canonical verifier job on the exact canary head.`,
+    );
+  }
+  return {
+    job,
+    checkRunId: parsePostCutoverAuditCheckRunApiUrl(job.check_run_url, repoSlug),
+  };
+}
+
+async function assertPostCutoverAuditCheckRunHistoryMatchesAttempts({
+  canary,
+  repoSlug,
+  encodedRepo,
+  runId,
+  currentAttemptJobs,
+  history,
+}) {
+  const historyByCheckRunId = new Map(
+    history.map((entry) => [entry.id, entry]),
+  );
+  const observedCheckRunIds = new Set();
+  for (
+    let runAttempt = 1;
+    runAttempt <= canary.v2_run_attempt;
+    runAttempt += 1
+  ) {
+    const jobs =
+      runAttempt === canary.v2_run_attempt
+        ? currentAttemptJobs
+        : await loadCompletePostCutoverAuditAttemptJobs({
+            repoSlug,
+            encodedRepo,
+            runId,
+            runAttempt,
+          });
+    const { job, checkRunId } = selectPostCutoverAuditVerifierAttemptJob({
+      jobs,
+      canary,
+      repoSlug,
+      runId,
+      runAttempt,
+    });
+    const historicalCheckRun = historyByCheckRunId.get(checkRunId);
+    if (
+      historicalCheckRun === undefined ||
+      historicalCheckRun.job_id !== job.id ||
+      historicalCheckRun.conclusion !== job.conclusion ||
+      observedCheckRunIds.has(checkRunId)
+    ) {
+      throw new Error(
+        `${repoSlug} fresh canary CheckRun history does not map one-to-one to attempt-scoped canonical verifier jobs.`,
+      );
+    }
+    observedCheckRunIds.add(checkRunId);
+  }
+  if (observedCheckRunIds.size !== historyByCheckRunId.size) {
+    throw new Error(
+      `${repoSlug} fresh canary CheckRun history contains an unmapped verifier job or attempt.`,
+    );
+  }
+}
+
 async function loadCompletePostCutoverAuditCheckSuites({
   repoSlug,
   encodedRepo,
   headSha,
 }) {
+  // GitHub documents no `filter` parameter for Check Suites. This paginated
+  // endpoint is the complete suite inventory that fences the subsequent
+  // Check Runs `filter=all` visibility window.
   const pages = await ghJson(
-    `repos/${encodedRepo}/commits/${headSha}/check-suites?filter=all&per_page=100`,
+    `repos/${encodedRepo}/commits/${headSha}/check-suites?per_page=100`,
     { paginate: true },
   );
   const checkSuites = assertCompletePostCutoverAuditPages({

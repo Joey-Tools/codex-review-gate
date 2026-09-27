@@ -496,6 +496,13 @@ export const POST_CUTOVER_AUDIT_ORGANIZATION_V2_RULESET = Object.freeze({
   ]),
 });
 
+// GitHub permits a workflow run to be re-run at most fifty times.  The
+// initial execution is attempt one, so a receipt-backed canary lineage can
+// contain at most fifty-one attempt-scoped job inventories.  This is a
+// resource bound for untrusted receipt/manifest input, not a relaxation of
+// the current-attempt success requirement.
+export const POST_CUTOVER_AUDIT_MAX_RUN_ATTEMPTS = 51;
+
 // The retained legacy organization rule is independently anchored for the
 // same reason as v2: the post-cutover receipt and its digest are caller input.
 // It must keep the archived legacy-only repository protected by exactly the
@@ -1466,6 +1473,11 @@ function validatePostCutoverAuditCanary(value, organization, index) {
   assertPositiveReceiptId(value.v2_job_id, `${label} v2_job_id`);
   assertPositiveReceiptId(value.v2_workflow_id, `${label} v2_workflow_id`);
   assertPositiveReceiptId(value.v2_run_attempt, `${label} v2_run_attempt`);
+  if (value.v2_run_attempt > POST_CUTOVER_AUDIT_MAX_RUN_ATTEMPTS) {
+    throw new Error(
+      `${label} v2_run_attempt exceeds the ${POST_CUTOVER_AUDIT_MAX_RUN_ATTEMPTS}-attempt GitHub rerun bound.`,
+    );
+  }
   return {
     ...repository,
     pull_number: value.pull_number,
