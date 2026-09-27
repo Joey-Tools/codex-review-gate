@@ -43,8 +43,10 @@
   consumer bridge deletion. The new audit must bind fresh canaries and live
   organization policy; its consumer re-reads that evidence before every
   destructive boundary, including a final same-run retry stability fence after
-  attempt-job mapping. Keep every cohort bridge installed until the fresh audit
-  proof validates.
+  attempt-job mapping. The repair's focused producer/consumer coverage also
+  locks final-run drift, same-run/different-CheckSuite history, and
+  post-mapping API-read failures to fail closed. Keep every cohort bridge
+  installed until the fresh audit proof validates.
 - [x] Complete the separate source-only bridge-removal flow for
   `Joey-Tools/codex-review-gate`: proof machinery landed first, then the merged
   default-branch helper derived the live source closure for historical Node 24

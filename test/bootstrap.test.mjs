@@ -3240,6 +3240,31 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
       expected: /CheckRun history contains more than one verifier run or CheckSuite lineage/u,
     },
     {
+      name: "checkrun-history-crosses-check-suite-lineage",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const checkRunsEndpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        const checkSuitesEndpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-suites?per_page=100`;
+        const page = structuredClone(responses[checkRunsEndpoint][0]);
+        page.total_count = 2;
+        page.check_runs.push({
+          ...page.check_runs[0],
+          id: canary.v2_check_run_id + 1,
+          conclusion: "failure",
+          check_suite: { id: postCutoverAuditCheckSuiteId(canary) + 1 },
+          details_url:
+            `https://github.com/${canary.full_name}/actions/runs/${canary.v2_run_id}/job/${canary.v2_job_id + 1}`,
+        });
+        return {
+          [checkRunsEndpoint]: [page],
+          [checkSuitesEndpoint]: postCutoverAuditCheckSuitePages(canary, 2),
+        };
+      },
+      expected: /CheckRun history contains more than one verifier run or CheckSuite lineage/u,
+    },
+    {
       name: "checkrun-history-has-unmapped-verifier-job",
       overrides: (receipt, canary) => {
         const responses = postCutoverAuditCanaryResponses(receipt);
@@ -3297,6 +3322,61 @@ test("post-cutover bridge removal re-reads every receipt-bound fresh canary befo
           },
         }),
       expected: /fresh canary Actions run is not bound/u,
+    },
+    {
+      name: "current-run-changes-after-attempt-job-mapping",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint = `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`;
+        const laterAttempt = structuredClone(responses[endpoint]);
+        laterAttempt.run_attempt += 1;
+        laterAttempt.conclusion = "failure";
+        return {
+          [endpoint]: {
+            __fake_sequence: [responses[endpoint], laterAttempt],
+          },
+        };
+      },
+      expected: /fresh canary Actions run is not bound to the receipt-bound verifier head\/test-merge execution/u,
+    },
+    {
+      name: "current-run-read-fails-after-attempt-job-mapping",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint = `repos/${canary.full_name}/actions/runs/${canary.v2_run_id}`;
+        return {
+          [endpoint]: {
+            __fake_sequence: [
+              responses[endpoint],
+              {
+                __fake_http_error: 503,
+                message: "post-mapping Actions run read failed",
+              },
+            ],
+          },
+        };
+      },
+      expected: /post-mapping Actions run read failed/u,
+    },
+    {
+      name: "checkrun-history-read-fails-after-attempt-job-mapping",
+      overrides: (receipt, canary) => {
+        const responses = postCutoverAuditCanaryResponses(receipt);
+        const endpoint =
+          `repos/${canary.full_name}/commits/${canary.head_sha}/check-runs?check_name=${encodeURIComponent(DEFAULT_STATUS_CONTEXT)}&filter=all&per_page=100`;
+        return {
+          [endpoint]: {
+            __fake_sequence: [
+              responses[endpoint],
+              {
+                __fake_http_error: 503,
+                message: "post-mapping CheckRun read failed",
+              },
+            ],
+          },
+        };
+      },
+      expected: /post-mapping CheckRun read failed/u,
     },
     {
       name: "protected-control-plane-file",

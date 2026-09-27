@@ -964,6 +964,8 @@ function createFakeGhHarness(
     canaryCreatedAt = "2026-09-25T00:00:00Z",
     mutateV2CheckRunHistory = null,
     v2CheckRunHistorySequence = null,
+    v2ActionsRunSequence = null,
+    v2ActionsRunFailureAt = null,
     v2AttemptJobInventories = null,
     mutateV2CheckSuiteHistory = null,
     v2CheckSuiteHistorySequence = null,
@@ -1040,6 +1042,26 @@ function createFakeGhHarness(
   ) {
     throw new Error(
       "mutateV2CheckRunHistory and v2CheckRunHistorySequence cannot overlap.",
+    );
+  }
+  if (
+    v2ActionsRunSequence !== null &&
+    typeof v2ActionsRunSequence !== "function"
+  ) {
+    throw new Error("v2ActionsRunSequence must be a function or null.");
+  }
+  if (
+    v2ActionsRunFailureAt !== null &&
+    (!Number.isSafeInteger(v2ActionsRunFailureAt) || v2ActionsRunFailureAt <= 0)
+  ) {
+    throw new Error("v2ActionsRunFailureAt must be a positive integer or null.");
+  }
+  if (
+    v2ActionsRunSequence !== null &&
+    v2ActionsRunFailureAt !== null
+  ) {
+    throw new Error(
+      "v2ActionsRunSequence and v2ActionsRunFailureAt cannot overlap.",
     );
   }
   if (
@@ -1158,6 +1180,10 @@ function createFakeGhHarness(
     v2CheckRunHistorySequence === null
       ? null
       : join(directory, "v2-check-run-history-read-count");
+  const v2ActionsRunReadStatePath =
+    v2ActionsRunSequence === null && v2ActionsRunFailureAt === null
+      ? null
+      : join(directory, "v2-actions-run-read-count");
   const legacyProducerRunDelayCompletionPath =
     legacyProducerRunDelayCompletionMarker
       ? join(directory, "legacy-producer-run-delay-complete")
@@ -1169,6 +1195,8 @@ function createFakeGhHarness(
   const forcedFailureRequests = [];
   const v2CheckSuiteHistorySequenceResponses = [];
   const v2CheckRunHistorySequenceResponses = [];
+  const v2ActionsRunSequenceResponses = [];
+  const v2ActionsRunFailureResponses = [];
   const legacyWriterRaceResponses = [];
   const schedulerWorkflowResponses = [];
   const cleanupResponses = [];
@@ -1709,29 +1737,64 @@ function createFakeGhHarness(
         v2CheckRunPages(checkRunHistory),
       );
     }
-    addFakeResponse(
-      responses,
-      `repos/${encodedSlug}/actions/runs/${repository.canary.v2_run_id}`,
-      {
-        id: repository.canary.v2_run_id,
-        workflow_id: repository.canary.v2_workflow_id,
-        run_attempt: repository.canary.v2_run_attempt,
-        display_title:
-          `${V2_VERIFIER_RUN_NAME_PREFIX}/${repository.canary.pull_number}/${repository.canary.test_merge_sha}`,
-        repository: { full_name: repository.slug },
-        head_repository: { full_name: repository.slug },
-        path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
-        head_sha: repository.canary.head_sha,
-        event: "pull_request",
-        status: "completed",
-        conclusion: "success",
-        pull_requests: [{
-          number: repository.canary.pull_number,
-          head: { sha: repository.canary.head_sha },
-          base: { ref: repository.default_branch },
-        }],
-      },
-    );
+    const actionsRunEndpoint =
+      `repos/${encodedSlug}/actions/runs/${repository.canary.v2_run_id}`;
+    const actionsRunResponse = {
+      id: repository.canary.v2_run_id,
+      workflow_id: repository.canary.v2_workflow_id,
+      run_attempt: repository.canary.v2_run_attempt,
+      display_title:
+        `${V2_VERIFIER_RUN_NAME_PREFIX}/${repository.canary.pull_number}/${repository.canary.test_merge_sha}`,
+      repository: { full_name: repository.slug },
+      head_repository: { full_name: repository.slug },
+      path: CANONICAL_WORKFLOW_IDENTITIES.verifier.path,
+      head_sha: repository.canary.head_sha,
+      event: "pull_request",
+      status: "completed",
+      conclusion: "success",
+      pull_requests: [{
+        number: repository.canary.pull_number,
+        head: { sha: repository.canary.head_sha },
+        base: { ref: repository.default_branch },
+      }],
+    };
+    const actionsRunSequence =
+      v2ActionsRunSequence !== null && repositoryIndex === 0
+        ? v2ActionsRunSequence(clone(actionsRunResponse), {
+            repository,
+            repositoryIndex,
+          })
+        : null;
+    if (actionsRunSequence !== null) {
+      if (
+        !Array.isArray(actionsRunSequence) ||
+        actionsRunSequence.length < 2 ||
+        actionsRunSequence.some(
+          (response) =>
+            response === null ||
+            typeof response !== "object" ||
+            Array.isArray(response),
+        )
+      ) {
+        throw new Error(
+          "v2ActionsRunSequence must return at least two Actions run objects.",
+        );
+      }
+      v2ActionsRunSequenceResponses.push({
+        request: `GET:${actionsRunEndpoint}`,
+        statePath: v2ActionsRunReadStatePath,
+        responses: actionsRunSequence.map((response) => JSON.stringify(response)),
+      });
+    } else {
+      addFakeResponse(responses, actionsRunEndpoint, actionsRunResponse);
+      if (v2ActionsRunFailureAt !== null && repositoryIndex === 0) {
+        v2ActionsRunFailureResponses.push({
+          request: `GET:${actionsRunEndpoint}`,
+          statePath: v2ActionsRunReadStatePath,
+          failureAt: v2ActionsRunFailureAt,
+        });
+      }
+    }
     addFakeResponse(
       responses,
       `repos/${encodedSlug}/actions/workflows/${repository.canary.v2_workflow_id}`,
@@ -2324,6 +2387,41 @@ function createFakeGhHarness(
     }
     scriptLines.push("esac");
   }
+  if (v2ActionsRunFailureResponses.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const response of v2ActionsRunFailureResponses) {
+      scriptLines.push(
+        `  ${shellQuote(response.request)})`,
+        `    count="$(cat ${shellQuote(response.statePath)})"`,
+        "    count=$((count + 1))",
+        `    printf '%s\\n' "$count" > ${shellQuote(response.statePath)}`,
+        `    if [ "$count" -ge ${response.failureAt} ]; then printf '%s\\n' 'simulated post-mapping Actions run read failure' >&2; exit 1; fi ;;`,
+      );
+    }
+    scriptLines.push("esac");
+  }
+  if (v2ActionsRunSequenceResponses.length > 0) {
+    scriptLines.push('case "$request" in');
+    for (const response of v2ActionsRunSequenceResponses) {
+      scriptLines.push(
+        `  ${shellQuote(response.request)})`,
+        `    count="$(cat ${shellQuote(response.statePath)})"`,
+        "    count=$((count + 1))",
+        `    printf '%s\\n' "$count" > ${shellQuote(response.statePath)}`,
+        "    case \"$count\" in",
+      );
+      for (const [index, payload] of response.responses.entries()) {
+        scriptLines.push(
+          `      ${index + 1}) respond ${shellQuote(payload)} ;;`,
+        );
+      }
+      scriptLines.push(
+        `      *) respond ${shellQuote(response.responses.at(-1))} ;;`,
+        "    esac ;;",
+      );
+    }
+    scriptLines.push("esac");
+  }
   if (forcedFailureRequests.length > 0) {
     scriptLines.push('case "$request" in');
     for (const failure of forcedFailureRequests) {
@@ -2383,6 +2481,9 @@ function createFakeGhHarness(
   }
   if (v2CheckRunHistorySequenceStatePath !== null) {
     writeFileSync(v2CheckRunHistorySequenceStatePath, "0\n");
+  }
+  if (v2ActionsRunReadStatePath !== null) {
+    writeFileSync(v2ActionsRunReadStatePath, "0\n");
   }
   if (repositoryIdentityDelayCompletionPath !== null) {
     writeFileSync(repositoryIdentityDelayCompletionPath, "pending\n");
@@ -7407,6 +7508,94 @@ test("post-cutover audit fails closed when a retry appears after attempt-job map
   assert.ok(fourthHistoryRead > secondAttemptJobRead, "final history fence must follow attempt-job mapping");
 });
 
+test("post-cutover audit fails closed when the current run advances after attempt-job mapping", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t, {
+    v2ActionsRunSequence(run) {
+      return [
+        run,
+        run,
+        run,
+        {
+          ...run,
+          run_attempt: run.run_attempt + 1,
+          conclusion: "failure",
+        },
+      ];
+    },
+  });
+
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit"),
+    /v2 CheckRun is not bound to the exact canonical test-merge run/u,
+  );
+  const requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(mutationRequests(requests), []);
+  const repository = harness.manifest.repositories[0];
+  const runEndpoint =
+    `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/` +
+    repository.canary.v2_run_id;
+  const attemptJobsEndpoint =
+    `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/` +
+    `${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`;
+  const fourthRunRead = requests.findIndex(
+    (request, index) =>
+      index > 0 &&
+      request.method === "GET" &&
+      request.endpoint === runEndpoint &&
+      countRequest(requests.slice(0, index + 1), "GET", runEndpoint) === 4,
+  );
+  const secondAttemptJobRead = requests.findIndex(
+    (request, index) =>
+      index > 0 &&
+      request.method === "GET" &&
+      request.endpoint === attemptJobsEndpoint &&
+      countRequest(requests.slice(0, index + 1), "GET", attemptJobsEndpoint) === 2,
+  );
+  assert.ok(secondAttemptJobRead >= 0, "second round must map the receipt-bound attempt job");
+  assert.ok(fourthRunRead > secondAttemptJobRead, "final run fence must follow attempt-job mapping");
+  assert.equal(
+    countRequest(requests, "GET", runEndpoint),
+    4,
+    "both stable rounds must read the current run before and after mapping jobs",
+  );
+});
+
+test("post-cutover audit fails closed when the final Actions run read is unavailable", async (t) => {
+  const harness = createFakePostCutoverAuditHarness(t, {
+    v2ActionsRunFailureAt: 4,
+  });
+
+  await assert.rejects(
+    runFakeCli(harness, "post-cutover-audit"),
+    /simulated post-mapping Actions run read failure/u,
+  );
+  const requests = fakeGhRequests(harness.logPath);
+  assert.deepEqual(mutationRequests(requests), []);
+  const repository = harness.manifest.repositories[0];
+  const runEndpoint =
+    `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/` +
+    repository.canary.v2_run_id;
+  const attemptJobsEndpoint =
+    `repos/${encodeEndpointPathForTest(repository.slug)}/actions/runs/` +
+    `${repository.canary.v2_run_id}/attempts/${repository.canary.v2_run_attempt}/jobs?per_page=100`;
+  const fourthRunRead = requests.findIndex(
+    (request, index) =>
+      index > 0 &&
+      request.method === "GET" &&
+      request.endpoint === runEndpoint &&
+      countRequest(requests.slice(0, index + 1), "GET", runEndpoint) === 4,
+  );
+  const secondAttemptJobRead = requests.findIndex(
+    (request, index) =>
+      index > 0 &&
+      request.method === "GET" &&
+      request.endpoint === attemptJobsEndpoint &&
+      countRequest(requests.slice(0, index + 1), "GET", attemptJobsEndpoint) === 2,
+  );
+  assert.ok(secondAttemptJobRead >= 0, "second round must map the receipt-bound attempt job");
+  assert.ok(fourthRunRead > secondAttemptJobRead, "the unavailable read must be the final run fence");
+});
+
 test("post-cutover audit fails closed for divergent or unmapped v2 retry lineage", async (t) => {
   const configureSecondAttempt = (manifest) => {
     const canary = manifest.repositories[0].canary;
@@ -7442,6 +7631,33 @@ test("post-cutover audit fails closed for divergent or unmapped v2 retry lineage
             details_url:
               `https://github.com/${repository.slug}/actions/runs/` +
               `${repository.canary.v2_run_id + 1}/job/${repository.canary.v2_job_id + 1}`,
+          },
+        ];
+      },
+    });
+    await assert.rejects(
+      runFakeCli(harness, "post-cutover-audit"),
+      /more than one verifier run or CheckSuite lineage/u,
+    );
+    assert.deepEqual(mutationRequests(fakeGhRequests(harness.logPath)), []);
+  });
+
+  await t.test("a CheckRun from another CheckSuite in the same workflow run", async (t) => {
+    const harness = createFakePostCutoverAuditHarness(t, {
+      mutateV2CheckSuiteHistory: (_history, { repository }) =>
+        v2CheckSuites(repository, 2),
+      mutateV2CheckRunHistory(history, { repository }) {
+        const latest = history[0];
+        return [
+          latest,
+          {
+            ...clone(latest),
+            id: latest.id + 1,
+            conclusion: "failure",
+            check_suite: { id: latest.check_suite.id + 1 },
+            details_url:
+              `https://github.com/${repository.slug}/actions/runs/` +
+              `${repository.canary.v2_run_id}/job/${repository.canary.v2_job_id + 1}`,
           },
         ];
       },

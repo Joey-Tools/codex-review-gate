@@ -1380,6 +1380,26 @@ evidence that a prior freeze remains in force.
   receipt-bound reread, 1,000-suite race, and closed-unmerged cases. The
   monolithic bootstrap suite produced no report before its bounded 300-second
   timeout, so it is explicitly not recorded as passing.
+- A follow-up generic Terra Ultra review found three test-only coverage gaps in
+  the retry fence, not a new production-code defect: the final current-run
+  reread was not independently made to drift, a same-run/different-CheckSuite
+  history fork was not exercised, and a post-mapping API-read failure lacked a
+  direct fail-closed fixture. The repaired tests now keep complete history
+  unchanged while the final run advances to `N+1`, inject a second CheckRun in
+  the same Actions run but in a second stable-visible CheckSuite, and inject
+  post-mapping 503/current-run read failures. Producer and consumer assertions
+  require rejection with no mutation; consumer assertions additionally retain
+  the legacy bridge and the pre-mutation CODEOWNERS sentinel. This records the
+  reason for the expanded fixture controls: they protect the retry fence's
+  execution-order and unavailable-read semantics rather than treating any
+  incidental API field change as evidence drift.
+- The coverage follow-up passed `npm run check`, `git diff --check`, and
+  project-journal validation. Its targeted consumer group passed 3/3 in
+  32.049 seconds; the complete producer suite
+  (`node --test --test-reporter=dot test/organization-review-gate-handoff.test.mjs`)
+  exited 0 in 154.43 seconds without failure output. The monolithic bootstrap
+  suite remains intentionally unclaimed because its prior bounded no-output
+  timeout is unrelated to this focused coverage patch.
 
 ## Next Steps
 
