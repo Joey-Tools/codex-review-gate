@@ -4066,22 +4066,56 @@ test("a closed same-author duplicate cohort cannot block one later canonical gen
     updated_at: "2026-08-25T08:03:00Z",
     html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
   });
-  const secondClean = cleanIssueComment(HEAD.slice(0, 10), {
+  const lateClean = cleanIssueComment(HEAD.slice(0, 10), {
     id: 202,
     created_at: "2026-08-25T08:04:00Z",
     updated_at: "2026-08-25T08:04:00Z",
   });
   const github = createGitHubMock({
-    issueComments: [first, second, firstClean, canonical, secondClean],
+    issueComments: [first, second, firstClean, canonical, lateClean],
   });
   const environment = runtimeEnvironment(context, {
     suffix: "duplicate-cohort-before-canonical-generation",
   });
   const { result } = await runGate(environment, github);
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.report.gateOutcome, "success");
-  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
   assert.equal(result.report.requiresReplacementPr, false);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+
+  const directGitHub = createGitHubMock({
+    issueComments: [first, second, firstClean, canonical, lateClean],
+    reactionsByCommentId: new Map([[String(canonical.id), [reaction({
+      id: 650,
+      created_at: "2026-08-25T08:04:30Z",
+    })]]]),
+  });
+  const directEnvironment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-canonical-direct-clean",
+  });
+  const { result: direct } = await runGate(directEnvironment, directGitHub);
+  assert.equal(direct.exitCode, 0);
+  assert.equal(direct.report.gateOutcome, "success");
+  assert.equal(direct.report.recoveryCode, "none");
+
+  const priorFinding = findingReview(HEAD, {
+    id: 401,
+    submitted_at: "2026-08-25T07:59:00Z",
+  });
+  const findingGitHub = createGitHubMock({
+    issueComments: [first, second, firstClean, canonical, lateClean],
+    reviews: [priorFinding],
+  });
+  const findingEnvironment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-late-clean-cannot-supersede-finding",
+  });
+  const { result: finding } = await runGate(findingEnvironment, findingGitHub);
+  assert.equal(finding.exitCode, 1);
+  assert.equal(finding.report.gateOutcome, "failure");
+  assert.equal(finding.report.counts.unresolved, 1);
+  assert.equal(finding.report.counts.resolved, 0);
+  assert.equal(findingGitHub.statusWrites.some(({ state }) => state === "success"), false);
 
   const incompleteGitHub = createGitHubMock({
     issueComments: [first, second, firstClean, canonical],

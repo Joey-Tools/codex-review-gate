@@ -108,9 +108,11 @@ token 无法可靠做到。它不会削弱 finding authority：任何合格 Code
 workflow）只能合并恰好两条严格按时间排序、未编辑、来自同一 user 的 ordinary request，并且
 必须没有 base epoch、两条都没有 official direct `eyes`/`+1`、随后有一条未编辑 official 顶层
 current-head clean、到该 clean 为止没有其他 provider activity/error，且唯一可能的 successor
-是一条精确绑定 current head/base 的 canonical request。第三条 request、另一 author、edit、
-finding、progress/error、inline-parent receipt 或竞争 successor 都会保持 pending。此例外不赋予
-commenter 启动 Codex 的权限，也不是让人或 agent 主动创建 pair 的说明。
+是一条精确绑定 current head/base 的 canonical request。若该 successor 存在，较晚 ordinary request
+保留为已闭合的 predecessor：raw terminal 不能令 successor pass，后者需要自身的 official direct
+`+1`。第三条 request、另一 author、edit、finding、progress/error、inline-parent receipt 或竞争
+successor 都会保持 pending。此例外不赋予 commenter 启动 Codex 的权限，也不是让人或 agent 主动
+创建 pair 的说明。
 
 Consumer workflows 没有 cron、`repository_dispatch`、`pull_request_target`、自动
 `pull_request_review` writer、runtime GitHub App、status bridge 或 ledger。evidence

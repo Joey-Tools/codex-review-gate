@@ -4140,15 +4140,14 @@ function selectV2DefaultAnyDuplicateCohortClosure({
     })) {
       continue;
     }
-    return successor
-      ? {
-          confirmedIds: [],
-          suppressedBoundaryIds: [first.id, second.id],
-        }
-      : {
-          confirmedIds: [second.id],
-          suppressedBoundaryIds: [first.id],
-        };
+    // Keep the later duplicate as the confirmed generation even when a
+    // canonical successor follows it. That preserves the settled cohort as a
+    // physical predecessor, so a delayed unbound terminal carrier cannot be
+    // attributed to the successor generation.
+    return {
+      confirmedIds: [second.id],
+      suppressedBoundaryIds: [first.id],
+    };
   }
   return null;
 }

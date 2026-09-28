@@ -239,9 +239,11 @@ request；两条都没有 official `eyes`/`+1`；之后有一条未编辑、offi
 clean，且无歧义解析到 current head；从第一条 request 到该 clean 之间没有其他 provider
 artifact 或 provider error。唯一允许的后继只能是一条严格更晚、绑定 current 完整 head/base tuple
 的 canonical workflow request。没有后继时，较晚的 ordinary request 被确认、较早的被合并；有该
-后继时，两条都在其前被合并。inline-parent receipt、第三条 request、不同 author、edit、base
-epoch、reaction、provider progress/error、finding 或其他 successor 均保持 fail-closed。agent 不得
-故意创建这类请求对；它只恢复 GitHub immutable snapshot 中已经存在的历史证据。
+后继时，较晚的 ordinary request 保留为已确认、已闭合的 predecessor，之后无绑定的 terminal 不能
+令 successor pass，后者必须取得自身的 official direct `+1`。inline-parent receipt、第三条
+request、不同 author、edit、base epoch、两条 ordinary request 上的 reaction、provider
+progress/error、finding 或其他 successor 均保持 fail-closed。agent 不得故意创建这类请求对；它只
+恢复 GitHub immutable snapshot 中已经存在的历史证据。
 
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base

@@ -368,10 +368,13 @@ and the first request through that clean has no other provider artifact or
 provider error. The only possible successor is one strictly later canonical
 workflow request with the current full head/base tuple. Without a successor,
 the later ordinary request is confirmed and the earlier one is coalesced; with
-that successor, both are coalesced before it. Inline-parent receipts, a third
-request, another author, edits, base epochs, reactions, provider activity or
-errors, findings, and every other successor remain fail-closed. This recovers
-an immutable historical pair; agents must not deliberately create one.
+that successor, the later ordinary request remains the explicitly confirmed,
+already-closed predecessor; an unbound terminal after the successor cannot
+complete it, and only a direct official `+1` on the successor can do so.
+Inline-parent receipts, a third request, another author, edits, base epochs,
+reactions on either ordinary request, provider activity or errors, findings,
+and every other successor remain fail-closed. This recovers an immutable
+historical pair; agents must not deliberately create one.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's

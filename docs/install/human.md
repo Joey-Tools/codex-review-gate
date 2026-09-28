@@ -142,10 +142,13 @@ strictly ordered, unedited ordinary requests from the same user only when there
 is no base epoch, neither has an official direct `eyes`/`+1`, one unedited
 official top-level current-head clean follows both, no other provider
 activity/error occurs through that clean, and the only possible successor is
-one exact current head/base-bound canonical request. A third request, another
-author, edit, finding, progress/error, inline-parent receipt, or competing
-successor remains pending. This exception never gives a commenter permission
-to start Codex and is not an instruction for humans or agents to emit pairs.
+one exact current head/base-bound canonical request. If that successor exists,
+the later ordinary request remains an already-closed predecessor: a raw
+terminal cannot pass the successor, which instead needs a direct official `+1`.
+A third request, another author, edit, finding, progress/error, inline-parent
+receipt, or competing successor remains pending. This exception never gives a
+commenter permission to start Codex and is not an instruction for humans or
+agents to emit pairs.
 
 The consumer workflows have no cron, `repository_dispatch`,
 `pull_request_target`, automatic `pull_request_review` writer, runtime GitHub

@@ -274,8 +274,11 @@ current head, and no other provider artifact or provider error from the first
 request through that clean. The only permitted successor is one strictly later
 canonical workflow request bound to the current full head/base tuple. With no
 successor, the later ordinary request is confirmed and the earlier one is
-coalesced; with that successor, both are coalesced before it. Inline-parent
-receipts, a third request, different authors, edits, base epochs, reactions,
+coalesced. With that successor, the later ordinary request remains the
+explicitly confirmed, already-closed predecessor: a raw terminal after the
+canonical request cannot satisfy it, so the canonical generation needs its own
+qualifying direct official `+1`. Inline-parent receipts, a third request,
+different authors, edits, base epochs, reactions on either ordinary request,
 provider progress/errors, findings, or any other successor remain fail-closed.
 Agents must never intentionally create this pair; it only recovers one that
 already exists in the immutable GitHub snapshot.

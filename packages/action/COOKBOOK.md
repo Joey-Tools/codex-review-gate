@@ -92,10 +92,12 @@ exception is the duplicate cohort: exactly two unedited, strictly ordered
 ordinary requests by the same user, no base epoch or official direct receipt,
 one unedited official top-level current-head clean after both, no other
 provider activity/error through that clean, and at most one later exact
-head/base-bound canonical request. It coalesces immutable historical evidence;
-it does not authorize a new producer pattern. Any third request, different
-author, edit, finding, progress/error, inline-parent receipt, or competing
-successor stays pending.
+head/base-bound canonical request. With that successor, the later ordinary
+request stays as an already-closed predecessor, so a raw terminal cannot pass
+the successor; it needs its own direct official `+1`. It coalesces immutable
+historical evidence; it does not authorize a new producer pattern. Any third
+request, different author, edit, finding, progress/error, inline-parent
+receipt, or competing successor stays pending.
 
 ### Workflow-coordinated review
 

@@ -1,11 +1,11 @@
 ---
 id: 20260928-inline-parent-clean-receipt
 title: V2 Inline Parent Clean Receipt Repair
-status: active
+status: completed
 created: 2026-09-28
 updated: 2026-09-28
 branch: wip/resolved-inline-clean
-pr:
+pr: 82
 supersedes: []
 superseded_by:
 ---
@@ -39,10 +39,12 @@ superseded_by:
   ordinary parent-level provider evidence; the installed ruleset remains the
   sole authority for `all conversations resolved`.
 
-## Current State
+## Completed Outcome
 
-- This is a narrow receipt-classification change, not a transfer of inline
-  thread enforcement from GitHub rulesets into the Action.
+- PR #82 merged to `master` as
+  `28ca4b54d6d41d86ca8105ab2b26261d2f2fa2fa`; this remains a narrow
+  receipt-classification change, not a transfer of inline thread enforcement
+  from GitHub rulesets into the Action.
 - Review hardening added an end-to-end fail-closed matrix for non-official
   provenance, wrong App, non-`COMMENTED` state, non-later timestamps, old
   native head, mismatched reviewed/native head, and non-closed grammar. It
@@ -53,18 +55,20 @@ superseded_by:
 - The two package README variants now describe both admitted terminal-clean
   forms, so the generated Action payload documentation cannot imply that only
   a top-level issue comment may complete this narrow path.
-- Validation for the amended candidate includes `npm run check`, `npm run
+- Validation for the amended candidate included `npm run check`, `npm run
   test:v2`, the focused inline-parent runtime tests, `node --test
   test/release-provenance.test.mjs`, and the schema-v3 Node24 release-pipeline
   regression. The release manifest was regenerated from the staged Action
   payload and independently matched its exact tree.
-- No package publication or rollout reconciliation result is asserted by this
-  journal entry.
+- Frozen source `28ca4b5` was published by completed release run `36410422637`
+  as stable `v2.1.1`; immutable `v2.1.1` and floating `v2` both peel to action
+  commit `2041f67c287a144c5b30de1f4c702a396535817d`.
 
-## Next Steps
+## Follow-up Scope
 
-- Follow the normal review and release procedures, then run the retained
-  consumers' exact-head reconciles against the published floating `v2` alias.
+- Consumer rollout and any remaining exact-head reconciles remain tracked by
+  the organization handoff workstream; this completed repair does not assert
+  their individual outcomes.
 
 ## Evidence
 

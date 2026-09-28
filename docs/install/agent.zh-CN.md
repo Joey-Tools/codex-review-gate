@@ -1109,9 +1109,10 @@ read-only verifier token 无法可靠做到。该设置不会让合格 finding �
 producer protocol）只能合并恰好两条严格按时间排序、未编辑、来自同一 user 的 ordinary
 request，并且必须没有 base epoch、两条均无 official direct `eyes`/`+1`、随后有一条未编辑
 official 顶层 current-head clean、到该 clean 为止没有其他 provider activity/error，且最多仅有
-一条之后精确绑定 current head/base 的 canonical request。第三条 request、不同 author、edit、
-finding、progress/error、inline-parent receipt 或竞争 successor 都保持 pending。它不提供启动
-Codex 的权限；只被动恢复已在 GitHub 中存在的证据。
+一条之后精确绑定 current head/base 的 canonical request。若该 successor 存在，较晚 ordinary
+request 保留为已闭合的 predecessor：raw terminal 不能令 successor pass，后者需要自身的 official
+direct `+1`。第三条 request、不同 author、edit、finding、progress/error、inline-parent receipt 或
+竞争 successor 都保持 pending。它不提供启动 Codex 的权限；只被动恢复已在 GitHub 中存在的证据。
 
 ## 阶段 2：暂存并验证 Disabled ruleset
 

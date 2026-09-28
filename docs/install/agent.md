@@ -1294,10 +1294,12 @@ two strictly ordered, unedited ordinary requests from the same user only with
 no base epoch, no official direct `eyes`/`+1` on either, one unedited official
 top-level current-head clean after both, no other provider activity/error
 through that clean, and at most one later exact current head/base-bound
-canonical request. A third request, different author, edit, finding,
-progress/error, inline-parent receipt, or competing successor remains pending.
-It never grants authority to start Codex; treat it only as passive recovery of
-evidence that already exists in GitHub.
+canonical request. If that successor exists, the later ordinary request remains
+an already-closed predecessor: a raw terminal cannot pass the successor, which
+instead needs a direct official `+1`. A third request, different author, edit,
+finding, progress/error, inline-parent receipt, or competing successor remains
+pending. It never grants authority to start Codex; treat it only as passive
+recovery of evidence that already exists in GitHub.
 
 The controller Action step must use underscore input names:
 `github_token`, `pr_number`, `expected_head_sha`, `operation`,
