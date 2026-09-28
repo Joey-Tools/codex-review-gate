@@ -12,7 +12,7 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "149cbb15bf320dfa22862e721992f766e66f44db"
+    "tree": "303f6d466e729aecc77778d73b345a5d0f352e63"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
@@ -25,29 +25,29 @@
       "path": "COOKBOOK.md",
       "type": "file",
       "mode": "100644",
-      "size": 28784,
-      "sha256": "f7aa21d04d790f6ad09ffbfa3dbe338e990aff51f9c4a680ffffc832ad835c67"
+      "size": 29931,
+      "sha256": "de84b3806a291baf7e55d62b263af415063a7a0344af91be7086f4f13c409c9d"
     },
     {
       "path": "COOKBOOK.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 28885,
-      "sha256": "2e9dc007f899728ff664cdf5680c4a4b27ee3706dc1b0ce1f67384784d79c1d9"
+      "size": 30087,
+      "sha256": "559c98b3d970c8788a78a52f7cf8f590c5311cac37565fe9ac5a5e7d7a11d976"
     },
     {
       "path": "DESIGN.md",
       "type": "file",
       "mode": "100644",
-      "size": 39029,
-      "sha256": "cfa16e9ed59e8c60d608f6d72e364465a7a11881562ea63ad3758ab002c1cd37"
+      "size": 39856,
+      "sha256": "91ce42b4ca427f7fe68ebb8a55e81b082982345b94efac73fe7f9707619e35d7"
     },
     {
       "path": "DESIGN.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 39111,
-      "sha256": "468d7884c5f8737b4fde6ddce10a1fcf25bc1b048cd90b1789eb06b5cf985e9f"
+      "size": 40026,
+      "sha256": "d706932fcce6ef546ba9fffda2f0cc3f20469b63462ad73013f9f9a1695b6050"
     },
     {
       "path": "EULA.md",
@@ -67,15 +67,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 29740,
-      "sha256": "ec8d55e8041298014c2fbd0488e99fbf0db10bf23bbe21e9f68a5802b13d6b53"
+      "size": 29881,
+      "sha256": "28f019030f43bb0c8b96d98da476b9d9ad7182e47b22fd8f39b8062972765d08"
     },
     {
       "path": "README.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 29264,
-      "sha256": "8e960e45256210d3d5bf453088afb0d723275a0b44d4ce00930b903d0fbe7666"
+      "size": 29971,
+      "sha256": "e9a68be1cf5939741af850447460ed215e891e647c79f0339145638469a37d60"
     },
     {
       "path": "SECURITY.md",

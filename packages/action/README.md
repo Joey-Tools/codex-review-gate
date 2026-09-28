@@ -267,16 +267,18 @@ Qualifying Codex findings block regardless of request-author permission.
 One recovery-only exception prevents an already-settled duplicate pair from
 permanently poisoning a later canonical generation. A *duplicate cohort* (a
 fixed legacy pair, not a request pattern to produce) is accepted only with no
-base epoch, exactly two strictly time-ordered, unedited ordinary requests from
-the same `User` login, no official `eyes`/`+1` on either request, one unedited
+base epoch, exactly two strictly sequential, unedited exact default-`any`
+ordinary (non-canonical-marker) `@codex review` requests from the same `User`
+login, no official `eyes`/`+1` on either request, one unedited
 official top-level issue-comment clean after both that resolves exactly to the
-current head, and no other provider artifact or provider error from the first
-request through that clean. The only permitted successor is one strictly later
+current head, no provider error in the snapshot, and no other provider artifact
+from the first request through that clean (or, if present, through its sole
+canonical successor). The only permitted successor is one strictly later
 canonical workflow request bound to the current full head/base tuple. With no
 successor, the later ordinary request is confirmed and the earlier one is
 coalesced. With that successor, the later ordinary request remains the
 explicitly confirmed, already-closed predecessor: a raw terminal after the
-canonical request cannot satisfy it, so the canonical generation needs its own
+canonical request cannot satisfy that successor, so the canonical generation needs its own
 qualifying direct official `+1`. Inline-parent receipts, a third request,
 different authors, edits, base epochs, reactions on either ordinary request,
 provider progress/errors, findings, or any other successor remain fail-closed.

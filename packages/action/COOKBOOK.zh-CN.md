@@ -68,7 +68,8 @@ current-head 顶层 issue comment（PR 的普通评论，不是 pull-request rev
 clean，或 official exact-head `COMMENTED` inline-parent 的 closed grammar（固定格式而非自由
 文本猜测）确认。后者只观察 immutable parent review，绝不读取或判断其 inline threads。
 第二条或 ambiguous request/boundary、任何 edit、terminal 不匹配，或 head/SHA binding 有歧义时，
-gate 保持 pending。terminal 的 short SHA 只有被
+普通 candidate 路径保持 pending；下述 duplicate cohort 是第二条 boundary 情形的唯一
+recovery-only 例外。terminal 的 short SHA 只有被
 GitHub 无歧义解析为 current PR head 才接受。同一 comment 上 official `eyes`/`+1` 的
 direct receipt 仍然受支持。这既不授予 commenter 启动或控制 Codex review 的权限，也不会
 使 Codex 启动，更不意味着任何用户都能导致 review；Codex 与 GitHub 仍决定是否接受
@@ -78,14 +79,17 @@ fail-closed pending。canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHO
 workflow 添加 strict policy。`write`/`maintain`/`admin` 仅保留给将来可以读取 collaborator
 permission 的 nonstandard verifier identity。
 
-不得故意重复发送 direct request。唯一的 recovery exception 是 duplicate cohort：恰好两条
-未编辑、严格按时间排序、同一 user 的 ordinary request；没有 base epoch 或 official direct
-receipt；之后有一条未编辑 official 顶层 current-head clean；到该 clean 为止没有其他 provider
-activity/error；并且最多只允许一条之后严格绑定 head/base 的 canonical request。它只合并
-immutable historical evidence，不授权一种新的 producer pattern。有该 successor 时，较晚 ordinary
-request 仍是已闭合的 predecessor，因此 raw terminal 不能令 successor pass，它需要自身的 official
-direct `+1`。第三条 request、不同 author、edit、finding、progress/error、inline-parent receipt 或
-竞争 successor 都保持 pending。
+不得故意重复发送 direct request。唯一的 recovery exception 是 duplicate cohort：恰好两条彼此
+严格顺序、未编辑、exact default-`any` 的 ordinary（不带 canonical marker）`@codex review`
+request，且来自同一 `User` login；没有 base epoch，且两条都没有 official direct `eyes`/`+1`；
+之后有一条未编辑 official 顶层 clean，且无歧义解析到 current PR head；整个 snapshot 没有
+provider error；从第一条 request 到该 clean（若有唯一 canonical successor，则到该 successor）
+之间没有其他 provider artifact；并且最多只允许一条之后严格绑定 head/base 的 canonical request。
+没有 successor 时，该 clean 确认较晚 request 并合并较早 request。它只合并 immutable historical
+evidence，不授权一种新的 producer pattern。有该 successor 时，较晚 ordinary request 仍是已闭合的
+predecessor，因此 raw terminal 不能令 successor pass，它需要自身的 official direct `+1`。第三条
+request、不同 author、edit、finding、progress/error、inline-parent receipt、两条 ordinary request
+上的 reaction 或竞争 successor 都保持 pending。
 
 ### Workflow-coordinated review
 
@@ -226,7 +230,7 @@ change。
 | `wait_provider` | 等待 Codex 发布 terminal evidence；不要 spam requests。 |
 | `reconcile` | 重读 exact current head 并运行一次 scoped reconcile。 |
 | `fix_findings` | 按 summary reason 操作。通常先修复报告的 current findings，另行解决 inline conversations，再取得合格 clean evidence 后 reconcile。若 finding 只是 policy-only inline finding，已解决的 conversation 只满足 ruleset 条件；同一 exact head 上已有的 qualified inline-parent receipt 可独立确认 clean，否则仍按 `request_clean_generation` 分流。若 reason 同时指出不可闭合的 historical lineage，应把修复放到 replacement PR，并在其中只运行一个 canonical generation，不得在原 PR 重发。 |
-| `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；或者仅限唯一、没有 base epoch、single-flight、未编辑的 default-`any` ordinary candidate，等待其匹配的未编辑 official current-head 顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head `COMMENTED` inline-parent review。generic pull-request review clean 不能确认该 candidate。finding 仍独立阻塞，绝不确认它。只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。既没有 direct receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
+| `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；或者仅限唯一、没有 base epoch、single-flight、未编辑的 default-`any` ordinary candidate，等待其匹配的未编辑 official current-head 顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head `COMMENTED` inline-parent review。generic pull-request review clean 不能确认该 candidate。上文 recovery-only duplicate cohort 不是 request path：不得主动创建；若 immutable snapshot 已满足它，应 reconcile；若有 canonical successor，后者仍需自身 direct `+1`。finding 仍独立阻塞，绝不确认它。只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。既没有 direct receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
 | `retry_reconcile` | `retry_safe` 允许时 retry 同一个 exact-head reconcile。 |
 | `wait_then_reconcile` | 等待 GitHub/Codex settle，重读 head，再 reconcile。 |
 | `use_expanded_limits` | 设置受保护 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`，再 reconcile 同一 exact head。 |
@@ -240,7 +244,8 @@ change。
 summary 才是该 code category 内具体 reason、lineage 和 object links 的 authority；仅凭
 recovery code 不得另发 request。若已存在的 latest/current canonical request 只缺少可归因
 clean，应取得该 request 上合格的 direct `+1`；唯一符合条件的 default-`any` candidate
-也可以等待其匹配 terminal-clean receipt。不得再增加 generation boundary。若存在不可闭合的
+也可以等待其匹配 terminal-clean receipt。已有 recovery-only duplicate cohort 只可 reconcile，
+不得主动创建；若它已有 canonical successor，仍须在 successor 上取得 direct `+1`。不得再增加 generation boundary。若存在不可闭合的
 historical unbound predecessor gap，必须使用 replacement PR，不能在原 PR 重发或仅靠 commit
 change reset。
 
@@ -277,7 +282,9 @@ lineage 的第一个物理 generation 中才具有相同 clean authority。该 l
 exact、未编辑的 default-`any` ordinary request，其匹配的未编辑 official current-head
 顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head
 `COMMENTED` inline-parent review，都可以提供建立第一个 generation 所需的最小 receipt。
-generic pull-request review clean 不可以。出现第二个物理
+generic pull-request review clean 不可以。recovery-only duplicate cohort 是唯一额外的顶层
+clean 情形：它只闭合较晚 ordinary request；任何 canonical successor 仍须自身 direct `+1`。
+该例外之外，出现第二个物理
 request 后，provider terminal evidence 只能闭合第一个 gap；之后的每个 gap，以及新
 generation 的 positive/superseding authority，都必须来自直接附着于相关 request 的
 合格 `+1`。延迟、重复、不匹配、被编辑或 head binding 有歧义的 terminal 都保持 pending。
@@ -288,7 +295,9 @@ generation 的 positive/superseding authority，都必须来自直接附着于�
 official current-head 顶层 issue-comment terminal clean，或 official exact-head `COMMENTED`
 inline-parent 的 fixed closed grammar，且仅适用于唯一、没有 base epoch、single-flight 的情况。
 出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的
-identity、order/head binding 有歧义时，该方式不可用。符合条件的 finding 独立阻塞，绝不
+identity、order/head binding 有歧义时，该方式不可用。上文 duplicate cohort 是第二条 boundary
+情形的唯一 recovery-only 例外：它只使用已经存在两条 request 的顶层 clean，不能令
+canonical successor 使用 terminal clean。符合条件的 finding 独立阻塞，绝不
 提升 candidate。升级后 ordinary request reactions 才仅用于 liveness；ordinary `+1` 不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会阻止 candidate clean
 完成。reaction-only change 不会启动 automatic run；通过 later provider event or manual
