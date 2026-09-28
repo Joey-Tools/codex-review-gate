@@ -160,7 +160,7 @@ stages:
 | `plan` | Unprivileged | Check the exact source commit, manifest, SemVer, reachability, release policy, and immutable target-parent policy. |
 | `candidate-a` | Unprivileged | Independently materialize and upload candidate A on a clean runner; record its tree, inventory, modes, sizes, and SHA-256 digests. |
 | `candidate-b` | Unprivileged | Independently materialize and upload candidate B on another clean runner. |
-| `source-validation` | Unprivileged | After both candidates are frozen, validate the exact source commit across one core cell and four Release-test shards on five clean runners. |
+| `source-validation` | Unprivileged | After both candidates are frozen, validate a current exact source commit across four bootstrap shards, one explicit core cell, and four Release-test shards on nine clean runners; retained legacy source recovery preserves its compatible five-cell partition. |
 | `assemble` | Unprivileged | Require byte-identical candidates and produce the canonical candidate bundle. |
 | `publication-plan` | Unprivileged | Reconstruct and validate the publication plan and candidate before approval; upload no privileged material. |
 | `publish` | Privileged | After Environment approval, revalidate everything and perform signed remote publication. |
@@ -169,12 +169,18 @@ stages:
 The light unprivileged `plan`, `candidate-a`, `candidate-b`, `assemble`,
 `publication-plan`, and `verify` jobs use `ubuntu-slim` with 14-minute
 timeouts. GitHub imposes a separate 15-minute hard limit on that single-CPU
-runner, so exact-source tests run in the `source-validation` matrix on five
-`ubuntu-24.04` runners: one core cell and four Release-test shards, each with a
-14-minute timeout and `fail-fast: false`. This replaces two serial full-suite
-validations that each took more than 17 minutes in the first live RC run while
-preserving independent candidate construction. The privileged `publish` job
-retains `ubuntu-24.04` with its existing 30-minute timeout.
+runner, so current exact-source tests run in the `source-validation` matrix on
+nine `ubuntu-24.04` runners: four mutually exclusive bootstrap shards, one
+explicit core inventory, and four mutually exclusive Release-test shards. Each
+cell has a 14-minute timeout and `fail-fast: false`. The core cell runs
+`npm run check` but does not rediscover bootstrap or Release suites serially.
+This replaces two serial full-suite validations that each took more than 17
+minutes in the first live RC run while preserving independent candidate
+construction. A retained legacy frozen source whose test inventory does not
+match this partition falls back to its source-local core discovery with the Release
+suite disabled, while the four Release shards preserve the compatible five-cell
+partition. The privileged `publish` job retains `ubuntu-24.04` with its
+existing 30-minute timeout.
 
 Only `publish` binds the `marketplace-production` Environment. Despite its
 historical name, this is the production publication-credential and approval
@@ -423,15 +429,19 @@ audit is incomplete and must not be reported as successful.
 `candidate-a` and `candidate-b` start from the same exact source commit but run
 independently. Each materializes, packs, and uploads its candidate on a
 separate clean runner. Only after both uploads succeed does the
-`source-validation` matrix create detached exact-source worktrees on five more
-clean runners. Its core cell runs `npm run check` plus every non-Release test;
-its four Release cells partition the complete Release-pipeline inventory. The
-matrix preserves all cell results, and `assemble` depends on the entire matrix,
-so any failed or missing cell blocks publication. Source test code cannot
-mutate either already-uploaded candidate because validation jobs do not
-download those artifacts. Candidate independence remains enforced by the two
-separate builders and the later byte-identical comparison. Each candidate
-emits a canonical inventory and digests. The
+`source-validation` matrix create detached exact-source worktrees. A current
+source uses nine clean runners: four bootstrap shards, a core cell that runs
+`npm run check` plus the closed current core inventory, and four Release cells
+that partition the complete Release-pipeline inventory. The matrix preserves
+all cell results, and `assemble` depends on the entire matrix, so any failed or
+missing cell blocks publication. If a retained frozen source has a different
+test inventory, the core cell deliberately reverts to its source-local full
+discovery with Release tests disabled; the four Release cells retain the legacy
+five-cell coverage partition. Source test code cannot mutate either
+already-uploaded candidate because validation jobs do not download those
+artifacts. Candidate independence remains enforced by the two separate
+builders and the later byte-identical comparison. Each candidate emits a
+canonical inventory and digests. The
 inventory byte-sorts every Git path and records its type, Git mode, logical
 size, and SHA-256 content digest. Only the explicit
 `src/v2/gate-runtime.mjs` v2 runtime module is admitted; reintroducing a retired

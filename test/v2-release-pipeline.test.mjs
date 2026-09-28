@@ -2494,6 +2494,36 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
     validation,
     /git worktree add --detach "\$RUNNER_TEMP\/release-source" "\$RELEASE_SOURCE_SHA"/u,
   );
+  const sourceInventoryStep = workflowStepBlock(
+    validation,
+    "Classify frozen source test inventory",
+  );
+  assert.match(
+    sourceInventoryStep,
+    /^      - name: Classify frozen source test inventory\n        id: source_test_inventory$/mu,
+  );
+  for (const path of [
+    "test/bootstrap.test.mjs",
+    "test/ci-test-shard.test.mjs",
+    "test/core.test.mjs",
+    "test/evidence-budget.test.mjs",
+    "test/gate-runner.test.mjs",
+    "test/organization-review-gate-handoff.test.mjs",
+    "test/producer-receipt.test.mjs",
+    "test/release-provenance.test.mjs",
+    "test/required-ci-workflow.test.mjs",
+    "test/v2-action.test.mjs",
+    "test/v2-gate-runtime.test.mjs",
+    "test/v2-release-pipeline.test.mjs",
+    "test/v2-workflow-contract.test.mjs",
+    "test/workflow-security-contract.test.mjs",
+  ]) {
+    assert.match(sourceInventoryStep, new RegExp(`^            ${path.replaceAll(".", "\\.")}$`, "mu"));
+  }
+  assert.match(sourceInventoryStep, /find test -type f -name '\*\.test\.mjs' -print \| LC_ALL=C sort/u);
+  assert.match(sourceInventoryStep, /current_inventory=false/u);
+  assert.match(sourceInventoryStep, /printf 'current_inventory=%s\\n' "\$current_inventory" >> "\$GITHUB_OUTPUT"/u);
+  assert.match(sourceInventoryStep, /Legacy frozen source test inventory/u);
   const bootstrapShardEnvironment = [
     "CODEX",
     "REVIEW",
@@ -2508,7 +2538,7 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
   );
   assert.match(
     bootstrapValidationStep,
-    /^      - name: Run bootstrap test shard\n        if: \$\{\{ matrix\.suite\.kind == 'bootstrap' \}\}/mu,
+    /^      - name: Run bootstrap test shard\n        if: \$\{\{ matrix\.suite\.kind == 'bootstrap' && steps\.source_test_inventory\.outputs\.current_inventory == 'true' \}\}/mu,
   );
   assert.match(
     bootstrapValidationStep,
@@ -2524,17 +2554,36 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
   const coreValidationStep = workflowStepBlock(validation, "Run syntax and core tests");
   assert.match(
     coreValidationStep,
-    /^      - name: Run syntax and core tests\n        if: \$\{\{ matrix\.suite\.kind == 'core' \}\}/mu,
+    /^      - name: Run syntax and core tests\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.current_inventory == 'true' \}\}/mu,
   );
   assert.match(
     coreValidationStep,
     /^          cd "\$RUNNER_TEMP\/release-source"\n          npm run check\n          node --test --test-concurrency=1 --test-reporter=dot test\/ci-test-shard\.test\.mjs test\/core\.test\.mjs test\/evidence-budget\.test\.mjs test\/gate-runner\.test\.mjs test\/organization-review-gate-handoff\.test\.mjs test\/producer-receipt\.test\.mjs test\/release-provenance\.test\.mjs test\/required-ci-workflow\.test\.mjs test\/v2-action\.test\.mjs test\/v2-gate-runtime\.test\.mjs test\/v2-workflow-contract\.test\.mjs test\/workflow-security-contract\.test\.mjs$/mu,
   );
   assert.doesNotMatch(coreValidationStep, /\bnpm test\b/u);
+  const legacyValidationStep = workflowStepBlock(
+    validation,
+    "Run legacy source test discovery",
+  );
+  assert.match(
+    legacyValidationStep,
+    /^      - name: Run legacy source test discovery\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.current_inventory != 'true' \}\}/mu,
+  );
+  assert.match(
+    legacyValidationStep,
+    new RegExp(
+      `^          ${releaseShardEnvironment}: "off"$`,
+      "mu",
+    ),
+  );
+  assert.match(
+    legacyValidationStep,
+    /^          cd "\$RUNNER_TEMP\/release-source"\n          npm run check\n          npm test -- --test-concurrency=1 --test-reporter=dot$/mu,
+  );
   const releaseShardStep = workflowStepBlock(validation, "Run release pipeline shard");
   assert.match(
     releaseShardStep,
-    /^      - name: Run release pipeline shard\n        if: \$\{\{ matrix\.suite\.release_test_shard != 'off' \}\}/mu,
+    /^      - name: Run release pipeline shard\n        if: \$\{\{ matrix\.suite\.kind == 'release' \}\}/mu,
   );
   assert.match(
     releaseShardStep,

@@ -363,21 +363,75 @@ jobs:
       - name: Prepare exact frozen source worktree
         run: |
           git worktree add --detach "$RUNNER_TEMP/release-source" "$RELEASE_SOURCE_SHA"
+      - name: Classify frozen source test inventory
+        id: source_test_inventory
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/release-source"
+          current_test_files=(
+            test/bootstrap.test.mjs
+            test/ci-test-shard.test.mjs
+            test/core.test.mjs
+            test/evidence-budget.test.mjs
+            test/gate-runner.test.mjs
+            test/organization-review-gate-handoff.test.mjs
+            test/producer-receipt.test.mjs
+            test/release-provenance.test.mjs
+            test/required-ci-workflow.test.mjs
+            test/v2-action.test.mjs
+            test/v2-gate-runtime.test.mjs
+            test/v2-release-pipeline.test.mjs
+            test/v2-workflow-contract.test.mjs
+            test/workflow-security-contract.test.mjs
+          )
+          mapfile -t discovered_test_files < <(
+            find test -type f -name '*.test.mjs' -print | LC_ALL=C sort
+          )
+          current_inventory=true
+          if (( ${#discovered_test_files[@]} != ${#current_test_files[@]} )); then
+            current_inventory=false
+          else
+            for index in "${!current_test_files[@]}"; do
+              if [[ "${discovered_test_files[$index]}" != "${current_test_files[$index]}" ]]; then
+                current_inventory=false
+                break
+              fi
+            done
+          fi
+          printf 'current_inventory=%s\n' "$current_inventory" >> "$GITHUB_OUTPUT"
+          if [[ "$current_inventory" == false ]]; then
+            {
+              echo "## Legacy frozen source test inventory"
+              echo
+              echo "This recovery source does not match the current closed test inventory."
+              echo "The core cell will retain source-local serial discovery with the"
+              echo "Release suite disabled, while the four Release shards preserve the"
+              echo "legacy five-cell partition."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Run bootstrap test shard
-        if: ${{ matrix.suite.kind == 'bootstrap' }}
+        if: ${{ matrix.suite.kind == 'bootstrap' && steps.source_test_inventory.outputs.current_inventory == 'true' }}
         env:
           CODEX_REVIEW_GATE_BOOTSTRAP_TEST_SHARD: ${{ matrix.suite.bootstrap_test_shard }}
         run: |
           cd "$RUNNER_TEMP/release-source"
           node --test --test-concurrency=1 --test-reporter=dot test/bootstrap.test.mjs
       - name: Run syntax and core tests
-        if: ${{ matrix.suite.kind == 'core' }}
+        if: ${{ matrix.suite.kind == 'core' && steps.source_test_inventory.outputs.current_inventory == 'true' }}
         run: |
           cd "$RUNNER_TEMP/release-source"
           npm run check
           node --test --test-concurrency=1 --test-reporter=dot test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs
+      - name: Run legacy source test discovery
+        if: ${{ matrix.suite.kind == 'core' && steps.source_test_inventory.outputs.current_inventory != 'true' }}
+        env:
+          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+        run: |
+          cd "$RUNNER_TEMP/release-source"
+          npm run check
+          npm test -- --test-concurrency=1 --test-reporter=dot
       - name: Run release pipeline shard
-        if: ${{ matrix.suite.release_test_shard != 'off' }}
+        if: ${{ matrix.suite.kind == 'release' }}
         env:
           CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: ${{ matrix.suite.release_test_shard }}
         run: |
