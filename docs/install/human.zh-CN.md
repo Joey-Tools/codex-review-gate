@@ -104,6 +104,30 @@ variable、public Action input 或 strict policy。`write`/`maintain`/`admin` pa
 可读取 collaborator permission 的 nonstandard verifier identity；bundled read-only verifier
 token 无法可靠做到。它不会削弱 finding authority：任何合格 Codex finding 仍然阻塞。
 
+不要故意重复发送 direct request。仅用于恢复的 duplicate cohort（固定历史 pair，而不是新
+workflow）只能合并恰好两条严格按时间排序、未编辑、来自同一 user 的 ordinary request，并且
+必须没有 base epoch、两条都没有 official direct `eyes`/`+1`、随后有一条未编辑 official 顶层
+current-head clean，且整个 snapshot 中不得出现任何 provider error。每一个 pair 之前、具有有效
+activity window 的 official 顶层 `issue-comment` provider artifact 都会否决 cohort，除非它是已安全
+分类的 historical terminal：kind 为 `clean` 或 `finding`、未编辑、没有
+`orderingError`/`resolutionError`，且跨 `resolvedHeadSha` 与 `headSha` 恰有一个完整、无歧义的 SHA。
+这也包括其他 unknown 或 unclassified、malformed、progress 或 nonterminal 的 official 顶层
+`issue-comment`：只要具有有效 activity window，就属于不透明 provider activity（只作阻塞，不作 clean
+证据），并否决 cohort。较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal 依赖这条明确例外，而非仅有
+full-head binding。除该 pair 外，closure clean 之前不得有任何相关 physical request boundary，其后
+最多只能有一条合格、精确绑定 current head/base 的 canonical successor。从第一条 ordinary request 到
+该 clean 的 revision 之间不得出现任何额外的 provider artifact 或具有有效 activity window 的不透明
+provider activity；若该 successor 存在，exclusive artifact window 延伸至该 successor 的 revision。
+不透明 provider activity 仅是排除用的 side channel：不进入普通 reducer、liveness、finding、clean 或
+计数路径。若该 successor 存在，较晚 ordinary request 保留为已闭合的
+predecessor：raw terminal 不能令 successor pass，后者需要自身的 official direct `+1`。第三条或同一
+时间的 request、另一 author、edit、finding、provider error、任一不属于上文安全 historical-terminal
+例外且具有有效 activity window 的 pre-pair official 顶层 `issue-comment` provider artifact、exclusive
+window 中额外的 provider artifact 或不透明 provider activity、inline-parent receipt，或不合格/竞争
+successor 都会保持 pending。
+该例外要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding
+被保留。此例外不赋予 commenter 启动 Codex 的权限，也不是让人或 agent 主动创建 pair 的说明。
+
 Consumer workflows 没有 cron、`repository_dispatch`、`pull_request_target`、自动
 `pull_request_review` writer、runtime GitHub App、status bridge 或 ledger。evidence
 由所选 verifier 从 PR 重建。

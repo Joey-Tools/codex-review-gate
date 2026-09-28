@@ -1288,6 +1288,43 @@ needs a verifier identity allowed to read collaborator permissions, which the
 bundled read-only verifier token cannot reliably do. The setting never makes a
 qualifying Codex finding non-blocking.
 
+Do not intentionally repeat a plain direct request. A recovery-only duplicate
+cohort (a fixed historical pair, not a producer protocol) can coalesce exactly
+two strictly ordered, unedited ordinary requests from the same user only with
+no base epoch, no official direct `eyes`/`+1` on either, one unedited official
+top-level current-head clean after both, and no provider error anywhere in the
+snapshot. Every pre-pair official top-level `issue-comment` provider artifact
+with a valid activity window vetoes the cohort unless it is a safely classified
+historical terminal: kind `clean` or `finding`, unedited, with no
+`orderingError`/`resolutionError`, and exactly one full unambiguous SHA across
+`resolvedHeadSha` and `headSha`. This includes any otherwise unknown or
+unclassified, malformed, progress, or nonterminal official top-level
+`issue-comment`: with a valid activity window, it is opaque provider activity
+(a blocker rather than clean evidence) and vetoes the cohort. An earlier
+carrier may own the later clean; this explicit exception—not merely a full-head
+binding—preserves safely
+classified historical terminals. Other than that pair, no relevant physical
+request boundary may precede the closure clean, and at most one qualifying
+exact current head/base-bound canonical successor may follow it. No additional
+provider artifact or opaque provider activity with a valid activity window may
+appear from the first ordinary request through the clean's revision; if that
+successor exists, the exclusive artifact window extends through the successor's
+revision. Opaque provider activity is an exclusion-only side channel: it does
+not enter the ordinary reducer, liveness, finding, clean, or count paths. If
+the successor exists, the later ordinary
+request remains an already-closed predecessor: a raw terminal cannot pass the
+successor, which instead needs a direct official `+1`. A third or same-time
+request, different author, edit, finding, provider error, a pre-pair official
+top-level `issue-comment` provider artifact with a valid activity window unless
+it is the safely classified historical-terminal exception above, an extra
+provider artifact or opaque provider activity in the exclusive window,
+inline-parent receipt, or
+nonqualifying/competing successor remains pending. The exception requires every
+listed terminal property; a historical terminal clean/finding is not preserved
+merely because it has a full-head binding. It never grants authority to start
+Codex; treat it only as passive
+recovery of evidence that already exists in GitHub.
+
 The controller Action step must use underscore input names:
 `github_token`, `pr_number`, `expected_head_sha`, `operation`,
 `request_comment_id`, and `request_review`. Both Action steps derive

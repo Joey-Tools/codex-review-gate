@@ -359,6 +359,42 @@ collaborator permissions; the bundled read-only verifier token cannot reliably
 do so. A workflow-authored request additionally needs the exact v2 marker
 binding the full head and run.
 
+The only duplicate-request recovery is a *duplicate cohort* (a fixed legacy
+pair, not a producer protocol). With no base epoch, it accepts exactly two
+strictly sequential, unedited exact default-`any` ordinary
+(non-canonical-marker) `@codex review` requests from the same `User` login only
+if neither has an official direct `eyes`/`+1`, a single unedited official
+top-level issue-comment clean after both resolves exactly to the current head,
+there is no provider error in the snapshot, and every pre-pair official
+top-level `issue-comment` provider artifact with a valid activity window vetoes
+the cohort unless it is a safely classified historical terminal: kind `clean`
+or `finding`, unedited, with no `orderingError`/`resolutionError`, and exactly
+one full unambiguous SHA across `resolvedHeadSha` and `headSha`. This includes
+any otherwise unknown or unclassified, malformed, progress, or nonterminal
+official top-level `issue-comment`: with a valid activity window, it is opaque
+provider activity (a blocker rather than clean evidence) and vetoes the
+cohort. An earlier carrier may own the later clean; this explicit exception—not merely a full-head
+binding—preserves safely classified historical terminals. From the first
+request through that clean (or, if present, through its sole canonical
+successor), no additional provider artifact or opaque provider activity with a
+valid activity window may appear. Opaque provider activity is an exclusion-only
+side channel: it does not enter the ordinary reducer, liveness, finding, clean,
+or count paths. The only possible successor is one strictly later canonical
+workflow request with the current full head/base tuple. Without a successor,
+the later ordinary request is confirmed and the earlier one is coalesced; with
+that successor, the later ordinary request remains the explicitly confirmed,
+already-closed predecessor; an unbound terminal after the successor cannot
+complete it, and only a direct official `+1` on the successor can do so.
+Inline-parent receipts, a third request, another author, edits, base epochs,
+reactions on either ordinary request, provider activity or errors, a pre-pair
+official top-level `issue-comment` provider artifact with a valid activity
+window unless it is the safely classified historical-terminal exception above,
+an extra provider artifact or opaque provider activity in that exclusive window,
+findings, and every other successor remain fail-closed. The exception requires
+every listed terminal property; a historical terminal clean/finding is not
+preserved merely because it has a full-head binding. This recovers an immutable
+historical pair; agents must not deliberately create one.
+
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
 permission. A finding never serves as the minimal terminal receipt. The exact
@@ -374,6 +410,9 @@ lineage. Physical boundary recognition is deliberately separate from positive
 authority, except that the narrow default-`any` top-level issue-comment or
 exact closed inline-parent terminal-clean receipt can establish that first
 generation and carry its clean authority at the same time.
+The recovery-only duplicate cohort is the sole top-level-clean variation: it
+confirms only its later ordinary request, never an inline-parent receipt or a
+canonical successor.
 An unconfirmed default-`any` ordinary candidate without a terminal-clean
 contender is otherwise not a physical boundary. A terminal-clean contender
 that cannot meet the narrow receipt conditions remains an unresolved,
@@ -405,6 +444,11 @@ terminal payloads have no originating request ID, so a later carrier could be
 delayed or duplicated from any older generation; stable snapshots cannot make
 that attribution unique. After a base epoch, provider terminal evidence cannot
 close even the first gap or receipt an ordinary candidate.
+
+The separately defined duplicate cohort is the sole recovery-only exception to
+that ordinary second-boundary rule: its one top-level clean closes the existing
+two-request cohort only. It cannot close, or supply a terminal-clean receipt
+for, a canonical successor.
 
 Official `eyes` or provider activity at or after a candidate closure and no
 later than the successor keeps the predecessor open. Equality with either
@@ -438,7 +482,10 @@ top-level issue-comment terminal clean or exact closed `COMMENTED` inline-parent
 review strictly after that candidate under the unique no-base-epoch,
 single-flight rule. It is unavailable after a base epoch, after a second or
 ambiguous request/boundary, after an edit, or when terminal identity, ordering,
-or head binding is ambiguous. Afterwards, ordinary request reactions are
+or head binding is ambiguous. The separately defined duplicate cohort is the
+sole recovery-only exception to the second-boundary case: it accepts only an
+already-existing two-request snapshot with a top-level clean and never makes a
+canonical successor terminal-clean eligible. Afterwards, ordinary request reactions are
 provider-liveness signals only; ordinary `+1` cannot head-bind clean. Same-time/later
 official `eyes`/progress from Codex vetoes candidate clean evidence. Because
 reaction changes do not trigger the consumer workflow, a later provider event

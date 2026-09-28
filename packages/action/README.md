@@ -264,6 +264,44 @@ workflow-authored request additionally carries the canonical v2 hidden marker
 binding the full head SHA, current base repository/ref/SHA and workflow run.
 Qualifying Codex findings block regardless of request-author permission.
 
+One recovery-only exception prevents an already-settled duplicate pair from
+permanently poisoning a later canonical generation. A *duplicate cohort* (a
+fixed legacy pair, not a request pattern to produce) is accepted only with no
+base epoch, exactly two strictly sequential, unedited exact default-`any`
+ordinary (non-canonical-marker) `@codex review` requests from the same `User`
+login, no official `eyes`/`+1` on either request, one unedited
+official top-level issue-comment clean after both that resolves exactly to the
+current head, no provider error in the snapshot, and every pre-pair official
+top-level `issue-comment` provider artifact with a valid activity window vetoes
+the cohort unless it is a safely classified historical terminal: kind `clean`
+or `finding`, unedited, with no `orderingError`/`resolutionError`, and exactly
+one full unambiguous SHA across `resolvedHeadSha` and `headSha`. This includes
+any otherwise unknown or unclassified, malformed, progress, or nonterminal
+official top-level `issue-comment`: with a valid activity window, it is opaque
+provider activity (a blocker rather than clean evidence) and vetoes the
+cohort. An earlier carrier may own the later clean; this explicit exception—not merely a full-head
+binding—preserves safely classified historical terminals. No additional provider
+artifact or opaque provider activity with a valid activity window may appear
+from the first request through that clean (or, if present, through its sole
+canonical successor). Opaque provider activity is an exclusion-only side
+channel: it does not enter the ordinary reducer, liveness, finding, clean, or
+count paths. The only permitted successor is one strictly later
+canonical workflow request bound to the current full head/base tuple. With no
+successor, the later ordinary request is confirmed and the earlier one is
+coalesced. With that successor, the later ordinary request remains the
+explicitly confirmed, already-closed predecessor: a raw terminal after the
+canonical request cannot satisfy that successor, so the canonical generation needs its own
+qualifying direct official `+1`. Inline-parent receipts, a third request,
+different authors, edits, base epochs, reactions on either ordinary request,
+provider progress/errors, a pre-pair official top-level `issue-comment`
+provider artifact with a valid activity window unless it is the safely
+classified historical-terminal exception above, findings, or any other
+successor remain fail-closed. The exception requires every listed terminal
+property; a historical terminal clean/finding is not preserved merely because
+it has a full-head binding.
+Agents must never intentionally create this pair; it only recovers one that
+already exists in the immutable GitHub snapshot.
+
 Every snapshot also reads the latest GitHub PR timeline
 `BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
 authority must be strictly newer than that base epoch; equal timestamps are
@@ -281,10 +319,12 @@ stays pending rather than being guessed into the new generation.
 Terminal clean text and a qualifying provider `+1` have equal clean authority
 only for the first physical generation of a no-base-epoch, single-flight
 lineage. For the one unique default-`any` ordinary request that satisfies the
-minimal receipt rule, the matching official top-level issue-comment terminal
-clean or exact closed `COMMENTED` Codex inline-parent review can both confirm
-that first generation and carry its clean authority. Other pull-request review
-cleans remain ordinary evidence and cannot confirm a default-`any` candidate.
+minimal receipt rule—or the recovery-only duplicate cohort above—the matching
+official top-level issue-comment terminal clean can establish that first
+generation and carry its clean authority. The exact closed `COMMENTED`
+inline-parent form remains available only for the unique-request path. Other
+pull-request review cleans remain ordinary evidence and cannot confirm a
+default-`any` candidate.
 The inline-parent form attests only the absence of a non-inline parent payload:
 the reducer neither reads nor decides its child threads, and the installed
 ruleset remains the sole authority requiring all conversations to be resolved.
@@ -333,7 +373,8 @@ issue-comment terminal clean or exact closed `COMMENTED` Codex inline-parent
 review strictly after the candidate under the unique no-base-epoch,
 single-flight rule above. It cannot be used after a base epoch,
 after a second or ambiguous request/boundary, after an edit, or when the
-terminal's identity, ordering, or current-head binding is ambiguous. After a direct-reaction
+terminal's identity, ordering, or current-head binding is ambiguous, except
+for the top-level-clean-only duplicate cohort defined above. After a direct-reaction
 upgrade, ordinary request reactions are provider liveness signals only;
 ordinary `+1` still cannot head-bind clean by itself. Same-time/later official
 `eyes`/progress from Codex vetoes a candidate clean because review activity has

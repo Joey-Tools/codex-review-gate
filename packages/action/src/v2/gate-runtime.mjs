@@ -3450,7 +3450,12 @@ async function loadV2DecisionCarriers(
     baseEpoch,
     requestReactions,
     providerArtifacts: providerEvidence.artifacts,
+    opaqueTopLevelProviderActivities: providerEvidence.opaqueTopLevelProviderActivities,
+    providerErrors: providerEvidence.errors,
     headSha,
+    baseSha,
+    baseRef: pullRequest.base.ref,
+    baseRepositoryId: String(pullRequest.base.repo.id),
   });
   const decisionEvidence = reduceV2Evidence({
     headSha,
@@ -3984,10 +3989,34 @@ function confirmV2DefaultAnyRequestCandidates({
   baseEpoch,
   requestReactions,
   providerArtifacts,
+  opaqueTopLevelProviderActivities,
+  providerErrors,
   headSha,
+  baseSha,
+  baseRef,
+  baseRepositoryId,
 }) {
   const confirmedIds = new Set();
   const receiptBoundaryIds = new Set();
+  const suppressedBoundaryIds = new Set();
+  const duplicateCohort = selectV2DefaultAnyDuplicateCohortClosure({
+    physicalBoundaries,
+    baseEpoch,
+    requestReactions,
+    providerArtifacts,
+    opaqueTopLevelProviderActivities,
+    providerErrors,
+    headSha,
+    baseSha,
+    baseRef,
+    baseRepositoryId,
+  });
+  if (duplicateCohort) {
+    for (const id of duplicateCohort.confirmedIds) confirmedIds.add(id);
+    for (const id of duplicateCohort.suppressedBoundaryIds) {
+      suppressedBoundaryIds.add(id);
+    }
+  }
   for (const request of authorized ?? []) {
     if (request?.requiresProviderConfirmation !== true) {
       confirmedIds.add(request.id);
@@ -4019,6 +4048,7 @@ function confirmV2DefaultAnyRequestCandidates({
   return {
     authorized: (authorized ?? []).filter(include),
     boundaries: (boundaries ?? []).flatMap((request) => {
+      if (suppressedBoundaryIds.has(request?.id)) return [];
       if (include(request)) return [request];
       if (!receiptBoundaryIds.has(request?.id)) return [];
       return [{
@@ -4031,7 +4061,246 @@ function confirmV2DefaultAnyRequestCandidates({
   };
 }
 
+function selectV2DefaultAnyDuplicateCohortClosure({
+  physicalBoundaries,
+  baseEpoch,
+  requestReactions,
+  providerArtifacts,
+  opaqueTopLevelProviderActivities,
+  providerErrors,
+  headSha,
+  baseSha,
+  baseRef,
+  baseRepositoryId,
+}) {
+  // This is deliberately a recovery-only exception for one legacy shape. It
+  // coalesces exactly two otherwise indistinguishable ordinary requests from
+  // one user only after an unedited, exact-head top-level clean proves that
+  // both requests were observed before the terminal result. It does not make
+  // later canonical generations accept an unbound terminal carrier.
+  if (baseEpoch?.event !== null && baseEpoch?.event !== undefined) return null;
+  if ((providerErrors ?? []).length > 0) return null;
+
+  const boundaries = [...(physicalBoundaries ?? [])]
+    .filter((boundary) => Number.isFinite(boundary?.revisionMs))
+    .sort((left, right) =>
+      left.revisionMs - right.revisionMs ||
+      compareV2LineageBoundaryIdsAscending(left, right)
+    );
+  const receipts = [...(providerArtifacts ?? [])]
+    .filter((artifact) =>
+      isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(artifact, headSha)
+    )
+    .sort((left, right) => {
+      const leftWindow = v2ProviderActivityWindow(left);
+      const rightWindow = v2ProviderActivityWindow(right);
+      return leftWindow.carrierCreatedMs - rightWindow.carrierCreatedMs ||
+        compareV2CanonicalIdsAscending(left, right);
+    });
+
+  for (const receipt of receipts) {
+    const receiptWindow = v2ProviderActivityWindow(receipt);
+    const beforeReceipt = boundaries.filter((boundary) =>
+      boundary.revisionMs < receiptWindow.carrierCreatedMs
+    );
+    if (beforeReceipt.length !== 2) continue;
+    const [first, second] = beforeReceipt;
+    if (
+      first.revisionMs >= second.revisionMs ||
+      !isV2DefaultAnyDuplicateCohortMember(first) ||
+      !isV2DefaultAnyDuplicateCohortMember(second) ||
+      !sameV2RequestAuthor(first, second) ||
+      hasV2DirectProviderReactionAtOrAfterRequest(first, requestReactions) ||
+      hasV2DirectProviderReactionAtOrAfterRequest(second, requestReactions)
+    ) {
+      continue;
+    }
+    // A later clean cannot be attributed to the raw pair while an earlier
+    // top-level provider carrier may still own it. Only a safely classified,
+    // fully bound historical terminal can be excluded from that ambiguity.
+    if (hasV2PreCohortUnsafeTopLevelProviderActivity({
+      providerArtifacts,
+      opaqueTopLevelProviderActivities,
+      firstRequest: first,
+    })) {
+      continue;
+    }
+
+    const afterReceipt = boundaries.filter((boundary) =>
+      boundary.revisionMs >= receiptWindow.carrierCreatedMs
+    );
+    const successor = afterReceipt[0] ?? null;
+    if (
+      afterReceipt.length > 1 ||
+      (successor && (
+        successor.revisionMs <= receiptWindow.carrierCreatedMs ||
+        !isV2CurrentCanonicalDuplicateCohortSuccessor({
+          request: successor,
+          headSha,
+          baseSha,
+          baseRef,
+          baseRepositoryId,
+        })
+      ))
+    ) {
+      continue;
+    }
+    const cohortEndMs = successor?.revisionMs ?? receiptWindow.carrierCreatedMs;
+    if (!hasV2ExclusiveDuplicateCohortProviderWindow({
+      providerArtifacts,
+      opaqueTopLevelProviderActivities,
+      firstRequest: first,
+      closure: receipt,
+      endMs: cohortEndMs,
+    })) {
+      continue;
+    }
+    // Keep the later duplicate as the confirmed generation even when a
+    // canonical successor follows it. That preserves the settled cohort as a
+    // physical predecessor, so a delayed unbound terminal carrier cannot be
+    // attributed to the successor generation.
+    return {
+      confirmedIds: [second.id],
+      suppressedBoundaryIds: [first.id],
+    };
+  }
+  return null;
+}
+
+function isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(
+  artifact,
+  headSha,
+) {
+  const resolvedHeadSha = String(artifact?.resolvedHeadSha || "").toLowerCase();
+  if (
+    artifact?.kind !== "clean" ||
+    artifact?.source !== "issue-comment" ||
+    artifact?.edited === true ||
+    artifact?.orderingError ||
+    artifact?.resolutionError ||
+    !FULL_SHA.test(resolvedHeadSha) ||
+    resolvedHeadSha !== headSha
+  ) {
+    return false;
+  }
+  const window = v2ProviderActivityWindow(artifact);
+  return window !== null && window.carrierCreatedMs === window.revisionMs;
+}
+
+function isV2DefaultAnyDuplicateCohortMember(request) {
+  const comment = request?.comment;
+  return request?.authorized === true &&
+    request?.requiresProviderConfirmation === true &&
+    request?.headBound !== true &&
+    request?.binding === null &&
+    request?.permission === "any" &&
+    Number.isFinite(request?.revisionMs) &&
+    isExactV2OrdinaryReviewRequestBody(comment?.body) &&
+    comment?.user?.type === "User" &&
+    typeof comment?.user?.login === "string" &&
+    comment.user.login.trim() !== "" &&
+    !hasV2ObservedIssueCommentEdit(comment) &&
+    isCanonicalUtcTimestamp(comment?.created_at) &&
+    isCanonicalUtcTimestamp(comment?.updated_at) &&
+    Date.parse(comment.created_at) === request.revisionMs;
+}
+
+function sameV2RequestAuthor(left, right) {
+  return String(left?.comment?.user?.login || "").toLowerCase() ===
+    String(right?.comment?.user?.login || "").toLowerCase();
+}
+
+function isV2CurrentCanonicalDuplicateCohortSuccessor({
+  request,
+  headSha,
+  baseSha,
+  baseRef,
+  baseRepositoryId,
+}) {
+  return request?.authorized === true &&
+    request?.permission === "workflow" &&
+    request?.requiresProviderConfirmation !== true &&
+    request?.headBound === true &&
+    request.binding?.headSha === headSha &&
+    request.binding?.baseSha === baseSha &&
+    request.binding?.baseRef === baseRef &&
+    request.binding?.baseRepositoryId === baseRepositoryId;
+}
+
+function hasV2ExclusiveDuplicateCohortProviderWindow({
+  providerArtifacts,
+  opaqueTopLevelProviderActivities,
+  firstRequest,
+  closure,
+  endMs,
+}) {
+  for (const artifact of [
+    ...(providerArtifacts ?? []),
+    ...(opaqueTopLevelProviderActivities ?? []),
+  ]) {
+    const window = v2ProviderActivityWindow(artifact);
+    if (!window) return false;
+    if (window.revisionMs < firstRequest.revisionMs || window.carrierCreatedMs > endMs) {
+      continue;
+    }
+    if (
+      artifact?.source === closure.source &&
+      String(artifact?.id) === String(closure.id)
+    ) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+function hasV2PreCohortUnsafeTopLevelProviderActivity({
+  providerArtifacts,
+  opaqueTopLevelProviderActivities,
+  firstRequest,
+}) {
+  return [
+    ...(providerArtifacts ?? []),
+    ...(opaqueTopLevelProviderActivities ?? []),
+  ].some((artifact) => {
+    if (artifact?.source !== "issue-comment") return false;
+    const window = v2ProviderActivityWindow(artifact);
+    if (!window || window.carrierCreatedMs >= firstRequest.revisionMs) return false;
+    return !isV2SafeHistoricalTopLevelProviderTerminal(artifact);
+  });
+}
+
+function isV2SafeHistoricalTopLevelProviderTerminal(artifact) {
+  return artifact?.source === "issue-comment" &&
+    (artifact?.kind === "clean" || artifact?.kind === "finding") &&
+    artifact?.edited !== true &&
+    !artifact?.orderingError &&
+    !artifact?.resolutionError &&
+    hasV2FullUnambiguousProviderArtifactHeadBinding(artifact);
+}
+
+function hasV2FullUnambiguousProviderArtifactHeadBinding(artifact) {
+  const bindings = new Set(
+    [artifact?.resolvedHeadSha, artifact?.headSha]
+      .map((value) => String(value || "").toLowerCase())
+      .filter((value) => FULL_SHA.test(value)),
+  );
+  return bindings.size === 1;
+}
+
 function hasV2DirectProviderReactionAfterRequest(request, requestReactions) {
+  return hasV2DirectProviderReactionAtOrAfterRequest(
+    request,
+    requestReactions,
+    { strictlyAfter: true },
+  );
+}
+
+function hasV2DirectProviderReactionAtOrAfterRequest(
+  request,
+  requestReactions,
+  { strictlyAfter = false } = {},
+) {
   return (requestReactions?.get(String(request.id)) ?? []).some((reaction) => {
     if (
       (reaction?.content !== "eyes" && reaction?.content !== "+1") ||
@@ -4042,7 +4311,10 @@ function hasV2DirectProviderReactionAfterRequest(request, requestReactions) {
     ) {
       return false;
     }
-    return Date.parse(reaction.created_at) > request.revisionMs;
+    const reactionMs = Date.parse(reaction.created_at);
+    return strictlyAfter
+      ? reactionMs > request.revisionMs
+      : reactionMs >= request.revisionMs;
   });
 }
 
@@ -5019,6 +5291,7 @@ async function collectV2ProviderEvidence(
   reviews,
 ) {
   const artifacts = [];
+  const opaqueTopLevelProviderActivities = [];
   const errors = [];
   for (const comment of issueComments) {
     if (!hasAnyV2ProviderIdentitySignal(comment)) continue;
@@ -5068,6 +5341,17 @@ async function collectV2ProviderEvidence(
         carrierUpdatedAt: revisionAt,
         revisionAt,
         edited: observedEdit,
+      });
+    } else {
+      // Keep unrecognized official activity out of the general reducer: it
+      // cannot be positive terminal evidence or generic liveness. The narrow
+      // duplicate-cohort recovery uses this window only to avoid attributing a
+      // later clean to a raw pair whose earlier provider carrier is opaque.
+      opaqueTopLevelProviderActivities.push({
+        source: "issue-comment",
+        id: String(comment.id),
+        carrierCreatedAt: comment.created_at,
+        revisionAt,
       });
     }
   }
@@ -5203,7 +5487,12 @@ async function collectV2ProviderEvidence(
       delete artifact.resolvedHeadSha;
     }
   }
-  return { artifacts, errors, commitResolutions };
+  return {
+    artifacts,
+    errors,
+    opaqueTopLevelProviderActivities,
+    commitResolutions,
+  };
 }
 
 function v2InlineParentReviewCleanArtifact(review) {

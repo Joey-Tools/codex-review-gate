@@ -136,6 +136,43 @@ the bundled read-only verifier token cannot reliably do. It never weakens Codex
 finding authority: every qualifying finding remains blocking regardless of
 request-author permission.
 
+Do not deliberately repeat a direct request. A recovery-only duplicate cohort
+(a fixed historical pair, not a new workflow) can coalesce exactly two
+strictly ordered, unedited ordinary requests from the same user only when there
+is no base epoch, neither has an official direct `eyes`/`+1`, one unedited
+official top-level current-head clean follows both, and the snapshot contains
+no provider error anywhere. Every pre-pair official top-level `issue-comment`
+provider artifact with a valid activity window vetoes the cohort unless it is a
+safely classified historical terminal: kind `clean` or `finding`, unedited,
+with no `orderingError`/`resolutionError`, and exactly one full unambiguous SHA
+across `resolvedHeadSha` and `headSha`. This includes any otherwise unknown or
+unclassified, malformed, progress, or nonterminal official top-level
+`issue-comment`: with a valid activity window, it is opaque provider activity
+(a blocker rather than clean evidence) and vetoes the cohort. An earlier
+carrier may own the later clean; this explicit exception—not merely a full-head
+binding—preserves safely
+classified historical terminals. Other than that pair, no relevant physical
+request boundary may precede the closure clean, and at most one qualifying
+exact current head/base-bound canonical successor may follow it. No additional
+provider artifact or opaque provider activity with a valid activity window may
+appear from the first ordinary request through the clean's revision; if that
+successor exists, the exclusive artifact window extends through the successor's
+revision. Opaque provider activity is an exclusion-only side channel: it does
+not enter the ordinary reducer, liveness, finding, clean, or count paths. If
+the successor exists, the later ordinary
+request remains an already-closed predecessor: a raw terminal cannot pass the
+successor, which instead needs a direct official `+1`. A third or same-time
+request, another author, edit, finding, provider error, a pre-pair official
+top-level `issue-comment` provider artifact with a valid activity window unless
+it is the safely classified historical-terminal exception above, an extra
+provider artifact or opaque provider activity in the exclusive window,
+inline-parent receipt, or
+nonqualifying/competing successor remains pending. The exception requires every
+listed terminal property; a historical terminal clean/finding is not preserved
+merely because it has a full-head binding. This exception never gives a
+commenter permission to start Codex and is not an instruction for humans or
+agents to emit pairs.
+
 The consumer workflows have no cron, `repository_dispatch`,
 `pull_request_target`, automatic `pull_request_review` writer, runtime GitHub
 App, status bridge or ledger. Evidence is rebuilt by the selected verifier.
