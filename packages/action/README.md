@@ -275,8 +275,11 @@ current head, no provider error in the snapshot, and every pre-pair official
 top-level `issue-comment` provider artifact with a valid activity window vetoes
 the cohort unless it is a safely classified historical terminal: kind `clean`
 or `finding`, unedited, with no `orderingError`/`resolutionError`, and exactly
-one full unambiguous SHA across `resolvedHeadSha` and `headSha`. An earlier
-carrier may own the later clean; this explicit exception—not merely a full-head
+one full unambiguous SHA across `resolvedHeadSha` and `headSha`. This includes
+any otherwise unknown or unclassified, malformed, progress, or nonterminal
+official top-level `issue-comment`: with a valid activity window, it is opaque
+provider activity (a blocker rather than clean evidence) and vetoes the
+cohort. An earlier carrier may own the later clean; this explicit exception—not merely a full-head
 binding—preserves safely classified historical terminals. No other provider
 artifact may appear from the first request through that clean (or, if present,
 through its sole canonical successor). The only permitted successor is one strictly later

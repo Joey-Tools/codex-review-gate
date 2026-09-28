@@ -35,8 +35,12 @@ superseded_by:
   vetoes the cohort unless it is a safely classified historical terminal: kind
   `clean` or `finding`, unedited, with no `orderingError`/`resolutionError`,
   and exactly one full unambiguous SHA across `resolvedHeadSha` and `headSha`.
-  An earlier carrier may own the later clean; this explicit exception—not merely
-  a full-head binding—preserves safely classified historical terminals. Other
+  This includes any otherwise unknown or unclassified, malformed, progress, or
+  nonterminal official top-level `issue-comment`: with a valid activity window,
+  it is opaque provider activity (a blocker rather than clean evidence) and
+  vetoes the cohort. An earlier carrier may own the later clean; this explicit
+  exception—not merely a full-head binding—preserves safely classified historical
+  terminals. Other
   than the pair, no relevant physical request boundary may precede the closure
   clean, and at most one qualifying exact current head/base-bound canonical
   successor may follow it. The clean must be the only provider artifact from

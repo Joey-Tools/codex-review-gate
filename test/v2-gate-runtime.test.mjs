@@ -4082,6 +4082,70 @@ test("an unbound top-level Codex progress before a duplicate cohort vetoes its c
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("an opaque official top-level Codex activity before a duplicate cohort vetoes its clean receipt", async (context) => {
+  const priorOpaqueActivity = opaqueProviderIssueComment({
+    created_at: "2026-08-25T07:59:00Z",
+    updated_at: "2026-08-25T07:59:00Z",
+  });
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [priorOpaqueActivity, first, second, terminal],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-prior-opaque-provider-activity",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a non-official opaque comment before a duplicate cohort does not veto its clean receipt", async (context) => {
+  const priorNonProviderComment = opaqueProviderIssueComment({
+    user: HUMAN,
+    performed_via_github_app: null,
+    created_at: "2026-08-25T07:59:00Z",
+    updated_at: "2026-08-25T07:59:00Z",
+  });
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [priorNonProviderComment, first, second, terminal],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-prior-non-provider-activity",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+});
+
 test("a safely bound historical terminal clean before a duplicate cohort does not veto its clean receipt", async (context) => {
   const historicalClean = cleanIssueComment("c".repeat(40), {
     id: 200,
@@ -9727,6 +9791,19 @@ function cleanIssueComment(commitRef = HEAD, overrides = {}) {
     created_at: "2026-08-25T08:01:00Z",
     updated_at: "2026-08-25T08:01:00Z",
     html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-201`,
+    user: CODEX_BOT,
+    performed_via_github_app: CODEX_APP,
+    ...overrides,
+  };
+}
+
+function opaqueProviderIssueComment(overrides = {}) {
+  return {
+    id: 200,
+    body: "Codex has started reviewing this pull request.",
+    created_at: "2026-08-25T07:59:00Z",
+    updated_at: "2026-08-25T07:59:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-200`,
     user: CODEX_BOT,
     performed_via_github_app: CODEX_APP,
     ...overrides,

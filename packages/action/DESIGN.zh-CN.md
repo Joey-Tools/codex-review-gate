@@ -318,7 +318,9 @@ producer protocol）。它要求没有 base epoch，且恰好两条彼此严格�
 provider error；每一个 pair 之前、具有有效 activity window 的 official 顶层 `issue-comment`
 provider artifact 都会否决 cohort，除非它是已安全分类的 historical terminal：kind 为 `clean` 或
 `finding`、未编辑、没有 `orderingError`/`resolutionError`，且跨 `resolvedHeadSha` 与 `headSha`
-恰有一个完整、无歧义的 SHA。较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal
+恰有一个完整、无歧义的 SHA。这也包括其他 unknown 或 unclassified、malformed、progress 或
+nonterminal 的 official 顶层 `issue-comment`：只要具有有效 activity window，就属于不透明 provider
+activity（只作阻塞，不作 clean 证据），并否决 cohort。较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal
 依赖这条明确例外，而非仅有 full-head binding。从第一条 request 到该 clean（若存在唯一 canonical
 successor，则到该 successor）之间不得有其他 provider artifact。唯一可能的 successor 是一条严格
 更晚、绑定 current 完整 head/base tuple 的 canonical workflow request。没有 successor 时，较晚

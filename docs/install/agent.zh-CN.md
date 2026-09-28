@@ -1112,7 +1112,9 @@ official 顶层 current-head clean，且整个 snapshot 中不得出现任何 pr
 之前、具有有效 activity window 的 official 顶层 `issue-comment` provider artifact 都会否决 cohort，
 除非它是已安全分类的 historical terminal：kind 为 `clean` 或 `finding`、未编辑、没有
 `orderingError`/`resolutionError`，且跨 `resolvedHeadSha` 与 `headSha` 恰有一个完整、无歧义的 SHA。
-较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal 依赖这条明确例外，而非仅有
+这也包括其他 unknown 或 unclassified、malformed、progress 或 nonterminal 的 official 顶层
+`issue-comment`：只要具有有效 activity window，就属于不透明 provider activity（只作阻塞，不作 clean
+证据），并否决 cohort。较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal 依赖这条明确例外，而非仅有
 full-head binding。除该 pair 外，closure clean 之前不得有任何相关 physical request boundary，其后
 最多只能有一条合格、精确绑定 current head/base 的 canonical successor。该 clean 必须是从第一条
 ordinary request 至其 revision 期间唯一的 provider artifact；若该 successor 存在，exclusive artifact

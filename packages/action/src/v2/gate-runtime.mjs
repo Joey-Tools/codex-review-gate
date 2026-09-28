@@ -3450,6 +3450,7 @@ async function loadV2DecisionCarriers(
     baseEpoch,
     requestReactions,
     providerArtifacts: providerEvidence.artifacts,
+    opaqueTopLevelProviderActivities: providerEvidence.opaqueTopLevelProviderActivities,
     providerErrors: providerEvidence.errors,
     headSha,
     baseSha,
@@ -3988,6 +3989,7 @@ function confirmV2DefaultAnyRequestCandidates({
   baseEpoch,
   requestReactions,
   providerArtifacts,
+  opaqueTopLevelProviderActivities,
   providerErrors,
   headSha,
   baseSha,
@@ -4002,6 +4004,7 @@ function confirmV2DefaultAnyRequestCandidates({
     baseEpoch,
     requestReactions,
     providerArtifacts,
+    opaqueTopLevelProviderActivities,
     providerErrors,
     headSha,
     baseSha,
@@ -4063,6 +4066,7 @@ function selectV2DefaultAnyDuplicateCohortClosure({
   baseEpoch,
   requestReactions,
   providerArtifacts,
+  opaqueTopLevelProviderActivities,
   providerErrors,
   headSha,
   baseSha,
@@ -4116,6 +4120,7 @@ function selectV2DefaultAnyDuplicateCohortClosure({
     // fully bound historical terminal can be excluded from that ambiguity.
     if (hasV2PreCohortUnsafeTopLevelProviderActivity({
       providerArtifacts,
+      opaqueTopLevelProviderActivities,
       firstRequest: first,
     })) {
       continue;
@@ -4246,9 +4251,13 @@ function hasV2ExclusiveDuplicateCohortProviderWindow({
 
 function hasV2PreCohortUnsafeTopLevelProviderActivity({
   providerArtifacts,
+  opaqueTopLevelProviderActivities,
   firstRequest,
 }) {
-  return (providerArtifacts ?? []).some((artifact) => {
+  return [
+    ...(providerArtifacts ?? []),
+    ...(opaqueTopLevelProviderActivities ?? []),
+  ].some((artifact) => {
     if (artifact?.source !== "issue-comment") return false;
     const window = v2ProviderActivityWindow(artifact);
     if (!window || window.carrierCreatedMs >= firstRequest.revisionMs) return false;
@@ -5277,6 +5286,7 @@ async function collectV2ProviderEvidence(
   reviews,
 ) {
   const artifacts = [];
+  const opaqueTopLevelProviderActivities = [];
   const errors = [];
   for (const comment of issueComments) {
     if (!hasAnyV2ProviderIdentitySignal(comment)) continue;
@@ -5326,6 +5336,17 @@ async function collectV2ProviderEvidence(
         carrierUpdatedAt: revisionAt,
         revisionAt,
         edited: observedEdit,
+      });
+    } else {
+      // Keep unrecognized official activity out of the general reducer: it
+      // cannot be positive terminal evidence or generic liveness. The narrow
+      // duplicate-cohort recovery uses this window only to avoid attributing a
+      // later clean to a raw pair whose earlier provider carrier is opaque.
+      opaqueTopLevelProviderActivities.push({
+        source: "issue-comment",
+        id: String(comment.id),
+        carrierCreatedAt: comment.created_at,
+        revisionAt,
       });
     }
   }
@@ -5461,7 +5482,12 @@ async function collectV2ProviderEvidence(
       delete artifact.resolvedHeadSha;
     }
   }
-  return { artifacts, errors, commitResolutions };
+  return {
+    artifacts,
+    errors,
+    opaqueTopLevelProviderActivities,
+    commitResolutions,
+  };
 }
 
 function v2InlineParentReviewCleanArtifact(review) {
