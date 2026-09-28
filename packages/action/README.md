@@ -239,9 +239,10 @@ boundary. It can receive provider confirmation in either of two ways:
 1. the official Codex Bot adds a directly attached, strictly post-revision
    `eyes` or `+1` receipt to that exact comment; or
 2. only for one unique, exact, unedited ordinary request in a no-base-epoch,
-   single-flight lineage, an unedited official top-level issue-comment terminal
-   clean (a normal PR comment, not a pull-request review body) is strictly later
-   than that request and unambiguously binds the current head.
+   single-flight lineage, an unedited official terminal-clean receipt is
+   strictly later than that request and unambiguously binds the current head.
+   The admitted receipt forms are a top-level issue-comment clean and the
+   exact closed `COMMENTED` Codex inline-parent review grammar.
 
 The second form is a deliberately narrow minimal receipt. An additional or
 ambiguous request or physical boundary, an edit to the request or terminal,
@@ -281,9 +282,13 @@ Terminal clean text and a qualifying provider `+1` have equal clean authority
 only for the first physical generation of a no-base-epoch, single-flight
 lineage. For the one unique default-`any` ordinary request that satisfies the
 minimal receipt rule, the matching official top-level issue-comment terminal
-clean can both confirm that first generation and carry its clean authority. A
-pull-request review clean remains ordinary evidence but cannot confirm a
-default-`any` candidate. A qualifying finding is
+clean or exact closed `COMMENTED` Codex inline-parent review can both confirm
+that first generation and carry its clean authority. Other pull-request review
+cleans remain ordinary evidence and cannot confirm a default-`any` candidate.
+The inline-parent form attests only the absence of a non-inline parent payload:
+the reducer neither reads nor decides its child threads, and the installed
+ruleset remains the sole authority requiring all conversations to be resolved.
+A qualifying finding is
 independently blocking and never acts as a receipt. A candidate with no receipt
 contender is not a physical boundary. A terminal-clean contender that fails a
 narrow-condition check remains pending as a fail-closed physical-only boundary.

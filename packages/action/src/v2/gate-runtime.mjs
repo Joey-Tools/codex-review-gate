@@ -4048,10 +4048,13 @@ function hasV2DirectProviderReactionAfterRequest(request, requestReactions) {
 
 function isV2TerminalCleanReceiptForDefaultAnyRequest(artifact, request, headSha) {
   const resolvedHeadSha = String(artifact?.resolvedHeadSha || "").toLowerCase();
+  const acceptedCarrier = artifact?.source === "issue-comment"
+    ? artifact?.edited !== true
+    : artifact?.source === "pull-request-review" &&
+      artifact?.inlineParentReceipt === true;
   if (
     artifact?.kind !== "clean" ||
-    artifact?.source !== "issue-comment" ||
-    artifact?.edited === true ||
+    !acceptedCarrier ||
     artifact?.orderingError ||
     artifact?.resolutionError ||
     !FULL_SHA.test(resolvedHeadSha) ||
@@ -5104,6 +5107,12 @@ async function collectV2ProviderEvidence(
       continue;
     }
     if (codexInlineParentReviewBodyHasClosedGrammar(review, { allowShortCommitRefs: true })) {
+      // This closed parent wrapper carries no non-inline finding payload. Its
+      // children remain entirely outside this REST-only reducer: the required
+      // ruleset owns whether every conversation is resolved. Treating the
+      // exact, submitted parent as a narrow terminal clean receipt preserves
+      // that split without querying or interpreting review threads here.
+      artifacts.push(v2InlineParentReviewCleanArtifact(review));
       continue;
     }
     const artifact = parseCodexReviewArtifact(review, {
@@ -5195,6 +5204,28 @@ async function collectV2ProviderEvidence(
     }
   }
   return { artifacts, errors, commitResolutions };
+}
+
+function v2InlineParentReviewCleanArtifact(review) {
+  const createdAt = String(review.submitted_at || review.created_at || "");
+  const headSha = String(review.commit_id || "").toLowerCase();
+  return {
+    source: "pull-request-review",
+    id: String(review.id),
+    kind: "clean",
+    // This marker is intentionally narrower than an ordinary APPROVED review:
+    // only the exact closed Codex inline-parent grammar may promote the one
+    // default-any, single-flight request through terminal-receipt authority.
+    inlineParentReceipt: true,
+    headSha,
+    nativeCommitId: headSha,
+    createdAt,
+    carrierCreatedAt: createdAt,
+    carrierUpdatedAt: createdAt,
+    revisionAt: createdAt,
+    edited: false,
+    url: review.html_url,
+  };
 }
 
 function approvedReviewCommitReferences(body) {
