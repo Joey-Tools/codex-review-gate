@@ -83,13 +83,19 @@ permission 的 nonstandard verifier identity。
 严格顺序、未编辑、exact default-`any` 的 ordinary（不带 canonical marker）`@codex review`
 request，且来自同一 `User` login；没有 base epoch，且两条都没有 official direct `eyes`/`+1`；
 之后有一条未编辑 official 顶层 clean，且无歧义解析到 current PR head；整个 snapshot 没有
-provider error；从第一条 request 到该 clean（若有唯一 canonical successor，则到该 successor）
-之间没有其他 provider artifact；并且最多只允许一条之后严格绑定 head/base 的 canonical request。
+provider error；pair 之前也没有 official `issue-comment` `pending`/`progress` carrier，且它的
+`resolvedHeadSha` 和 `headSha` 都不是 full SHA（缺少 full-head binding、之后仍可能发出表面 clean 的
+provider activity carrier）；从第一条 request 到该 clean（若有唯一 canonical successor，则到该
+successor）之间没有其他 provider artifact；并且最多只允许一条之后严格绑定 head/base 的 canonical
+request。
 没有 successor 时，该 clean 确认较晚 request 并合并较早 request。它只合并 immutable historical
 evidence，不授权一种新的 producer pattern。有该 successor 时，较晚 ordinary request 仍是已闭合的
 predecessor，因此 raw terminal 不能令 successor pass，它需要自身的 official direct `+1`。第三条
 request、不同 author、edit、finding、progress/error、inline-parent receipt、两条 ordinary request
-上的 reaction 或竞争 successor 都保持 pending。
+上的 reaction、pair 之前缺少 full-head binding 的 official `issue-comment` `pending`/`progress`
+carrier 或竞争 successor 都保持 pending。这不是仅按时间否决历史 terminal clean 或 finding：单独早于
+pair 的 terminal clean 或 finding 仍刻意允许，并按普通 terminal/finding 规则分类；拒绝这个
+pre-pair carrier，是因为其 in-flight work 缺少 full-head binding，之后仍可能发出表面 clean。
 
 ### Workflow-coordinated review
 

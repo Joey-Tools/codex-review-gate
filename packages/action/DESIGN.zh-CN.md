@@ -315,14 +315,20 @@ head 和 run。
 producer protocol）。它要求没有 base epoch，且恰好两条彼此严格顺序、未编辑、来自同一
 `User` login 的 exact default-`any` ordinary（不带 canonical marker）`@codex review` request；两条都不能带 official direct `eyes`/`+1`。随后必须只有一条
 未编辑 official 顶层 issue-comment clean，且它无歧义解析到 current PR head；整个 snapshot 不得有
-provider error；从第一条 request 到该 clean（若存在唯一 canonical successor，则到该 successor）之间
-不得有其他 provider artifact。唯一可能的 successor 是一条严格
+provider error；pair 之前也不得有 official `issue-comment` `pending`/`progress` carrier，且它的
+`resolvedHeadSha` 和 `headSha` 都不是 full SHA（缺少 full-head binding、之后仍可能发出表面 clean 的
+provider activity carrier）；从第一条 request 到该 clean（若存在唯一 canonical successor，则到该
+successor）之间不得有其他 provider artifact。唯一可能的 successor 是一条严格
 更晚、绑定 current 完整 head/base tuple 的 canonical workflow request。没有 successor 时，较晚
 ordinary request 被确认、较早者被合并；有该 successor 时，较晚 ordinary request 保留为已确认、
 已闭合的 predecessor；在 successor 之后出现的无绑定 terminal 不能令其 pass，只有该 successor
 上的 official direct `+1` 可以。inline-parent receipt、第三条 request、另一 author、edit、base
-epoch、两条 ordinary request 上的 reaction、provider activity/error、finding 及任何其他 successor
-均保持 fail-closed。此规则只恢复不可变的历史 pair；agent 不得主动创建。
+epoch、两条 ordinary request 上的 reaction、provider activity/error、pair 之前缺少 full-head
+binding 的 official `issue-comment` `pending`/`progress` carrier、finding 及任何其他 successor
+均保持 fail-closed。这不是仅按时间否决历史 terminal clean 或 finding：单独早于 pair 的 terminal
+clean 或 finding 仍刻意允许，并按普通 terminal/finding 规则分类；拒绝这个 pre-pair carrier，是因为
+其 in-flight work 缺少 full-head binding，之后仍可能发出表面 clean。此规则只恢复不可变的历史
+pair；agent 不得主动创建。
 
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。finding 绝不充当最小

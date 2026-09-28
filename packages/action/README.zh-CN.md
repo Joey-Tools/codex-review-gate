@@ -238,14 +238,21 @@ run。符合条件的 Codex findings 不受 request-author permission 影响，�
 接受：没有 base epoch；恰好两条彼此严格顺序、未编辑、exact default-`any` 的 ordinary
 （不带 canonical marker）`@codex review` request，且来自同一 `User` login；两条都没有
 official `eyes`/`+1`；之后有一条未编辑、official 的顶层 issue-comment clean，且无歧义解析到
-current PR head；整个 snapshot 没有 provider error；从第一条 request 到该 clean（若存在唯一
-canonical successor，则到该 successor）之间没有其他 provider artifact。唯一允许的后继只能是一条严格更晚、绑定 current 完整 head/base tuple
+current PR head；整个 snapshot 没有 provider error；pair 之前也没有 official `issue-comment`
+`pending`/`progress` carrier，且它的 `resolvedHeadSha` 和 `headSha` 都不是 full SHA（缺少
+full-head binding、之后仍可能发出表面 clean 的 provider activity carrier）；从第一条 request
+到该 clean（若存在唯一 canonical successor，则到该 successor）之间没有其他 provider artifact。
+唯一允许的后继只能是一条严格更晚、绑定 current 完整 head/base tuple
 的 canonical workflow request。没有后继时，较晚的 ordinary request 被确认、较早的被合并；有该
 后继时，较晚的 ordinary request 保留为已确认、已闭合的 predecessor，之后无绑定的 terminal 不能
 令 successor pass，后者必须取得自身的 official direct `+1`。inline-parent receipt、第三条
 request、不同 author、edit、base epoch、两条 ordinary request 上的 reaction、provider
-progress/error、finding 或其他 successor 均保持 fail-closed。agent 不得故意创建这类请求对；它只
-恢复 GitHub immutable snapshot 中已经存在的历史证据。
+progress/error、pair 之前缺少 full-head binding 的 official `issue-comment`
+`pending`/`progress` carrier、finding 或其他 successor 均保持 fail-closed。这不是仅按时间否决
+历史 terminal clean 或 finding：单独早于 pair 的 terminal clean 或 finding 仍刻意允许，并按普通
+terminal/finding 规则分类；拒绝这个 pre-pair carrier，是因为其 in-flight work 缺少 full-head
+binding，之后仍可能发出表面 clean。agent 不得故意创建这类请求对；它只恢复 GitHub immutable
+snapshot 中已经存在的历史证据。
 
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base

@@ -108,14 +108,19 @@ token 无法可靠做到。它不会削弱 finding authority：任何合格 Code
 workflow）只能合并恰好两条严格按时间排序、未编辑、来自同一 user 的 ordinary request，并且
 必须没有 base epoch、两条都没有 official direct `eyes`/`+1`、随后有一条未编辑 official 顶层
 current-head clean，且整个 snapshot 中不得出现任何 provider error。除该 pair 外，closure clean
-之前不得有任何相关 physical request boundary，其后最多只能有一条合格、精确绑定 current
-head/base 的 canonical successor。该 clean 必须是从第一条 ordinary request 至其 revision 期间唯一的
-provider artifact；若该 successor 存在，exclusive artifact window 延伸至该 successor 的 revision。
-若该 successor 存在，较晚 ordinary request 保留为已闭合的 predecessor：raw terminal 不能令
-successor pass，后者需要自身的 official direct `+1`。第三条或同一时间的 request、另一 author、
-edit、finding、provider error、exclusive window 中额外的 provider artifact、inline-parent receipt，
-或不合格/竞争 successor 都会保持 pending。此例外不赋予 commenter 启动 Codex 的权限，也不是让人
-或 agent 主动创建 pair 的说明。
+之前不得有 official `issue-comment` `pending`/`progress` carrier，且它的 `resolvedHeadSha` 和
+`headSha` 都不是 full SHA（缺少 full-head binding、之后仍可能发出表面 clean 的 provider activity
+carrier）。除该 pair 外，closure clean 之前不得有任何相关 physical request boundary，其后最多只能有
+一条合格、精确绑定 current head/base 的 canonical successor。该 clean 必须是从第一条 ordinary
+request 至其 revision 期间唯一的 provider artifact；若该 successor 存在，exclusive artifact window
+延伸至该 successor 的 revision。若该 successor 存在，较晚 ordinary request 保留为已闭合的
+predecessor：raw terminal 不能令 successor pass，后者需要自身的 official direct `+1`。第三条或同一
+时间的 request、另一 author、edit、finding、provider error、pair 之前缺少 full-head binding 的
+official `issue-comment` `pending`/`progress` carrier、exclusive window 中额外的 provider artifact、
+inline-parent receipt，或不合格/竞争 successor 都会保持 pending。这不是仅按时间否决历史 terminal
+clean 或 finding：单独早于 pair 的 terminal clean 或 finding 仍刻意允许，并按普通 terminal/finding
+规则分类；拒绝这个 pre-pair carrier，是因为其 in-flight work 缺少 full-head binding，之后仍可能发出
+表面 clean。此例外不赋予 commenter 启动 Codex 的权限，也不是让人或 agent 主动创建 pair 的说明。
 
 Consumer workflows 没有 cron、`repository_dispatch`、`pull_request_target`、自动
 `pull_request_review` writer、runtime GitHub App、status bridge 或 ledger。evidence

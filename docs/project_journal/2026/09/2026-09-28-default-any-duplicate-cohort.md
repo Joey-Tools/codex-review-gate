@@ -30,12 +30,15 @@ superseded_by:
   unedited, same-author ordinary default-`any` requests may be coalesced only
   when a single unedited official top-level current-head clean follows both,
   no base epoch exists, neither request has an official direct receipt, and the
-  snapshot contains no provider error anywhere. Other than the pair, no
-  relevant physical request boundary may precede the closure clean, and at most
-  one qualifying exact current head/base-bound canonical successor may follow
-  it. The clean must be the only provider artifact from the first ordinary
-  request through its revision; if that successor exists, the exclusive
-  artifact window extends through the successor revision.
+  snapshot contains no provider error anywhere. It also rejects a pre-pair
+  official `issue-comment` `pending`/`progress` carrier with neither
+  `resolvedHeadSha` nor `headSha` a full SHA: that carrier lacks a full-head
+  binding and its in-flight work could later emit the apparent clean. Other
+  than the pair, no relevant physical request boundary may precede the closure
+  clean, and at most one qualifying exact current head/base-bound canonical
+  successor may follow it. The clean must be the only provider artifact from
+  the first ordinary request through its revision; if that successor exists,
+  the exclusive artifact window extends through the successor revision.
 - With no successor, the second ordinary request becomes the sole confirmed
   generation and the first is coalesced. With one strictly later exact current
   head/base-bound canonical workflow request, the second ordinary request
@@ -49,9 +52,17 @@ superseded_by:
 
 - The exception excludes inline-parent receipts, a third or same-time request,
   another author, any edit, base epochs, any official direct `eyes`/`+1` on
-  the ordinary pair, provider progress/errors, findings, stale or competing
-  canonical successors, ambiguous short-SHA resolution, and any unbound raw
-  terminal after an accepted canonical successor.
+  the ordinary pair, provider progress/errors, a pre-pair official
+  `issue-comment` `pending`/`progress` carrier lacking a full-head binding,
+  findings, stale or competing canonical successors, ambiguous short-SHA
+  resolution, and any unbound raw terminal after an accepted canonical
+  successor.
+- This is not a generic time-based veto. A historical terminal clean or
+  finding alone that predates the pair remains intentionally allowed and is
+  classified under the ordinary terminal/finding rules. The new rejection is
+  limited to the pre-pair unbound-progress shape because it can still become
+  the source of the later clean; record that reason here so future changes do
+  not broaden the predicate to historical terminal/finding evidence.
 - Agents and users must not intentionally create duplicate direct requests.
   This is passive recovery of immutable historical evidence, not a producer
   protocol or a relaxation of finding blocking.

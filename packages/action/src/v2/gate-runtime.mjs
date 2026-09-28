@@ -4111,6 +4111,15 @@ function selectV2DefaultAnyDuplicateCohortClosure({
     ) {
       continue;
     }
+    // An earlier unbound top-level progress carrier may belong to a provider
+    // generation that is still capable of producing the later clean. Do not
+    // coalesce the raw pair unless that preceding activity is fully scoped.
+    if (hasV2PreCohortUnboundTopLevelProviderProgress({
+      providerArtifacts,
+      firstRequest: first,
+    })) {
+      continue;
+    }
 
     const afterReceipt = boundaries.filter((boundary) =>
       boundary.revisionMs >= receiptWindow.carrierCreatedMs
@@ -4233,6 +4242,26 @@ function hasV2ExclusiveDuplicateCohortProviderWindow({
     return false;
   }
   return true;
+}
+
+function hasV2PreCohortUnboundTopLevelProviderProgress({
+  providerArtifacts,
+  firstRequest,
+}) {
+  return (providerArtifacts ?? []).some((artifact) => {
+    if (
+      artifact?.source !== "issue-comment" ||
+      artifact?.kind !== "pending" ||
+      artifact?.pendingKind !== "progress"
+    ) {
+      return false;
+    }
+    const window = v2ProviderActivityWindow(artifact);
+    if (!window || window.carrierCreatedMs >= firstRequest.revisionMs) return false;
+    const resolvedHeadSha = String(artifact?.resolvedHeadSha || "").toLowerCase();
+    const headSha = String(artifact?.headSha || "").toLowerCase();
+    return !FULL_SHA.test(resolvedHeadSha) && !FULL_SHA.test(headSha);
+  });
 }
 
 function hasV2DirectProviderReactionAfterRequest(request, requestReactions) {

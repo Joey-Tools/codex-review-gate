@@ -94,15 +94,24 @@ exception is the duplicate cohort: exactly two strictly sequential, unedited
 exact default-`any` ordinary (non-canonical-marker) `@codex review` requests by
 the same `User` login, no base epoch or official direct `eyes`/`+1` on either,
 one unedited official top-level clean that resolves exactly to the current PR head after
-both, no provider error in the snapshot, no other provider artifact from the
-first request through that clean (or, if present, its sole successor), and at
-most one later exact head/base-bound canonical request. Without a successor,
+both, no provider error in the snapshot, no pre-pair official `issue-comment`
+`pending`/`progress` carrier with neither `resolvedHeadSha` nor `headSha` a
+full SHA (a provider activity carrier lacking a full-head binding that might
+later emit the apparent clean), no other provider artifact from the first
+request through that clean (or, if present, its sole successor), and at most
+one later exact head/base-bound canonical request. Without a successor,
 that clean confirms the later request and coalesces the earlier one. With that successor,
 the later ordinary request stays as an already-closed predecessor, so a raw
 terminal cannot pass the successor; it needs its own direct official `+1`. It coalesces immutable
 historical evidence; it does not authorize a new producer pattern. Any third
-request, different author, edit, finding, progress/error, inline-parent
-receipt, or competing successor stays pending.
+request, different author, edit, finding, progress/error, a pre-pair official
+`issue-comment` `pending`/`progress` carrier lacking a full-head binding,
+inline-parent receipt, or competing successor stays pending. This is not a
+time-based veto for a historical terminal clean or finding: a terminal clean
+or finding alone that predates the pair remains intentionally allowed and is
+classified by the normal terminal/finding rules; the pre-pair carrier is
+rejected because its in-flight work lacks a full-head binding and might later
+emit the apparent clean.
 
 ### Workflow-coordinated review
 

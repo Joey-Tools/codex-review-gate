@@ -365,7 +365,10 @@ strictly sequential, unedited exact default-`any` ordinary
 (non-canonical-marker) `@codex review` requests from the same `User` login only
 if neither has an official direct `eyes`/`+1`, a single unedited official
 top-level issue-comment clean after both resolves exactly to the current head,
-there is no provider error in the snapshot, and the first request through that
+there is no provider error in the snapshot, no pre-pair official
+`issue-comment` `pending`/`progress` carrier with neither `resolvedHeadSha` nor
+`headSha` a full SHA (a provider activity carrier lacking a full-head binding
+that might later emit the apparent clean), and the first request through that
 clean (or, if present, through its sole canonical successor) has no other
 provider artifact. The only possible successor is one strictly later canonical
 workflow request with the current full head/base tuple. Without a successor,
@@ -374,8 +377,14 @@ that successor, the later ordinary request remains the explicitly confirmed,
 already-closed predecessor; an unbound terminal after the successor cannot
 complete it, and only a direct official `+1` on the successor can do so.
 Inline-parent receipts, a third request, another author, edits, base epochs,
-reactions on either ordinary request, provider activity or errors, findings,
-and every other successor remain fail-closed. This recovers an immutable
+reactions on either ordinary request, provider activity or errors, a pre-pair
+official `issue-comment` `pending`/`progress` carrier lacking a full-head
+binding, findings, and every other successor remain fail-closed. This is not a
+time-based veto for a historical terminal clean or finding: a terminal clean
+or finding alone that predates the pair remains intentionally allowed and is
+classified by the normal terminal/finding rules; the pre-pair carrier is
+rejected because its in-flight work lacks a full-head binding and might later
+emit the apparent clean. This recovers an immutable
 historical pair; agents must not deliberately create one.
 
 The permission threshold protects generation resets, not negative evidence.
