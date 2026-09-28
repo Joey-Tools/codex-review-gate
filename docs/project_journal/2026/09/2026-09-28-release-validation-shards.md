@@ -27,8 +27,10 @@ superseded_by:
 
 - `source-validation` now has nine matrix cells for a current frozen source:
   four bootstrap shards, one explicit core inventory, and four release-pipeline
-  shards. A retained source whose complete test tree differs from that closed
-  current inventory instead uses the compatible legacy five-cell partition.
+  shards. A retained source uses that path only when its complete test tree
+  matches the closed current inventory and it descends from the commit that
+  introduced the sealed bootstrap-shard ABI; otherwise it uses the compatible
+  legacy five-cell partition.
 - The bootstrap and release adapters retain their existing four-way,
   mutually-exclusive registrations. The current core cell runs the closed
   twelve-file inventory plus `npm run check`; it does not rediscover bootstrap
@@ -57,9 +59,11 @@ superseded_by:
   `test/organization-review-gate-handoff.test.mjs`. A control-defined core
   list would have rejected that otherwise admitted source before publication.
 - The repair classifies the detached frozen source's full discoverable test
-  tree. Only an exact match uses the modern nine-cell partition. Any mismatch
-  retains source-local core discovery with the Release suite disabled while the
-  four existing Release shards provide the legacy five-cell coverage shape.
+  tree and its Git ancestry relative to the sealed bootstrap-shard capability
+  commit. Only an exact inventory match plus that capability boundary uses the
+  modern nine-cell partition. Any mismatch retains source-local core discovery
+  with the Release suite disabled while the four existing Release shards provide
+  the legacy five-cell coverage shape.
 - The same review found stale English and Chinese release-topology text. Both
   guides now distinguish the current nine-cell schedule from the compatible
   legacy recovery path.

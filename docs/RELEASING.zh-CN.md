@@ -148,8 +148,9 @@ bootstrap shards、一个显式 core inventory，以及四个互斥的 Release-t
 cell 的 timeout 都是 14 分钟，并设置 `fail-fast: false`。Core cell 运行
 `npm run check`，但不再串行重新发现 bootstrap 或 Release suites。这替代了首次 live RC
 中两次各自超过 17 分钟的串行完整套件验证，同时保留独立 candidate construction。若保留期内
-的 legacy frozen source 不匹配该 inventory 分区，core cell 会回退到 source-local discovery，
-并禁用 Release suite；四个 Release shards 保持兼容的五 cell 分区。privileged `publish`
+的 legacy frozen source 不匹配该 inventory 分区或 sealed bootstrap-shard capability，core cell
+会回退到 source-local discovery，并禁用 Release suite；四个 Release shards 保持兼容的五 cell
+分区。privileged `publish`
 job 继续使用 `ubuntu-24.04` 与既有 30 分钟 timeout。
 
 只有 `publish` 绑定 `marketplace-production` Environment。尽管保留了历史名称，它
@@ -363,9 +364,9 @@ upload 都成功后，`source-validation` matrix 才会在 detached exact-source
 当前 source 使用九个 clean runners：四个 bootstrap shards、一个运行 `npm run check` 与
 closed current core inventory 的 core cell，以及四个分割完整 Release-pipeline inventory 的
 Release cells。Matrix 保留所有 cell 结果，而 `assemble` 依赖整个 matrix，因此任一 cell
-失败或缺失都会阻止发布。若保留期内的 frozen source 具有不同的 test inventory，core cell 会
-刻意回退为 source-local full discovery 并禁用 Release tests；四个 Release cells 继续形成
-legacy five-cell coverage partition。Validation jobs 不下载 candidate artifacts，所以 source
+失败或缺失都会阻止发布。若保留期内的 frozen source 具有不同的 test inventory，或缺少 sealed
+bootstrap-shard capability，core cell 会刻意回退为 source-local full discovery 并禁用 Release
+tests；四个 Release cells 继续形成 legacy five-cell coverage partition。Validation jobs 不下载 candidate artifacts，所以 source
 test 无法修改已经上传的 candidate。两份独立 builder 与之后的 byte-identical comparison
 继续保证 candidate independence。每份 candidate 都产出 canonical inventory 与 digests。Inventory 按 Git path bytes 排序，记录每个 entry 的 type、Git
 mode、logical size 与 SHA-256 content digest。只允许明确列出的

@@ -176,10 +176,11 @@ cell has a 14-minute timeout and `fail-fast: false`. The core cell runs
 `npm run check` but does not rediscover bootstrap or Release suites serially.
 This replaces two serial full-suite validations that each took more than 17
 minutes in the first live RC run while preserving independent candidate
-construction. A retained legacy frozen source whose test inventory does not
-match this partition falls back to its source-local core discovery with the Release
-suite disabled, while the four Release shards preserve the compatible five-cell
-partition. The privileged `publish` job retains `ubuntu-24.04` with its
+construction. A retained legacy frozen source whose test inventory or sealed
+bootstrap-shard capability does not match this partition falls back to its
+source-local core discovery with the Release suite disabled, while the four
+Release shards preserve the compatible five-cell partition. The privileged
+`publish` job retains `ubuntu-24.04` with its
 existing 30-minute timeout.
 
 Only `publish` binds the `marketplace-production` Environment. Despite its
@@ -435,9 +436,10 @@ source uses nine clean runners: four bootstrap shards, a core cell that runs
 that partition the complete Release-pipeline inventory. The matrix preserves
 all cell results, and `assemble` depends on the entire matrix, so any failed or
 missing cell blocks publication. If a retained frozen source has a different
-test inventory, the core cell deliberately reverts to its source-local full
-discovery with Release tests disabled; the four Release cells retain the legacy
-five-cell coverage partition. Source test code cannot mutate either
+test inventory or lacks the sealed bootstrap-shard capability, the core cell
+deliberately reverts to its source-local full discovery with Release tests
+disabled; the four Release cells retain the legacy five-cell coverage partition.
+Source test code cannot mutate either
 already-uploaded candidate because validation jobs do not download those
 artifacts. Candidate independence remains enforced by the two separate
 builders and the later byte-identical comparison. Each candidate emits a
