@@ -310,6 +310,16 @@ strict-policy setting。更严格的 `write` threshold（`write`、`maintain` �
 verifier token 无法可靠做到。workflow-authored request 还需要 exact v2 marker，绑定 full
 head 和 run。
 
+唯一允许的 duplicate-request recovery 是 *duplicate cohort*（固定的历史两条请求对，不是
+producer protocol）。它要求没有 base epoch，且恰好两条严格按时间排序、未编辑、来自同一
+`User` login 的 ordinary request；两条都不能带 official direct `eyes`/`+1`。随后必须只有一条
+未编辑 official 顶层 issue-comment clean，且它无歧义解析到 current head；从第一条 request 到
+该 clean 之间不得有其他 provider artifact 或 provider error。唯一可能的 successor 是一条严格
+更晚、绑定 current 完整 head/base tuple 的 canonical workflow request。没有 successor 时，较晚
+ordinary request 被确认、较早者被合并；有该 successor 时，两条都在其前被合并。inline-parent
+receipt、第三条 request、另一 author、edit、base epoch、reaction、provider activity/error、finding
+及任何其他 successor 均保持 fail-closed。此规则只恢复不可变的历史 pair；agent 不得主动创建。
+
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。finding 绝不充当最小
 terminal receipt。generic pull-request review clean 不能充当该 receipt；只有上文限定的

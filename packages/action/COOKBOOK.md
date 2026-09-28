@@ -87,6 +87,16 @@ pending. Canonical workflows fix
 to an ordinary consumer workflow. `write`/`maintain`/`admin` is reserved for a
 nonstandard future verifier identity that can read collaborator permissions.
 
+Do not intentionally post a duplicate direct request. The only recovery
+exception is the duplicate cohort: exactly two unedited, strictly ordered
+ordinary requests by the same user, no base epoch or official direct receipt,
+one unedited official top-level current-head clean after both, no other
+provider activity/error through that clean, and at most one later exact
+head/base-bound canonical request. It coalesces immutable historical evidence;
+it does not authorize a new producer pattern. Any third request, different
+author, edit, finding, progress/error, inline-parent receipt, or competing
+successor stays pending.
+
 ### Workflow-coordinated review
 
 Use `begin-review` when the controller must own the

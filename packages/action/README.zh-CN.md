@@ -232,6 +232,17 @@ read-only verifier token 无法可靠完成这个读取。workflow-authored requ
 canonical v2 hidden marker，绑定完整 head SHA、当前 base repository/ref/SHA 和 workflow
 run。符合条件的 Codex findings 不受 request-author permission 影响，始终阻塞。
 
+有一个仅用于恢复的例外，避免已经完成的重复对永久污染后续 canonical generation。这里的
+*duplicate cohort*（固定的历史两条请求对，不是应主动生成的请求模式）只在以下条件同时成立时
+接受：没有 base epoch；恰好两条严格按时间排序、未编辑、来自同一 `User` login 的 ordinary
+request；两条都没有 official `eyes`/`+1`；之后有一条未编辑、official 的顶层 issue-comment
+clean，且无歧义解析到 current head；从第一条 request 到该 clean 之间没有其他 provider
+artifact 或 provider error。唯一允许的后继只能是一条严格更晚、绑定 current 完整 head/base tuple
+的 canonical workflow request。没有后继时，较晚的 ordinary request 被确认、较早的被合并；有该
+后继时，两条都在其前被合并。inline-parent receipt、第三条 request、不同 author、edit、base
+epoch、reaction、provider progress/error、finding 或其他 successor 均保持 fail-closed。agent 不得
+故意创建这类请求对；它只恢复 GitHub immutable snapshot 中已经存在的历史证据。
+
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base
 epoch；timestamp 相同属于歧义，保持 pending。provider terminal payload 不会标明
