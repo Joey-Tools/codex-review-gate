@@ -29,8 +29,13 @@ superseded_by:
 - Add a recovery-only duplicate cohort: exactly two strictly time-ordered,
   unedited, same-author ordinary default-`any` requests may be coalesced only
   when a single unedited official top-level current-head clean follows both,
-  no base epoch exists, neither request has an official direct receipt, and no
-  other provider artifact or provider error appears through the closure.
+  no base epoch exists, neither request has an official direct receipt, and the
+  snapshot contains no provider error anywhere. Other than the pair, no
+  relevant physical request boundary may precede the closure clean, and at most
+  one qualifying exact current head/base-bound canonical successor may follow
+  it. The clean must be the only provider artifact from the first ordinary
+  request through its revision; if that successor exists, the exclusive
+  artifact window extends through the successor revision.
 - With no successor, the second ordinary request becomes the sole confirmed
   generation and the first is coalesced. With one strictly later exact current
   head/base-bound canonical workflow request, the second ordinary request
@@ -63,5 +68,7 @@ superseded_by:
 ## Next Steps
 
 - Deliver this as an independent clean patch PR from current `master`.
-- If merged and separately approved, publish it as a new `v2.1.2` release
-  intent. Do not replay or dispatch the already completed `v2.1.1` admission.
+- After merge, the already-frozen `v2.1.2` release intent becomes eligible for
+  staged publisher approval. Until that protected release completes, `v2`
+  remains at `v2.1.1`. Do not replay or dispatch the already completed
+  `v2.1.1` admission.

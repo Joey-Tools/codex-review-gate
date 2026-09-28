@@ -1108,11 +1108,15 @@ read-only verifier token 无法可靠做到。该设置不会让合格 finding �
 不要故意重复 plain direct request。仅用于恢复的 duplicate cohort（固定历史 pair，不是
 producer protocol）只能合并恰好两条严格按时间排序、未编辑、来自同一 user 的 ordinary
 request，并且必须没有 base epoch、两条均无 official direct `eyes`/`+1`、随后有一条未编辑
-official 顶层 current-head clean、到该 clean 为止没有其他 provider activity/error，且最多仅有
-一条之后精确绑定 current head/base 的 canonical request。若该 successor 存在，较晚 ordinary
-request 保留为已闭合的 predecessor：raw terminal 不能令 successor pass，后者需要自身的 official
-direct `+1`。第三条 request、不同 author、edit、finding、progress/error、inline-parent receipt 或
-竞争 successor 都保持 pending。它不提供启动 Codex 的权限；只被动恢复已在 GitHub 中存在的证据。
+official 顶层 current-head clean，且整个 snapshot 中不得出现任何 provider error。除该 pair 外，
+closure clean 之前不得有任何相关 physical request boundary，其后最多只能有一条合格、精确绑定
+current head/base 的 canonical successor。该 clean 必须是从第一条 ordinary request 至其 revision
+期间唯一的 provider artifact；若该 successor 存在，exclusive artifact window 延伸至该 successor 的
+revision。若该 successor 存在，较晚 ordinary request 保留为已闭合的 predecessor：raw terminal
+不能令 successor pass，后者需要自身的 official direct `+1`。第三条或同一时间的 request、不同
+author、edit、finding、provider error、exclusive window 中额外的 provider artifact、inline-parent
+receipt，或不合格/竞争 successor 都保持 pending。它不提供启动 Codex 的权限；只被动恢复已在
+GitHub 中存在的证据。
 
 ## 阶段 2：暂存并验证 Disabled ruleset
 

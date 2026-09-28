@@ -140,15 +140,19 @@ Do not deliberately repeat a direct request. A recovery-only duplicate cohort
 (a fixed historical pair, not a new workflow) can coalesce exactly two
 strictly ordered, unedited ordinary requests from the same user only when there
 is no base epoch, neither has an official direct `eyes`/`+1`, one unedited
-official top-level current-head clean follows both, no other provider
-activity/error occurs through that clean, and the only possible successor is
-one exact current head/base-bound canonical request. If that successor exists,
-the later ordinary request remains an already-closed predecessor: a raw
-terminal cannot pass the successor, which instead needs a direct official `+1`.
-A third request, another author, edit, finding, progress/error, inline-parent
-receipt, or competing successor remains pending. This exception never gives a
-commenter permission to start Codex and is not an instruction for humans or
-agents to emit pairs.
+official top-level current-head clean follows both, and the snapshot contains
+no provider error anywhere. Other than that pair, no relevant physical request
+boundary may precede the closure clean, and at most one qualifying exact
+current head/base-bound canonical successor may follow it. The clean must be
+the only provider artifact from the first ordinary request through its
+revision; if that successor exists, the exclusive artifact window extends
+through the successor's revision. If the successor exists, the later ordinary
+request remains an already-closed predecessor: a raw terminal cannot pass the
+successor, which instead needs a direct official `+1`. A third or same-time
+request, another author, edit, finding, provider error, extra provider artifact
+in the exclusive window, inline-parent receipt, or nonqualifying/competing
+successor remains pending. This exception never gives a commenter permission
+to start Codex and is not an instruction for humans or agents to emit pairs.
 
 The consumer workflows have no cron, `repository_dispatch`,
 `pull_request_target`, automatic `pull_request_review` writer, runtime GitHub

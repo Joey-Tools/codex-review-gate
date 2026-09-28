@@ -1292,12 +1292,17 @@ Do not intentionally repeat a plain direct request. A recovery-only duplicate
 cohort (a fixed historical pair, not a producer protocol) can coalesce exactly
 two strictly ordered, unedited ordinary requests from the same user only with
 no base epoch, no official direct `eyes`/`+1` on either, one unedited official
-top-level current-head clean after both, no other provider activity/error
-through that clean, and at most one later exact current head/base-bound
-canonical request. If that successor exists, the later ordinary request remains
-an already-closed predecessor: a raw terminal cannot pass the successor, which
-instead needs a direct official `+1`. A third request, different author, edit,
-finding, progress/error, inline-parent receipt, or competing successor remains
+top-level current-head clean after both, and no provider error anywhere in the
+snapshot. Other than that pair, no relevant physical request boundary may
+precede the closure clean, and at most one qualifying exact current
+head/base-bound canonical successor may follow it. The clean must be the only
+provider artifact from the first ordinary request through its revision; if that
+successor exists, the exclusive artifact window extends through the successor's
+revision. If the successor exists, the later ordinary request remains an
+already-closed predecessor: a raw terminal cannot pass the successor, which
+instead needs a direct official `+1`. A third or same-time request, different
+author, edit, finding, provider error, extra provider artifact in the exclusive
+window, inline-parent receipt, or nonqualifying/competing successor remains
 pending. It never grants authority to start Codex; treat it only as passive
 recovery of evidence that already exists in GitHub.
 
