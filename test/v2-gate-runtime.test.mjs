@@ -4113,6 +4113,96 @@ test("an opaque official top-level Codex activity before a duplicate cohort veto
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("opaque official top-level Codex activity in every duplicate-cohort exclusive window vetoes its clean receipt", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const closure = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const successor = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "103" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const cases = [
+    [
+      "first-second",
+      [
+        first,
+        opaqueProviderIssueComment({
+          id: 202,
+          created_at: "2026-08-25T08:00:30Z",
+          updated_at: "2026-08-25T08:00:30Z",
+          html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+        }),
+        second,
+        closure,
+      ],
+      new Map(),
+    ],
+    [
+      "second-closure",
+      [
+        first,
+        second,
+        opaqueProviderIssueComment({
+          id: 202,
+          created_at: "2026-08-25T08:01:30Z",
+          updated_at: "2026-08-25T08:01:30Z",
+          html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+        }),
+        closure,
+      ],
+      new Map(),
+    ],
+    [
+      "closure-successor",
+      [
+        first,
+        second,
+        closure,
+        opaqueProviderIssueComment({
+          id: 202,
+          created_at: "2026-08-25T08:02:30Z",
+          updated_at: "2026-08-25T08:02:30Z",
+          html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+        }),
+        successor,
+      ],
+      new Map([[String(successor.id), [reaction({
+        id: 650,
+        created_at: "2026-08-25T08:03:30Z",
+      })]]]),
+    ],
+  ];
+
+  for (const [suffix, comments, reactionsByCommentId] of cases) {
+    const github = createGitHubMock({
+      issueComments: comments,
+      reactionsByCommentId,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `duplicate-cohort-opaque-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
 test("a non-official opaque comment before a duplicate cohort does not veto its clean receipt", async (context) => {
   const priorNonProviderComment = opaqueProviderIssueComment({
     user: HUMAN,

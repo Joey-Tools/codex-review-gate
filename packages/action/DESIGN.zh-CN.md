@@ -322,14 +322,17 @@ provider artifact 都会否决 cohort，除非它是已安全分类的 historica
 nonterminal 的 official 顶层 `issue-comment`：只要具有有效 activity window，就属于不透明 provider
 activity（只作阻塞，不作 clean 证据），并否决 cohort。较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal
 依赖这条明确例外，而非仅有 full-head binding。从第一条 request 到该 clean（若存在唯一 canonical
-successor，则到该 successor）之间不得有其他 provider artifact。唯一可能的 successor 是一条严格
+successor，则到该 successor）之间不得出现任何额外的 provider artifact 或具有有效 activity window 的
+不透明 provider activity。不透明 provider activity 仅是排除用的 side channel：不进入普通 reducer、
+liveness、finding、clean 或计数路径。唯一可能的 successor 是一条严格
 更晚、绑定 current 完整 head/base tuple 的 canonical workflow request。没有 successor 时，较晚
 ordinary request 被确认、较早者被合并；有该 successor 时，较晚 ordinary request 保留为已确认、
 已闭合的 predecessor；在 successor 之后出现的无绑定 terminal 不能令其 pass，只有该 successor
 上的 official direct `+1` 可以。inline-parent receipt、第三条 request、另一 author、edit、base
 epoch、两条 ordinary request 上的 reaction、provider activity/error、任一不属于上文安全
 historical-terminal 例外且具有有效 activity window 的 pre-pair official 顶层 `issue-comment`
-provider artifact、finding 及任何其他 successor 均保持 fail-closed。该例外要求列出的每项 terminal
+provider artifact、该 exclusive window 中额外的 provider artifact 或不透明 provider activity、finding
+及任何其他 successor 均保持 fail-closed。该例外要求列出的每项 terminal
 property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。此规则只恢复不可变的历史
 pair；agent 不得主动创建。
 

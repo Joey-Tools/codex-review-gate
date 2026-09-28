@@ -90,7 +90,9 @@ provider artifact 都会否决 cohort，除非它是已安全分类的 historica
 nonterminal 的 official 顶层 `issue-comment`：只要具有有效 activity window，就属于不透明 provider
 activity（只作阻塞，不作 clean 证据），并否决 cohort。较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal
 依赖这条明确例外，而非仅有 full-head binding。从第一条 request 到该 clean（若有唯一 canonical
-successor，则到该 successor）之间没有其他 provider artifact；并且最多只允许一条之后严格绑定
+successor，则到该 successor）之间不得出现任何额外的 provider artifact 或具有有效 activity window 的
+不透明 provider activity。不透明 provider activity 仅是排除用的 side channel：不进入普通 reducer、
+liveness、finding、clean 或计数路径；并且最多只允许一条之后严格绑定
 head/base 的 canonical request。
 没有 successor 时，该 clean 确认较晚 request 并合并较早 request。它只合并 immutable historical
 evidence，不授权一种新的 producer pattern。有该 successor 时，较晚 ordinary request 仍是已闭合的

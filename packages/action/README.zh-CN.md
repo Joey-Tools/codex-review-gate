@@ -245,7 +245,9 @@ terminal：kind 为 `clean` 或 `finding`、未编辑、没有 `orderingError`/`
 malformed、progress 或 nonterminal 的 official 顶层 `issue-comment`：只要具有有效 activity window，
 就属于不透明 provider activity（只作阻塞，不作 clean 证据），并否决 cohort。较早的 carrier 仍可能是后来 clean 的
 来源；保留安全历史 terminal 依赖这条明确例外，而非仅有 full-head binding。从第一条 request 到该
-clean（若存在唯一 canonical successor，则到该 successor）之间没有其他 provider artifact。唯一允许的
+clean（若存在唯一 canonical successor，则到该 successor）之间不得出现任何额外的 provider artifact
+或具有有效 activity window 的不透明 provider activity。不透明 provider activity 仅是排除用的 side
+channel：不进入普通 reducer、liveness、finding、clean 或计数路径。唯一允许的
 后继只能是一条严格更晚、绑定 current 完整 head/base tuple
 的 canonical workflow request。没有后继时，较晚的 ordinary request 被确认、较早的被合并；有该
 后继时，较晚的 ordinary request 保留为已确认、已闭合的 predecessor，之后无绑定的 terminal 不能

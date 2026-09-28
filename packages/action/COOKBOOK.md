@@ -103,9 +103,12 @@ otherwise unknown or unclassified, malformed, progress, or nonterminal official
 top-level `issue-comment`: with a valid activity window, it is opaque provider
 activity (a blocker rather than clean evidence) and vetoes the cohort. An
 earlier carrier may own the later clean; this explicit exception—not merely a full-head
-binding—preserves safely classified historical terminals. No other provider
-artifact may appear from the first request through that clean (or, if present,
-its sole successor), and at most one later exact head/base-bound canonical
+binding—preserves safely classified historical terminals. No additional provider
+artifact or opaque provider activity with a valid activity window may appear
+from the first request through that clean (or, if present, its sole successor).
+Opaque provider activity is an exclusion-only side channel: it does not enter
+the ordinary reducer, liveness, finding, clean, or count paths. At most one
+later exact head/base-bound canonical
 request. Without a successor,
 that clean confirms the later request and coalesces the earlier one. With that successor,
 the later ordinary request stays as an already-closed predecessor, so a raw

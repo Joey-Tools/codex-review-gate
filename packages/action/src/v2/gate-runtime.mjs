@@ -4148,6 +4148,7 @@ function selectV2DefaultAnyDuplicateCohortClosure({
     const cohortEndMs = successor?.revisionMs ?? receiptWindow.carrierCreatedMs;
     if (!hasV2ExclusiveDuplicateCohortProviderWindow({
       providerArtifacts,
+      opaqueTopLevelProviderActivities,
       firstRequest: first,
       closure: receipt,
       endMs: cohortEndMs,
@@ -4228,11 +4229,15 @@ function isV2CurrentCanonicalDuplicateCohortSuccessor({
 
 function hasV2ExclusiveDuplicateCohortProviderWindow({
   providerArtifacts,
+  opaqueTopLevelProviderActivities,
   firstRequest,
   closure,
   endMs,
 }) {
-  for (const artifact of providerArtifacts ?? []) {
+  for (const artifact of [
+    ...(providerArtifacts ?? []),
+    ...(opaqueTopLevelProviderActivities ?? []),
+  ]) {
     const window = v2ProviderActivityWindow(artifact);
     if (!window) return false;
     if (window.revisionMs < firstRequest.revisionMs || window.carrierCreatedMs > endMs) {

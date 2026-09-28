@@ -12,7 +12,7 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "fef5ab25fc6788974937a4491cc29cb93a310503"
+    "tree": "a185d639c6fe746b1c8af784afa8f061542acb32"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
@@ -25,29 +25,29 @@
       "path": "COOKBOOK.md",
       "type": "file",
       "mode": "100644",
-      "size": 30989,
-      "sha256": "a687c0338645d5d7d55cab45e3bc8d71cb435552aa02de7b1fe6360e8d646ff3"
+      "size": 31189,
+      "sha256": "77396dd56e00e5bab799cdf0c7cd90ddbdac79e7de357796d1081636256f19f5"
     },
     {
       "path": "COOKBOOK.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 31110,
-      "sha256": "7f1760f09ccebdf444ef21a2554e165dcf95ce7497dcfd2107b48266be679497"
+      "size": 31323,
+      "sha256": "47805dafe3ce3880b9f70d8f01ed8c69460f94a4fad397aaaf95e73242529e5c"
     },
     {
       "path": "DESIGN.md",
       "type": "file",
       "mode": "100644",
-      "size": 40899,
-      "sha256": "97278f929caafba7738b3a581f4caffb614053fedd782d5d656f3563668c55e1"
+      "size": 41197,
+      "sha256": "199264559315013449ee0d48bb9d332565d7bd6a040b82bbb4ad699945965c42"
     },
     {
       "path": "DESIGN.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 41048,
-      "sha256": "dffe8e87e3fa3b2344c9ce4ee7bd59c89a8625767082e9ee193eba75b5d267e9"
+      "size": 41343,
+      "sha256": "b93bdfaeec96f572efa606e842f4a41c095d856471c8a134737c473b79d2132f"
     },
     {
       "path": "EULA.md",
@@ -67,15 +67,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 30935,
-      "sha256": "ba0c191810adb23145e5c0e0e7d99d210dfcf756ee637f9546932dea8a98b1b1"
+      "size": 31139,
+      "sha256": "1edb997f5b398945cab7535f7b09a8efb2ca71877a2981d49b3d8d4f7702cabf"
     },
     {
       "path": "README.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 30999,
-      "sha256": "8e201454d82ebe36574ecc88d95461cc490144fec4544c29d8d1b920d22ec0aa"
+      "size": 31210,
+      "sha256": "73559c16276c5fe65b61ffac37132f9277b4cedeb5b24067f276d964455ef8d0"
     },
     {
       "path": "SECURITY.md",
@@ -144,8 +144,8 @@
       "path": "src/v2/gate-runtime.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 254394,
-      "sha256": "b725257ab4836844377b4751db65c37a90e4d5836c8b86819a68143948bcb829"
+      "size": 254535,
+      "sha256": "0dac20b51766d5f39c38ab6fde2def3d16614f6fc72cb10108f74a4c3ee0e589"
     }
   ],
   "entrypoint": {

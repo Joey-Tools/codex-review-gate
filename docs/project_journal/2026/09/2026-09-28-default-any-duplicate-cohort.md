@@ -43,9 +43,12 @@ superseded_by:
   terminals. Other
   than the pair, no relevant physical request boundary may precede the closure
   clean, and at most one qualifying exact current head/base-bound canonical
-  successor may follow it. The clean must be the only provider artifact from
-  the first ordinary request through its revision; if that successor exists,
-  the exclusive artifact window extends through the successor revision.
+  successor may follow it. No additional provider artifact or opaque provider
+  activity with a valid activity window may appear from the first ordinary
+  request through the clean's revision; if that successor exists, the exclusive
+  artifact window extends through the successor revision. Opaque provider
+  activity is an exclusion-only side channel: it does not enter the ordinary
+  reducer, liveness, finding, clean, or count paths.
 - With no successor, the second ordinary request becomes the sole confirmed
   generation and the first is coalesced. With one strictly later exact current
   head/base-bound canonical workflow request, the second ordinary request
@@ -69,6 +72,11 @@ superseded_by:
   veto exists because an earlier carrier may be the source of the later clean.
   Record this exact exception and reason here so future changes do not broaden
   it to any full-bound artifact or weaken the fail-closed attribution rule.
+- P1 correction: opaque official top-level `issue-comment` activity is not a
+  normal reducer artifact, so screening it only before the pair left a later
+  apparent clean vulnerable to misattribution. Its valid activity window must
+  veto the entire exclusive `first -> second -> closure -> successor` window;
+  it must not acquire ordinary liveness, finding, clean, or counting meaning.
 - Agents and users must not intentionally create duplicate direct requests.
   This is passive recovery of immutable historical evidence, not a producer
   protocol or a relaxation of finding blocking.
@@ -79,6 +87,10 @@ superseded_by:
   terminal that cannot pass a later canonical generation, the latter's direct
   `+1` recovery, finding supersession protection, and competing requests,
   activity, direct reactions, canonical predecessors, and base epochs.
+- Focused P1 tests cover valid-window opaque provider activity in all three
+  exclusive-window segments: first request -> second request, second request
+  -> closure clean, and closure clean -> canonical successor. Each must keep
+  the cohort pending and must not write success.
 - The broader current-head/default-any and finding-blocking tests remain part
   of the local validation gate before this branch is reviewed and merged.
 

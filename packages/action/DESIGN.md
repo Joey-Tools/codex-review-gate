@@ -374,9 +374,12 @@ any otherwise unknown or unclassified, malformed, progress, or nonterminal
 official top-level `issue-comment`: with a valid activity window, it is opaque
 provider activity (a blocker rather than clean evidence) and vetoes the
 cohort. An earlier carrier may own the later clean; this explicit exception—not merely a full-head
-binding—preserves safely classified historical terminals. The first request
-through that clean (or, if present, through its sole canonical successor) has
-no other provider artifact. The only possible successor is one strictly later canonical
+binding—preserves safely classified historical terminals. From the first
+request through that clean (or, if present, through its sole canonical
+successor), no additional provider artifact or opaque provider activity with a
+valid activity window may appear. Opaque provider activity is an exclusion-only
+side channel: it does not enter the ordinary reducer, liveness, finding, clean,
+or count paths. The only possible successor is one strictly later canonical
 workflow request with the current full head/base tuple. Without a successor,
 the later ordinary request is confirmed and the earlier one is coalesced; with
 that successor, the later ordinary request remains the explicitly confirmed,
@@ -386,6 +389,7 @@ Inline-parent receipts, a third request, another author, edits, base epochs,
 reactions on either ordinary request, provider activity or errors, a pre-pair
 official top-level `issue-comment` provider artifact with a valid activity
 window unless it is the safely classified historical-terminal exception above,
+an extra provider artifact or opaque provider activity in that exclusive window,
 findings, and every other successor remain fail-closed. The exception requires
 every listed terminal property; a historical terminal clean/finding is not
 preserved merely because it has a full-head binding. This recovers an immutable

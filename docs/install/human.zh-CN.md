@@ -115,13 +115,16 @@ activity window 的 official 顶层 `issue-comment` provider artifact 都会否�
 `issue-comment`：只要具有有效 activity window，就属于不透明 provider activity（只作阻塞，不作 clean
 证据），并否决 cohort。较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal 依赖这条明确例外，而非仅有
 full-head binding。除该 pair 外，closure clean 之前不得有任何相关 physical request boundary，其后
-最多只能有一条合格、精确绑定 current head/base 的 canonical successor。该 clean 必须是从第一条
-ordinary request 至其 revision 期间唯一的 provider artifact；若该 successor 存在，exclusive artifact
-window 延伸至该 successor 的 revision。若该 successor 存在，较晚 ordinary request 保留为已闭合的
+最多只能有一条合格、精确绑定 current head/base 的 canonical successor。从第一条 ordinary request 到
+该 clean 的 revision 之间不得出现任何额外的 provider artifact 或具有有效 activity window 的不透明
+provider activity；若该 successor 存在，exclusive artifact window 延伸至该 successor 的 revision。
+不透明 provider activity 仅是排除用的 side channel：不进入普通 reducer、liveness、finding、clean 或
+计数路径。若该 successor 存在，较晚 ordinary request 保留为已闭合的
 predecessor：raw terminal 不能令 successor pass，后者需要自身的 official direct `+1`。第三条或同一
 时间的 request、另一 author、edit、finding、provider error、任一不属于上文安全 historical-terminal
 例外且具有有效 activity window 的 pre-pair official 顶层 `issue-comment` provider artifact、exclusive
-window 中额外的 provider artifact、inline-parent receipt，或不合格/竞争 successor 都会保持 pending。
+window 中额外的 provider artifact 或不透明 provider activity、inline-parent receipt，或不合格/竞争
+successor 都会保持 pending。
 该例外要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding
 被保留。此例外不赋予 commenter 启动 Codex 的权限，也不是让人或 agent 主动创建 pair 的说明。
 
