@@ -4128,6 +4128,116 @@ test("a closed same-author duplicate cohort cannot block one later canonical gen
   assert.equal(incomplete.report.recoveryCode, "wait_provider");
 });
 
+test("duplicate-cohort recovery stays fail-closed when provider activity separates its closure from a canonical successor", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const closure = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const canonical = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "103" }),
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const cases = [
+    [
+      "competing-clean",
+      cleanIssueComment(HEAD, {
+        id: 202,
+        created_at: "2026-08-25T08:03:00Z",
+        updated_at: "2026-08-25T08:03:00Z",
+      }),
+    ],
+    [
+      "competing-progress",
+      progressIssueComment({
+        id: 203,
+        created_at: "2026-08-25T08:03:00Z",
+        updated_at: "2026-08-25T08:03:00Z",
+      }),
+    ],
+  ];
+
+  for (const [suffix, competingArtifact] of cases) {
+    const github = createGitHubMock({
+      issueComments: [first, second, closure, competingArtifact, canonical],
+      reactionsByCommentId: new Map([[String(canonical.id), [reaction({
+        id: 650,
+        created_at: "2026-08-25T08:04:30Z",
+      })]]]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `duplicate-cohort-successor-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(result.report.requiresReplacementPr, true, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("duplicate-cohort recovery globally rejects a provider error outside its artifact window", async (context) => {
+  const invalidProviderBeforePair = cleanIssueComment(HEAD, {
+    id: 200,
+    performed_via_github_app: { slug: "wrong-provider" },
+    created_at: "2026-08-25T07:59:00Z",
+    updated_at: "2026-08-25T07:59:00Z",
+  });
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const closure = cleanIssueComment(HEAD, {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const canonical = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "103" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const github = createGitHubMock({
+    issueComments: [invalidProviderBeforePair, first, second, closure, canonical],
+    reactionsByCommentId: new Map([[String(canonical.id), [reaction({
+      id: 651,
+      created_at: "2026-08-25T08:03:30Z",
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-provider-error-outside-window",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(result.report.counts.indeterminate > 0, true);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
 test("duplicate-cohort closure rejects provider errors, invalid provenance, and findings in its window", async (context) => {
   const first = ordinaryRequest({ id: 101, user: HUMAN });
   const second = ordinaryRequest({
