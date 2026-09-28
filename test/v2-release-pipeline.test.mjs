@@ -2452,15 +2452,41 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
       "      fail-fast: false",
       "      matrix:",
       "        suite:",
+      "          - name: bootstrap 1/4",
+      "            kind: bootstrap",
+      "            bootstrap_test_shard: \"1/4\"",
+      "            release_test_shard: \"off\"",
+      "          - name: bootstrap 2/4",
+      "            kind: bootstrap",
+      "            bootstrap_test_shard: \"2/4\"",
+      "            release_test_shard: \"off\"",
+      "          - name: bootstrap 3/4",
+      "            kind: bootstrap",
+      "            bootstrap_test_shard: \"3/4\"",
+      "            release_test_shard: \"off\"",
+      "          - name: bootstrap 4/4",
+      "            kind: bootstrap",
+      "            bootstrap_test_shard: \"4/4\"",
+      "            release_test_shard: \"off\"",
       "          - name: core",
+      "            kind: core",
+      "            bootstrap_test_shard: \"off\"",
       "            release_test_shard: \"off\"",
       "          - name: release 1/4",
+      "            kind: release",
+      "            bootstrap_test_shard: \"off\"",
       "            release_test_shard: \"1/4\"",
       "          - name: release 2/4",
+      "            kind: release",
+      "            bootstrap_test_shard: \"off\"",
       "            release_test_shard: \"2/4\"",
       "          - name: release 3/4",
+      "            kind: release",
+      "            bootstrap_test_shard: \"off\"",
       "            release_test_shard: \"3/4\"",
       "          - name: release 4/4",
+      "            kind: release",
+      "            bootstrap_test_shard: \"off\"",
       "            release_test_shard: \"4/4\"",
     ].join("\n"),
   );
@@ -2468,23 +2494,106 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
     validation,
     /git worktree add --detach "\$RUNNER_TEMP\/release-source" "\$RELEASE_SOURCE_SHA"/u,
   );
-  const coreValidationStep = workflowStepBlock(
+  const sourceInventoryStep = workflowStepBlock(
     validation,
-    "Run checks and non-release tests",
+    "Classify frozen source test inventory",
+  );
+  assert.match(
+    sourceInventoryStep,
+    /^      - name: Classify frozen source test inventory\n        id: source_test_inventory$/mu,
+  );
+  for (const path of [
+    "test/bootstrap.test.mjs",
+    "test/ci-test-shard.test.mjs",
+    "test/core.test.mjs",
+    "test/evidence-budget.test.mjs",
+    "test/gate-runner.test.mjs",
+    "test/organization-review-gate-handoff.test.mjs",
+    "test/producer-receipt.test.mjs",
+    "test/release-provenance.test.mjs",
+    "test/required-ci-workflow.test.mjs",
+    "test/v2-action.test.mjs",
+    "test/v2-gate-runtime.test.mjs",
+    "test/v2-release-pipeline.test.mjs",
+    "test/v2-workflow-contract.test.mjs",
+    "test/workflow-security-contract.test.mjs",
+  ]) {
+    assert.match(sourceInventoryStep, new RegExp(`^            ${path.replaceAll(".", "\\.")}$`, "mu"));
+  }
+  assert.match(sourceInventoryStep, /find test -type f -name '\*\.test\.mjs' -print \| LC_ALL=C sort/u);
+  assert.match(
+    sourceInventoryStep,
+    /bootstrap_shard_capability_commit=5b0d1726461b48c1b71ec8db051e57fd516d7196/u,
+  );
+  assert.match(
+    sourceInventoryStep,
+    /git merge-base --is-ancestor "\$bootstrap_shard_capability_commit" "\$RELEASE_SOURCE_SHA"/u,
+  );
+  assert.match(sourceInventoryStep, /current_inventory=false/u);
+  assert.match(sourceInventoryStep, /modern_partition=false/u);
+  assert.match(sourceInventoryStep, /\[\[ "\$current_inventory" == true && "\$bootstrap_shards" == true \]\]/u);
+  assert.match(sourceInventoryStep, /printf 'modern_partition=%s\\n' "\$modern_partition" >> "\$GITHUB_OUTPUT"/u);
+  assert.match(sourceInventoryStep, /Legacy frozen source test inventory/u);
+  const bootstrapShardEnvironment = [
+    "CODEX",
+    "REVIEW",
+    "GATE",
+    "BOOTSTRAP",
+    "TEST",
+    "SHARD",
+  ].join("_");
+  const bootstrapValidationStep = workflowStepBlock(
+    validation,
+    "Run bootstrap test shard",
+  );
+  assert.match(
+    bootstrapValidationStep,
+    /^      - name: Run bootstrap test shard\n        if: \$\{\{ matrix\.suite\.kind == 'bootstrap' && steps\.source_test_inventory\.outputs\.modern_partition == 'true' \}\}/mu,
+  );
+  assert.match(
+    bootstrapValidationStep,
+    new RegExp(
+      `^          ${bootstrapShardEnvironment}: \\$\\{\\{ matrix\\.suite\\.bootstrap_test_shard \\}\\}$`,
+      "mu",
+    ),
+  );
+  assert.match(
+    bootstrapValidationStep,
+    /^          cd "\$RUNNER_TEMP\/release-source"\n          node --test --test-concurrency=1 --test-reporter=dot test\/bootstrap\.test\.mjs$/mu,
+  );
+  const coreValidationStep = workflowStepBlock(validation, "Run syntax and core tests");
+  assert.match(
+    coreValidationStep,
+    /^      - name: Run syntax and core tests\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.modern_partition == 'true' \}\}/mu,
   );
   assert.match(
     coreValidationStep,
-    /^      - name: Run checks and non-release tests\n        if: \$\{\{ matrix\.suite\.release_test_shard == 'off' \}\}/mu,
+    /^          cd "\$RUNNER_TEMP\/release-source"\n          npm run check\n          node --test --test-concurrency=1 --test-reporter=dot test\/ci-test-shard\.test\.mjs test\/core\.test\.mjs test\/evidence-budget\.test\.mjs test\/gate-runner\.test\.mjs test\/organization-review-gate-handoff\.test\.mjs test\/producer-receipt\.test\.mjs test\/release-provenance\.test\.mjs test\/required-ci-workflow\.test\.mjs test\/v2-action\.test\.mjs test\/v2-gate-runtime\.test\.mjs test\/v2-workflow-contract\.test\.mjs test\/workflow-security-contract\.test\.mjs$/mu,
+  );
+  assert.doesNotMatch(coreValidationStep, /\bnpm test\b/u);
+  const legacyValidationStep = workflowStepBlock(
+    validation,
+    "Run legacy source test discovery",
   );
   assert.match(
-    coreValidationStep,
+    legacyValidationStep,
+    /^      - name: Run legacy source test discovery\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.modern_partition != 'true' \}\}/mu,
+  );
+  assert.match(
+    legacyValidationStep,
+    new RegExp(
+      `^          ${releaseShardEnvironment}: "off"$`,
+      "mu",
+    ),
+  );
+  assert.match(
+    legacyValidationStep,
     /^          cd "\$RUNNER_TEMP\/release-source"\n          npm run check\n          npm test -- --test-concurrency=1 --test-reporter=dot$/mu,
   );
-  assert.ok(validation.includes(`${releaseShardEnvironment}: "off"`));
   const releaseShardStep = workflowStepBlock(validation, "Run release pipeline shard");
   assert.match(
     releaseShardStep,
-    /^      - name: Run release pipeline shard\n        if: \$\{\{ matrix\.suite\.release_test_shard != 'off' \}\}/mu,
+    /^      - name: Run release pipeline shard\n        if: \$\{\{ matrix\.suite\.kind == 'release' \}\}/mu,
   );
   assert.match(
     releaseShardStep,
