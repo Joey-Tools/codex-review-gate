@@ -3,8 +3,8 @@
 ## Current State
 - The source workspace keeps the publishable GitHub Action package under `packages/action`.
 - The v2 runtime, installation, and manifest-driven publisher infrastructure
-  are released as immutable stable `v2.1.1` with the floating `v2` alias; both
-  tags peel to action commit `2041f67c287a144c5b30de1f4c702a396535817d`. The
+  are released as immutable stable `v2.1.2` with the floating `v2` alias; both
+  tags peel to action commit `e767d516f55e04d314392de9c57886299764d7bc`. The
   published payload declares Node 24. The
   controlled organization-wide v2 handoff is complete for its fixed 10-member
   active cohort: the old organization rule no longer requires v1, and all eight
@@ -30,6 +30,7 @@
 - Action subtree layout workstream: `docs/project_journal/2026/05/2026-05-18-action-subtree-layout-4df8f16.md`
 - Completed v2 delivery plan and release evidence: `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`
 - Completed v2.1.1 frozen-source release validation: `docs/project_journal/2026/09/2026-09-28-release-validation-shards.md`
+- Completed v2.1.2 duplicate-cohort recovery release: `docs/project_journal/2026/09/2026-09-28-default-any-duplicate-cohort.md`
 - Authoritative active organization v2 cohort handoff: `docs/project_journal/2026/09/2026-09-18-organization-v2-handoff.md`
 - Superseded pre-confirmation v2 implementation record: `docs/project_journal/2026/08/2026-08-13-action-v2-release-pipeline-7bf930a.md`
 - Superseded v1 release automation history: `docs/project_journal/2026/05/2026-05-18-action-release-automation-9a806cf.md`
