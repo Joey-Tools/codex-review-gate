@@ -4128,6 +4128,223 @@ test("a closed same-author duplicate cohort cannot block one later canonical gen
   assert.equal(incomplete.report.recoveryCode, "wait_provider");
 });
 
+test("duplicate-cohort closure rejects provider errors, invalid provenance, and findings in its window", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const closure = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const invalidProvider = cleanIssueComment(HEAD, {
+    id: 202,
+    performed_via_github_app: { slug: "wrong-provider" },
+    created_at: "2026-08-25T08:01:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const invalidReaction = reaction({
+    id: "not-a-positive-id",
+    content: "eyes",
+    created_at: "2026-08-25T08:01:30Z",
+  });
+  const errorCases = [
+    [
+      "provider-reaction-error",
+      createGitHubMock({
+        issueComments: [first, second, closure],
+        reactionsByCommentId: new Map([[String(first.id), [invalidReaction]]]),
+      }),
+      { executionHealth: "unhealthy", recoveryCode: "wait_then_reconcile" },
+    ],
+    [
+      "invalid-provider-provenance",
+      createGitHubMock({ issueComments: [first, second, invalidProvider, closure] }),
+      { executionHealth: "healthy", indeterminate: true },
+    ],
+  ];
+  for (const [suffix, github, expected] of errorCases) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `duplicate-cohort-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, expected.executionHealth, suffix);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    if (expected.recoveryCode) {
+      assert.equal(result.report.recoveryCode, expected.recoveryCode, suffix);
+    }
+    if (expected.indeterminate) {
+      assert.equal(result.report.counts.indeterminate > 0, true, suffix);
+    }
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+
+  const findingGitHub = createGitHubMock({
+    issueComments: [first, second, findingIssueComment(HEAD, {
+      id: 203,
+      created_at: "2026-08-25T08:01:30Z",
+      updated_at: "2026-08-25T08:01:30Z",
+    }), closure],
+  });
+  const findingEnvironment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-window-finding",
+  });
+  const { result: finding } = await runGate(findingEnvironment, findingGitHub);
+  assert.equal(finding.exitCode, 1);
+  assert.equal(finding.report.gateOutcome, "failure");
+  assert.equal(finding.report.counts.unresolved, 1);
+  assert.equal(finding.report.counts.resolved, 0);
+  assert.equal(findingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("duplicate-cohort recovery rejects ambiguous or malformed successors before a late raw clean", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const closure = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const lateClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 202,
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const successorAt = (id, createdAt, overrides = {}) => workflowRequest({
+    id,
+    body: canonicalRequestBody(HEAD, { runId: String(id) }),
+    created_at: createdAt,
+    updated_at: createdAt,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${id}`,
+    ...overrides,
+  });
+  const cases = [
+    [
+      "same-time-pair",
+      [ordinaryRequest({
+        id: 102,
+        user: HUMAN,
+        created_at: first.created_at,
+        updated_at: first.updated_at,
+        html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+      })],
+      [],
+    ],
+    ["same-time-successor", [second], [successorAt(103, closure.created_at)]],
+    [
+      "wrong-base-successor",
+      [second],
+      [successorAt(104, "2026-08-25T08:03:00Z", {
+        body: canonicalRequestBody(HEAD, { baseSha: "b".repeat(40), runId: "104" }),
+      })],
+    ],
+    [
+      "noncanonical-successor",
+      [second],
+      [ordinaryRequest({
+        id: 105,
+        user: HUMAN,
+        created_at: "2026-08-25T08:03:00Z",
+        updated_at: "2026-08-25T08:03:00Z",
+        html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-105`,
+      })],
+    ],
+    [
+      "edited-successor",
+      [second],
+      [successorAt(106, "2026-08-25T08:03:00Z", {
+        updated_at: "2026-08-25T08:03:30Z",
+        last_edited_at: "2026-08-25T08:03:30Z",
+      })],
+    ],
+    [
+      "multiple-successors",
+      [second],
+      [
+        successorAt(107, "2026-08-25T08:03:00Z"),
+        successorAt(108, "2026-08-25T08:03:30Z"),
+      ],
+    ],
+  ];
+  for (const [suffix, pair, successors] of cases) {
+    const github = createGitHubMock({
+      issueComments: [first, ...pair, closure, ...successors, lateClean],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `duplicate-cohort-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("reverse opening and closing duplicate-cohort snapshots stay fail-closed and stable", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const closure = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const successor = workflowRequest({
+    id: 103,
+    body: canonicalRequestBody(HEAD, { runId: "103" }),
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const lateClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 202,
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const forward = [first, second, closure, successor, lateClean];
+  const reverse = [...forward].reverse();
+  const outcomes = [];
+  for (const [suffix, snapshots] of [
+    ["forward-reverse", [forward, reverse]],
+    ["reverse-forward", [reverse, forward]],
+  ]) {
+    const github = createGitHubMock({ issueCommentSnapshots: snapshots });
+    const environment = runtimeEnvironment(context, {
+      suffix: `duplicate-cohort-${suffix}`,
+    });
+    const { result } = await runGate(environment, github, { stabilityWindowMs: 1 });
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    outcomes.push([
+      result.report.executionHealth,
+      result.report.gateOutcome,
+      result.report.recoveryCode,
+      result.report.requiresReplacementPr,
+    ]);
+  }
+  assert.deepEqual(outcomes[0], outcomes[1]);
+});
+
 test("a duplicate default-any cohort remains fail-closed when it has competing activity", async (context) => {
   const first = ordinaryRequest({ id: 101, user: HUMAN });
   const second = ordinaryRequest({
