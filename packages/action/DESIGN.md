@@ -359,6 +359,20 @@ collaborator permissions; the bundled read-only verifier token cannot reliably
 do so. A workflow-authored request additionally needs the exact v2 marker
 binding the full head and run.
 
+The only duplicate-request recovery is a *duplicate cohort* (a fixed legacy
+pair, not a producer protocol). With no base epoch, it accepts exactly two
+strictly time-ordered, unedited ordinary requests from the same `User` login
+only if neither has an official direct `eyes`/`+1`, a single unedited official
+top-level issue-comment clean after both resolves exactly to the current head,
+and the first request through that clean has no other provider artifact or
+provider error. The only possible successor is one strictly later canonical
+workflow request with the current full head/base tuple. Without a successor,
+the later ordinary request is confirmed and the earlier one is coalesced; with
+that successor, both are coalesced before it. Inline-parent receipts, a third
+request, another author, edits, base epochs, reactions, provider activity or
+errors, findings, and every other successor remain fail-closed. This recovers
+an immutable historical pair; agents must not deliberately create one.
+
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
 permission. A finding never serves as the minimal terminal receipt. The exact

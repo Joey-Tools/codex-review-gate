@@ -4018,6 +4018,161 @@ test("a terminal clean receipt cannot uniquely satisfy multiple default-any requ
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("a same-author pair of plain default-any requests can recover through one exact-head clean", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const terminal = cleanIssueComment(HEAD.slice(0, 10), {
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({ issueComments: [first, second, terminal] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "same-author-default-any-duplicate-cohort",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(result.report.requiresReplacementPr, false);
+  assert.equal(
+    github.calls.some((call) => call.path.endsWith(`/commits/${HEAD.slice(0, 10)}`)),
+    true,
+  );
+});
+
+test("a closed same-author duplicate cohort cannot block one later canonical generation", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const firstClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 201,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const canonical = workflowRequest({
+    id: 103,
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const secondClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 202,
+    created_at: "2026-08-25T08:04:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [first, second, firstClean, canonical, secondClean],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-before-canonical-generation",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(result.report.requiresReplacementPr, false);
+
+  const incompleteGitHub = createGitHubMock({
+    issueComments: [first, second, firstClean, canonical],
+  });
+  const incompleteEnvironment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-canonical-awaits-terminal",
+  });
+  const { result: incomplete } = await runGate(incompleteEnvironment, incompleteGitHub);
+  assert.notEqual(incomplete.report.gateOutcome, "success");
+  assert.equal(incomplete.report.recoveryCode, "wait_provider");
+});
+
+test("a duplicate default-any cohort remains fail-closed when it has competing activity", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: HUMAN });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const terminal = cleanIssueComment(HEAD, {
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:03:00Z",
+  });
+  const third = ordinaryRequest({
+    id: 103,
+    user: HUMAN,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-103`,
+  });
+  const progress = progressIssueComment({
+    id: 204,
+    created_at: "2026-08-25T08:02:30Z",
+    updated_at: "2026-08-25T08:02:30Z",
+  });
+  const editedOverlap = cleanIssueComment(HEAD, {
+    id: 205,
+    created_at: "2026-08-25T07:59:00Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const cases = [
+    ["third-plain-request", [first, second, third, terminal], new Map()],
+    ["intervening-provider-activity", [first, second, progress, terminal], new Map()],
+    ["overlapping-edited-provider-activity", [editedOverlap, first, second, terminal], new Map()],
+    ["direct-official-reaction", [first, second, terminal], new Map([[String(first.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T08:01:30Z",
+    })]]])],
+    ["same-time-official-reaction", [first, second, terminal], new Map([[String(first.id), [reaction({
+      content: "eyes",
+      created_at: first.created_at,
+    })]]])],
+  ];
+  for (const [suffix, issueComments, reactionsByCommentId] of cases) {
+    const github = createGitHubMock({ issueComments, reactionsByCommentId });
+    const environment = runtimeEnvironment(context, {
+      suffix: `duplicate-cohort-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+
+  const canonicalBeforeClosure = workflowRequest({
+    id: 104,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-104`,
+  });
+  const canonicalGitHub = createGitHubMock({
+    issueComments: [first, second, canonicalBeforeClosure, terminal],
+  });
+  const canonicalEnvironment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-canonical-before-closure",
+  });
+  const { result: canonicalResult } = await runGate(canonicalEnvironment, canonicalGitHub);
+  assert.notEqual(canonicalResult.report.gateOutcome, "success");
+
+  const baseEpochGitHub = createGitHubMock({
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:59:00Z" }),
+    issueComments: [first, second, terminal],
+  });
+  const baseEpochEnvironment = runtimeEnvironment(context, {
+    suffix: "duplicate-cohort-base-epoch",
+  });
+  const { result: baseEpochResult } = await runGate(baseEpochEnvironment, baseEpochGitHub);
+  assert.notEqual(baseEpochResult.report.gateOutcome, "success");
+});
+
 test("a previous-head request does not make a current default-any terminal receipt ambiguous", async (context) => {
   const current = ordinaryRequest({ user: READER });
   const previousHead = workflowRequest({

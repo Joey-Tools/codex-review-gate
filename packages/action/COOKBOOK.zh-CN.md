@@ -78,6 +78,13 @@ fail-closed pending。canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHO
 workflow 添加 strict policy。`write`/`maintain`/`admin` 仅保留给将来可以读取 collaborator
 permission 的 nonstandard verifier identity。
 
+不得故意重复发送 direct request。唯一的 recovery exception 是 duplicate cohort：恰好两条
+未编辑、严格按时间排序、同一 user 的 ordinary request；没有 base epoch 或 official direct
+receipt；之后有一条未编辑 official 顶层 current-head clean；到该 clean 为止没有其他 provider
+activity/error；并且最多只允许一条之后严格绑定 head/base 的 canonical request。它只合并
+immutable historical evidence，不授权一种新的 producer pattern。第三条 request、不同 author、
+edit、finding、progress/error、inline-parent receipt 或竞争 successor 都保持 pending。
+
 ### Workflow-coordinated review
 
 controller 必须拥有 request 时，使用 `begin-review`；这也包括旧
