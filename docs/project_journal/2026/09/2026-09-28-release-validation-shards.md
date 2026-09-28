@@ -1,11 +1,11 @@
 ---
 id: 20260928-release-validation-shards
 title: Release Source Validation Shard Repair
-status: active
+status: completed
 created: 2026-09-28
 updated: 2026-09-28
-branch: wip/release-validation-shards
-pr:
+branch: wip/release-validation-shards-replacement
+pr: 84
 supersedes: []
 superseded_by:
 ---
@@ -68,7 +68,16 @@ superseded_by:
   guides now distinguish the current nine-cell schedule from the compatible
   legacy recovery path.
 
-## Next Steps
+## Completed Outcome
 
-- Validate the repair, review and merge it, then dispatch the frozen `v2.1.1`
-  admission through the normal privileged publication stage.
+- Replacement PR #84 merged as `ed5b57d58ccfee502e40b13a9470bfa235364ee6`.
+  It carried the byte-identical control-plane tree from the self-locked #83
+  through a clean review timeline; the release source itself remained frozen.
+- Recovery run `36410422637` reused the retained admission for
+  `28ca4b54d6d41d86ca8105ab2b26261d2f2fa2fa`. Its plan, two independent
+  candidates, all nine frozen-source validation shards, candidate comparison,
+  privileged publication, and final published-release verification succeeded.
+- Immutable [`v2.1.1`](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.1)
+  was published by `codex-review-gate-action-publisher[bot]`. The floating
+  `v2` alias and the immutable `v2.1.1` tag both peel to action commit
+  `2041f67c287a144c5b30de1f4c702a396535817d`.
