@@ -2521,8 +2521,18 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
     assert.match(sourceInventoryStep, new RegExp(`^            ${path.replaceAll(".", "\\.")}$`, "mu"));
   }
   assert.match(sourceInventoryStep, /find test -type f -name '\*\.test\.mjs' -print \| LC_ALL=C sort/u);
+  assert.match(
+    sourceInventoryStep,
+    /bootstrap_shard_capability_commit=5b0d1726461b48c1b71ec8db051e57fd516d7196/u,
+  );
+  assert.match(
+    sourceInventoryStep,
+    /git merge-base --is-ancestor "\$bootstrap_shard_capability_commit" "\$RELEASE_SOURCE_SHA"/u,
+  );
   assert.match(sourceInventoryStep, /current_inventory=false/u);
-  assert.match(sourceInventoryStep, /printf 'current_inventory=%s\\n' "\$current_inventory" >> "\$GITHUB_OUTPUT"/u);
+  assert.match(sourceInventoryStep, /modern_partition=false/u);
+  assert.match(sourceInventoryStep, /\[\[ "\$current_inventory" == true && "\$bootstrap_shards" == true \]\]/u);
+  assert.match(sourceInventoryStep, /printf 'modern_partition=%s\\n' "\$modern_partition" >> "\$GITHUB_OUTPUT"/u);
   assert.match(sourceInventoryStep, /Legacy frozen source test inventory/u);
   const bootstrapShardEnvironment = [
     "CODEX",
@@ -2538,7 +2548,7 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
   );
   assert.match(
     bootstrapValidationStep,
-    /^      - name: Run bootstrap test shard\n        if: \$\{\{ matrix\.suite\.kind == 'bootstrap' && steps\.source_test_inventory\.outputs\.current_inventory == 'true' \}\}/mu,
+    /^      - name: Run bootstrap test shard\n        if: \$\{\{ matrix\.suite\.kind == 'bootstrap' && steps\.source_test_inventory\.outputs\.modern_partition == 'true' \}\}/mu,
   );
   assert.match(
     bootstrapValidationStep,
@@ -2554,7 +2564,7 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
   const coreValidationStep = workflowStepBlock(validation, "Run syntax and core tests");
   assert.match(
     coreValidationStep,
-    /^      - name: Run syntax and core tests\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.current_inventory == 'true' \}\}/mu,
+    /^      - name: Run syntax and core tests\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.modern_partition == 'true' \}\}/mu,
   );
   assert.match(
     coreValidationStep,
@@ -2567,7 +2577,7 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
   );
   assert.match(
     legacyValidationStep,
-    /^      - name: Run legacy source test discovery\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.current_inventory != 'true' \}\}/mu,
+    /^      - name: Run legacy source test discovery\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.modern_partition != 'true' \}\}/mu,
   );
   assert.match(
     legacyValidationStep,
