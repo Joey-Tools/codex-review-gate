@@ -315,15 +315,41 @@ jobs:
       fail-fast: false
       matrix:
         suite:
+          - name: bootstrap 1/4
+            kind: bootstrap
+            bootstrap_test_shard: "1/4"
+            release_test_shard: "off"
+          - name: bootstrap 2/4
+            kind: bootstrap
+            bootstrap_test_shard: "2/4"
+            release_test_shard: "off"
+          - name: bootstrap 3/4
+            kind: bootstrap
+            bootstrap_test_shard: "3/4"
+            release_test_shard: "off"
+          - name: bootstrap 4/4
+            kind: bootstrap
+            bootstrap_test_shard: "4/4"
+            release_test_shard: "off"
           - name: core
+            kind: core
+            bootstrap_test_shard: "off"
             release_test_shard: "off"
           - name: release 1/4
+            kind: release
+            bootstrap_test_shard: "off"
             release_test_shard: "1/4"
           - name: release 2/4
+            kind: release
+            bootstrap_test_shard: "off"
             release_test_shard: "2/4"
           - name: release 3/4
+            kind: release
+            bootstrap_test_shard: "off"
             release_test_shard: "3/4"
           - name: release 4/4
+            kind: release
+            bootstrap_test_shard: "off"
             release_test_shard: "4/4"
     steps:
       - uses: actions/checkout@v4
@@ -337,14 +363,19 @@ jobs:
       - name: Prepare exact frozen source worktree
         run: |
           git worktree add --detach "$RUNNER_TEMP/release-source" "$RELEASE_SOURCE_SHA"
-      - name: Run checks and non-release tests
-        if: ${{ matrix.suite.release_test_shard == 'off' }}
+      - name: Run bootstrap test shard
+        if: ${{ matrix.suite.kind == 'bootstrap' }}
         env:
-          CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
+          CODEX_REVIEW_GATE_BOOTSTRAP_TEST_SHARD: ${{ matrix.suite.bootstrap_test_shard }}
+        run: |
+          cd "$RUNNER_TEMP/release-source"
+          node --test --test-concurrency=1 --test-reporter=dot test/bootstrap.test.mjs
+      - name: Run syntax and core tests
+        if: ${{ matrix.suite.kind == 'core' }}
         run: |
           cd "$RUNNER_TEMP/release-source"
           npm run check
-          npm test -- --test-concurrency=1 --test-reporter=dot
+          node --test --test-concurrency=1 --test-reporter=dot test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs
       - name: Run release pipeline shard
         if: ${{ matrix.suite.release_test_shard != 'off' }}
         env:
