@@ -25,16 +25,20 @@ superseded_by:
 
 ## Adopted Change
 
-- `source-validation` now has nine matrix cells: four bootstrap shards, one
-  explicit core inventory, and four release-pipeline shards.
+- `source-validation` now has nine matrix cells for a current frozen source:
+  four bootstrap shards, one explicit core inventory, and four release-pipeline
+  shards. A retained source whose complete test tree differs from that closed
+  current inventory instead uses the compatible legacy five-cell partition.
 - The bootstrap and release adapters retain their existing four-way,
-  mutually-exclusive registrations. The core cell runs the closed twelve-file
-  inventory plus `npm run check`; it does not rediscover bootstrap or release
-  suites serially.
-- The release-pipeline contract test freezes the nine-cell matrix, commands,
-  environment binding, and the absence of broad `npm test` discovery in the
-  core cell. Thus a future edit cannot silently reintroduce the timeout-prone
-  duplication.
+  mutually-exclusive registrations. The current core cell runs the closed
+  twelve-file inventory plus `npm run check`; it does not rediscover bootstrap
+  or release suites serially. The legacy core fallback uses source-local full
+  discovery with the Release suite disabled while the four Release shards
+  retain coverage.
+- The release-pipeline contract test freezes the nine-cell matrix, current and
+  legacy commands, inventory classification, and environment binding. Thus a
+  future edit cannot silently reintroduce the timeout-prone duplication or
+  make retained admissions unrecoverable.
 
 ## Recovery Boundary
 
@@ -45,6 +49,20 @@ superseded_by:
   run `36387695551`, attempt `1`.
 - The dispatch remains subject to the workflow's existing live-control and
   immutable-admission validation; it cannot publish an arbitrary source.
+
+## Review Follow-up
+
+- GitHub Codex review of the first control-only commit found that a retained
+  `v2.0.0` source within the ninety-day recovery window lacks
+  `test/organization-review-gate-handoff.test.mjs`. A control-defined core
+  list would have rejected that otherwise admitted source before publication.
+- The repair classifies the detached frozen source's full discoverable test
+  tree. Only an exact match uses the modern nine-cell partition. Any mismatch
+  retains source-local core discovery with the Release suite disabled while the
+  four existing Release shards provide the legacy five-cell coverage shape.
+- The same review found stale English and Chinese release-topology text. Both
+  guides now distinguish the current nine-cell schedule from the compatible
+  legacy recovery path.
 
 ## Next Steps
 
