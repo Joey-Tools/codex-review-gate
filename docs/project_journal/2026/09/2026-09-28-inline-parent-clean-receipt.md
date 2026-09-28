@@ -43,9 +43,21 @@ superseded_by:
 
 - This is a narrow receipt-classification change, not a transfer of inline
   thread enforcement from GitHub rulesets into the Action.
-- Local validation completed for the frozen source candidate: `npm run check`,
-  `npm run test:v2`, `node --test test/release-provenance.test.mjs`, and the
-  schema-v3 Node24 release-pipeline regression all passed.
+- Review hardening added an end-to-end fail-closed matrix for non-official
+  provenance, wrong App, non-`COMMENTED` state, non-later timestamps, old
+  native head, mismatched reviewed/native head, and non-closed grammar. It
+  also covers the independent later canonical physical-boundary veto and the
+  accepted seven-character reviewed-commit prefix bound by the native full
+  head. The successful inline-parent path asserts that the runtime makes no
+  `reviewThreads` GraphQL query.
+- The two package README variants now describe both admitted terminal-clean
+  forms, so the generated Action payload documentation cannot imply that only
+  a top-level issue comment may complete this narrow path.
+- Validation for the amended candidate includes `npm run check`, `npm run
+  test:v2`, the focused inline-parent runtime tests, `node --test
+  test/release-provenance.test.mjs`, and the schema-v3 Node24 release-pipeline
+  regression. The release manifest was regenerated from the staged Action
+  payload and independently matched its exact tree.
 - No package publication or rollout reconciliation result is asserted by this
   journal entry.
 

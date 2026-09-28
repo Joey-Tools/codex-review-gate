@@ -328,9 +328,10 @@ terminal revision; only that carrier's own terminal endpoint is exempt from
 self-veto when evaluating the same terminal.
 For an unconfirmed default-`any` ordinary candidate, a direct official
 post-revision `eyes` or `+1` first serves as its receipt and upgrades it into a
-boundary. The only alternative is the matching unedited official top-level
-issue-comment terminal clean strictly after the candidate under the unique
-no-base-epoch, single-flight rule above. It cannot be used after a base epoch,
+boundary. The only alternatives are the matching unedited official top-level
+issue-comment terminal clean or exact closed `COMMENTED` Codex inline-parent
+review strictly after the candidate under the unique no-base-epoch,
+single-flight rule above. It cannot be used after a base epoch,
 after a second or ambiguous request/boundary, after an edit, or when the
 terminal's identity, ordering, or current-head binding is ambiguous. After a direct-reaction
 upgrade, ordinary request reactions are provider liveness signals only;

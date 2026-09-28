@@ -282,9 +282,10 @@ endpoint，不能豁免其他 carrier。provider terminal 只有在 predecessor 
 完整，且从该 terminal 到 successor 没有当前 `eyes` 或 provider activity 时，才能闭合
 第一个 gap。
 未确认的 default-`any` ordinary candidate 上，official 直接且 post-revision 的 `eyes` 或
-`+1` 先充当 receipt，把它升级为 boundary。唯一替代方式是上述唯一、没有 base epoch、
-single-flight rule 下严格晚于 candidate 的匹配未编辑 official 顶层 issue-comment terminal clean。
-出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的 identity、
+`+1` 先充当 receipt，把它升级为 boundary。替代方式是在上述唯一、没有 base epoch、
+single-flight rule 下严格晚于 candidate 的匹配未编辑 official 顶层 issue-comment terminal clean，
+或 exact closed `COMMENTED` Codex inline-parent review。出现 base epoch、第二个或
+ambiguous request/boundary、任何 edit，或 terminal 的 identity、
 ordering/current-head binding 有歧义时，都不能使用该方式。direct-reaction upgrade 后，
 ordinary request reactions 才只用于 provider liveness；ordinary `+1` 本身仍不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会 veto candidate
