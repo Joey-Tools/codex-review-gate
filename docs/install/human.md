@@ -141,27 +141,29 @@ Do not deliberately repeat a direct request. A recovery-only duplicate cohort
 strictly ordered, unedited ordinary requests from the same user only when there
 is no base epoch, neither has an official direct `eyes`/`+1`, one unedited
 official top-level current-head clean follows both, and the snapshot contains
-no provider error anywhere, and no pre-pair official `issue-comment`
-`pending`/`progress` carrier with neither `resolvedHeadSha` nor `headSha` a
-full SHA (a provider activity carrier lacking a full-head binding that might
-later emit the apparent clean). Other than that pair, no relevant physical
+no provider error anywhere. Every pre-pair official top-level `issue-comment`
+provider artifact with a valid activity window vetoes the cohort unless it is a
+safely classified historical terminal: kind `clean` or `finding`, unedited,
+with no `orderingError`/`resolutionError`, and exactly one full unambiguous SHA
+across `resolvedHeadSha` and `headSha`. An earlier carrier may own the later
+clean; this explicit exception—not merely a full-head binding—preserves safely
+classified historical terminals. Other than that pair, no relevant physical
 request boundary may precede the closure clean, and at most one qualifying
-exact current head/base-bound canonical successor may follow it. The clean
-must be the only provider artifact from the first ordinary request through its
+exact current head/base-bound canonical successor may follow it. The clean must
+be the only provider artifact from the first ordinary request through its
 revision; if that successor exists, the exclusive artifact window extends
 through the successor's revision. If the successor exists, the later ordinary
 request remains an already-closed predecessor: a raw terminal cannot pass the
 successor, which instead needs a direct official `+1`. A third or same-time
 request, another author, edit, finding, provider error, a pre-pair official
-`issue-comment` `pending`/`progress` carrier lacking a full-head binding, extra
-provider artifact in the exclusive window, inline-parent receipt, or
-nonqualifying/competing successor remains pending. This is not a time-based
-veto for a historical terminal clean or finding: a terminal clean or finding
-alone that predates the pair remains intentionally allowed and is classified by
-the normal terminal/finding rules; the pre-pair carrier is rejected because its
-in-flight work lacks a full-head binding and might later emit the apparent
-clean. This exception never gives a commenter permission to start Codex and is
-not an instruction for humans or agents to emit pairs.
+top-level `issue-comment` provider artifact with a valid activity window unless
+it is the safely classified historical-terminal exception above, extra provider
+artifact in the exclusive window, inline-parent receipt, or
+nonqualifying/competing successor remains pending. The exception requires every
+listed terminal property; a historical terminal clean/finding is not preserved
+merely because it has a full-head binding. This exception never gives a
+commenter permission to start Codex and is not an instruction for humans or
+agents to emit pairs.
 
 The consumer workflows have no cron, `repository_dispatch`,
 `pull_request_target`, automatic `pull_request_review` writer, runtime GitHub

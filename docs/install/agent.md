@@ -1293,26 +1293,28 @@ cohort (a fixed historical pair, not a producer protocol) can coalesce exactly
 two strictly ordered, unedited ordinary requests from the same user only with
 no base epoch, no official direct `eyes`/`+1` on either, one unedited official
 top-level current-head clean after both, and no provider error anywhere in the
-snapshot, and no pre-pair official `issue-comment` `pending`/`progress` carrier
-with neither `resolvedHeadSha` nor `headSha` a full SHA (a provider activity
-carrier lacking a full-head binding that might later emit the apparent clean).
-Other than that pair, no relevant physical request boundary may precede the
-closure clean, and at most one qualifying exact current head/base-bound
-canonical successor may follow it. The clean must be the only provider artifact
-from the first ordinary request through its revision; if that successor exists,
-the exclusive artifact window extends through the successor's revision. If the
-successor exists, the later ordinary request remains an already-closed
-predecessor: a raw terminal cannot pass the successor, which instead needs a
-direct official `+1`. A third or same-time request, different author, edit,
-finding, provider error, a pre-pair official `issue-comment`
-`pending`/`progress` carrier lacking a full-head binding, extra provider
+snapshot. Every pre-pair official top-level `issue-comment` provider artifact
+with a valid activity window vetoes the cohort unless it is a safely classified
+historical terminal: kind `clean` or `finding`, unedited, with no
+`orderingError`/`resolutionError`, and exactly one full unambiguous SHA across
+`resolvedHeadSha` and `headSha`. An earlier carrier may own the later clean;
+this explicit exception—not merely a full-head binding—preserves safely
+classified historical terminals. Other than that pair, no relevant physical
+request boundary may precede the closure clean, and at most one qualifying
+exact current head/base-bound canonical successor may follow it. The clean must
+be the only provider artifact from the first ordinary request through its
+revision; if that successor exists, the exclusive artifact window extends
+through the successor's revision. If the successor exists, the later ordinary
+request remains an already-closed predecessor: a raw terminal cannot pass the
+successor, which instead needs a direct official `+1`. A third or same-time
+request, different author, edit, finding, provider error, a pre-pair official
+top-level `issue-comment` provider artifact with a valid activity window unless
+it is the safely classified historical-terminal exception above, extra provider
 artifact in the exclusive window, inline-parent receipt, or
-nonqualifying/competing successor remains pending. This is not a time-based
-veto for a historical terminal clean or finding: a terminal clean or finding
-alone that predates the pair remains intentionally allowed and is classified by
-the normal terminal/finding rules; the pre-pair carrier is rejected because its
-in-flight work lacks a full-head binding and might later emit the apparent
-clean. It never grants authority to start Codex; treat it only as passive
+nonqualifying/competing successor remains pending. The exception requires every
+listed terminal property; a historical terminal clean/finding is not preserved
+merely because it has a full-head binding. It never grants authority to start
+Codex; treat it only as passive
 recovery of evidence that already exists in GitHub.
 
 The controller Action step must use underscore input names:

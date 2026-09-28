@@ -365,12 +365,15 @@ strictly sequential, unedited exact default-`any` ordinary
 (non-canonical-marker) `@codex review` requests from the same `User` login only
 if neither has an official direct `eyes`/`+1`, a single unedited official
 top-level issue-comment clean after both resolves exactly to the current head,
-there is no provider error in the snapshot, no pre-pair official
-`issue-comment` `pending`/`progress` carrier with neither `resolvedHeadSha` nor
-`headSha` a full SHA (a provider activity carrier lacking a full-head binding
-that might later emit the apparent clean), and the first request through that
-clean (or, if present, through its sole canonical successor) has no other
-provider artifact. The only possible successor is one strictly later canonical
+there is no provider error in the snapshot, and every pre-pair official
+top-level `issue-comment` provider artifact with a valid activity window vetoes
+the cohort unless it is a safely classified historical terminal: kind `clean`
+or `finding`, unedited, with no `orderingError`/`resolutionError`, and exactly
+one full unambiguous SHA across `resolvedHeadSha` and `headSha`. An earlier
+carrier may own the later clean; this explicit exception—not merely a full-head
+binding—preserves safely classified historical terminals. The first request
+through that clean (or, if present, through its sole canonical successor) has
+no other provider artifact. The only possible successor is one strictly later canonical
 workflow request with the current full head/base tuple. Without a successor,
 the later ordinary request is confirmed and the earlier one is coalesced; with
 that successor, the later ordinary request remains the explicitly confirmed,
@@ -378,13 +381,11 @@ already-closed predecessor; an unbound terminal after the successor cannot
 complete it, and only a direct official `+1` on the successor can do so.
 Inline-parent receipts, a third request, another author, edits, base epochs,
 reactions on either ordinary request, provider activity or errors, a pre-pair
-official `issue-comment` `pending`/`progress` carrier lacking a full-head
-binding, findings, and every other successor remain fail-closed. This is not a
-time-based veto for a historical terminal clean or finding: a terminal clean
-or finding alone that predates the pair remains intentionally allowed and is
-classified by the normal terminal/finding rules; the pre-pair carrier is
-rejected because its in-flight work lacks a full-head binding and might later
-emit the apparent clean. This recovers an immutable
+official top-level `issue-comment` provider artifact with a valid activity
+window unless it is the safely classified historical-terminal exception above,
+findings, and every other successor remain fail-closed. The exception requires
+every listed terminal property; a historical terminal clean/finding is not
+preserved merely because it has a full-head binding. This recovers an immutable
 historical pair; agents must not deliberately create one.
 
 The permission threshold protects generation resets, not negative evidence.

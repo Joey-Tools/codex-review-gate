@@ -271,12 +271,15 @@ base epoch, exactly two strictly sequential, unedited exact default-`any`
 ordinary (non-canonical-marker) `@codex review` requests from the same `User`
 login, no official `eyes`/`+1` on either request, one unedited
 official top-level issue-comment clean after both that resolves exactly to the
-current head, no provider error in the snapshot, no pre-pair official
-`issue-comment` `pending`/`progress` carrier with neither `resolvedHeadSha` nor
-`headSha` a full SHA (a provider activity carrier lacking a full-head binding
-that might later emit the apparent clean), and no other provider artifact from
-the first request through that clean (or, if present, through its sole canonical
-successor). The only permitted successor is one strictly later
+current head, no provider error in the snapshot, and every pre-pair official
+top-level `issue-comment` provider artifact with a valid activity window vetoes
+the cohort unless it is a safely classified historical terminal: kind `clean`
+or `finding`, unedited, with no `orderingError`/`resolutionError`, and exactly
+one full unambiguous SHA across `resolvedHeadSha` and `headSha`. An earlier
+carrier may own the later clean; this explicit exception—not merely a full-head
+binding—preserves safely classified historical terminals. No other provider
+artifact may appear from the first request through that clean (or, if present,
+through its sole canonical successor). The only permitted successor is one strictly later
 canonical workflow request bound to the current full head/base tuple. With no
 successor, the later ordinary request is confirmed and the earlier one is
 coalesced. With that successor, the later ordinary request remains the
@@ -284,14 +287,12 @@ explicitly confirmed, already-closed predecessor: a raw terminal after the
 canonical request cannot satisfy that successor, so the canonical generation needs its own
 qualifying direct official `+1`. Inline-parent receipts, a third request,
 different authors, edits, base epochs, reactions on either ordinary request,
-provider progress/errors, a pre-pair official `issue-comment`
-`pending`/`progress` carrier lacking a full-head binding, findings, or any
-other successor remain fail-closed. This is not a time-based veto for a
-historical terminal clean or finding: a terminal clean or finding alone that
-predates the pair remains intentionally allowed and is classified by the
-normal terminal/finding rules; the pre-pair carrier is rejected because its
-in-flight work lacks a full-head binding and might later emit the apparent
-clean.
+provider progress/errors, a pre-pair official top-level `issue-comment`
+provider artifact with a valid activity window unless it is the safely
+classified historical-terminal exception above, findings, or any other
+successor remain fail-closed. The exception requires every listed terminal
+property; a historical terminal clean/finding is not preserved merely because
+it has a full-head binding.
 Agents must never intentionally create this pair; it only recovers one that
 already exists in the immutable GitHub snapshot.
 

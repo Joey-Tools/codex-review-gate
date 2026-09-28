@@ -238,21 +238,21 @@ run。符合条件的 Codex findings 不受 request-author permission 影响，�
 接受：没有 base epoch；恰好两条彼此严格顺序、未编辑、exact default-`any` 的 ordinary
 （不带 canonical marker）`@codex review` request，且来自同一 `User` login；两条都没有
 official `eyes`/`+1`；之后有一条未编辑、official 的顶层 issue-comment clean，且无歧义解析到
-current PR head；整个 snapshot 没有 provider error；pair 之前也没有 official `issue-comment`
-`pending`/`progress` carrier，且它的 `resolvedHeadSha` 和 `headSha` 都不是 full SHA（缺少
-full-head binding、之后仍可能发出表面 clean 的 provider activity carrier）；从第一条 request
-到该 clean（若存在唯一 canonical successor，则到该 successor）之间没有其他 provider artifact。
-唯一允许的后继只能是一条严格更晚、绑定 current 完整 head/base tuple
+current PR head；整个 snapshot 没有 provider error；每一个 pair 之前、具有有效 activity window 的
+official 顶层 `issue-comment` provider artifact 都会否决 cohort，除非它是已安全分类的 historical
+terminal：kind 为 `clean` 或 `finding`、未编辑、没有 `orderingError`/`resolutionError`，且跨
+`resolvedHeadSha` 与 `headSha` 恰有一个完整、无歧义的 SHA。较早的 carrier 仍可能是后来 clean 的
+来源；保留安全历史 terminal 依赖这条明确例外，而非仅有 full-head binding。从第一条 request 到该
+clean（若存在唯一 canonical successor，则到该 successor）之间没有其他 provider artifact。唯一允许的
+后继只能是一条严格更晚、绑定 current 完整 head/base tuple
 的 canonical workflow request。没有后继时，较晚的 ordinary request 被确认、较早的被合并；有该
 后继时，较晚的 ordinary request 保留为已确认、已闭合的 predecessor，之后无绑定的 terminal 不能
 令 successor pass，后者必须取得自身的 official direct `+1`。inline-parent receipt、第三条
 request、不同 author、edit、base epoch、两条 ordinary request 上的 reaction、provider
-progress/error、pair 之前缺少 full-head binding 的 official `issue-comment`
-`pending`/`progress` carrier、finding 或其他 successor 均保持 fail-closed。这不是仅按时间否决
-历史 terminal clean 或 finding：单独早于 pair 的 terminal clean 或 finding 仍刻意允许，并按普通
-terminal/finding 规则分类；拒绝这个 pre-pair carrier，是因为其 in-flight work 缺少 full-head
-binding，之后仍可能发出表面 clean。agent 不得故意创建这类请求对；它只恢复 GitHub immutable
-snapshot 中已经存在的历史证据。
+progress/error、任一不属于上文安全 historical-terminal 例外且具有有效 activity window 的 pre-pair
+official 顶层 `issue-comment` provider artifact、finding 或其他 successor 均保持 fail-closed。该例外
+要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。
+agent 不得故意创建这类请求对；它只恢复 GitHub immutable snapshot 中已经存在的历史证据。
 
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base

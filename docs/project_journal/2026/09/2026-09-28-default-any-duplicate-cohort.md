@@ -30,10 +30,13 @@ superseded_by:
   unedited, same-author ordinary default-`any` requests may be coalesced only
   when a single unedited official top-level current-head clean follows both,
   no base epoch exists, neither request has an official direct receipt, and the
-  snapshot contains no provider error anywhere. It also rejects a pre-pair
-  official `issue-comment` `pending`/`progress` carrier with neither
-  `resolvedHeadSha` nor `headSha` a full SHA: that carrier lacks a full-head
-  binding and its in-flight work could later emit the apparent clean. Other
+  snapshot contains no provider error anywhere. Every pre-pair official
+  top-level `issue-comment` provider artifact with a valid activity window
+  vetoes the cohort unless it is a safely classified historical terminal: kind
+  `clean` or `finding`, unedited, with no `orderingError`/`resolutionError`,
+  and exactly one full unambiguous SHA across `resolvedHeadSha` and `headSha`.
+  An earlier carrier may own the later clean; this explicit exception—not merely
+  a full-head binding—preserves safely classified historical terminals. Other
   than the pair, no relevant physical request boundary may precede the closure
   clean, and at most one qualifying exact current head/base-bound canonical
   successor may follow it. The clean must be the only provider artifact from
@@ -52,17 +55,16 @@ superseded_by:
 
 - The exception excludes inline-parent receipts, a third or same-time request,
   another author, any edit, base epochs, any official direct `eyes`/`+1` on
-  the ordinary pair, provider progress/errors, a pre-pair official
-  `issue-comment` `pending`/`progress` carrier lacking a full-head binding,
-  findings, stale or competing canonical successors, ambiguous short-SHA
-  resolution, and any unbound raw terminal after an accepted canonical
-  successor.
-- This is not a generic time-based veto. A historical terminal clean or
-  finding alone that predates the pair remains intentionally allowed and is
-  classified under the ordinary terminal/finding rules. The new rejection is
-  limited to the pre-pair unbound-progress shape because it can still become
-  the source of the later clean; record that reason here so future changes do
-  not broaden the predicate to historical terminal/finding evidence.
+  the ordinary pair, provider progress/errors, every pre-pair official
+  top-level `issue-comment` provider artifact with a valid activity window
+  except the safely classified historical-terminal exception above, findings,
+  stale or competing canonical successors, ambiguous short-SHA resolution, and
+  any unbound raw terminal after an accepted canonical successor.
+- The historical-terminal exception requires every listed property; an artifact
+  is not exempt merely because it has a full-head binding. The broad pre-pair
+  veto exists because an earlier carrier may be the source of the later clean.
+  Record this exact exception and reason here so future changes do not broaden
+  it to any full-bound artifact or weaken the fail-closed attribution rule.
 - Agents and users must not intentionally create duplicate direct requests.
   This is passive recovery of immutable historical evidence, not a producer
   protocol or a relaxation of finding blocking.

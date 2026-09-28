@@ -4111,10 +4111,10 @@ function selectV2DefaultAnyDuplicateCohortClosure({
     ) {
       continue;
     }
-    // An earlier unbound top-level progress carrier may belong to a provider
-    // generation that is still capable of producing the later clean. Do not
-    // coalesce the raw pair unless that preceding activity is fully scoped.
-    if (hasV2PreCohortUnboundTopLevelProviderProgress({
+    // A later clean cannot be attributed to the raw pair while an earlier
+    // top-level provider carrier may still own it. Only a safely classified,
+    // fully bound historical terminal can be excluded from that ambiguity.
+    if (hasV2PreCohortUnsafeTopLevelProviderActivity({
       providerArtifacts,
       firstRequest: first,
     })) {
@@ -4244,24 +4244,34 @@ function hasV2ExclusiveDuplicateCohortProviderWindow({
   return true;
 }
 
-function hasV2PreCohortUnboundTopLevelProviderProgress({
+function hasV2PreCohortUnsafeTopLevelProviderActivity({
   providerArtifacts,
   firstRequest,
 }) {
   return (providerArtifacts ?? []).some((artifact) => {
-    if (
-      artifact?.source !== "issue-comment" ||
-      artifact?.kind !== "pending" ||
-      artifact?.pendingKind !== "progress"
-    ) {
-      return false;
-    }
+    if (artifact?.source !== "issue-comment") return false;
     const window = v2ProviderActivityWindow(artifact);
     if (!window || window.carrierCreatedMs >= firstRequest.revisionMs) return false;
-    const resolvedHeadSha = String(artifact?.resolvedHeadSha || "").toLowerCase();
-    const headSha = String(artifact?.headSha || "").toLowerCase();
-    return !FULL_SHA.test(resolvedHeadSha) && !FULL_SHA.test(headSha);
+    return !isV2SafeHistoricalTopLevelProviderTerminal(artifact);
   });
+}
+
+function isV2SafeHistoricalTopLevelProviderTerminal(artifact) {
+  return artifact?.source === "issue-comment" &&
+    (artifact?.kind === "clean" || artifact?.kind === "finding") &&
+    artifact?.edited !== true &&
+    !artifact?.orderingError &&
+    !artifact?.resolutionError &&
+    hasV2FullUnambiguousProviderArtifactHeadBinding(artifact);
+}
+
+function hasV2FullUnambiguousProviderArtifactHeadBinding(artifact) {
+  const bindings = new Set(
+    [artifact?.resolvedHeadSha, artifact?.headSha]
+      .map((value) => String(value || "").toLowerCase())
+      .filter((value) => FULL_SHA.test(value)),
+  );
+  return bindings.size === 1;
 }
 
 function hasV2DirectProviderReactionAfterRequest(request, requestReactions) {

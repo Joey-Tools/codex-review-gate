@@ -1108,20 +1108,21 @@ read-only verifier token 无法可靠做到。该设置不会让合格 finding �
 不要故意重复 plain direct request。仅用于恢复的 duplicate cohort（固定历史 pair，不是
 producer protocol）只能合并恰好两条严格按时间排序、未编辑、来自同一 user 的 ordinary
 request，并且必须没有 base epoch、两条均无 official direct `eyes`/`+1`、随后有一条未编辑
-official 顶层 current-head clean，且整个 snapshot 中不得出现任何 provider error。除该 pair 外，
-pair 之前不得有 official `issue-comment` `pending`/`progress` carrier，且它的 `resolvedHeadSha`
-和 `headSha` 都不是 full SHA（缺少 full-head binding、之后仍可能发出表面 clean 的 provider
-activity carrier）。除该 pair 外，closure clean 之前不得有任何相关 physical request boundary，其后
+official 顶层 current-head clean，且整个 snapshot 中不得出现任何 provider error。每一个 pair
+之前、具有有效 activity window 的 official 顶层 `issue-comment` provider artifact 都会否决 cohort，
+除非它是已安全分类的 historical terminal：kind 为 `clean` 或 `finding`、未编辑、没有
+`orderingError`/`resolutionError`，且跨 `resolvedHeadSha` 与 `headSha` 恰有一个完整、无歧义的 SHA。
+较早的 carrier 仍可能是后来 clean 的来源；保留安全历史 terminal 依赖这条明确例外，而非仅有
+full-head binding。除该 pair 外，closure clean 之前不得有任何相关 physical request boundary，其后
 最多只能有一条合格、精确绑定 current head/base 的 canonical successor。该 clean 必须是从第一条
 ordinary request 至其 revision 期间唯一的 provider artifact；若该 successor 存在，exclusive artifact
 window 延伸至该 successor 的 revision。若该 successor 存在，较晚 ordinary request 保留为已闭合的
 predecessor：raw terminal 不能令 successor pass，后者需要自身的 official direct `+1`。第三条或同一
-时间的 request、不同 author、edit、finding、provider error、pair 之前缺少 full-head binding 的
-official `issue-comment` `pending`/`progress` carrier、exclusive window 中额外的 provider artifact、
-inline-parent receipt，或不合格/竞争 successor 都保持 pending。这不是仅按时间否决历史 terminal
-clean 或 finding：单独早于 pair 的 terminal clean 或 finding 仍刻意允许，并按普通 terminal/finding
-规则分类；拒绝这个 pre-pair carrier，是因为其 in-flight work 缺少 full-head binding，之后仍可能发出
-表面 clean。它不提供启动 Codex 的权限；只被动恢复已在 GitHub 中存在的证据。
+时间的 request、不同 author、edit、finding、provider error、任一不属于上文安全 historical-terminal
+例外且具有有效 activity window 的 pre-pair official 顶层 `issue-comment` provider artifact、exclusive
+window 中额外的 provider artifact、inline-parent receipt，或不合格/竞争 successor 都保持 pending。
+该例外要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding
+被保留。它不提供启动 Codex 的权限；只被动恢复已在 GitHub 中存在的证据。
 
 ## 阶段 2：暂存并验证 Disabled ruleset
 
