@@ -65,8 +65,10 @@ official Codex Bot 在同一条 comment 上直接留下严格晚于 revision 的
 gate receipt；也可以使用刻意收窄的 terminal-clean 方式：没有 base epoch、single-flight
 lineage 中唯一一条 exact、未编辑的 ordinary request，能由严格晚于它的未编辑 official
 current-head 顶层 issue comment（PR 的普通评论，不是 pull-request review body）中的 terminal
-clean 确认。第二条或 ambiguous request/boundary、任何 edit、terminal
-不匹配，或 head/SHA binding 有歧义时，gate 保持 pending。terminal 的 short SHA 只有被
+clean，或 official exact-head `COMMENTED` inline-parent 的 closed grammar（固定格式而非自由
+文本猜测）确认。后者只观察 immutable parent review，绝不读取或判断其 inline threads。
+第二条或 ambiguous request/boundary、任何 edit、terminal 不匹配，或 head/SHA binding 有歧义时，
+gate 保持 pending。terminal 的 short SHA 只有被
 GitHub 无歧义解析为 current PR head 才接受。同一 comment 上 official `eyes`/`+1` 的
 direct receipt 仍然受支持。这既不授予 commenter 启动或控制 Codex review 的权限，也不会
 使 Codex 启动，更不意味着任何用户都能导致 review；Codex 与 GitHub 仍决定是否接受
@@ -214,8 +216,8 @@ change。
 | `none` | evaluator 无需恢复；执行 exact-head merge closure。 |
 | `wait_provider` | 等待 Codex 发布 terminal evidence；不要 spam requests。 |
 | `reconcile` | 重读 exact current head 并运行一次 scoped reconcile。 |
-| `fix_findings` | 按 summary reason 操作。通常先修复报告的 current findings，另行解决 inline conversations，取得 later head-bound clean evidence，再 reconcile。若 reason 同时指出不可闭合的 historical lineage，应把修复放到 replacement PR，并在其中只运行一个 canonical generation，不得在原 PR 重发。 |
-| `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；或者仅限唯一、没有 base epoch、single-flight、未编辑的 default-`any` ordinary candidate，等待其匹配的未编辑 official current-head 顶层 issue-comment terminal clean。pull-request review clean 不能确认该 candidate。finding 仍独立阻塞，绝不确认它。只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。既没有 direct receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
+| `fix_findings` | 按 summary reason 操作。通常先修复报告的 current findings，另行解决 inline conversations，再取得合格 clean evidence 后 reconcile。若 finding 只是 policy-only inline finding，已解决的 conversation 只满足 ruleset 条件；同一 exact head 上已有的 qualified inline-parent receipt 可独立确认 clean，否则仍按 `request_clean_generation` 分流。若 reason 同时指出不可闭合的 historical lineage，应把修复放到 replacement PR，并在其中只运行一个 canonical generation，不得在原 PR 重发。 |
+| `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；或者仅限唯一、没有 base epoch、single-flight、未编辑的 default-`any` ordinary candidate，等待其匹配的未编辑 official current-head 顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head `COMMENTED` inline-parent review。generic pull-request review clean 不能确认该 candidate。finding 仍独立阻塞，绝不确认它。只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。既没有 direct receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
 | `retry_reconcile` | `retry_safe` 允许时 retry 同一个 exact-head reconcile。 |
 | `wait_then_reconcile` | 等待 GitHub/Codex settle，重读 head，再 reconcile。 |
 | `use_expanded_limits` | 设置受保护 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`，再 reconcile 同一 exact head。 |
@@ -243,8 +245,9 @@ change reset。
 - `findings_indeterminate`——无法安全确定 current classification 的 findings。
 
 API read、page set 不完整或 capped scan 会使受影响值为 `unknown`，绝不是 zero。
-counts 只是 diagnostic。inline conversations 不计数；ruleset 的 “all
-conversations resolved” 要求负责它们。
+counts 只是 diagnostic。inline threads、其 child 与 conversation resolution 不计数，也不进入
+decision fingerprint；已被接受的 inline-parent receipt 只以其 parent review 作为 provider
+carrier 进入稳定性判断。ruleset 的 “all conversations resolved” 要求负责所有 thread enforcement。
 
 任何符合条件的 current-head non-inline finding 都会立即阻塞。它不是 permanent
 lease：在同一 head 上可以被 supersede，但只能由严格更新的 authorised
@@ -256,13 +259,16 @@ lineage，应把修复放到 replacement PR，不得在原 PR 再请求 generati
 finding 已 obsolete 或不适用时，按 `request_clean_generation` 的 summary reason 分流。
 只有 lineage 仍可恢复时，才在原 PR 请求或完成 latest/current canonical clean；若 reason
 指出不可闭合的 historical unbound predecessor gap，应使用 replacement PR。两种情况都要
-等待 later provider result 后 reconcile；只解决 inline conversation 不会改变 reducer state。
+等待 later provider result 后 reconcile；只 resolve inline conversation 不会改变 reducer
+state，也不会凭空生成 receipt；它只让 ruleset 的 “all conversations resolved” 条件可被
+满足。已经存在的合格 inline-parent receipt 仍独立按 parent review 的 fixed grammar 判定。
 
 terminal clean text 与合格 provider `+1`，只有在没有 base epoch、single-flight
 lineage 的第一个物理 generation 中才具有相同 clean authority。该 lineage 中唯一一条
 exact、未编辑的 default-`any` ordinary request，其匹配的未编辑 official current-head
-顶层 issue-comment terminal clean 还可以提供建立第一个 generation 所需的最小 receipt。
-pull-request review clean 不可以。出现第二个物理
+顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head
+`COMMENTED` inline-parent review，都可以提供建立第一个 generation 所需的最小 receipt。
+generic pull-request review clean 不可以。出现第二个物理
 request 后，provider terminal evidence 只能闭合第一个 gap；之后的每个 gap，以及新
 generation 的 positive/superseding authority，都必须来自直接附着于相关 request 的
 合格 `+1`。延迟、重复、不匹配、被编辑或 head binding 有歧义的 terminal 都保持 pending。
@@ -270,8 +276,9 @@ generation 的 positive/superseding authority，都必须来自直接附着于�
 
 未确认 default-`any` ordinary candidate 上，official 直接且严格 post-revision 的 `eyes`
 或 `+1` 先是 receipt，把 candidate 升级为 boundary。唯一替代方式是匹配的未编辑
-official current-head 顶层 issue-comment terminal clean，且仅适用于唯一、没有 base epoch、single-flight
-的情况。出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的
+official current-head 顶层 issue-comment terminal clean，或 official exact-head `COMMENTED`
+inline-parent 的 fixed closed grammar，且仅适用于唯一、没有 base epoch、single-flight 的情况。
+出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的
 identity、order/head binding 有歧义时，该方式不可用。符合条件的 finding 独立阻塞，绝不
 提升 candidate。升级后 ordinary request reactions 才仅用于 liveness；ordinary `+1` 不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会阻止 candidate clean

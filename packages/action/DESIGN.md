@@ -285,8 +285,11 @@ sticky does not make the boundary harmless.
 ### Admitted evidence
 
 The reducer consumes qualifying Codex top-level issue comments and pull-request
-review bodies. It does not treat inline review threads or conversation
-resolution as reducer authority; the installed ruleset owns that condition.
+review bodies. A closed official `COMMENTED` inline-parent review may be a
+terminal receipt only when its fixed grammar and native commit binding verify;
+it is treated as a clean non-inline parent payload. The reducer still does not
+query, count, fingerprint, or decide inline review threads or conversation
+resolution; the installed ruleset owns that condition.
 
 Provider carriers must bind exact bot identity. Similar names, copied text or
 user-authored claims have no authority. A finding's severity label does not
@@ -332,11 +335,13 @@ visible text. Under the default `any` policy, an ordinary request author at any
 repository permission is admitted only as an unconfirmed candidate. It can
 receive provider confirmation either from an official Codex Bot `eyes` or `+1`
 reaction directly attached strictly after that comment's revision, or from an
-unedited official top-level issue-comment terminal clean (a normal PR comment,
-not a pull-request review body) strictly after the candidate. The terminal form
-is allowed only for the one unique, exact, unedited ordinary request in a
-no-base-epoch, single-flight lineage, and only when the terminal unambiguously
-binds the current head. An additional or ambiguous request or physical
+unedited official terminal-clean receipt strictly after the candidate. The
+terminal form is allowed only for the one unique, exact, unedited ordinary
+request in a no-base-epoch, single-flight lineage, and only when the terminal
+unambiguously binds the current head. Its admitted carriers are a top-level
+issue-comment clean and the exact closed `COMMENTED` Codex inline-parent review
+grammar; generic pull-request reviews are not receipts. An additional or
+ambiguous request or physical
 boundary, an edit to either carrier, an unmatched terminal, or ambiguous
 head/SHA binding leaves the state pending. A terminal short SHA is accepted
 only when GitHub resolves it unambiguously to the current PR head. Direct
@@ -356,15 +361,19 @@ binding the full head and run.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
-permission. A finding never serves as the minimal terminal receipt. A
-pull-request review clean remains ordinary evidence but cannot be that receipt.
+permission. A finding never serves as the minimal terminal receipt. The exact
+closed Codex inline-parent form is a narrow receipt for its non-inline parent
+payload only: this REST-only reducer does not read its child threads or use
+their state as authority. The installed ruleset remains the sole enforcement
+for all conversations resolved; other pull-request review cleans remain
+ordinary evidence and cannot be that receipt.
 
 Terminal clean text and a qualifying provider `+1` are equal clean carriers
 only for the first physical generation of a no-base-epoch, single-flight
 lineage. Physical boundary recognition is deliberately separate from positive
-authority, except that the narrow default-`any` top-level issue-comment
-terminal-clean receipt can establish that first generation and carry its clean
-authority at the same time.
+authority, except that the narrow default-`any` top-level issue-comment or
+exact closed inline-parent terminal-clean receipt can establish that first
+generation and carry its clean authority at the same time.
 An unconfirmed default-`any` ordinary candidate without a terminal-clean
 contender is otherwise not a physical boundary. A terminal-clean contender
 that cannot meet the narrow receipt conditions remains an unresolved,
@@ -425,10 +434,11 @@ clear a finding. This is a deliberate fail-closed exception to carrier parity.
 For an unconfirmed default-`any` ordinary candidate, a direct official
 post-revision `eyes` or `+1` is first a receipt that promotes it into a
 boundary. The only alternative is a matching unedited official current-head
-top-level issue-comment terminal clean strictly after that candidate under the
-unique no-base-epoch, single-flight rule. It is unavailable after a base epoch,
-after a second or ambiguous request/boundary, after an edit, or when terminal
-identity, ordering, or head binding is ambiguous. Afterwards, ordinary request reactions are
+top-level issue-comment terminal clean or exact closed `COMMENTED` inline-parent
+review strictly after that candidate under the unique no-base-epoch,
+single-flight rule. It is unavailable after a base epoch, after a second or
+ambiguous request/boundary, after an edit, or when terminal identity, ordering,
+or head binding is ambiguous. Afterwards, ordinary request reactions are
 provider-liveness signals only; ordinary `+1` cannot head-bind clean. Same-time/later
 official `eyes`/progress from Codex vetoes candidate clean evidence. Because
 reaction changes do not trigger the consumer workflow, a later provider event

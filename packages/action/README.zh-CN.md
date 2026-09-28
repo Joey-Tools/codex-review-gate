@@ -191,24 +191,33 @@ controller 不提供 verdict，也不改写 CheckRun；只有只读 verifier 收
 conclusion 承载 required result。
 
 reducer 读取符合条件的 Codex top-level issue comments 和 PR review bodies。
-inline review threads 有意留在 reducer 外；ruleset 的 “all conversations
-resolved” 要求才是其 authority。
+inline review thread 有意留在 reducer 外：即使一个官方 exact-head `COMMENTED`
+inline-parent（只含固定闭合语法的 review parent）可作为下文所述的窄
+terminal-clean receipt，runtime 也只观察其 immutable parent 身份、正文、终态和
+native commit binding，不查询、判断、计数或 fingerprint 任何 child/thread resolution。
+ruleset 的 “all conversations resolved” 要求仍是 inline conversation 的唯一
+enforcement authority。
 
 ## Evidence 语义
 
 review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
 line 必须 exact，且不得有其他 visible text。默认 `any` policy 会把 ordinary request
 author（任意 repository permission）纳入 snapshot 作为 candidate，而不是立刻视作
-generation boundary。它有两种获得 provider confirmation 的方式：
+generation boundary。它有两类获得 provider confirmation 的方式：
 
 1. official Codex Bot 在同一条 comment 上留下严格晚于当前 revision 的直接 `eyes` 或
    `+1` receipt；或
 2. 仅限没有 base epoch、single-flight lineage 中唯一一条 exact、未编辑的 ordinary
-   request：严格晚于该 request 的未编辑 official 顶层 issue comment（PR 的普通评论，
-   不是 pull-request review body）中的 terminal clean 可以在无歧义绑定 current head 时
-   充当 receipt。
+   request：严格晚于该 request、无歧义绑定 current head 的未编辑 official
+   terminal-clean receipt 可以是：
+   - 顶层 issue comment（PR 的普通评论，不是 pull-request review body）中的 terminal
+     clean；或
+   - 官方 Codex Bot 的 `COMMENTED` PR review parent；它必须通过 closed grammar（固定标题、
+     `Reviewed commit` 与 native `commit_id` 的无歧义匹配、以及固定官方 disclosure，
+     而不是自由文本猜测）验证；它只证明 parent 没有 non-inline finding payload，不证明
+     任何 child/thread 存在或已 resolved。
 
-第二种是刻意收窄的最小 receipt。额外或 ambiguous request/physical boundary、request 或
+第二类是刻意收窄的最小 receipt。额外或 ambiguous request/physical boundary、request 或
 terminal 被编辑、terminal carrier 不匹配，或 head/SHA binding 有歧义时，gate 都保持
 pending。terminal 指定 reviewed SHA 时，short SHA 只有被 GitHub 无歧义解析为 current PR
 head 才接受。同一 comment 上 official `eyes`/`+1` 的直接 receipt 仍然受支持。这只决定
@@ -236,9 +245,11 @@ pending，runtime 不会猜测它属于新 generation。
 
 terminal clean 文本和符合条件的 provider `+1`，只有在没有 base epoch、single-flight
 lineage 的第一个物理 generation 中才具有相同 clean authority。唯一符合最小 receipt rule
-的 default-`any` ordinary request，其匹配的 official 顶层 issue-comment terminal clean
-可以同时确认这个第一个 generation，并携带该 clean authority。pull-request review clean
-仍是普通 evidence，但不能确认 default-`any` candidate。符合条件的 finding 独立阻塞，绝不充当 receipt。
+的 default-`any` ordinary request，其匹配的 official 顶层 issue-comment terminal clean，
+或上文所定义的 official exact-head `COMMENTED` inline-parent closed-grammar review，
+可以同时确认这个第一个 generation，并携带该 clean authority。后者不是 generic
+pull-request review clean：任意不满足该固定 parent grammar 的 review 都不能确认
+default-`any` candidate。符合条件的 finding 独立阻塞，绝不充当 receipt。
 没有 receipt contender 的 candidate 不是 physical boundary。存在 terminal-clean contender
 但未满足狭窄条件时，它以 fail-closed physical-only boundary 保持 pending。其他每条可能触发
 provider 的 request-shaped comment 都是物理 generation boundary，包括 duplicate hidden
@@ -271,9 +282,10 @@ endpoint，不能豁免其他 carrier。provider terminal 只有在 predecessor 
 完整，且从该 terminal 到 successor 没有当前 `eyes` 或 provider activity 时，才能闭合
 第一个 gap。
 未确认的 default-`any` ordinary candidate 上，official 直接且 post-revision 的 `eyes` 或
-`+1` 先充当 receipt，把它升级为 boundary。唯一替代方式是上述唯一、没有 base epoch、
-single-flight rule 下严格晚于 candidate 的匹配未编辑 official 顶层 issue-comment terminal clean。
-出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的 identity、
+`+1` 先充当 receipt，把它升级为 boundary。替代方式是在上述唯一、没有 base epoch、
+single-flight rule 下严格晚于 candidate 的匹配未编辑 official 顶层 issue-comment terminal clean，
+或 exact closed `COMMENTED` Codex inline-parent review。出现 base epoch、第二个或
+ambiguous request/boundary、任何 edit，或 terminal 的 identity、
 ordering/current-head binding 有歧义时，都不能使用该方式。direct-reaction upgrade 后，
 ordinary request reactions 才只用于 provider liveness；ordinary `+1` 本身仍不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会 veto candidate

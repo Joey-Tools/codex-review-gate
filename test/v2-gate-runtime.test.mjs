@@ -4063,7 +4063,7 @@ test("a base epoch rejects a default-any terminal clean receipt", async (context
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("a pull-request review clean cannot promote a default-any request", async (context) => {
+test("a generic pull-request review clean cannot promote a default-any request", async (context) => {
   const request = ordinaryRequest({ user: READER });
   const review = approvedReview(HEAD, {
     submitted_at: "2026-08-25T08:02:00Z",
@@ -4079,6 +4079,179 @@ test("a pull-request review clean cannot promote a default-any request", async (
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a closed Codex inline-parent review can promote one default-any request", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const review = inlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [request],
+    reviews: [review],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "default-any-inline-parent-terminal-receipt",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(
+    github.calls.some(({ path, body }) =>
+      path === "/graphql" && /reviewThreads/iu.test(String(body?.query || ""))
+    ),
+    false,
+    "the REST-only reducer must not inspect inline review threads",
+  );
+});
+
+test("an inline-parent receipt fails closed when an eligibility predicate is not met", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const valid = inlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const cases = [
+    ["non-official-bot", { ...valid, user: { login: "other-reviewer[bot]", type: "Bot" } }],
+    ["wrong-app", {
+      ...valid,
+      app: { slug: "other-reviewer" },
+      performed_via_github_app: { slug: "other-reviewer" },
+    }],
+    ["non-commented", { ...valid, state: "APPROVED" }],
+    ["same-request-revision", {
+      ...valid,
+      submitted_at: "2026-08-25T08:00:00Z",
+    }],
+    ["pre-request-revision", {
+      ...valid,
+      submitted_at: "2026-08-25T07:59:59Z",
+    }],
+    ["old-native-head", inlineParentReview(OLD_HEAD, {
+      submitted_at: "2026-08-25T08:02:00Z",
+    })],
+    ["reviewed-native-head-mismatch", {
+      ...valid,
+      commit_id: OLD_HEAD,
+    }],
+    ["non-closed-grammar", {
+      ...valid,
+      body: `${valid.body}\nUnexpected terminal content`,
+    }],
+  ];
+
+  for (const [suffix, review] of cases) {
+    const github = createGitHubMock({
+      issueComments: [request],
+      reviews: [review],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `default-any-inline-parent-receipt-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("a seven-character inline-parent reviewed commit remains bound by its native full head", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const standard = inlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const review = {
+    ...standard,
+    body: standard.body.replace(HEAD.slice(0, 10), HEAD.slice(0, 7)),
+  };
+  const github = createGitHubMock({
+    issueComments: [request],
+    reviews: [review],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "default-any-inline-parent-seven-character-reviewed-commit",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+});
+
+test("a closed Codex inline-parent review cannot uniquely satisfy multiple default-any requests", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: READER });
+  const second = ordinaryRequest({
+    id: 102,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const review = inlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [first, second],
+    reviews: [review],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "multiple-default-any-inline-parent-terminal-receipt",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a closed inline-parent review cannot cross a later canonical physical boundary", async (context) => {
+  const first = ordinaryRequest({ id: 101, user: READER });
+  const laterCanonical = workflowRequest({
+    id: 102,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const review = inlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [first, laterCanonical],
+    reviews: [review],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "inline-parent-later-canonical-physical-boundary",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a closed Codex inline-parent review cannot promote default-any after a base epoch", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const review = inlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:59:00Z" }),
+    issueComments: [request],
+    reviews: [review],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "default-any-inline-parent-terminal-receipt-base-epoch",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.requiresReplacementPr, true);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -8956,6 +9129,41 @@ function approvedReview(commitRef = HEAD, overrides = {}) {
     user: CODEX_BOT,
     app: null,
     performed_via_github_app: null,
+    ...overrides,
+  };
+}
+
+function inlineParentReview(commitRef = HEAD, overrides = {}) {
+  return {
+    id: 403,
+    state: "COMMENTED",
+    body: [
+      "### 💡 Codex Review",
+      "",
+      "Here are some automated review suggestions for this pull request.",
+      "",
+      `**Reviewed commit:** \`${commitRef.slice(0, 10)}\``,
+      "",
+      "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+      "<br/>",
+      "",
+      "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+      "- Open a pull request for review",
+      "- Mark a draft as ready",
+      '- Comment "@codex review".',
+      "",
+      "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+      "",
+      "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
+      "",
+      "</details>",
+    ].join("\n"),
+    commit_id: commitRef,
+    submitted_at: "2026-08-25T08:05:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#pullrequestreview-403`,
+    user: CODEX_BOT,
+    app: CODEX_APP,
+    performed_via_github_app: CODEX_APP,
     ...overrides,
   };
 }
