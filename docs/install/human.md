@@ -1019,8 +1019,9 @@ produce a fresh final read-only verify output under a new freeze. Never use the
 > commands.** Current bootstrap releases reject
 > `organization-review-gate-handoff-output/v2` as a bridge-removal input. Use
 > the [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)
-> instead: it produces the only admitted proof and makes the consumer reread
-> current policy and canary evidence before every deletion boundary.
+> instead: it produces the only admitted proof. During an explicitly declared
+> configuration freeze, the consumer treats it as a frozen receipt for local
+> cleanup and does not rescan GitHub at every deletion boundary.
 
 Every ordinary authoritative success boundary reads one complete snapshot,
 waits five seconds, and reads it again. If selected evidence or policy differs,
@@ -1087,30 +1088,33 @@ node "$SOURCE_ROOT/scripts/bootstrap-codex-review-gate.mjs" \
 
 Historically, `--final-closure-receipt` took the complete final read-only
 verify JSON file. Current releases reject it before any local mutation. The
-current bootstrap instead admits only the fresh-audit output above and validates its terminal top-level
-fields, recomputes the canonical embedded receipt digest, compares the explicit
-expected SHA-256, parses the worktree's unambiguous GitHub `origin`, and reads
-the current repository metadata from GitHub. It requires exact equality of
-`full_name`, `id`, `node_id`, and `default_branch` with one entry in the fixed
-ten-member manifest-derived `manifest_repositories` cohort; the separate
-observed `repositories` list is checked for equality but is not an
-authorization source. The archived legacy-only repository is deliberately
-absent, so it cannot authorize bridge removal. At the pre-rename boundary, it
-reads `origin` before and after the live-metadata query, repeats the local
-object checks, then reads `origin` once more immediately before the atomic
-bridge quarantine rename. After that rename and before unlink, it
-repeats the complete `origin` -> live metadata identity/default-branch ->
-`origin` check and then revalidates the quarantined file's admitted object
-identity and canonical content. If the remote binding recheck fails, it
-attempts to restore that same admitted bridge at the canonical path with
-no-clobber hard-link creation. An occupied destination or failed restoration
-verification fails closed, never overwrites the occupant, and reports no
-removal success. Thus an observed same-name re-creation, repository transfer,
-default-branch drift, unreadable metadata, or other mismatch cannot authorize
-unlink; a receipt for another cohort or repository cannot authorize removal.
-These are point-in-time remote binding and local identity/content checks, not a
-continuous lock.
-Do not edit the receipt or retarget `origin` to bypass this proof.
+current bootstrap instead admits only the fresh-audit output above, validates
+its terminal fields and canonical embedded receipt digest, compares the
+explicit expected SHA-256, and checks that the local GitHub `origin` slug is a
+member of the fixed ten-member receipt cohort. The archived legacy-only
+repository is deliberately absent, so it cannot authorize bridge removal.
+
+This is a **freeze-bound receipt-only local cleanup**. While the approved
+configuration freeze holds, the command makes no GitHub API calls: it checks
+the local receipt/origin binding at each local mutation boundary, preserves the
+canonical verifier/controller/CODEOWNERS bytes, and protects the bridge's exact
+file object and content during quarantine and unlink. A local safety failure
+after quarantine uses no-clobber restoration, never overwrites a concurrent
+destination, and never reports removal success.
+
+This deliberately does not prove current GitHub state. It cannot detect a
+same-slug repository recreation, later default-branch/ruleset/canary change,
+or another bypass actor. The bridge-removal PR is instead protected online by
+its exact-head v2 required check, ruleset, CODEOWNERS, and normal review policy.
+After the freeze ends, when relevant configuration changes, or before another
+rollout, request a bounded full online audit and fresh receipt. Do not edit the
+receipt, retarget `origin`, or bypass a reported local safety failure.
+
+The only exception is an explicitly requested one-off diagnostic using
+`--live-revalidate-final-closure`. It repeats the historical organization and
+canary revalidation and can make substantial GitHub API traffic, so never add
+it to normal batch cleanup during a freeze. It does not replace the PR's
+exact-head v2 online merge gate.
 
 If the bridge is already absent, the bridge-removal component is an idempotent
 no-op. An existing non-canonical bridge is rejected rather than deleted. The

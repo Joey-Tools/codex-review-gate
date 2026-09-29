@@ -358,5 +358,11 @@ template's `organization-review-gate-handoff-output/v2` verify output to
 `bootstrap-codex-review-gate.mjs --remove-legacy-bridge`; the consumer now
 rejects it before any local or GitHub mutation. After a completed cutover, use
 the separate [post-cutover fresh-audit template](../organization-review-gate-post-cutover-audit/README.md)
-to create the only admitted proof. That proof rebinds current organization
-policy and receipt-bound canary evidence at each consumer deletion boundary.
+to create the only admitted proof. During an explicitly declared configuration
+freeze, the consumer's default deletion path is receipt-only local cleanup: it
+does not rebind current organization policy or receipt-bound canary evidence
+at each deletion boundary. Its resulting PR exact-head v2 gate remains online
+enforcement. The post-cutover template documents the separate, explicitly
+requested low-concurrency live-revalidation compatibility mode for one
+diagnostic consumer cleanup. It does not replace the fresh post-cutover audit
+and receipt required after the freeze or a relevant configuration change.

@@ -730,8 +730,8 @@ live `active` state。
    > **以下第 9、10 步仅为历史记录，禁止执行。** 当前 bootstrap release 会在任何本地 mutation
    > 前拒绝把 `organization-review-gate-handoff-output/v2` 用作 bridge-removal input，即使其
    > digest 有效。唯一现行路径是 [post-cutover fresh-audit template](../../templates/organization-review-gate-post-cutover-audit/README.md)：
-   > 它生成新的 v1 audit output，并要求 consumer 在每个本地删除边界前重新读取 policy 与
-   > canary evidence。
+   > 它生成新的 v1 audit output。在显式声明的 configuration freeze 期间，consumer 将已批准
+   > output 用作冻结的 local-cleanup receipt，而不会在每个删除边界重扫 GitHub。
 
 10. 只有步骤 9 成功 closure 后，每个活动 cohort member 才从 clean worktree 另开
    bridge-removal PR。**这段只保留作历史记录，禁止执行这些命令。** 不得为已归档、仅属于
@@ -758,19 +758,27 @@ live `active` state。
    历史上，虽然 option 名称是 singular `--final-closure-receipt`，它接收的是完整的最终只读
    verify output。当前 bootstrap release 会在任何本地 mutation 前拒绝这份历史 output；现行
    bootstrap 只接受上文的 fresh-audit output，然后验证 terminal top-level fields、重新计算 canonical embedded receipt
-   digest、比对显式 expected SHA-256、解析 target worktree 中无歧义的 GitHub `origin`，并从
-GitHub 读取 live repository metadata。它要求 `full_name`、`id`、`node_id` 与
-`default_branch` 都和固定 10 仓 manifest-derived `manifest_repositories` cohort 中的一项精确
-相等。Observed `repositories` list 会独立验证完全相等，但不是 authorization source。已归档、
-仅属于 legacy 的 repository 被刻意排除，因此不能授权 bridge removal。在 atomic bridge
-quarantine rename 前的边界，它会先在 live-metadata query 前后各读取一次 `origin`，重新验证
-本地对象后，再紧邻 rename 读取一次 `origin`。Rename 后、unlink 前，它会再次执行完整的 `origin` -> live
-metadata identity/default-branch -> `origin` 检查，并重新验证 quarantine 中 admitted file 的
-object identity 与 canonical content。若该 remote binding check 失败，它会通过 no-clobber
-hard-link creation 尝试把同一 admitted bridge 恢复到 canonical path；若目标路径已被占用或
-恢复后的验证失败，则 fail closed、绝不覆盖占用者，也不报告删除成功。这些是 point-in-time 的
-remote binding 与 local identity/content checks，并非连续锁。不得编辑 receipt、切换 `origin`
-或绕过这份 proof。
+   digest、比对显式 expected SHA-256，并解析 target worktree 中无歧义的 GitHub `origin`。
+   本地 origin 的 normalized `OWNER/REPO` slug 必须是固定 10 仓 receipt cohort 的一员；已归档、
+   仅属于 legacy 的 repository 被刻意排除，因此不能授权 bridge removal。
+
+   这是 **freeze-bound receipt-only local cleanup**：admission、dry run、每个本地 mutation
+   boundary、quarantine/unlink 与 no-op readback 都不会调用 GitHub API。它们会重新读取本地
+   origin route/membership，并保留 exact canonical verifier/controller/CODEOWNERS bytes，以及
+   bridge file 的 object identity 和 content。若 quarantine 后本地边界失败，helper 使用
+   no-clobber restoration，绝不覆盖并发 destination，也不报告 removal success。
+
+   receipt 不是 live-control-plane proof。这条路径不能发现 same-slug GitHub repository
+   replacement、后续 default-branch/ruleset/canary drift，或新加入的 bypass actor。相应 PR 的
+   exact-head v2 required check、ruleset、CODEOWNERS 与 ordinary review policy 才是线上 merge
+   gate。声明的 freeze 结束、相关 configuration 发生变化，或开始下一次 rollout 时，应请求
+   单独限定范围的 full online audit 与 fresh receipt，不能把此次 local cleanup 当作 current
+   remote state 的证据。不得编辑 receipt、retarget `origin` 或绕过已报告的 local safety failure。
+
+   唯一例外是明确要求的一次性诊断：附加
+   `--live-revalidate-final-closure`。它会重复历史上的 organization/canary revalidation，可能
+   产生大量 GitHub API 流量，因此 freeze 期间的常规批量 cleanup 绝不能加入该 flag。它也不替代
+   PR 的 exact-head v2 online merge gate。
 
    Bridge absent 时，bridge-removal component 是 idempotent no-op；已有但 non-canonical
    的 bridge 会被拒绝。整个 command 也会强制 canonical verifier、controller 与 managed

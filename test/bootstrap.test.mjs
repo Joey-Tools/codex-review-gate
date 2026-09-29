@@ -2530,14 +2530,8 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
     "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n";
   try {
     initializeGitRepository(targetRoot);
-    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
-    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
-      output: auditFixture.output,
-    });
-    const auditProofEnv = postCutoverAuditGhEnvironment(
-      targetRoot,
-      auditFixture,
-    );
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot);
+    const noGitHubApi = noGitHubApiEnvironment(targetRoot);
     mkdirSync(workflowsDirectory, { recursive: true });
     writeFileSync(verifierPath, legacyVerifier, "utf8");
 
@@ -2591,9 +2585,10 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
       targetRoot,
       "--remove-legacy-bridge",
       ...auditProofArgs,
-    ], { env: auditProofEnv });
+    ], { env: noGitHubApi.environment });
     assert.equal(removalDryRun.status, 0, removalDryRun.stderr);
     assert.match(removalDryRun.stdout, /remove the exact temporary legacy bridge/u);
+    assert.match(removalDryRun.stdout, /Frozen receipt local cleanup: no GitHub API reads/u);
     assert.equal(existsSync(bridgePath), true);
 
     const removal = runBootstrap([
@@ -2602,7 +2597,7 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
       "--remove-legacy-bridge",
       ...auditProofArgs,
       "--apply",
-    ], { env: auditProofEnv });
+    ], { env: noGitHubApi.environment });
     assert.equal(removal.status, 0, removal.stderr);
     assert.match(removal.stdout, /Applied: remove the exact temporary legacy bridge/u);
     assert.equal(existsSync(bridgePath), false);
@@ -2613,7 +2608,7 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
       "--remove-legacy-bridge",
       ...auditProofArgs,
       "--apply",
-    ], { env: auditProofEnv });
+    ], { env: noGitHubApi.environment });
     assert.equal(removalRepeat.status, 0, removalRepeat.stderr);
     assert.match(removalRepeat.stdout, /legacy bridge is already absent/u);
     const strictAfterRemoval = runBootstrap([
@@ -2622,12 +2617,13 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
       "--apply",
     ]);
     assert.equal(strictAfterRemoval.status, 0, strictAfterRemoval.stderr);
+    assertNoGitHubApiCalls(noGitHubApi.callLog);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
   }
 });
 
-test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
+test("legacy bridge removal uses a fresh post-cutover receipt without GitHub API reads", () => {
   const targetRoot = mkdtempSync(
     join(tmpdir(), "codex-review-gate-post-cutover-audit-removal-"),
   );
@@ -2637,14 +2633,8 @@ test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
   );
   try {
     initializeGitRepository(targetRoot);
-    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
-    const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
-      output: auditFixture.output,
-    });
-    const auditProofEnv = postCutoverAuditGhEnvironment(
-      targetRoot,
-      auditFixture,
-    );
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot);
+    const noGitHubApi = noGitHubApiEnvironment(targetRoot);
     mkdirSync(join(targetRoot, ".github", "workflows"), { recursive: true });
     writeFileSync(
       join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
@@ -2669,11 +2659,12 @@ test("legacy bridge removal admits a fresh post-cutover v2 audit proof", () => {
       "--remove-legacy-bridge",
       ...auditProofArgs,
       "--apply",
-    ], { env: auditProofEnv });
+    ], { env: noGitHubApi.environment });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Admitted bridge-removal proof/u);
     assert.match(result.stdout, /Applied: remove the exact temporary legacy bridge/u);
     assert.equal(existsSync(bridgePath), false);
+    assertNoGitHubApiCalls(noGitHubApi.callLog);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
   }
@@ -4513,23 +4504,21 @@ test("post-cutover audit repository legacy revalidation rejects same-slug object
 test("legacy bridge removal requires a repository-bound post-cutover audit proof and rejects historical handoffs before mutation", () => {
   const prepareHistoricalProof = (targetRoot, options = {}) => ({
     proofArgs: prepareFinalClosureReceipt(targetRoot, options),
-    env: finalClosureGhEnvironment(targetRoot, options),
-    ghCallLog: join(targetRoot, ".final-closure-gh-calls.log"),
+    ...noGitHubApiEnvironment(targetRoot),
   });
   const prepareAuditProof = (targetRoot, { originRepoSlug } = {}) => {
-    const auditFixture = buildPostCutoverAuditLivePolicyFixture();
     return {
-      proofArgs: preparePostCutoverAuditProof(targetRoot, {
-        output: auditFixture.output,
-        originRepoSlug,
-      }),
-      env: postCutoverAuditGhEnvironment(targetRoot, auditFixture),
+      proofArgs: preparePostCutoverAuditProof(targetRoot, { originRepoSlug }),
+      ...noGitHubApiEnvironment(targetRoot),
     };
   };
   for (const scenario of [
     {
       name: "missing-proof",
-      prepare: () => ({ proofArgs: [] }),
+      prepare: (targetRoot) => ({
+        proofArgs: [],
+        ...noGitHubApiEnvironment(targetRoot),
+      }),
       expected: /requires --final-closure-receipt/u,
     },
     {
@@ -4622,7 +4611,7 @@ test("legacy bridge removal requires a repository-bound post-cutover audit proof
         "--remove-legacy-bridge",
         ...proof.proofArgs,
         "--apply",
-      ], { env: proof.env });
+      ], { env: proof.environment });
       assert.equal(result.status, 1, `${scenario.name}: ${result.stderr}`);
       assert.match(result.stderr, scenario.expected, scenario.name);
       assert.equal(existsSync(bridgePath), true, scenario.name);
@@ -4652,13 +4641,7 @@ test("legacy bridge removal requires a repository-bound post-cutover audit proof
           `${scenario.name}: admission must reject before controller mutation`,
         );
       }
-      if (scenario.assertNoApiCall === true) {
-        assert.equal(
-          existsSync(proof.ghCallLog),
-          false,
-          `${scenario.name}: historical proof rejection must happen before any GitHub API call`,
-        );
-      }
+      assertNoGitHubApiCalls(proof.callLog);
     } finally {
       rmSync(targetRoot, { recursive: true, force: true });
     }
@@ -5185,6 +5168,88 @@ test("legacy bridge removal restores the bridge when its remote binding drifts a
   }
 });
 
+test("freeze-bound bridge removal restores the exact bridge after a post-quarantine origin retarget without GitHub API reads", () => {
+  const targetRoot = mkdtempSync(
+    join(tmpdir(), "codex-review-gate-frozen-post-rename-origin-drift-"),
+  );
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const bridgePath = join(
+    targetRoot,
+    ...DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    const auditProofArgs = preparePostCutoverAuditProof(targetRoot);
+    const noGitHubApi = noGitHubApiEnvironment(targetRoot);
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
+      CANONICAL_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(
+      join(targetRoot, ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/")),
+      CANONICAL_CONTROLLER_WORKFLOW,
+      "utf8",
+    );
+    writeFileSync(bridgePath, CANONICAL_LEGACY_BRIDGE_WORKFLOW, "utf8");
+    const admittedBridge = lstatSync(bridgePath, { bigint: true });
+    writeFileSync(
+      join(targetRoot, ".github", "CODEOWNERS"),
+      ensureControlPlaneCodeownersContent(null).content,
+      "utf8",
+    );
+    const preloadPath = join(targetRoot, "frozen-post-rename-origin-drift.cjs");
+    const bridgeMutationLog = join(targetRoot, "bridge-mutation-calls.log");
+    writeFileSync(preloadPath, localApplyRacePreloadSource(), "utf8");
+
+    const result = runBootstrap([
+      "--prepare-worktree",
+      targetRoot,
+      "--remove-legacy-bridge",
+      ...auditProofArgs,
+      "--apply",
+    ], {
+      env: {
+        ...noGitHubApi.environment,
+        NODE_OPTIONS: `--require=${preloadPath}`,
+        CODEX_BOOTSTRAP_TEST_RACE_MODE:
+          "removal-origin-drift-after-quarantine-rename",
+        CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
+        CODEX_BOOTSTRAP_TEST_BRIDGE_MUTATION_LOG: bridgeMutationLog,
+      },
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Git origin repository changed during after legacy bridge quarantine rename and before unlink/u,
+    );
+    assert.match(result.stderr, /admitted exact bridge remains installed/u);
+    assert.doesNotMatch(result.stdout, /Applied:|Next:/u);
+    assertNoGitHubApiCalls(noGitHubApi.callLog);
+    assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
+    const restoredBridge = lstatSync(bridgePath, { bigint: true });
+    assert.equal(restoredBridge.dev, admittedBridge.dev);
+    assert.equal(restoredBridge.ino, admittedBridge.ino);
+    assert.equal(
+      readFileSync(bridgeMutationLog, "utf8"),
+      "rename\nunlink\n",
+      "the only unlink removes the restored quarantine link; dev/ino proves the canonical bridge remains",
+    );
+    assert.equal(
+      readdirSync(workflowsDirectory, { withFileTypes: true }).some(
+        (entry) =>
+          entry.isDirectory() &&
+          entry.name.startsWith(".codex-review-gate-removal-"),
+      ),
+      false,
+    );
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
 test("prepare-worktree installs the bridge before replacing a canonical-path v1 producer", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bridge-order-"));
   const workflowsDirectory = join(targetRoot, ".github", "workflows");
@@ -5361,14 +5426,8 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
       );
       mkdirSync(targetRoot);
       initializeGitRepository(targetRoot);
-      const auditFixture = buildPostCutoverAuditLivePolicyFixture();
-      const auditProofArgs = preparePostCutoverAuditProof(targetRoot, {
-        output: auditFixture.output,
-      });
-      const auditProofEnv = postCutoverAuditGhEnvironment(
-        targetRoot,
-        auditFixture,
-      );
+      const auditProofArgs = preparePostCutoverAuditProof(targetRoot);
+      const noGitHubApi = noGitHubApiEnvironment(targetRoot);
       mkdirSync(workflowsDirectory, { recursive: true });
       writeFileSync(
         join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/")),
@@ -5398,7 +5457,7 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
         "--apply",
       ], {
         env: {
-          ...auditProofEnv,
+          ...noGitHubApi.environment,
           NODE_OPTIONS: `--require=${preloadPath}`,
           CODEX_BOOTSTRAP_TEST_RACE_MODE: mode,
           CODEX_BOOTSTRAP_TEST_RACE_ROOT: targetRoot,
@@ -5407,6 +5466,7 @@ test("legacy bridge removal fails closed across replacement, deletion, unlink, a
       assert.equal(result.status, 1, `${mode}: ${result.stderr}`);
       assert.match(result.stderr, expected, mode);
       assert.doesNotMatch(result.stdout, /Applied:|Next:/u, mode);
+      assertNoGitHubApiCalls(noGitHubApi.callLog);
       const quarantineDirectories = readdirSync(workflowsDirectory, {
         withFileTypes: true,
       }).filter(
@@ -9890,6 +9950,11 @@ test("post-cleanup verification admission remains read-only and rejects the old 
       /local-only.*--prepare-worktree/u,
     ],
     [
+      "live-revalidation-without-local-removal",
+      ["--prepare-worktree", "/tmp/consumer", "--live-revalidate-final-closure"],
+      /valid only with --remove-legacy-bridge/u,
+    ],
+    [
       "without-repo",
       ["--verify-post-cleanup"],
       /Choose exactly one mode/u,
@@ -13508,6 +13573,30 @@ function fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }) {
   };
 }
 
+function noGitHubApiEnvironment(targetRoot) {
+  const fakeBin = join(targetRoot, ".no-github-api-bin");
+  const stateDir = join(targetRoot, ".no-github-api-state");
+  const callLog = join(targetRoot, ".no-github-api-calls.log");
+  createFakeGhExecutable(fakeBin);
+  return {
+    environment: fakeGhEnvironment({
+      fakeBin,
+      responses: {},
+      stateDir,
+      callLog,
+    }),
+    callLog,
+  };
+}
+
+function assertNoGitHubApiCalls(callLog) {
+  assert.equal(
+    existsSync(callLog),
+    false,
+    "freeze-bound consumer cleanup must not invoke gh api",
+  );
+}
+
 function sourceClosureTimingPreloadSource() {
   return `
 const nativeSetTimeout = global.setTimeout;
@@ -13574,7 +13663,7 @@ syncBuiltinESMExports();
 
 assert.equal(
   test.registeredCount,
-  163,
+  164,
   "bootstrap test shard registration inventory drift",
 );
 
@@ -13727,6 +13816,13 @@ function runBootstrap(
   } = {},
 ) {
   const preparedArgs = [...args];
+  if (
+    env.CODEX_BOOTSTRAP_TEST_LIVE_REVALIDATE === "1" &&
+    preparedArgs.includes("--remove-legacy-bridge") &&
+    !preparedArgs.includes("--live-revalidate-final-closure")
+  ) {
+    preparedArgs.push("--live-revalidate-final-closure");
+  }
   const repoIndex = preparedArgs.indexOf("--repo");
   const verifiesPostCleanup = preparedArgs.includes("--verify-post-cleanup");
   if (
@@ -14407,7 +14503,8 @@ function postCutoverAuditGhEnvironment(
   const stateDir = join(targetRoot, ".post-cutover-audit-gh-state");
   const callLog = join(targetRoot, ".post-cutover-audit-gh-calls.log");
   createFakeGhExecutable(fakeBin);
-  return fakeGhEnvironment({
+  return {
+    ...fakeGhEnvironment({
     fakeBin,
     stateDir,
     callLog,
@@ -14446,7 +14543,11 @@ function postCutoverAuditGhEnvironment(
       ),
       ...repositoryControlPlaneResponseOverrides,
     },
-  });
+    }),
+    // Historical remote-audit fixtures exercise the explicit compatibility
+    // path, while default bridge-removal tests use the no-GitHub-API fixture.
+    CODEX_BOOTSTRAP_TEST_LIVE_REVALIDATE: "1",
+  };
 }
 
 function postCutoverAuditCanaryResponses(
