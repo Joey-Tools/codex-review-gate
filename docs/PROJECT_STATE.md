@@ -9,6 +9,11 @@
   controlled organization-wide v2 handoff is complete for its fixed 10-member
   active cohort: the old organization rule no longer requires v1, and all eight
   affected repository-local legacy surfaces now require only `test`.
+- The separate active-cohort v1 bridge-retirement phase is complete across all
+  10 members: three were pre-existing canonical no-ops and seven cleanup PRs
+  merged, ending with `Joey-Tools/codex-private-workflows` #206. This was
+  frozen-receipt local cleanup, not a fresh online audit; the default-branch
+  Private Overlay Release run was only queued at the closure checkpoint.
 - The source repository `Joey-Tools/codex-review-gate` is not part of that
   cohort. Its canonical v2 verifier and controller are installed without a v1
   bridge, and separate status-only v2 ruleset `23927388` is Active. Fresh
@@ -31,7 +36,7 @@
 - Completed v2 delivery plan and release evidence: `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`
 - Completed v2.1.1 frozen-source release validation: `docs/project_journal/2026/09/2026-09-28-release-validation-shards.md`
 - Completed v2.1.2 duplicate-cohort recovery release: `docs/project_journal/2026/09/2026-09-28-default-any-duplicate-cohort.md`
-- Authoritative active organization v2 cohort handoff: `docs/project_journal/2026/09/2026-09-18-organization-v2-handoff.md`
+- Completed organization v2 cohort handoff: `docs/project_journal/2026/09/2026-09-18-organization-v2-handoff.md`
 - Superseded pre-confirmation v2 implementation record: `docs/project_journal/2026/08/2026-08-13-action-v2-release-pipeline-7bf930a.md`
 - Superseded v1 release automation history: `docs/project_journal/2026/05/2026-05-18-action-release-automation-9a806cf.md`
 
@@ -39,12 +44,12 @@
 - The approved post-cutover fresh-audit receipt for the active 10-member cohort
   is retained outside this repository as canonical digest
   `9a8b38f2188a14168423a07639d6662c87e198fe2dd12041f67fc224f363817e`.
-  During Joey's declared configuration freeze, consumer bridge removal uses it
-  only as a receipt-bound local cleanup authorization: it validates the receipt
+  During Joey's declared configuration freeze, consumer bridge removal used it
+  only as a receipt-bound local cleanup authorization: it validated the receipt
   schema/digest and local origin/cohort membership while preserving canonical
   local workflow, CODEOWNERS, and file-object boundaries. It intentionally does
   not reread GitHub rulesets, canaries, repository metadata, or bypass actors.
-  The resulting PR's exact-head v2 gate remains online enforcement. After the
+  The exact-head v2 PR gate remained online enforcement. After the
   freeze, a relevant configuration change, or before another rollout, request
   a bounded fresh full audit; this path cannot discover later online drift or a
   newly added bypass actor. It cannot authorize a source-local bridge outside

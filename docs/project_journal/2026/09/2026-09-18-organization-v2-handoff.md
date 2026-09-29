@@ -1,10 +1,10 @@
 ---
 id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
-status: active
+status: completed
 created: 2026-09-18
 updated: 2026-09-29
-branch: wip/frozen-receipt-local-cleanup
+branch: codex/close-v2-cohort-cleanup
 pr:
 supersedes: []
 superseded_by:
@@ -1500,13 +1500,40 @@ evidence that a prior freeze remains in force.
 - The source self-hosting bridge lifecycle is unchanged: it remains a separate
   authority domain with its own live-rebind contract and is not widened by this
   consumer-only change.
+- Fixed-cohort consumer v1 bridge retirement is complete across all 10 active
+  repositories under the previously approved frozen post-cutover receipt
+  digest `9a8b38f2188a14168423a07639d6662c87e198fe2dd12041f67fc224f363817e`:
+  `codex-apple-notes-toolkit`, `codex-debug-triage`, and `codex-toolbox` were
+  pre-existing canonical no-ops; the following seven cleanup PRs merged:
+  - `codex-rollout-backup` #16 at `af03058d7295a0015c59855294861abc3344698f`.
+  - `codex-workflow-hygiene` #85 at `bf07ced21d1b9a192d93f7a92d2fbc1f7605ce02`.
+  - `codex-session-retrospective-history` #15 at `52cdc6470f88e7ec3c0f42feac15791cb1e19204`.
+  - `codex-project-journal` #14 at `12809d9336fcc10698bb51fa9982be9d6f0627d6`.
+  - `codex-personal-sync` #29 at `a4855f33ce5d63f791c565df56dba25cbd0a333a`.
+  - `codex-review-workflows` #123 at `c30e3600a47df66da8e8472bd8879df95b6b0a83`.
+  - `codex-private-workflows` replacement #206 at `67ceac9e0845fd0367de06ebe51a4a11a357190c`.
+- The final #206 merge was a normal squash merge on 2026-09-29 at
+  12:48:39 UTC from exact reviewed head
+  `0031e68b6c7c2136092202a4939c2e7a0cfa0247`. Required checks `Build
+  private overlay release`, `codex/github-review-gate`, and `test` passed;
+  historical gate/legacy-bridge failures were not bypassed. Source helper
+  PR #89 merged at `02689cee592c5d836b0f619dfd58dcbe4773632d`; it is
+  supporting source tooling, not an eleventh cohort cleanup. Default-branch
+  Private Overlay Release push run `36570626618` was queued at this checkpoint;
+  no successful release-run outcome is claimed here.
+- This checkpoint records PR outcomes against the frozen local-cleanup
+  receipt; it is not a fresh online ruleset, canary, repository, or bypass-actor
+  audit. Archived `codex-waited-delivery` remains outside the active receipt
+  and cleanup scope. The old organization ruleset retains its non-v1 deletion
+  and non-fast-forward protections.
 
 ## Next Steps
 
-1. Complete the remaining active-cohort bridge-removal PRs using the approved
-   freeze-bound receipt-only local cleanup. Do not apply that receipt to the
-   source-local bridge domain or to `codex-waited-delivery`; historical schema-2
-   output remains audit-only and cannot authorize either deletion path.
+1. Separately confirm the outcome of default-branch Private Overlay Release
+   push run `36570626618`; it was only queued at the closure checkpoint and
+   is not evidence of a successful release. Do not apply the frozen receipt to
+   the source-local bridge domain or to `codex-waited-delivery`; historical
+   schema-2 output remains audit-only and cannot authorize either deletion path.
 2. Treat the cohort v1 status transition as complete: do not restore
    `codex/review-gate` in the old organization rule or on any fixed active
    cohort repository. The old organization ruleset intentionally remains Active
