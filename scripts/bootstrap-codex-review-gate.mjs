@@ -158,6 +158,7 @@ async function main() {
       controlPlaneOwner: options.controlPlaneOwner,
       legacyBridge: options.legacyBridge,
       removeLegacyBridge: options.removeLegacyBridge,
+      liveRevalidateFinalClosure: options.liveRevalidateFinalClosure,
       finalClosureReceiptPath: options.finalClosureReceiptPath,
       expectedFinalClosureReceiptSha256:
         options.expectedFinalClosureReceiptSha256,
@@ -721,6 +722,7 @@ function readCliOptions() {
       activate: { type: "boolean", default: false },
       "legacy-bridge": { type: "boolean", default: false },
       "remove-legacy-bridge": { type: "boolean", default: false },
+      "live-revalidate-final-closure": { type: "boolean", default: false },
       "remove-source-legacy-bridge": { type: "boolean", default: false },
       "final-closure-receipt": { type: "string" },
       "expected-final-closure-receipt-sha256": { type: "string" },
@@ -865,6 +867,14 @@ function readCliOptions() {
   ) {
     throw new Error(
       "--final-closure-receipt and --expected-final-closure-receipt-sha256 are valid only with --remove-legacy-bridge.",
+    );
+  }
+  if (
+    values["live-revalidate-final-closure"] &&
+    !values["remove-legacy-bridge"]
+  ) {
+    throw new Error(
+      "--live-revalidate-final-closure is valid only with --remove-legacy-bridge.",
     );
   }
   if (removeSourceLegacyBridge && !hasPrepareWorktree) {
@@ -1121,6 +1131,7 @@ function readCliOptions() {
     activate: values.activate,
     legacyBridge: values["legacy-bridge"],
     removeLegacyBridge: values["remove-legacy-bridge"],
+    liveRevalidateFinalClosure: values["live-revalidate-final-closure"],
     removeSourceLegacyBridge,
     finalClosureReceiptPath: values["remove-legacy-bridge"]
       ? resolve(values["final-closure-receipt"])
@@ -1185,7 +1196,7 @@ function readCliOptions() {
 
 function printUsage() {
   console.log(`Usage:
-  node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--legacy-bridge | --remove-legacy-bridge --final-closure-receipt PATH --expected-final-closure-receipt-sha256 SHA256] [--control-plane-owner @USER] [--apply]
+  node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--legacy-bridge | --remove-legacy-bridge --final-closure-receipt PATH --expected-final-closure-receipt-sha256 SHA256 [--live-revalidate-final-closure]] [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 [--ruleset-profile full] [--legacy-bridge] [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --activate --canary-pr NUMBER --canary-head SHA [--ruleset-profile full] [--legacy-bridge] [--control-plane-owner @USER] [--apply]
   node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --expected-legacy-inventory-sha256 SHA256 --derive-post-cleanup-plan [--ruleset-profile full] [--legacy-bridge] [--control-plane-owner @USER]
@@ -1196,7 +1207,9 @@ Options:
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
   --legacy-bridge         Explicitly require/install the exact temporary v1 producer at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. Keep this flag through legacy cleanup verification.
-  --remove-legacy-bridge  Local-only post-cutover removal of an exact canonical bridge. Requires a repository-bound admitted bridge-removal proof.
+  --remove-legacy-bridge  Freeze-bound, local-only post-cutover removal of an exact canonical bridge. By default it uses no GitHub API reads.
+  --live-revalidate-final-closure
+                          Explicitly repeat the expensive live organization/canary closure audit for one diagnostic cleanup. Do not use for batch consumer cleanup during a freeze.
   --final-closure-receipt
                           JSON admitted bridge-removal proof. Only post-cutover audit output/v1 + post-cutover audit receipt/v1 is admitted; historical handoff outputs are audit-only.
   --expected-final-closure-receipt-sha256
@@ -5600,6 +5613,22 @@ function assertPostCutoverAuditCanonicalWorkflowInventory(
   );
 }
 
+// A consumer bridge deletion is intentionally a freeze-bound local cleanup.
+// The admitted receipt is a fixed authorization boundary, not a live control-
+// plane query.  Re-read only the local Git origin route so a retargeted
+// checkout cannot reuse a receipt admitted for another cohort member.  This
+// cannot detect same-slug GitHub object replacement, later ruleset/canary
+// drift, or a newly added bypass actor; those remain explicit full-audit and
+// PR exact-head gate responsibilities.
+async function assertFrozenReceiptBridgeRemovalBindingStable(
+  targetRoot,
+  proof,
+  phase,
+) {
+  const current = await loadGitHubOriginRepository(targetRoot);
+  assertOrganizationFinalClosureOriginMatchesProof(current, proof, phase);
+}
+
 async function loadCurrentOrganizationFinalClosureRepository(
   originRepository,
   phase,
@@ -5611,7 +5640,11 @@ async function loadCurrentOrganizationFinalClosureRepository(
   );
 }
 
-async function assertOrganizationFinalClosureBindingStable(
+// This expensive compatibility path is deliberately opt-in. It preserves the
+// complete live audit used to mint and diagnose post-cutover evidence, but is
+// unsuitable for batch consumer cleanup because each local boundary expands
+// into organization- and canary-wide API reads.
+async function assertLiveOrganizationFinalClosureBindingStable(
   targetRoot,
   proof,
   canonicalWorkflows,
@@ -6162,6 +6195,7 @@ async function prepareConsumerWorktree({
   controlPlaneOwner,
   legacyBridge,
   removeLegacyBridge,
+  liveRevalidateFinalClosure,
   finalClosureReceiptPath,
   expectedFinalClosureReceiptSha256,
   apply,
@@ -6174,6 +6208,24 @@ async function prepareConsumerWorktree({
         expectedSha256: expectedFinalClosureReceiptSha256,
       })
     : null;
+  const assertBridgeRemovalBindingStable = async (phase) => {
+    if (bridgeRemovalProof === null) return;
+    if (liveRevalidateFinalClosure) {
+      await assertLiveOrganizationFinalClosureBindingStable(
+        targetRoot,
+        bridgeRemovalProof,
+        canonicalWorkflows,
+        controlPlaneOwner,
+        phase,
+      );
+      return;
+    }
+    await assertFrozenReceiptBridgeRemovalBindingStable(
+      targetRoot,
+      bridgeRemovalProof,
+      phase,
+    );
+  };
   const parentWitnesses = await prepareVerifiedWorkflowParents({
     targetRoot,
     rootWitness,
@@ -6228,20 +6280,13 @@ async function prepareConsumerWorktree({
   });
   await revalidateDirectoryChain(parentWitnesses, "after local workflow inspection");
   // Admission follows the fail-closed local workflow/object inspection so a
-  // drifted or displaced bridge receives its local diagnostic without an
-  // unrelated remote API dependency. It still precedes every mutation and
-  // binds the receipt to the current GitHub object, not merely to a reusable
-  // OWNER/REPO path: a repository can be deleted and recreated with the same
-  // slug between proof production and this local cutover.
-  if (bridgeRemovalProof !== null) {
-    await assertOrganizationFinalClosureBindingStable(
-      targetRoot,
-      bridgeRemovalProof,
-      canonicalWorkflows,
-      controlPlaneOwner,
-      "bridge-removal proof admission",
-    );
-  }
+  // drifted or displaced bridge receives its local diagnostic before its
+  // selected binding check. The default freeze-bound path authorizes local
+  // cleanup only; it deliberately does not claim to bind a current GitHub
+  // object or discover later online policy, canary, or bypass-actor changes.
+  // The explicit live flag keeps the historical full revalidation for a
+  // one-off diagnostic, never as batch cleanup behavior.
+  await assertBridgeRemovalBindingStable("bridge-removal proof admission");
 
   const verifierChanged =
     currentVerifierWorkflow !== canonicalWorkflows.verifier;
@@ -6262,6 +6307,15 @@ async function prepareConsumerWorktree({
     console.log(
       `Admitted bridge-removal proof: ${bridgeRemovalProof.repository.full_name} at ${bridgeRemovalProof.sha256}`,
     );
+    if (liveRevalidateFinalClosure) {
+      console.log(
+        "Explicit live final-closure revalidation: organization-wide GitHub API checks are enabled; do not use this mode for batch consumer cleanup.",
+      );
+    } else {
+      console.log(
+        "Frozen receipt local cleanup: no GitHub API reads; later online drift is checked only by the PR exact-head gate or a separately requested full audit.",
+      );
+    }
   }
   console.log(`Control plane: ${DEFAULT_CODEOWNERS_PATH} -> ${controlPlaneOwner}`);
   if (!verifierChanged) {
@@ -6298,15 +6352,7 @@ async function prepareConsumerWorktree({
       finalNoopState,
       "no-op success readback",
     );
-    if (bridgeRemovalProof !== null) {
-      await assertOrganizationFinalClosureBindingStable(
-        targetRoot,
-        bridgeRemovalProof,
-        canonicalWorkflows,
-        controlPlaneOwner,
-        "no-op success readback",
-      );
-    }
+    await assertBridgeRemovalBindingStable("no-op success readback");
     return;
   }
 
@@ -6407,9 +6453,11 @@ async function prepareConsumerWorktree({
   const beforePlannedMutation = async (phase) => {
     // The initial local inventory can only be compared before the first
     // planned change: later checkpoints intentionally include prior applied
-    // changes. The remote bridge-removal proof, however, must bind every
-    // planned mutation boundary so a same-slug repository recreation or a
-    // retargeted origin cannot authorize a later local change.
+    // changes. The selected binding mode still runs at every planned mutation
+    // boundary, so a locally retargeted checkout cannot authorize a later
+    // local change. The default freeze-bound mode rebinds only the local
+    // origin route; explicit live revalidation additionally checks the
+    // remote closure before the same local file-object boundary.
     if (!initialLocalSecurityBoundaryComplete) {
       const preMutationState = await loadLocalInstallationSecurityState({
         targetRoot,
@@ -6426,15 +6474,7 @@ async function prepareConsumerWorktree({
       );
       initialLocalSecurityBoundaryComplete = true;
     }
-    if (bridgeRemovalProof !== null) {
-      await assertOrganizationFinalClosureBindingStable(
-        targetRoot,
-        bridgeRemovalProof,
-        canonicalWorkflows,
-        controlPlaneOwner,
-        phase,
-      );
-    }
+    await assertBridgeRemovalBindingStable(phase);
   };
   const beforeLegacyBridgeQuarantineRename = async () => {
     await beforePlannedMutation(
@@ -6559,15 +6599,7 @@ async function prepareConsumerWorktree({
       successBoundaryState,
       "immediately before local apply success",
     );
-    if (bridgeRemovalProof !== null) {
-      await assertOrganizationFinalClosureBindingStable(
-        targetRoot,
-        bridgeRemovalProof,
-        canonicalWorkflows,
-        controlPlaneOwner,
-        "immediately before local apply success",
-      );
-    }
+    await assertBridgeRemovalBindingStable("immediately before local apply success");
   } catch (error) {
     throw buildPartialLocalApplyError(error, installedLabels, plannedChanges);
   }
@@ -6668,12 +6700,13 @@ async function installPreparedConsumerFile({
 // Node does not expose unlinkat against an already-open file descriptor, so the
 // final quarantine check and path-based unlink remain a best-effort boundary
 // under the existing same-UID non-interference assumption.
-// The remote authorization is a point-in-time property: the GitHub repository
-// identity/default branch and origin binding are fully revalidated after the
-// quarantine rename and before unlink. A final local identity/content check
-// follows that remote read, so remote I/O cannot weaken the admitted file-object
-// property. This detects observed drift through those boundaries; it does not
-// claim a continuous lock against a same-UID rewrite after the final checks.
+// The caller's authorization callback runs at each deletion boundary. The
+// default consumer callback revalidates the local receipt/origin binding; the
+// source callback instead performs its separately authorized live closure
+// rebind. A final local identity/content check follows either callback, so it
+// cannot weaken the admitted file-object property. These checks detect observed
+// local route/object drift through their boundaries; they do not claim
+// continuous protection against same-UID rewrite or other post-check changes.
 async function removePreparedConsumerFile({
   path,
   expectedContent,
@@ -6747,9 +6780,10 @@ async function removePreparedConsumerFile({
     );
     await assertConsumerFileContentStable(path, expectedContent, label);
     await beforeFinalQuarantineRename();
-    // The authorization check above can perform remote I/O. Rebind the local
-    // object after it returns; inode/content (rather than incidental stat
-    // fields) are the protected local property immediately before rename.
+    // The caller-owned authorization check above may do local receipt/origin
+    // validation or a source-live rebind. Rebind the local object after it
+    // returns; inode/content (rather than incidental stat fields) are the
+    // protected local property immediately before rename.
     await revalidateDirectoryChain(
       parentWitnesses,
       `after final ${label} quarantine authorization revalidation`,
@@ -6798,9 +6832,10 @@ async function removePreparedConsumerFile({
       `${label} quarantine`,
     );
     try {
-      // Recheck remote target identity only after the quarantined object's
-      // identity/content have been observed. The post-I/O local check below
-      // then detects a concurrent local replacement before unlink.
+      // Invoke the caller-owned final authorization callback only after the
+      // quarantined object's identity/content have been observed. The post-
+      // callback local check below then detects a concurrent local replacement
+      // before unlink.
       await beforeQuarantineUnlink({ quarantinePath });
     } catch (authorizationError) {
       restorationAttempted = true;
@@ -6887,7 +6922,7 @@ async function removePreparedConsumerFile({
   await admittedIdentity.handle.close();
 }
 
-// Recovery property: a remote-authorization failure after quarantine must
+// Recovery property: an authorization-revalidation failure after quarantine must
 // leave the admitted exact bridge installed at its canonical path. link(2)
 // creates that path only when absent, so a concurrent destination is never
 // overwritten. dev/ino and exact content bind both hard links to the admitted

@@ -236,23 +236,40 @@ After reviewing that exact preview and only for the selected target worktree,
 repeat the same command with `--apply` to write the bridge-removal change that
 the PR will contain. The receipt alone does not merge or publish anything.
 
+That default command is a **freeze-bound receipt-only local cleanup**. It
+validates the receipt's canonical digest, local Git-origin route and cohort
+membership, canonical verifier/controller/CODEOWNERS bytes, and local bridge
+file-object boundaries at every local write boundary, but deliberately makes no
+GitHub API call. The resulting PR's exact-head v2 gate is the online
+enforcement. Do not use it to infer that a same-slug repository replacement,
+default-branch/ruleset/canary drift, or a new bypass actor would be detected.
+After the freeze, a relevant configuration change, or before another rollout,
+request a separate low-concurrency full audit.
+
+`--live-revalidate-final-closure` is an explicit, expensive compatibility path
+for one diagnostic cleanup only; it repeats the historical live organization
+and canary revalidation described below. Do not add it to normal batch consumer
+cleanup during a freeze. When it is explicitly requested, append the flag to
+both the preview and `--apply` command, and use it at low concurrency.
+
 The bootstrap boundary admits the receipt only for the bound active member.
 It does not authorize a source-local bridge, `codex-waited-delivery`, a subset,
 or a replacement repository. Treat each resulting PR as a normal
 control-plane change: obtain the required reviews, pass the v2 gate, and merge
 only after its current exact head is clean.
 
-The consumer independently enforces the same fixed ten-member identity cohort
-from the receipt's `full_name`, numeric `id`, `node_id`, and `default_branch`;
-a digest-valid receipt with a substituted but otherwise self-consistent cohort
-is not authority. For this post-cutover receipt format only, it also re-reads
+The receipt records the fixed ten-member identity cohort by `full_name`,
+numeric `id`, `node_id`, and `default_branch`. The default cleanup admits only
+the local Git-origin normalized slug's membership in the frozen, digest-bound
+receipt; it does not independently re-read remote numeric identity or default
+branch. In the explicit live-revalidation mode only, it also re-reads
 the receipt-bound organization identity, archive identity, exact retained
 legacy ruleset, and exact v2 ruleset details at proof admission and before
 every local mutation/removal-quarantine boundary. The receipt is complete
 historical/integrity evidence, but it is not a cryptographic authorization:
 both its file and expected digest are supplied by the bridge-removal caller.
-Before trusting its writable-policy hashes as drift detectors, the consumer
-independently anchors the live fixed Joey-Tools organization identity and both
+Before trusting its writable-policy hashes as drift detectors, that opt-in live
+path independently anchors the live fixed Joey-Tools organization identity and both
 known organization-policy shapes: active enforcement, no bypass actors, the
 exact selector, the retained legacy `deletion` and `non_fast_forward` rules,
 and one strict
@@ -261,13 +278,13 @@ and one strict
 unreadable detail, restored `codex/review-gate`, disabled or weakened v2, or
 any legacy/v2 policy drift leaves the bridge installed. The receipt does not
 carry a replayable repository-local ruleset-policy snapshot, so the consumer
-does not invent an unbound complete repository-policy hash comparison. It does
-  re-read the target default branch's classic required-status and effective-
+does not invent an unbound complete repository-policy hash comparison. In that
+  opt-in mode it re-reads the target default branch's classic required-status and effective-
   ruleset surfaces and requires that neither still requires
   `codex/review-gate`; the separate origin/live-repository identity/default-
   branch rebind continues to select the exact repository object. These are
   point-in-time checks at the listed boundaries, not a claim of a continuous
-  remote lock. At those same post-cutover-only boundaries, Q1 is one GitHub
+  remote lock. At those same opt-in live-revalidation boundaries, Q1 is one GitHub
   GraphQL repository observation that binds `nameWithOwner`, numeric database
   ID, node ID, unarchived state, default-branch name, and target OID together
   against the receipt. The consumer reads the complete remote workflow
@@ -284,8 +301,9 @@ mismatch leaves the bridge installed. Historical handoff-v2 proofs remain
 readable for audit only and are rejected as bridge-removal inputs because they
 contain no replayable current policy-and-canary authority.
 
-At the same boundary the consumer re-reads every receipt-bound canary PR, its
-protected-file inventory, CheckRun history, workflow run, workflow, and job.
+At the same opt-in live-revalidation boundary the consumer re-reads every
+receipt-bound canary PR, its protected-file inventory, CheckRun history,
+workflow run, workflow, and job.
 The PR may still be open or may be closed unmerged after the audit; a merged,
 draft, mismatched head/base/repository, or changed evidence fails closed. It
 does not rely on `run.pull_requests`, which GitHub may clear after a

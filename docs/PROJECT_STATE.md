@@ -36,15 +36,19 @@
 - Superseded v1 release automation history: `docs/project_journal/2026/05/2026-05-18-action-release-automation-9a806cf.md`
 
 ## Global Blockers
-- Temporary bridge removal for the frozen active 10-member cohort remains
-  blocked until the authorized post-cutover fresh-audit repair produces
-  a new receipt from fresh v2 canaries plus current exact policy and workflow
-  readback. It must retain equal manifest-derived and observed identity lists
-  and explicit `bypass_actors` arrays from every manifest-bound ruleset detail
-  read; a redacted/malformed bypass field requires a ruleset-write-capable
-  credential and a fresh read under the applicable freeze. It cannot authorize
-  removal of a source-local bridge outside that cohort or claim historical
-  activation evidence retroactively.
+- The approved post-cutover fresh-audit receipt for the active 10-member cohort
+  is retained outside this repository as canonical digest
+  `9a8b38f2188a14168423a07639d6662c87e198fe2dd12041f67fc224f363817e`.
+  During Joey's declared configuration freeze, consumer bridge removal uses it
+  only as a receipt-bound local cleanup authorization: it validates the receipt
+  schema/digest and local origin/cohort membership while preserving canonical
+  local workflow, CODEOWNERS, and file-object boundaries. It intentionally does
+  not reread GitHub rulesets, canaries, repository metadata, or bypass actors.
+  The resulting PR's exact-head v2 gate remains online enforcement. After the
+  freeze, a relevant configuration change, or before another rollout, request
+  a bounded fresh full audit; this path cannot discover later online drift or a
+  newly added bypass actor. It cannot authorize a source-local bridge outside
+  that cohort or claim historical activation evidence retroactively.
 - The source repository's v1 required-status transition is complete: its
   independent local ruleset `16410326` no longer requires
   `codex/review-gate`, while Active status-only v2 ruleset `23927388` and every
@@ -66,9 +70,10 @@
   `manifest_repositories` list and the stable observed `repositories` list;
   canonical entry-by-entry equality is required. It is immutable historical
   audit evidence, not a bridge-removal authority. Only a fresh post-cutover
-  audit/v1 receipt may authorize a consumer bridge deletion after its live
-  policy and canary evidence have been re-read at each mutation boundary. In
-  this rollout, either historical list rejects
+  audit/v1 receipt may authorize a consumer bridge deletion; under the declared
+  freeze its consumer path is receipt-only local cleanup, while a later full
+  audit is required to re-establish live policy/canary evidence. In this
+  rollout, either historical list rejects
   `Joey-Tools/codex-waited-delivery` by slug, ID, or node ID. Schema-1 keeps
   its historical exact shape and canonical digest for audit but authorizes no
   new bridge removal.

@@ -3,8 +3,8 @@ id: 20260918-organization-v2-handoff
 title: Organization v2 Cohort Handoff
 status: active
 created: 2026-09-18
-updated: 2026-09-27
-branch: wip/postcutover-audit-contract-repair
+updated: 2026-09-29
+branch: wip/frozen-receipt-local-cleanup
 pr:
 supersedes: []
 superseded_by:
@@ -96,16 +96,24 @@ superseded_by:
   for audit, but it cannot authorize a new consumer mutation. It lacks a
   replayable, current policy-and-canary authority after cutover.
 - Removal of each temporary bridge is a later, separate PR phase authorized
-  only by `organization-review-gate-post-cutover-audit-output/v1`. That fresh
-  audit binds the fixed active 10-member cohort, current strict v2 and retained
-  legacy organization policy, and a newly created v2 canary for every member.
-  Before every local destructive boundary, a consumer re-reads its own exact
-  canary PR, CheckRun, Actions run/workflow/job, archive identity, organization
-  rules, default-branch control plane, and `origin` binding. It fails closed on
-  a changed or unreadable selected object. The consumer accepts either current
-  canonical workflow bytes or the single fixed frozen handoff inventory, then
-  normalizes the latter locally; it does not accept caller-supplied historical
-  equivalence.
+  only by `organization-review-gate-post-cutover-audit-output/v1`. The fresh
+  audit binds the fixed active 10-member cohort, strict v2 and retained legacy
+  organization policy, and one v2 canary for every member at its evidence time.
+  During the explicitly declared configuration freeze, its default consumer is a
+  freeze-bound receipt-only local cleanup: it validates receipt schema/digest,
+  local origin slug/cohort membership, canonical workflow/CODEOWNERS bytes, and
+  local object/content boundaries, but intentionally performs no GitHub API
+  reads at local deletion boundaries. It cannot detect later online ruleset,
+  canary, same-slug repository, default-branch, or bypass-actor drift. The
+  resulting PR's exact-head v2 required check remains the online merge gate;
+  after the freeze, a relevant configuration change, or another rollout, a
+  bounded full online audit and fresh receipt are required. The separately
+  requested `--live-revalidate-final-closure` compatibility mode remains only
+  for one low-concurrency diagnostic cleanup; it is not batch behavior and does
+  not replace that fresh audit. The consumer accepts
+  either current canonical workflow bytes or the single fixed frozen handoff
+  inventory, then normalizes the latter locally; it does not accept
+  caller-supplied historical equivalence.
 
 ## Current State
 
@@ -1448,9 +1456,9 @@ evidence that a prior freeze remains in force.
 - The replacement PR's live CI then confirmed a liveness cost in the old
   source matrix: both all-in-one non-Release `core` legs passed, but took
   roughly fifteen and sixteen minutes on Node 20 and Node 24 respectively.
-  The slow path was the serialized 163-case bootstrap suite. Per Joey's
+  The slow path was the serialized 164-case bootstrap suite. Per Joey's
   approved multi-runner strategy, each Node version now has four bootstrap
-  shards with a sealed 41/41/41/40 registration partition, one explicit
+  shards with a sealed 41/41/41/41 registration partition, one explicit
   non-Release core inventory, and the existing four sealed Release shards.
   Every leg has a fourteen-minute timeout and there is no aggregate result
   that could hide a failed matrix member. The workflow contract proves that
@@ -1460,13 +1468,45 @@ evidence that a prior freeze remains in force.
   also forbids direct `nodeTest` registrations, so a future test cannot run
   outside the four-way partition while leaving the ordinal count unchanged.
 
+## Execution Update — 2026-09-29 (freeze-bound receipt-only consumer cleanup)
+
+- Joey confirmed that the organization configuration is frozen while the
+  remaining active-cohort bridge-removal PRs are completed. The previously
+  approved post-cutover audit receipt is therefore treated as a frozen
+  authorization boundary rather than repeatedly regenerated online evidence.
+- The default consumer `--remove-legacy-bridge` path now validates the admitted receipt
+  schema and canonical digest, local Git origin slug/cohort membership, exact
+  canonical bridge bytes, current verifier/controller/CODEOWNERS bytes, and
+  local object identity/content through quarantine and no-clobber restoration.
+  In that default freeze-bound mode, it makes no `gh api` request for admission,
+  dry-run, apply, no-op, or the quarantine/unlink checkpoints.
+- This is a deliberate operational scope reduction, not a claim of stronger
+  atomicity. The path does not automatically discover a later online ruleset,
+  canary, default-branch, same-slug repository replacement, or additional
+  bypass actor. The exact-head v2 PR gate supplies online enforcement. A
+  bounded full audit is deferred until the freeze ends, relevant configuration
+  changes, or another rollout requires current online evidence.
+- The helper retains `--live-revalidate-final-closure` as an explicit
+  compatibility path for one low-concurrency diagnostic cleanup. It preserves
+  the former full live organization/canary revalidation but is prohibited for
+  batch cleanup and cannot replace the separate fresh post-cutover audit that
+  mints a new receipt.
+- The bootstrap test inventory is now 164 tests, evenly partitioned as 41 per
+  shard. Local validation passed `npm run check`, all four bootstrap shards,
+  the shard-registration contract, `git diff --check`, and project-journal
+  validation; the new default-path regression proves zero `gh api` calls and
+  no-clobber restoration of the same admitted file object after a local origin
+  retarget at the post-quarantine boundary.
+- The source self-hosting bridge lifecycle is unchanged: it remains a separate
+  authority domain with its own live-rebind contract and is not widened by this
+  consumer-only change.
+
 ## Next Steps
 
-1. Keep the temporary legacy bridges installed. Before any active-cohort
-   bridge-removal PR, use a ruleset-write-capable credential to mint a fresh
-   post-cutover audit proof against the now-cut-over state using the merged
-   repair. Historical schema-2 output is audit-only and cannot authorize a
-   source-local or active-cohort bridge deletion.
+1. Complete the remaining active-cohort bridge-removal PRs using the approved
+   freeze-bound receipt-only local cleanup. Do not apply that receipt to the
+   source-local bridge domain or to `codex-waited-delivery`; historical schema-2
+   output remains audit-only and cannot authorize either deletion path.
 2. Treat the cohort v1 status transition as complete: do not restore
    `codex/review-gate` in the old organization rule or on any fixed active
    cohort repository. The old organization ruleset intentionally remains Active
@@ -1480,10 +1520,14 @@ evidence that a prior freeze remains in force.
    and a fresh live rebind; do not rerun that historical lifecycle against the
    current source default branch. The organization closure receipt still cannot
    authorize a source-local bridge operation.
-4. If a durable provenance record is needed, investigate the observed v2
+4. When the freeze ends, relevant configuration changes, or another rollout
+   begins, run one bounded full online audit and mint a fresh receipt before
+   claiming current organization/canary/bypass evidence. Do not infer that the
+   local cleanup discovered online drift.
+5. If a durable provenance record is needed, investigate the observed v2
    activation separately; it is not required for the currently verified policy
    state and was intentionally deferred by the switch-first decision.
-5. Treat a future deliberate source bridge reintroduction as a new workstream:
+6. Treat a future deliberate source bridge reintroduction as a new workstream:
    it must not reuse this historical receipt, canary, or approval. The canonical
    template and active-cohort bridge lifecycle remain separate from the completed
    source exception.
