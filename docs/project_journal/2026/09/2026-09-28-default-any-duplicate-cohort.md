@@ -1,11 +1,11 @@
 ---
 id: 20260928-default-any-duplicate-cohort
 title: Default-Any Duplicate Cohort Recovery
-status: active
+status: completed
 created: 2026-09-28
 updated: 2026-09-28
 branch: wip/default-any-duplicate-cohort-v212
-pr:
+pr: 86
 supersedes: []
 superseded_by:
 ---
@@ -94,10 +94,16 @@ superseded_by:
 - The broader current-head/default-any and finding-blocking tests remain part
   of the local validation gate before this branch is reviewed and merged.
 
-## Next Steps
+## Completed Outcome
 
-- Deliver this as an independent clean patch PR from current `master`.
-- After merge, the already-frozen `v2.1.2` release intent becomes eligible for
-  staged publisher approval. Until that protected release completes, `v2`
-  remains at `v2.1.1`. Do not replay or dispatch the already completed
-  `v2.1.1` admission.
+- PR #86 merged as `6599dbdae6e6fa4141915889d716c3c7584242da` after the
+  exact-head v2 verifier, GitHub Codex review, and all 21 PR checks passed.
+- Protected release run `36446478100` built two byte-identical candidates,
+  completed every frozen-source validation shard and credential-free
+  publication plan, then published and publicly verified
+  [`v2.1.2`](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.2).
+- The immutable `v2.1.2` tag and floating `v2` alias both peel to action
+  commit `e767d516f55e04d314392de9c57886299764d7bc`. Their GitHub signature
+  verification passed, and the public `release-provenance.json` detached
+  signature verified with signing subkey
+  `4DD48552DDEAF6D961769DD4A49827EC48984E2C`.
