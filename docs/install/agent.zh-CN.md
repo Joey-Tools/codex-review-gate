@@ -1107,7 +1107,10 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
 
 可选的自动请求路径让 canonical `pull_request` verifier 保持只读，并通过现有受保护的
 controller workflow，在 canonical verifier 首次 attempt 失败后的 `workflow_run` 事件上运行。
-重跑旧 verifier attempt 不会启动此路径。公开仓库的
+重跑旧 verifier attempt 不会启动此路径。应在 `on.workflow_run.workflows` 使用静态 verifier
+workflow name 订阅，而不要在 job 条件里将 `workflow_run.name` 与静态名称比较：verifier 的
+`run-name` 会使每次 run 的 name 动态变化。Action 仍校验 canonical workflow ID、path、run 和
+PR scope。公开仓库的
 policy 不允许使用可写的 `pull_request_target` handler。controller 只接受 open、ready
 （非 draft）、same-repository、base 指向当前 default branch 的 PR；失败的 verifier 必须
 绑定其当前 exact head，且不能已有 matching canonical request，包括先前 controller run 中与

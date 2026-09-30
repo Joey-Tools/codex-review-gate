@@ -191,7 +191,6 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
       github.event_name == 'workflow_run' &&
       vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' &&
       github.event.action == 'completed' &&
-      github.event.workflow_run.name == 'Codex Review Gate Verifier' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.run_attempt == 1 &&
       github.event.workflow_run.conclusion == 'failure' &&

@@ -181,7 +181,6 @@ test("canonical controller starts runners only for dispatches, Codex comments, o
     "github.event_name == 'workflow_run'",
     "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
     "github.event.action == 'completed'",
-    "github.event.workflow_run.name == 'Codex Review Gate Verifier'",
     "github.event.workflow_run.event == 'pull_request'",
     "github.event.workflow_run.run_attempt == 1",
     "github.event.workflow_run.conclusion == 'failure'",
@@ -190,6 +189,7 @@ test("canonical controller starts runners only for dispatches, Codex comments, o
   ]) {
     assert.ok(templateController.includes(required), `missing auto-request filter: ${required}`);
   }
+  assert.doesNotMatch(templateController, /github\.event\.workflow_run\.name/u);
 
   const jobIfCount = templateController.match(/^    if:/gmu)?.length ?? 0;
   assert.equal(jobIfCount, 1);

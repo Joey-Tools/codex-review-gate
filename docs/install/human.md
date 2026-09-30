@@ -111,6 +111,10 @@ boundaries that an Action step cannot define:
   cannot post a request, but case variants such as `TRUE` can pass GitHub
   Actions' case-insensitive job condition and allocate a controller runner;
   the runtime's exact-value check then rejects them before any request POST.
+  The `workflow_run.workflows` subscription selects the verifier's static
+  workflow name; the controller must not compare `workflow_run.name` with that
+  name because the verifier's `run-name` makes individual run names dynamic.
+  Runtime still verifies the canonical workflow ID, path, run, and PR scope.
   An authorized request also requires a verified canonical source run and a
   fresh same-repository, open, non-draft PR targeting the current default
   branch, still on the source run's current head, and no matching canonical

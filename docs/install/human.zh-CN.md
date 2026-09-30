@@ -87,7 +87,9 @@ uses: JoeyTeng/codex-review-gate-action@v2
   failure，且只用于自动创建 request。只有字面量 `true` 才授权创建 request；变量未设置时，
   此路径默认不启动。其他值不能发送 request，但 `TRUE` 等大小写变体可能通过 GitHub Actions
   不区分大小写的 job 条件并分配 controller runner；运行时的精确值检查会在任何 request POST 前
-  拒绝它们。它必须验证来源是 canonical run，并重新读取 same-repository、open、
+  拒绝它们。`workflow_run.workflows` 订阅使用 verifier 的静态 workflow name；verifier 的
+  `run-name` 会使单次 run name 动态变化，因此 controller 不再将 `workflow_run.name` 与静态名称
+  比较。运行时仍会校验 canonical workflow ID、path、run 和 PR scope。它必须验证来源是 canonical run，并重新读取 same-repository、open、
   non-draft、target 为当前 default branch 的 PR，确认仍位于 source run 的 current head，且
   不存在匹配的 canonical request。由 `opened`、`reopened`、`synchronize` 或
   `ready_for_review` 启动的 verifier 失败后都可能触发此路径。此路径不会立即 rerun verifier；

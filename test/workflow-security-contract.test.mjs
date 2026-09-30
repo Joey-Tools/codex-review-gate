@@ -154,7 +154,6 @@ const CLOSED_JOB_IF = [
   "github.event_name == 'workflow_run' &&",
   "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' &&",
   "github.event.action == 'completed' &&",
-  "github.event.workflow_run.name == 'Codex Review Gate Verifier' &&",
   "github.event.workflow_run.event == 'pull_request' &&",
   "github.event.workflow_run.run_attempt == 1 &&",
   "github.event.workflow_run.conclusion == 'failure' &&",
@@ -268,7 +267,6 @@ test("automatic runner admission separates read-only PR verification from opted-
     "github.event.comment.user.type == 'Bot'",
     "github.event_name == 'workflow_run'",
     "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
-    "github.event.workflow_run.name == 'Codex Review Gate Verifier'",
     "github.event.workflow_run.event == 'pull_request'",
     "github.event.workflow_run.run_attempt == 1",
     "github.event.workflow_run.conclusion == 'failure'",
@@ -277,6 +275,7 @@ test("automatic runner admission separates read-only PR verification from opted-
   ]) {
     assert.ok(jobIf.includes(expression), `missing pre-runner filter: ${expression}`);
   }
+  assert.doesNotMatch(jobIf, /github\.event\.workflow_run\.name/u);
 });
 
 test("controller forwards the raw auto-request variable for strict runtime admission", () => {
