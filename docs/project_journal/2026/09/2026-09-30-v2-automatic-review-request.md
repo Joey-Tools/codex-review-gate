@@ -61,9 +61,11 @@ superseded_by:
 1. Implement, validate, review, and merge the Action runtime, canonical
    controller template, installer contract, tests, and documentation without
    changing the release manifest.
-2. Submit a separate reviewed release-intent PR for the next compatible v2
-   version, publish with the existing Environment approval boundary, and
-   verify the floating `v2` alias points to the released runtime.
+2. The separate release intent selects Action `v2.1.4` after the dynamic
+   verifier run-name fix (#93), advancing the manifest from `v2.1.3` without
+   changing publisher controls. Publish through the existing Environment
+   approval boundary, then verify the floating `v2` alias points to the
+   released runtime.
 3. Update the canonical controller workflow in all fifteen previously
    installed, non-archived Joey-Tools repositories. Keep the variable unset,
    so the new job has no runner or write effect during installation.
