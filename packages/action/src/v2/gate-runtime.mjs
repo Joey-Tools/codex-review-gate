@@ -1484,6 +1484,28 @@ async function runV2Verifier(client, config, context, {
   }
   assertV2VerifierLaunchScope(config, initialPr);
   context.headValidated = true;
+  const verifierRun = await loadExactV2VerifierRun(
+    client,
+    config,
+    initialPr,
+    config.runId,
+    new V2SnapshotBudget(config),
+  );
+  if (
+    !isCanonicalUtcTimestamp(verifierRun.created_at) ||
+    verifierRun.repository?.id !== repository.id ||
+    verifierRun.repository?.full_name !== config.repository ||
+    verifierRun.head_repository?.id !== repository.id ||
+    verifierRun.head_repository?.full_name !== config.repository ||
+    verifierRun.head_branch !== initialPr.head.ref
+  ) {
+    throw new V2RuntimeFailure(
+      `Verifier workflow run ${config.runId} has no trustworthy creation boundary`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  config.verifierRunCreatedAt = verifierRun.created_at;
+  config.verifierRunCreatedMs = Date.parse(verifierRun.created_at);
   return runV2Reconcile(client, config, context, {
     sleep,
     now,
@@ -3339,6 +3361,10 @@ async function loadCompleteV2Snapshot(client, config, {
     sameV2InventoryCounts(before, after) &&
     opening.fingerprint === closing.fingerprint;
   const fingerprintPayload = {
+    verifierRun: {
+      id: config.runId,
+      createdAt: config.verifierRunCreatedAt,
+    },
     repository: {
       opening: fingerprintV2RepositoryScope(beforeRepository),
       closing: fingerprintV2RepositoryScope(afterRepository),
@@ -3641,6 +3667,7 @@ async function loadV2DecisionCarriers(
     baseSha,
     baseRef: pullRequest.base.ref,
     baseRepositoryId: String(pullRequest.base.repo.id),
+    verifierRunCreatedMs: config.verifierRunCreatedMs,
   });
   const decisionEvidence = reduceV2Evidence({
     headSha,
@@ -3655,6 +3682,8 @@ async function loadV2DecisionCarriers(
     artifacts: providerEvidence.artifacts,
     providerErrors: providerEvidence.errors,
     deletedCommentEvents,
+    headCleanRecovery: effectiveRequestAuthority.headCleanRecovery,
+    verifierRunCreatedMs: config.verifierRunCreatedMs,
   });
   const carrierPayload = {
     headSha,
@@ -3724,6 +3753,8 @@ function reduceV2Evidence({
   artifacts,
   providerErrors,
   deletedCommentEvents,
+  headCleanRecovery,
+  verifierRunCreatedMs,
 }) {
   const deletedBoundaries = (deletedCommentEvents ?? []).map(v2DeletedCommentBoundary);
   const scopedErrors = [
@@ -3920,13 +3951,30 @@ function reduceV2Evidence({
     livenessFloorMs: baseEpochMs,
     allowProviderTerminalFirstGapClosure: baseEpochMs === null,
   });
+  generationLineage.headCleanRecovery = headCleanRecovery;
   const sameTimeConflicts = findCrossChannelTimestampConflicts(currentArtifacts);
   for (const conflict of sameTimeConflicts) {
     scopedErrors.push(normalizeV2EvidenceError(conflict));
     indeterminate += 1;
   }
+  const hasPreRunCurrentHeadClean = currentHeadTerminalArtifacts.some((artifact) =>
+    artifact.kind === "clean" &&
+    artifact.source === "issue-comment" &&
+    Number.isFinite(verifierRunCreatedMs) &&
+    Date.parse(artifact.createdAt) <= verifierRunCreatedMs
+  );
   const positiveCleans = currentArtifacts.filter((artifact) =>
     artifact.kind === "clean" &&
+    (
+      artifact.source !== "issue-comment" ||
+      !Number.isFinite(verifierRunCreatedMs) ||
+      Date.parse(artifact.createdAt) > verifierRunCreatedMs
+    ) &&
+    (
+      artifact.source === "request-reaction" ||
+      !hasPreRunCurrentHeadClean ||
+      requestEpoch.selected?.revisionMs > verifierRunCreatedMs
+    ) &&
     (
       baseEpochMs === null ||
       (
@@ -4033,10 +4081,14 @@ function reduceV2Evidence({
   };
   const latestPhysicalBoundary = generationLineage.generations.at(-1) ?? null;
   const latestBoundaryCannotBeContinued = latestPhysicalBoundary !== null &&
-    latestPhysicalBoundary.authorized !== true;
+    latestPhysicalBoundary.authorized !== true &&
+    latestPhysicalBoundary.physicalOnlyReason !== "post-run-unconfirmed-review-request";
   const requiresReplacementPr =
     generationLineage.gapClosures.some((closure) => closure === null) ||
     latestBoundaryCannotBeContinued;
+  const waitingForPostRunClean =
+    latestPhysicalBoundary?.physicalOnlyReason === "post-run-unconfirmed-review-request" &&
+    generationLineage.gapClosures.every((closure) => closure !== null);
 
   let decision;
   if (counts.unresolved > 0) {
@@ -4081,6 +4133,22 @@ function reduceV2Evidence({
         "A current-head Codex terminal clean exists after the base epoch, but it cannot be " +
         "attributed to the latest exact head/base-bound canonical request; obtain a qualifying " +
         "Codex +1 reaction on that request, then run manual reconcile",
+      recoveryCode: "request_clean_generation",
+    };
+  } else if (waitingForPostRunClean) {
+    decision = {
+      gateOutcome: "pending",
+      reason:
+        "A new @codex review request exists after this verifier run, but no qualifying " +
+        "new current-head terminal clean follows it; wait for Codex, then reconcile",
+      recoveryCode: "wait_provider",
+    };
+  } else if (hasPreRunCurrentHeadClean) {
+    decision = {
+      gateOutcome: "pending",
+      reason:
+        "The current-head Codex clean predates this verifier run; post a new independent " +
+        "@codex review comment, wait for a new current-head terminal clean, then reconcile",
       recoveryCode: "request_clean_generation",
     };
   } else {
@@ -4180,6 +4248,7 @@ function confirmV2DefaultAnyRequestCandidates({
   baseSha,
   baseRef,
   baseRepositoryId,
+  verifierRunCreatedMs,
 }) {
   const confirmedIds = new Set();
   const receiptBoundaryIds = new Set();
@@ -4228,21 +4297,161 @@ function confirmV2DefaultAnyRequestCandidates({
       confirmedIds.add(request.id);
     }
   }
+  const headCleanRecovery = selectV2PostRunHeadCleanRecovery({
+    authorized,
+    physicalBoundaries,
+    baseEpoch,
+    providerArtifacts,
+    providerErrors,
+    opaqueTopLevelProviderActivities,
+    confirmedIds,
+    headSha,
+    baseSha,
+    baseRef,
+    baseRepositoryId,
+    verifierRunCreatedMs,
+  });
+  if (headCleanRecovery) confirmedIds.add(headCleanRecovery.requestId);
   const include = (request) =>
     request?.requiresProviderConfirmation !== true || confirmedIds.has(request.id);
   return {
+    headCleanRecovery,
     authorized: (authorized ?? []).filter(include),
     boundaries: (boundaries ?? []).flatMap((request) => {
       if (suppressedBoundaryIds.has(request?.id)) return [];
       if (include(request)) return [request];
-      if (!receiptBoundaryIds.has(request?.id)) return [];
+      if (
+        !receiptBoundaryIds.has(request?.id) &&
+        !isV2PostRunOrdinaryPhysicalBoundary(
+          request,
+          physicalBoundaries,
+          baseEpoch,
+          verifierRunCreatedMs,
+        )
+      ) return [];
       return [{
         ...request,
         authorized: false,
         permission: "physical-only",
-        physicalOnlyReason: "ambiguous-terminal-clean-receipt",
+        physicalOnlyReason: receiptBoundaryIds.has(request?.id)
+          ? "ambiguous-terminal-clean-receipt"
+          : "post-run-unconfirmed-review-request",
       }];
     }),
+  };
+}
+
+function isV2PostRunOrdinaryPhysicalBoundary(
+  request,
+  physicalBoundaries,
+  baseEpoch,
+  verifierRunCreatedMs,
+) {
+  return Number.isFinite(verifierRunCreatedMs) &&
+    (baseEpoch?.event === null || baseEpoch?.event === undefined) &&
+    Number.isFinite(request?.revisionMs) &&
+    request.revisionMs > verifierRunCreatedMs &&
+    (physicalBoundaries ?? []).some((prior) =>
+      prior.id !== request.id &&
+      Number.isFinite(prior.revisionMs) &&
+      prior.revisionMs < request.revisionMs
+    ) &&
+    request.headBound !== true &&
+    isExactV2OrdinaryReviewRequestBody(request.comment?.body) &&
+    !hasV2ObservedIssueCommentEdit(request.comment);
+}
+
+function selectV2PostRunHeadCleanRecovery({
+  authorized,
+  physicalBoundaries,
+  baseEpoch,
+  providerArtifacts,
+  providerErrors,
+  opaqueTopLevelProviderActivities,
+  confirmedIds,
+  headSha,
+  baseSha,
+  baseRef,
+  baseRepositoryId,
+  verifierRunCreatedMs,
+}) {
+  // A pre-run terminal can settle the first generation, but must never pass
+  // the newly created verifier by itself. The second ordinary request and its
+  // separate post-request clean are a narrow recovery path, not proof that
+  // Codex causally attributed the latter carrier to that specific request.
+  if (
+    !Number.isFinite(verifierRunCreatedMs) ||
+    (baseEpoch?.event !== null && baseEpoch?.event !== undefined) ||
+    (providerErrors ?? []).length > 0 ||
+    (physicalBoundaries ?? []).some((boundary) => !Number.isFinite(boundary?.revisionMs))
+  ) {
+    return null;
+  }
+  const physical = [...(physicalBoundaries ?? [])]
+    .sort((left, right) =>
+      left.revisionMs - right.revisionMs ||
+      compareV2LineageBoundaryIdsAscending(left, right)
+    );
+  if (physical.length !== 2) return null;
+  const [prior, recovery] = physical;
+  const authorizedIds = new Set((authorized ?? []).map((request) => request.id));
+  const comment = recovery.comment;
+  if (
+    !authorizedIds.has(prior.id) ||
+    !confirmedIds.has(prior.id) ||
+    (
+      prior.headBound === true &&
+      (
+        prior.binding?.headSha !== headSha ||
+        prior.binding?.baseSha !== baseSha ||
+        prior.binding?.baseRef !== baseRef ||
+        prior.binding?.baseRepositoryId !== baseRepositoryId
+      )
+    ) ||
+    !authorizedIds.has(recovery.id) ||
+    recovery.authorized !== true ||
+    recovery.headBound === true ||
+    recovery.binding !== null ||
+    !isExactV2OrdinaryReviewRequestBody(comment?.body) ||
+    comment?.user?.type !== "User" ||
+    typeof comment?.user?.login !== "string" ||
+    comment.user.login.trim() === "" ||
+    hasV2ObservedIssueCommentEdit(comment) ||
+    !isCanonicalUtcTimestamp(comment?.created_at) ||
+    !isCanonicalUtcTimestamp(comment?.updated_at) ||
+    Date.parse(comment.created_at) !== recovery.revisionMs ||
+    Date.parse(comment.updated_at) !== recovery.revisionMs ||
+    prior.revisionMs >= verifierRunCreatedMs ||
+    recovery.revisionMs <= verifierRunCreatedMs
+  ) {
+    return null;
+  }
+  const receipts = (providerArtifacts ?? [])
+    .filter((artifact) =>
+      isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(artifact, headSha)
+    )
+    .map((artifact) => ({ artifact, window: v2ProviderActivityWindow(artifact) }));
+  const priorCleans = receipts.filter(({ window }) =>
+    window.carrierCreatedMs > prior.revisionMs &&
+    window.carrierCreatedMs <= verifierRunCreatedMs
+  );
+  const recoveryCleans = receipts.filter(({ window }) =>
+    window.carrierCreatedMs > recovery.revisionMs
+  );
+  if (priorCleans.length !== 1 || recoveryCleans.length !== 1) return null;
+  const priorCleanMs = priorCleans[0].window.carrierCreatedMs;
+  if ((opaqueTopLevelProviderActivities ?? []).some((activity) => {
+    const window = v2ProviderActivityWindow(activity);
+    return !window || window.revisionMs >= priorCleanMs;
+  })) {
+    return null;
+  }
+  return {
+    priorRequestId: prior.id,
+    priorCleanId: priorCleans[0].artifact.id,
+    priorCleanMs,
+    requestId: recovery.id,
+    cleanId: recoveryCleans[0].artifact.id,
   };
 }
 
@@ -4576,6 +4785,10 @@ function findV2SupersedingGenerationClean({
     .sort(compareV2RequestEpochNewestFirst);
   for (const generation of generations) {
     const clean = currentCleans.find((candidate) =>
+      !(
+        candidate.source === "issue-comment" &&
+        candidate.id === generationLineage.headCleanRecovery?.cleanId
+      ) &&
       (!evidenceHeadSha || candidate.headSha === evidenceHeadSha) &&
       Date.parse(candidate.createdAt) > generation.revisionMs &&
       isV2QualifyingCleanForGeneration(
@@ -4621,6 +4834,15 @@ function isV2QualifyingCleanForGeneration(
     generationId: generation.id,
     beforeMs: cleanMs,
     floorMs: generationLineage.livenessFloorMs,
+    settledPriorEyes:
+      clean.source === "issue-comment" &&
+      clean.id === generationLineage.headCleanRecovery?.cleanId &&
+      generation.id === generationLineage.headCleanRecovery?.requestId
+        ? {
+            requestId: generationLineage.headCleanRecovery.priorRequestId,
+            beforeMs: generationLineage.headCleanRecovery.priorCleanMs,
+          }
+        : null,
   });
   const laterProviderActivity = hasV2ProviderActivityInClosedWindow({
     activities: generationLineage.providerActivities,
@@ -4685,6 +4907,21 @@ function v2CleanLineageError({
   }
   if (clean.source !== "request-reaction" && generationIndex > 0) {
     const predecessor = generationLineage.generations[generationIndex - 1];
+    const recovery = generationLineage.headCleanRecovery;
+    const closure = generationLineage.gapClosures[generationIndex - 1];
+    if (
+      generationIndex === 1 &&
+      generationLineage.generations.length === 2 &&
+      recovery?.priorRequestId === predecessor.id &&
+      recovery.requestId === generation.id &&
+      recovery.cleanId === clean.id &&
+      clean.source === "issue-comment" &&
+      closure?.kind === "provider-terminal" &&
+      closure.source === "issue-comment" &&
+      closure.id === recovery.priorCleanId
+    ) {
+      return null;
+    }
     return (
       `Terminal clean ${clean.source}:${clean.id} cannot be uniquely attributed to review request ` +
       `${generation.id}: earlier physical request ${predecessor.id} can emit delayed or duplicate ` +
@@ -4913,6 +5150,7 @@ function hasV2UnsettledOfficialEyesOnOtherRequests({
   generationId,
   beforeMs,
   floorMs = null,
+  settledPriorEyes = null,
 }) {
   const canonicalReactionIdCounts = new Map();
   for (const reactions of requestReactions?.values() ?? []) {
@@ -4954,6 +5192,10 @@ function hasV2UnsettledOfficialEyesOnOtherRequests({
       content === "eyes" &&
       createdMs >= lowerBoundMs &&
       createdMs < beforeMs &&
+      !(
+        String(requestId) === settledPriorEyes?.requestId &&
+        createdMs < settledPriorEyes.beforeMs
+      ) &&
       !plusOneTimes.some((plusOneMs) => plusOneMs > createdMs)
     );
     if (hasUnsettledEyes) return true;
@@ -5530,8 +5772,8 @@ async function collectV2ProviderEvidence(
     } else {
       // Keep unrecognized official activity out of the general reducer: it
       // cannot be positive terminal evidence or generic liveness. The narrow
-      // duplicate-cohort recovery uses this window only to avoid attributing a
-      // later clean to a raw pair whose earlier provider carrier is opaque.
+      // duplicate-cohort and post-run clean recovery paths inspect its window
+      // before attributing a later clean to a request generation.
       opaqueTopLevelProviderActivities.push({
         source: "issue-comment",
         id: String(comment.id),

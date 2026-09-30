@@ -59,6 +59,11 @@ GitHub.com/default-branch PR scope 时停止。
   将来可读取 collaborator permission 的 nonstandard verifier identity。
 - 每次调用 bootstrap 都显式保留同一个 `CONTROL_PLANE_OWNER`。默认值是
   `@JoeyTeng`；非 Joey 仓库必须替换成自己的合格 GitHub user。
+- 在采用需要读取自身 `pull_request` Actions run 的 GitHub-server `created_at` 的
+  floating `v2` runtime 前，要求 canonical read-only verifier 配有
+  `actions: read`。Private repository 缺少此权限时 self-run API 读取失败。
+  须在 release 前升级已安装 consumer workflow；不能使用 Git commit date 或近似
+  event time 代替。
 
 ## 已完成 cutover 的 fresh audit
 
@@ -1280,7 +1285,10 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    合格 `issue_comment` `created` event 才启动 controller workflow。编辑既有 comment 不会启动它，
    需要重新评估时手动 reconcile。Review 或 reaction 本身没有自动 consumer job。把这个
    direct comment 只当作 candidate，直到 official Codex Bot 在同一条 comment 上直接添加
-   严格 post-revision 的 `eyes` 或 `+1` reaction；PR 其他位置的 terminal 不能代替该 receipt。
+   严格 post-revision 的 `eyes` 或 `+1` reaction。PR 其他位置的 terminal 不是通用
+   替代品；只有另行限定的 no-base-epoch first-generation receipt 与 current-head
+   clean recovery（恢复早于本次 verifier run 的同 head clean 的狭窄路径）才能接受
+   严格匹配的顶层 clean。
 
    ### Dual-protection legacy-status recovery
 
@@ -1451,7 +1459,8 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    把每条物理 request（未确认 default-`any` ordinary candidate 除外）都视为 generation
    boundary。没有 base epoch 时，unbound provider terminal evidence 只能闭合第一个 gap；
    只要前面已有物理 request，之后的每个 gap 和 positive/superseding authority 都必须来自
-   直接附着在对应 canonical request 上的合格 `+1`。有 base epoch 时，每个 gap 都必须使用
+   直接附着在对应 canonical request 上的合格 `+1`，唯一相关例外是下文精确限定的
+   两条 boundary 的 current-head clean recovery。有 base epoch 时，每个 gap 都必须使用
    direct `+1`。绝不能只按 timestamp 把
    later terminal 归给新 generation；它可能是旧 flight 的延迟或重复 carrier。每条可能
    触发 provider 的 request shape 都是物理 boundary，即使它 edited、malformed、
@@ -1468,6 +1477,27 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    当前 exact scope 已有成功 verifier，而 caller 需要 deliberate same-head re-review，
    先执行第 4 步 `begin-review` 并要求严格更新的 verifier attempt。不能依靠 direct
    comment 原子化地使旧 success 失效。
+
+   若 pending verifier 的 current head 已有 clean，先通过
+   `GET /repos/{owner}/{repo}/actions/runs/{run_id}` 读取本次 exact
+   `pull_request` verifier run，并要求 GitHub-server `created_at`。它是保守
+   cutoff，不是精确 `synchronize` timestamp；绝不能回退到 Git commit date 或近似
+   event time。若 official、未编辑、绑定 current head 的顶层 issue-comment clean
+   `C0` 不晚于该 cutoff，`C0` 单独不能 pass。狭窄恢复只在没有 base epoch、恰好一条
+   较早 authorised request `R0`（ordinary 或 canonical）的 first-generation gap
+   已由 `C0` 闭合、且没有其他相关 physical boundary 或未闭合 gap 时可用。确认没有
+   active automatic/controller request producer 后，复用第 3 步的 direct issue-comment
+   POST，新建一条**独立**、exact、未编辑的 ordinary `@codex review` request `R1`；
+   不得编辑 `R0` 或以 `begin-review` 代替。读回 `R1`，证明其 `created_at` 和
+   `updated_at` 都严格晚于 run cutoff。再等待一条严格晚于 `R1` 的新 official、
+   未编辑、绑定 current head 的顶层 issue-comment terminal clean `C1`
+   （`C1.created_at > R1.updated_at`），且其后没有
+   boundary；inline-parent review 不合格。单独的 comment 不证明 provider 已启动，
+   timestamp 加 SHA 也不证明因果来源。必须重新运行同一 run ID 的 exact-head verifier，
+   并保留所有
+   已知 finding、provider error、liveness、exact-refetch 和两轮稳定 snapshot 检查。
+   无法证明这些条件时，此例外不可用；按 summary 指示走普通 request-bound `+1`
+   或 replacement-PR 路径。新的 PR 事件会创建新 cutoff，不保证 `R1/C1` 可复用。
 
    若 base retarget 后 current exact head/base/test-merge scope 没有 verifier，按
    `create_verifier_run` 恢复：ready PR 先转 draft 再标记 ready；already-draft PR 直接标记
@@ -1491,7 +1521,8 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
      request，也不能依赖仅修改 commit 来 reset。应从目标 branch/commits 新建 replacement
      PR，只运行一个 canonical producer；验证通过后关闭旧歧义 PR。
 
-   在这些 mode 中，later terminal clean 不能证明 request/base lineage，不得视为 pass；
+   除上文精确限定的 current-head clean recovery 外，在这些 mode 中，later terminal
+   clean 不能证明 request/base lineage，不得视为 pass；
    findings 仍始终阻塞。
 
 4. 只有 controller 必须协调 fresh request 和 newer verifier attempt 时，才使用

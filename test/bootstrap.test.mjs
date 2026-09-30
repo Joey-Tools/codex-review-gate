@@ -2367,6 +2367,11 @@ test("fixed frozen handoff inventory accepts only the recorded immutable workflo
     }),
     frozenWorkflows,
   );
+  assert.throws(
+    () => validateCanonicalV2WorkflowContent(FROZEN_HANDOFF_VERIFIER_WORKFLOW),
+    /unexpected top-level permissions mapping/u,
+    "the immutable handoff remains historical, not current installation policy",
+  );
   const changed = structuredClone(inventory);
   changed[0].content = `${changed[0].content}\n# replacement\n`;
   assert.throws(
@@ -5949,6 +5954,30 @@ test("parent revalidation ignores benign child-entry churn", () => {
 test("validates exact canonical v2 workflow shape and remote bytes", () => {
   const canonical = canonicalWorkflowFixture();
   assert.equal(validateCanonicalV2WorkflowContent(canonical), canonical);
+  for (const [name, invalid] of [
+    [
+      "missing Actions run read permission",
+      canonical.replace("  actions: read\n", ""),
+    ],
+    [
+      "write Actions permission",
+      canonical.replace("  actions: read\n", "  actions: write\n"),
+    ],
+    [
+      "extra top-level permission",
+      canonical.replace("  actions: read\n", "  actions: read\n  checks: read\n"),
+    ],
+    [
+      "duplicate quoted mapping",
+      canonical.replace("permissions:\n", "permissions:\n'permissions':\n  actions: read\n"),
+    ],
+  ]) {
+    assert.throws(
+      () => validateCanonicalV2WorkflowContent(invalid),
+      /top-level permissions mapping/u,
+      name,
+    );
+  }
   for (const [name, invalid] of [
     [
       "omitted run-name",

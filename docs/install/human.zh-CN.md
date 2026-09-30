@@ -106,6 +106,12 @@ uses: JoeyTeng/codex-review-gate-action@v2
   comment；GitHub 的 issue-comment REST endpoint 对该目标接受 pull-request write。两者都
   没有 `issues: write`、`statuses: write`、`checks: write` 或 `contents: write`。
 
+Verifier 的只读权限包括 `actions: read`：它必须通过 Actions run API 取得自身
+`pull_request` run 由 GitHub 服务器记录的 `created_at`。Private repository 必须有
+此权限。对已安装 consumer，须先更新 canonical verifier workflow，再发布依赖该读取
+的 floating `v2` Action；旧 workflow 会 fail closed，Git commit date 或近似 event
+time 都不能代替 run timestamp。
+
 自动 request 的 opt-in 不增加 GitHub App、ruleset 或 Action input/operation。普通 consumer
 应保持关闭，先在 `Joey-Tools/codex-private-workflows` 做 rollout canary，再扩大启用范围。
 此次 canary 应使用 `Joey-Tools` organisation Actions variable，并将 selected-repository
@@ -114,11 +120,12 @@ visibility 仅限该仓库，不使用 repository-level override。
 `workflow_run` 入口的原因。
 
 默认情况下，普通用户发出的 exact `@codex review` 在 `any` policy 下、任意 repository
-permission 都只会作为 candidate 被纳入，而不是立刻成为 review-generation boundary。只有
+permission 都只会作为 candidate 被纳入，而不是立刻成为 review-generation boundary。通常只有
 official Codex Bot 在同一条 comment 上直接添加严格晚于当前 revision 的 `eyes` 或 `+1`
-receipt，它才升级为 boundary。这是 gate attribution 决策，不是调用 Codex 的权限，也不保证
+receipt，它才升级为 boundary；单条、没有 base epoch 的 terminal-clean receipt 是另行
+限定的窄例外。这是 gate attribution 决策，不是调用 Codex 的权限，也不保证
 Codex 会启动；provider-side eligibility 与 delivery 独立决定。PR 其他位置后来出现的
-terminal 或 progress carrier 不能建立该因果 receipt，所以未确认 candidate 不能抢占既有
+任意其他 terminal 或 progress carrier 不能建立该因果 receipt，所以未确认 candidate 不能抢占既有
 clean。canonical workflow 直接设定
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`；不要给普通 consumer 添加 repository
 variable、public Action input 或 strict policy。`write`/`maintain`/`admin` path 仅保留给将来
@@ -1388,6 +1395,23 @@ per-PR concurrency namespace。生效的 `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确
 `reconcile` 执行下一次评估。若要对同一 head deliberate re-review，先运行 `begin-review`，
 读回新 request 并观察严格更新的 verifier attempt。单独发 comment 不会 atomically
 invalidate 旧 success。
+
+另有一个更窄的 pending-current-head 情形。读取 exact current `pull_request`
+verifier run 在 GitHub 服务器上的 `created_at`；它是保守 cutoff，不是精确的 PR
+`synchronize` 时间，也不能用 Git commit date 回退。若 official、未编辑、绑定
+current head 的顶层 clean `C0` 不晚于此 cutoff，`C0` 单独不能 pass。没有 base
+epoch、较早 authorised request `R0`（ordinary 或 canonical）的 first-generation
+gap 已由 `C0` 闭合、且没有其他相关 physical
+boundary 或未闭合 gap 时，恢复可使用一条**新建、独立**、未编辑的 ordinary
+`@codex review` issue comment `R1`；其创建与 revision 都必须严格晚于 cutoff。
+等待一条严格晚于 `R1` 的新 official、未编辑、绑定 current head 的顶层
+issue-comment clean `C1`，且其后没有 boundary；再通过合格 bot-comment wake-up
+或受保护手动 `reconcile` 要求同一 verifier run ID 的 exact-head verifier 重新评估。
+新的 PR 事件会创建新 cutoff，不保证 `R1/C1` 可复用。不能编辑旧 request、
+复用 `C0`、使用 inline-parent receipt，或与自动/controller-owned request 重叠。
+如果该 producer 已建立 canonical generation，应走普通的 request-bound `+1`
+路径。发出 comment 不证明 Codex 已启动；timestamp 加 SHA 也不证明 clean 的
+因果来源。finding、provider error、liveness 和稳定 snapshot 检查仍阻塞 success。
 
 事件校验仅限 PR head/base 的 SHA、ref 与 repository；其 `merge_commit_sha` 可以缺失或来自
 历史快照，明确不作为 binding input。

@@ -1409,7 +1409,7 @@ test("after a base epoch only a direct canonical-request +1 can recover clean", 
     crossedBoundaryEnvironment,
     crossedBoundaryGitHub,
   );
-  assert.equal(crossedBoundary.report.gateOutcome, "success");
+  assert.equal(crossedBoundary.report.gateOutcome, "success", crossedBoundary.report.reason);
   assert.equal(crossedBoundary.report.recoveryCode, "none");
 });
 
@@ -3852,6 +3852,362 @@ test("terminal clean without an authorized request generation cannot pass", asyn
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a prior clean cannot satisfy a newly created current-head verifier until a fresh request and clean arrive", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const prior = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  const selfVerifierRun = verifierSelfRun({ created_at: cutoff });
+  const initialGitHub = createGitHubMock({
+    issueComments: prior,
+    selfVerifierRun,
+  });
+  const initialEnvironment = runtimeEnvironment(context, {
+    suffix: "verifier-prior-clean-before-cutoff",
+  });
+  const { result: initial } = await runGate(initialEnvironment, initialGitHub);
+  assert.equal(initial.exitCode, 1);
+  assert.equal(initial.report.gateOutcome, "pending");
+  assert.notEqual(initial.report.recoveryCode, "none");
+  assert.deepEqual(initialGitHub.statusWrites, []);
+  assert.ok(initialGitHub.calls.some(({ method, path }) =>
+    method === "GET" && path === `/repos/${REPOSITORY}/actions/runs/123`
+  ));
+
+  const recoveredGitHub = createGitHubMock({
+    issueComments: [
+      ...prior,
+      recoveryRequest(),
+      recoveryClean(),
+    ],
+    selfVerifierRun,
+  });
+  const recoveredEnvironment = runtimeEnvironment(context, {
+    suffix: "verifier-fresh-clean-after-cutoff",
+  });
+  const { result: recovered } = await runGate(recoveredEnvironment, recoveredGitHub);
+  assert.equal(recovered.exitCode, 0, recovered.report.reason);
+  assert.equal(recovered.report.executionHealth, "healthy");
+  assert.equal(recovered.report.gateOutcome, "success");
+  assert.equal(recovered.report.recoveryCode, "none");
+  assert.deepEqual(recoveredGitHub.statusWrites, []);
+});
+
+test("an earlier canonical workflow request may close the historical generation before ordinary recovery", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [
+      workflowRequest({ body: canonicalRequestBody(HEAD, { runId: "122" }) }),
+      cleanIssueComment(HEAD),
+      recoveryRequest(),
+      recoveryClean(),
+    ],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "recovery-canonical-prior-request" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("a historical canonical request with the wrong base tuple cannot authorize clean recovery", async (context) => {
+  for (const [suffix, baseOverride] of [
+    ["base-sha", { baseSha: OLD_HEAD }],
+    ["base-ref", { baseRef: "release" }],
+    ["base-repository", { baseRepositoryId: REPO_ID + 1 }],
+  ]) {
+    const priorRequest = workflowRequest({
+      body: canonicalRequestBody(HEAD, { runId: "122", ...baseOverride }),
+    });
+    const github = createGitHubMock({
+      issueComments: [priorRequest, cleanIssueComment(HEAD), recoveryRequest(), recoveryClean()],
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-wrong-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "pending", `${suffix}: ${result.report.reason}`);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("verifier clean recovery needs both a fresh request and a newer clean", async (context) => {
+  const prior = [ordinaryRequest(), cleanIssueComment(HEAD)];
+  const cases = [
+    ["no-new-request", [...prior, recoveryClean()]],
+    ["old-head-clean", [...prior, recoveryRequest(), recoveryClean({
+      body: cleanIssueComment(OLD_HEAD).body,
+    })]],
+    ["non-provider-clean", [...prior, recoveryRequest(), recoveryClean({ user: HUMAN })]],
+    ["canonical-second-request", [...prior, workflowRequest({
+      id: 301,
+      body: canonicalRequestBody(HEAD, { runId: "124" }),
+      created_at: "2026-08-25T08:11:00Z",
+      updated_at: "2026-08-25T08:11:00Z",
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-301`,
+    }), recoveryClean()]],
+  ];
+  for (const [suffix, issueComments] of cases) {
+    const github = createGitHubMock({
+      issueComments,
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, `${suffix}: ${result.report.reason}`);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("a post-run ordinary request without a new clean waits without requiring a replacement PR", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD), recoveryRequest()],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "recovery-wait-for-new-clean" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider", result.report.reason);
+  assert.equal(result.report.requiresReplacementPr, false);
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("verifier clean recovery requires request and terminal to be strictly after their boundaries", async (context) => {
+  const cases = [
+    ["request-before-cutoff", "2026-08-25T08:09:00Z", "2026-08-25T08:12:00Z"],
+    ["request-at-cutoff", "2026-08-25T08:10:00Z", "2026-08-25T08:12:00Z"],
+    ["clean-before-cutoff", "2026-08-25T08:11:00Z", "2026-08-25T08:09:00Z"],
+    ["clean-at-cutoff", "2026-08-25T08:11:00Z", "2026-08-25T08:10:00Z"],
+    ["clean-at-request", "2026-08-25T08:11:00Z", "2026-08-25T08:11:00Z"],
+  ];
+  for (const [suffix, requestAt, cleanAt] of cases) {
+    const github = createGitHubMock({
+      issueComments: [
+        ordinaryRequest(),
+        cleanIssueComment(HEAD),
+        recoveryRequest({ created_at: requestAt, updated_at: requestAt }),
+        recoveryClean({ created_at: cleanAt, updated_at: cleanAt }),
+      ],
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-time-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, `${suffix}: ${result.report.reason}`);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("verifier clean recovery rejects missing or malformed exact-run metadata", async (context) => {
+  const cases = [
+    ["missing-created-at", verifierSelfRun({ created_at: undefined })],
+    ["malformed-created-at", verifierSelfRun({ created_at: "not-a-timestamp" })],
+  ];
+  for (const [suffix, selfVerifierRun] of cases) {
+    const github = createGitHubMock({
+      issueComments: recoveryEvidence(),
+      selfVerifierRun,
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-run-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("verifier clean recovery rejects a self-run bound to an older feature head", async (context) => {
+  const github = createGitHubMock({
+    issueComments: recoveryEvidence(),
+    selfVerifierRun: verifierSelfRun({
+      created_at: "2026-08-25T08:10:00Z",
+      head_sha: OLD_HEAD,
+    }),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "recovery-run-old-head" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("edited recovery carriers cannot turn an earlier clean into verifier success", async (context) => {
+  const cases = [
+    ["prior-clean", [
+      ordinaryRequest(),
+      cleanIssueComment(HEAD, { updated_at: "2026-08-25T08:01:01Z" }),
+      recoveryRequest(),
+      recoveryClean(),
+    ]],
+    ["new-request", recoveryEvidence({
+      request: recoveryRequest({ updated_at: "2026-08-25T08:11:01Z" }),
+    })],
+    ["new-clean", recoveryEvidence({
+      clean: recoveryClean({ updated_at: "2026-08-25T08:12:01Z" }),
+    })],
+  ];
+  for (const [suffix, issueComments] of cases) {
+    const github = createGitHubMock({
+      issueComments,
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-edited-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("later findings and provider activity veto a recovered verifier clean", async (context) => {
+  const cases = [
+    ["finding", {
+      issueComments: [...recoveryEvidence(), findingIssueComment(HEAD, {
+        id: 501,
+        created_at: "2026-08-25T08:13:00Z",
+        updated_at: "2026-08-25T08:13:00Z",
+        html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
+      })],
+    }],
+    ["eyes", {
+      issueComments: recoveryEvidence(),
+      reactionsByCommentId: new Map([["301", [reaction({
+        id: 601,
+        content: "eyes",
+        created_at: "2026-08-25T08:13:00Z",
+      })]]]),
+    }],
+    ["ambiguous-provider-comment", {
+      issueComments: [...recoveryEvidence(), opaqueProviderIssueComment({
+        id: 501,
+        created_at: "2026-08-25T08:13:00Z",
+        updated_at: "2026-08-25T08:13:00Z",
+        html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
+      })],
+    }],
+    ["malformed-provider-result", {
+      issueComments: [...recoveryEvidence(), cleanIssueComment(HEAD, {
+        id: 501,
+        body: "Codex Review: Didn't find any major issues.",
+        created_at: "2026-08-25T08:13:00Z",
+        updated_at: "2026-08-25T08:13:00Z",
+        html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
+      })],
+    }],
+  ];
+  for (const [suffix, githubOptions] of cases) {
+    const github = createGitHubMock({
+      ...githubOptions,
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-later-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("post-run clean recovery does not supersede an unresolved finding before the new request", async (context) => {
+  const [priorRequest, priorClean, newRequest, newClean] = recoveryEvidence();
+  const finding = findingIssueComment(HEAD, {
+    id: 251,
+    created_at: "2026-08-25T08:05:00Z",
+    updated_at: "2026-08-25T08:05:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-251`,
+  });
+  const github = createGitHubMock({
+    issueComments: [priorRequest, priorClean, finding, newRequest, newClean],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "recovery-prior-unresolved-finding" });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.recoveryCode, "fix_findings");
+  assert.equal(result.report.counts.unresolved, 1);
+  assert.equal(result.report.counts.resolved, 0);
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("historical clean settles old-request eyes only when the eyes preceded that clean", async (context) => {
+  for (const [suffix, eyesAt, expectedOutcome] of [
+    ["before-historical-clean", "2026-08-25T08:00:30Z", "success"],
+    ["at-historical-clean", "2026-08-25T08:01:00Z", "pending"],
+    ["after-historical-clean", "2026-08-25T08:05:00Z", "pending"],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: recoveryEvidence(),
+      reactionsByCommentId: new Map([["101", [reaction({
+        id: 601,
+        content: "eyes",
+        created_at: eyesAt,
+      })]]]),
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-old-eyes-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, expectedOutcome, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.exitCode, expectedOutcome === "success" ? 0 : 1, suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+});
+
+test("verifier clean recovery does not reopen ambiguous request lineage", async (context) => {
+  const thirdRequest = ordinaryRequest({
+    id: 501,
+    created_at: "2026-08-25T08:13:00Z",
+    updated_at: "2026-08-25T08:13:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
+  });
+  const duplicatePriorClean = cleanIssueComment(HEAD, {
+    id: 202,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+  });
+  const cases = [
+    ["unclosed-prior-gap", {
+      issueComments: [
+        workflowRequest({ body: canonicalRequestBody(HEAD, { runId: "122" }) }),
+        recoveryRequest(),
+        recoveryClean(),
+      ],
+    }],
+    ["extra-prior-clean", {
+      issueComments: [
+        ordinaryRequest(),
+        cleanIssueComment(HEAD),
+        duplicatePriorClean,
+        recoveryRequest(),
+        recoveryClean(),
+      ],
+    }],
+    ["third-request", { issueComments: [...recoveryEvidence(), thirdRequest] }],
+    ["base-epoch", {
+      issueComments: recoveryEvidence(),
+      baseEpoch: baseRefChangedEvent(),
+    }],
+  ];
+  for (const [suffix, githubOptions] of cases) {
+    const github = createGitHubMock({
+      ...githubOptions,
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `recovery-lineage-${suffix}` });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
 });
 
 test("default-any ordinary requests accept an official terminal clean receipt", async (context) => {
@@ -10076,7 +10432,7 @@ test("finding recovery distinguishes authorized ordinary and latest physical-onl
 
   assert.equal(authorized.report.gateOutcome, "failure");
   assert.equal(authorized.report.recoveryCode, "fix_findings");
-  assert.equal(authorized.report.requiresReplacementPr, false);
+  assert.equal(authorized.report.requiresReplacementPr, false, authorized.report.reason);
   const authorizedSummary = readFileSync(
     authorizedEnvironment.GITHUB_STEP_SUMMARY,
     "utf8",
@@ -10265,6 +10621,30 @@ function cleanIssueComment(commitRef = HEAD, overrides = {}) {
     performed_via_github_app: CODEX_APP,
     ...overrides,
   };
+}
+
+function recoveryRequest(overrides = {}) {
+  return ordinaryRequest({
+    id: 301,
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-301`,
+    ...overrides,
+  });
+}
+
+function recoveryClean(overrides = {}) {
+  return cleanIssueComment(HEAD, {
+    id: 401,
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-401`,
+    ...overrides,
+  });
+}
+
+function recoveryEvidence({ request = recoveryRequest(), clean = recoveryClean() } = {}) {
+  return [ordinaryRequest(), cleanIssueComment(HEAD), request, clean];
 }
 
 function opaqueProviderIssueComment(overrides = {}) {
@@ -10524,6 +10904,18 @@ function verifierRun(overrides = {}) {
   };
 }
 
+function verifierSelfRun(overrides = {}) {
+  return verifierRun({
+    id: 123,
+    run_number: 40,
+    status: "in_progress",
+    conclusion: null,
+    created_at: "2026-08-25T07:59:00Z",
+    html_url: `https://github.com/${REPOSITORY}/actions/runs/123`,
+    ...overrides,
+  });
+}
+
 function verifierJob({ runId = 7001, runAttempt = 2, status = "queued", ...overrides } = {}) {
   return {
     id: 8001,
@@ -10698,6 +11090,7 @@ function createGitHubMock({
   postUnknownConcurrentComments = [],
   createdCommentOverrides = {},
   verifierRuns = [verifierRun()],
+  selfVerifierRun = verifierSelfRun(),
   verifierAttemptStatus = "queued",
   verifierRerunAdvances = true,
   verifierRerunAttemptDelta = 1,
@@ -10882,7 +11275,9 @@ function createGitHubMock({
     }
     const exactRun = /^\/repos\/owner\/repo\/actions\/runs\/(\d+)$/u.exec(path);
     if (method === "GET" && exactRun) {
-      const run = verifierRuns.find((value) => String(value.id) === exactRun[1]);
+      const run = String(selfVerifierRun?.id) === exactRun[1]
+        ? selfVerifierRun
+        : verifierRuns.find((value) => String(value.id) === exactRun[1]);
       if (!run) return jsonResponse({ message: "not found" }, 404);
       return jsonResponse({
         ...structuredClone(run),

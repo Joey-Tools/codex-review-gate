@@ -227,7 +227,7 @@ test("manual dispatch exposes only the typed single-PR business inputs", () => {
 test("canonical verifier is read-only, latest-wins, and uses the direct Action", () => {
   assert.match(
     templateVerifier,
-    /^permissions:\n  contents: read\n  issues: read\n  pull-requests: read$/mu,
+    /^permissions:\n  actions: read\n  contents: read\n  issues: read\n  pull-requests: read$/mu,
   );
   assert.match(
     templateVerifier,

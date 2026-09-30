@@ -327,6 +327,7 @@ test("consumer permissions and runtime shape cannot read or execute pull-request
   const verifier = parseVerifierWorkflow(templateConsumer);
   const controller = parseControllerWorkflow(templateController);
   assert.deepEqual(blockScalarMapping(verifier.permissions), {
+    actions: "read",
     contents: "read",
     issues: "read",
     "pull-requests": "read",
@@ -3042,6 +3043,7 @@ function parseVerifierWorkflow(source) {
 
   const permissions = blockChild(root, "permissions");
   assert.deepEqual(blockDirectKeys(permissions), [
+    "actions",
     "contents",
     "issues",
     "pull-requests",

@@ -141,6 +141,13 @@ boundaries that an Action step cannot define:
   REST endpoints. Neither workflow has `issues: write`, `statuses: write`,
   `checks: write`, or `contents: write`.
 
+The verifier's read-only permissions include `actions: read`: it must fetch its
+own `pull_request` run's GitHub-server `created_at` through the Actions run
+API. Private repositories need this permission for that read. For existing
+consumers, update the canonical verifier workflow before releasing a floating
+`v2` Action that depends on it; an old installed workflow fails closed, and a
+Git commit date or approximate event time cannot replace the run timestamp.
+
 The auto-request opt-in adds no GitHub App, ruleset, or Action input/operation.
 Keep it disabled for ordinary consumers until it has been exercised first on
 `Joey-Tools/codex-private-workflows` as the rollout canary. Use the `Joey-Tools`
@@ -151,12 +158,13 @@ uses the protected `workflow_run` entry.
 
 By default, an ordinary human-authored exact `@codex review` request is admitted
 as a candidate at any repository permission, not as an immediate
-review-generation boundary. It becomes a boundary only when the official Codex
+review-generation boundary. It becomes a boundary when the official Codex
 Bot directly adds a strictly post-revision `eyes` or `+1` receipt to that exact
-comment. This is a gate attribution decision, not permission to invoke Codex
+comment; the separately documented unique no-base-epoch terminal-clean
+receipt is a narrow alternative. This is a gate attribution decision, not permission to invoke Codex
 and not a guarantee that Codex starts; provider-side eligibility and delivery
-decide that separately. A terminal or progress carrier elsewhere on the PR
-cannot establish that causal receipt, so an unconfirmed candidate cannot
+decide that separately. An arbitrary terminal or progress carrier elsewhere
+on the PR cannot establish that causal receipt, so an unconfirmed candidate cannot
 preempt an existing clean. Canonical workflows set
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly; do
 not add a repository variable, public Action input, or strict policy to an
@@ -1697,6 +1705,28 @@ bot `issue_comment` or use manual `reconcile` for the next evaluation. Before a
 deliberate same-head re-review, run `begin-review` so the new request is read
 back and a strictly newer verifier attempt becomes observable. A direct comment alone
 does not atomically invalidate an older success.
+
+There is one narrower pending-current-head case. Read the exact current
+`pull_request` verifier run's GitHub-server `created_at`; it is a conservative
+cutoff, not the exact PR `synchronize` time, and Git commit dates are not a
+fallback. An official, unedited, current-head top-level clean `C0` at or
+before that cutoff cannot itself pass. With no base epoch, if one earlier
+authorised request `R0` (ordinary or canonical) had its first-generation gap
+closed by `C0` and there are no other relevant
+physical boundaries or unclosed gaps, recovery may use a **new independent**
+unedited ordinary `@codex review` issue comment `R1` whose creation and
+revision are strictly after the cutoff. Wait for a new official, unedited,
+current-head top-level issue-comment clean `C1` strictly after `R1`, with no
+later boundary; then require a fresh exact-head verifier evaluation through
+the qualifying bot-comment wake-up or protected manual `reconcile` on the
+same verifier run ID. A new PR event creates a new cutoff and does not
+guarantee reuse of `R1/C1`. Do not
+edit the old request, reuse `C0`, use an inline-parent receipt, or overlap an
+automatic/controller-owned request. If that producer already established a
+canonical generation, follow its ordinary request-bound `+1` path. Posting a
+comment does not prove Codex started, and timestamps plus SHA do not prove
+which request caused a clean. Findings, provider errors, liveness and stable
+snapshot checks still block success.
 
 If a base retarget leaves no verifier for the current exact
 head/base/test-merge scope, follow

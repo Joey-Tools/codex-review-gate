@@ -147,6 +147,16 @@ is the execution binding that lets a successful feature-head CheckRun prove
 evaluation of the exact current test-merge. The CheckRun itself does not
 belong to the test-merge SHA.
 
+The verifier reads its own `pull_request` Actions run through
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}` and requires the
+GitHub-server `created_at`. This is a conservative current-run cutoff for
+head-clean evidence, not an exact `synchronize` event time. There is no
+fallback to a Git commit date or unverified event timestamp. The canonical
+verifier therefore needs read-only `actions: read`, including in private
+repositories. Installed consumers must receive that canonical permission
+before a floating `v2` release requires this read; missing authority fails
+closed.
+
 The controller admits `issue_comment` `created`, default-branch
 `workflow_dispatch`, and the opt-in `workflow_run` `completed` path for a failed
 canonical verifier. Comment admission checks both event sender and comment
@@ -439,6 +449,40 @@ every listed terminal property; a historical terminal clean/finding is not
 preserved merely because it has a full-head binding. This recovers an immutable
 historical pair; agents must not deliberately create one.
 
+A separate *current-head clean recovery* (a narrow path for a clean that
+predates this verifier run) is available only without a base epoch. It starts
+with exactly one earlier authorised request `R0`, ordinary or canonical, whose
+first-generation gap was closed by an official, unedited, current-head
+top-level issue-comment terminal clean `C0`. If `C0.created_at` is at or
+before this `pull_request` verifier run's GitHub-server `created_at`, `C0`
+alone remains pending even though its
+reviewed SHA names the current head. A canonical `R0` must match the current
+head, base SHA, base ref and base repository identity; an old-base binding
+cannot enter this recovery. Recovery requires a **new, independent** exact,
+unedited ordinary `@codex review` issue comment `R1`, with both its
+`created_at` and `updated_at` strictly after that cutoff, followed strictly
+later by a new official, unedited, current-head top-level issue-comment
+terminal clean `C1` (`C1.created_at > R1.updated_at`). The lineage must have
+exactly these two relevant physical request boundaries, with no later boundary
+or unclosed predecessor
+gap. Editing `R0`, reusing `C0`, or using an inline-parent review does not
+satisfy this exception. A request comment alone does not prove Codex started;
+an official `eyes` on `R0` strictly before `C0` is settled by that terminal
+clean for this recovery only, while `eyes` at or after `C0` remains blocking.
+the two timestamps and current-head SHA establish ordering and scope, not
+causal attribution of `C1` to `R1`. This is deliberately limited head-scoped
+recovery, not a general later-generation terminal-clean rule. Known findings,
+provider errors, same-time or later liveness, exact-refetch failures and all
+complete-inventory and two-stable-snapshot checks remain blocking. A
+qualifying later Codex bot comment or protected manual reconcile must rerun
+the exact current-head verifier before success can be considered.
+The cutoff is fixed across attempts of that same verifier run ID; a new PR
+event creates a different run and a new cutoff, so this recovery does not
+promise to carry `R1/C1` into that new run.
+While `R1` exists but `C1` has not arrived, the gate remains pending with a
+`wait_provider` recovery instruction; that wait alone does not require a
+replacement PR when `C0` safely closed the earlier gap.
+
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
 permission. A finding never serves as the minimal terminal receipt. The exact
@@ -448,14 +492,15 @@ their state as authority. The installed ruleset remains the sole enforcement
 for all conversations resolved; other pull-request review cleans remain
 ordinary evidence and cannot be that receipt.
 
-Terminal clean text and a qualifying provider `+1` are equal clean carriers
-only for the first physical generation of a no-base-epoch, single-flight
-lineage. Physical boundary recognition is deliberately separate from positive
-authority, except that the narrow default-`any` top-level issue-comment or
+Apart from the current-head clean recovery above, terminal clean text and a
+qualifying provider `+1` are equal clean carriers only for the first physical
+generation of a no-base-epoch, single-flight lineage. Physical boundary
+recognition is deliberately separate from positive authority, except that
+the narrow default-`any` top-level issue-comment or
 exact closed inline-parent terminal-clean receipt can establish that first
 generation and carry its clean authority at the same time.
-The recovery-only duplicate cohort is the sole top-level-clean variation: it
-confirms only its later ordinary request, never an inline-parent receipt or a
+The recovery-only duplicate cohort is another narrow top-level-clean
+variation: it confirms only its later ordinary request, never an inline-parent receipt or a
 canonical successor.
 An unconfirmed default-`any` ordinary candidate without a terminal-clean
 contender is otherwise not a physical boundary. A terminal-clean contender
@@ -483,16 +528,17 @@ successor may close only that first gap. For an ordinary default-`any`
 candidate, it can also serve as that first request's minimal receipt only under
 the unique single-flight rule above. Every later predecessor-to-successor gap,
 and positive or superseding authority for any generation with a physical
-predecessor, requires a qualifying `+1` directly on that request. Provider
+predecessor, requires a qualifying `+1` directly on that request, except for
+the exact two-boundary current-head clean recovery above. Provider
 terminal payloads have no originating request ID, so a later carrier could be
 delayed or duplicated from any older generation; stable snapshots cannot make
 that attribution unique. After a base epoch, provider terminal evidence cannot
 close even the first gap or receipt an ordinary candidate.
 
-The separately defined duplicate cohort is the sole recovery-only exception to
-that ordinary second-boundary rule: its one top-level clean closes the existing
-two-request cohort only. It cannot close, or supply a terminal-clean receipt
-for, a canonical successor.
+The separately defined duplicate cohort is the only other recovery-only
+exception to that ordinary second-boundary rule: its one top-level clean
+closes the existing two-request cohort only. It cannot close, or supply a
+terminal-clean receipt for, a canonical successor.
 
 Official `eyes` or provider activity at or after a candidate closure and no
 later than the successor keeps the predecessor open. Equality with either
@@ -521,13 +567,14 @@ An unlineaged terminal clean remains diagnostic evidence and cannot pass or
 clear a finding. This is a deliberate fail-closed exception to carrier parity.
 For an unconfirmed default-`any` ordinary candidate, a direct official
 post-revision `eyes` or `+1` is first a receipt that promotes it into a
-boundary. The only alternative is a matching unedited official current-head
-top-level issue-comment terminal clean or exact closed `COMMENTED` inline-parent
+boundary. For the ordinary single-flight candidate, the only alternative is
+a matching unedited official current-head top-level issue-comment terminal
+clean or exact closed `COMMENTED` inline-parent
 review strictly after that candidate under the unique no-base-epoch,
 single-flight rule. It is unavailable after a base epoch, after a second or
 ambiguous request/boundary, after an edit, or when terminal identity, ordering,
 or head binding is ambiguous. The separately defined duplicate cohort is the
-sole recovery-only exception to the second-boundary case: it accepts only an
+other recovery-only exception to the second-boundary case: it accepts only an
 already-existing two-request snapshot with a top-level clean and never makes a
 canonical successor terminal-clean eligible. Afterwards, ordinary request reactions are
 provider-liveness signals only; ordinary `+1` cannot head-bind clean. Same-time/later
@@ -550,7 +597,8 @@ proved:
 2. a later clean belongs to that newer generation under the lineage rule
    above: a terminal clean only when it is the first no-base-epoch physical
    generation (and, for a default-`any` ordinary candidate, meets the minimal
-   terminal-receipt rule), otherwise a qualifying request-bound `+1`.
+   terminal-receipt rule), otherwise a qualifying request-bound `+1`. The
+   current-head clean recovery does not supersede a finding.
 
 An unrelated later clean cannot clear the finding. Ambiguous temporal order,
 generation binding or head binding remains failure or inconclusive. A
