@@ -37,6 +37,39 @@ each PR's independently read head.
 
 ## Choose the path
 
+### Optional automatic request after verifier failure
+
+The existing canonical controller has a protected `workflow_run` entry that is
+off by default. Set the repository or organisation Actions variable
+`CODEX_REVIEW_GATE_AUTO_REQUEST` to exactly `true` to opt in; a missing value or
+any other value remains off. For rollout, set the `Joey-Tools` organisation
+variable with selected-repository visibility limited to
+`codex-private-workflows` for the first canary; do not use a repository-level
+override for that canary. This does not add a workflow, GitHub App or
+ruleset, and uses `workflow_run` rather than `pull_request_target` because of
+the public-repository policy restriction.
+
+After the first attempt (`run_attempt=1`) of the canonical read-only
+`Codex Review Gate Verifier` PR workflow completes with failure, the controller
+may create one canonical request for the current feature head only when the PR
+is still open, ready, in the same repository, targeting the default branch,
+and has no matching canonical request. This may follow `opened`, `reopened`,
+`synchronize` or `ready_for_review`, not just a push. The automatic path is
+request-only: it does not immediately rerun the verifier or turn the failed
+check green. A qualifying Codex Bot `issue_comment` later wakes the controller;
+otherwise dispatch a protected manual `reconcile` for the exact current head.
+If a merge conflict prevents any verifier run, there is no automatic request;
+use the documented manual recovery. Rerunning an old verifier attempt does not
+start this automatic path; use manual `begin-review` or `reconcile` as appropriate.
+If a request POST has an uncertain outcome, reread its evidence and leave the
+gate pending rather than blindly posting again. Cross-run marker adoption is
+not an exactly-once guarantee.
+
+Before using either manual request path below with this option enabled, inspect
+the exact-head controller run and canonical marker so a pending automatic
+request cannot overlap a direct or manual controller request. The automatic
+path is not a substitute for deliberate same-head re-review after success.
+
 ### Ordinary low-cost review
 
 When the exact head is not already carrying a success that must be invalidated,

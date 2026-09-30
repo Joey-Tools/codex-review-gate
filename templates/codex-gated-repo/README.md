@@ -5,8 +5,9 @@ This directory contains the canonical consumer-side assets:
 - `.github/workflows/codex-review-gate.yml` is the read-only pull-request
   verifier that calls `JoeyTeng/codex-review-gate-action@v2`;
 - `.github/workflows/codex-review-gate-controller.yml` is the protected
-  default-branch controller that admits Codex events and precisely reruns the
-  verifier;
+  default-branch controller that admits Codex events, optionally requests
+  review after a failed verifier run, and precisely reruns the verifier when
+  reconciliation is needed;
 - `.github/CODEOWNERS` is the default control-plane ownership file; replace
   `@JoeyTeng` with one GitHub user that has `write`, `maintain`, or `admin`
   permission when installing outside Joey-owned repositories;
@@ -16,10 +17,30 @@ This directory contains the canonical consumer-side assets:
 Copy both workflows unchanged. The verifier runs for pull-request `opened`,
 `reopened`, `synchronize`, and `ready_for_review` events and emits the sole
 required native CheckRun. The controller provides `issue_comment`
-`created` bot filtering before runner allocation and the sole manual
-entry point, `workflow_dispatch`. One manual run targets one PR and exact
-expected head. Neither workflow has cron, `repository_dispatch`, an automatic
-`pull_request_review` job, a runtime GitHub App, or a ledger.
+`created` bot filtering before runner allocation, an opt-in `workflow_run`
+`completed` entry after a failed first attempt (`run_attempt=1`) of the
+canonical `Codex Review Gate Verifier`, and the sole manual entry
+point, `workflow_dispatch`. One manual run targets one PR and exact expected
+head. Neither workflow has cron, `repository_dispatch`, `pull_request_target`,
+an automatic `pull_request_review` job, a runtime GitHub App, or a ledger.
+
+Automatic requests are disabled unless the organisation or repository Actions
+variable `CODEX_REVIEW_GATE_AUTO_REQUEST` is exactly `true`; a missing or other
+value is false, and a repository value overrides the organisation value. The
+same protected controller revalidates the failed verifier run and exact current
+PR/head/base. For an open, ready, same-repository PR targeting the current
+default branch, it may post a canonical request if no current-scope match
+exists or adopt an existing match; uncertain outcomes remain pending. The
+automatic path is request-only: it does
+not immediately rerun the verifier. A later Codex bot comment or protected
+manual `reconcile` processes the provider result. This may follow any of the
+four verifier PR events above, not just `synchronize`. If a merge conflict
+prevents the verifier from running, no automatic request is possible; resolve
+the conflict and use manual recovery if needed. For the Joey-Tools rollout,
+set the organisation variable's selected-repository visibility first to only
+`codex-private-workflows`, without a repository-level override, then expand
+after its canary succeeds. No new
+GitHub App or ruleset is required.
 
 The controller's sole `pull-requests: write` permission posts its canonical
 request marker and diagnostics only on a PR. GitHub's issue-comment endpoints

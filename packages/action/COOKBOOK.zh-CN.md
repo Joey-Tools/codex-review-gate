@@ -37,6 +37,32 @@ push、update-branch operation、base change、close/reopen transition，或 PR 
 
 ## 选择路径
 
+### 可选：verifier 失败后自动发送 request
+
+现有 canonical controller 有一个受保护的 `workflow_run` 入口，默认关闭。将 repository 或
+organisation Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的 `true`
+才会启用；缺失或其他任何值均保持关闭。首次 canary 使用 `Joey-Tools` organisation variable，
+将 selected-repository visibility 仅限 `codex-private-workflows`，不使用 repository-level
+override；之后再考虑扩大启用范围。这不增加 workflow、GitHub App 或 ruleset；采用
+`workflow_run` 而非 `pull_request_target` 是为了遵守 public repository 的 policy 限制。
+
+canonical 只读 PR workflow `Codex Review Gate Verifier` 的首次 attempt
+（`run_attempt=1`）以 failure 完成后，controller 只有在 PR 仍为 open、ready、
+同仓库、指向 default branch，且 current feature head 没有匹配的 canonical request 时，
+才可能为该 head 创建一条 canonical request。它可能发生在 `opened`、`reopened`、
+`synchronize` 或 `ready_for_review` 之后，不仅仅是 push。自动路径只发送 request：
+不会立刻重跑 verifier，也不会使失败的 check 变绿。随后合格的 Codex Bot
+`issue_comment` 会唤醒 controller；否则应针对 exact current head 发起受保护的手动
+`reconcile`。若 merge conflict 导致 verifier 根本没有运行，就不会有自动 request；
+应使用文档中的手动恢复流程。重跑旧 verifier attempt 不会启动这条自动路径；
+应按情况手动使用 `begin-review` 或 `reconcile`。
+如果 request POST 的结果不确定，应重新读取证据并保持 gate pending，不得盲目再发一条。
+跨 run 采用 canonical marker 不构成严格的 exactly-once 保证。
+
+启用此选项时，在使用下面任何一条手动 request 路径前，先检查 exact-head controller
+run 与 canonical marker，避免尚在进行的自动 request 与 direct 或手动 controller request
+重叠。自动路径不能替代 success 之后有意进行的 same-head re-review。
+
 ### 普通低成本 review
 
 只有在 PR 没有 base epoch，且这是第一个物理 generation 时，才使用下面的普通 agent

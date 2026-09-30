@@ -57,7 +57,26 @@ repository:
 - `.github/workflows/codex-review-gate-controller.yml` is the protected
   default-branch controller. It admits exact Codex events and typed manual
   operations, creates review requests, and establishes a strictly newer full
-  verifier attempt when reconciliation is needed.
+  verifier attempt when reconciliation is needed. The same controller can also
+  request review after a failed canonical verifier run when explicitly enabled;
+  no third workflow is installed.
+
+Automatic requests are off by default. Set the organisation or repository
+Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` to exactly `true` to enable
+them; an unset value or any other value disables them, and a repository value
+overrides the organisation value. After the verifier runs for `opened`,
+`reopened`, `synchronize` or `ready_for_review`, a completed failed run can
+trigger the protected controller for an open, ready, same-repository PR on the
+current default base and exact current head. It verifies the run and may post
+or adopt a canonical current-scope `@codex review` request; uncertain outcomes
+remain pending. This automatic
+path does not rerun the verifier: a later Codex bot comment or protected manual
+`reconcile` handles the result. A merge conflict that prevents a verifier run
+cannot start this path; resolve the conflict and use the manual recovery path
+if needed. For the Joey-Tools rollout, set the organisation variable's
+selected-repository visibility first to only `codex-private-workflows` as a
+canary before expanding it; do not set a repository-level override for that
+canary.
 
 Both workflows call the compatible floating major:
 

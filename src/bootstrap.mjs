@@ -186,6 +186,17 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
       github.event.sender.type == 'Bot' &&
       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
       github.event.comment.user.type == 'Bot'
+    ) ||
+    (
+      github.event_name == 'workflow_run' &&
+      vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' &&
+      github.event.action == 'completed' &&
+      github.event.workflow_run.name == 'Codex Review Gate Verifier' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.run_attempt == 1 &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.pull_requests[0].number &&
+      !github.event.workflow_run.pull_requests[1]
     )
   }}
 `);
@@ -3801,6 +3812,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
   return validateV2ControllerWorkflowContent(value, {
     jobIfExpression: CANONICAL_CONTROLLER_JOB_IF_EXPRESSION,
     issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
+    workflowRun: true,
   });
 }
 
@@ -3809,6 +3821,7 @@ function validateFrozenHandoffV2ControllerWorkflowContent(value) {
     jobIfExpression: FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION,
     issueCommentTypes: FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES,
     requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
+    workflowRun: false,
   });
 }
 
@@ -3816,12 +3829,15 @@ function validateV2ControllerWorkflowContent(value, {
   jobIfExpression: expectedJobIfExpression,
   issueCommentTypes,
   requestAuthorPermission = CANONICAL_REQUEST_AUTHOR_PERMISSION,
+  workflowRun,
 }) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
   }
   assertCanonicalWorkflowLineEndings(value);
-  const controllerMappings = assertCanonicalControllerWorkflowStructure(value);
+  const controllerMappings = assertCanonicalControllerWorkflowStructure(value, {
+    workflowRun,
+  });
   assertOneCanonicalActionCall(value, "controller");
   assertCommonWorkflowSafety(value, "controller");
   if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
@@ -3842,12 +3858,23 @@ function validateV2ControllerWorkflowContent(value, {
       `Canonical v2 controller workflow must expose issue_comment ${issueCommentTypes} and workflow_dispatch.`,
     );
   }
+  if (
+    workflowRun &&
+    !value.includes(
+      "  workflow_run:\n    workflows: [Codex Review Gate Verifier]\n    types: [completed]",
+    )
+  ) {
+    throw new Error(
+      "Canonical v2 controller workflow must expose only the completed Codex Review Gate Verifier workflow_run.",
+    );
+  }
   for (const forbiddenEvent of [
     "pull_request",
     "pull_request_target",
     "pull_request_review",
     "pull_request_review_comment",
     "repository_dispatch",
+    ...(!workflowRun ? ["workflow_run"] : []),
   ]) {
     if (new RegExp(`^  ${forbiddenEvent}:`, "m").test(value)) {
       throw new Error(
@@ -3869,6 +3896,47 @@ function validateV2ControllerWorkflowContent(value, {
     "on.issue_comment.types",
     issueCommentTypes,
   );
+  if (workflowRun) {
+    assertControllerMappingScalar(
+      controllerMappings,
+      "on.workflow_run.workflows",
+      "[Codex Review Gate Verifier]",
+    );
+    assertControllerMappingScalar(
+      controllerMappings,
+      "on.workflow_run.types",
+      "[completed]",
+    );
+  }
+  const routedInputs = workflowRun
+    ? {
+        concurrencyGroup:
+          "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}",
+        prNumber:
+          "${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
+        expectedHeadSha:
+          "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
+        operation:
+          "${{ github.event_name == 'workflow_run' && 'begin-review' || github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
+        requestCommentId:
+          "${{ github.event_name == 'issue_comment' && github.event.comment.id || github.event_name == 'workflow_dispatch' && inputs.request_comment_id || '' }}",
+        requestReview:
+          "${{ github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
+      }
+    : {
+        concurrencyGroup:
+          "codex-review-gate-controller-${{ github.repository }}-${{ github.event.issue.number || inputs.pr_number }}",
+        prNumber:
+          "${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
+        expectedHeadSha:
+          "${{ github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
+        operation:
+          "${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
+        requestCommentId:
+          "${{ github.event_name == 'workflow_dispatch' && inputs.request_comment_id || github.event.comment.id }}",
+        requestReview:
+          "${{ github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
+      };
   for (const [path, expected] of [
     ["on.workflow_dispatch.inputs.operation.required", "true"],
     ["on.workflow_dispatch.inputs.operation.type", "choice"],
@@ -3886,6 +3954,7 @@ function validateV2ControllerWorkflowContent(value, {
     ["permissions.checks", "read"],
     ["permissions.contents", "read"],
     ["permissions.pull-requests", "write"],
+    ["concurrency.group", routedInputs.concurrencyGroup],
     ["concurrency.cancel-in-progress", "false"],
     ["jobs.codex-review-gate-controller.name", "codex/review-gate-controller"],
     ["jobs.codex-review-gate-controller.if", ">-"],
@@ -3907,23 +3976,23 @@ function validateV2ControllerWorkflowContent(value, {
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.pr_number",
-      "${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
+      routedInputs.prNumber,
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.expected_head_sha",
-      "${{ github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
+      routedInputs.expectedHeadSha,
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.operation",
-      "${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
+      routedInputs.operation,
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.request_comment_id",
-      "${{ github.event_name == 'workflow_dispatch' && inputs.request_comment_id || github.event.comment.id }}",
+      routedInputs.requestCommentId,
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.request_review",
-      "${{ github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
+      routedInputs.requestReview,
     ],
     [
       "jobs.codex-review-gate-controller.steps.with.limits_profile",
@@ -3948,6 +4017,14 @@ function validateV2ControllerWorkflowContent(value, {
     "github.event.comment.user.login",
     "github.event.comment.user.type",
     "chatgpt-codex-connector[bot]",
+    ...(workflowRun ? [
+      "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
+      "github.event.workflow_run.event == 'pull_request'",
+      "github.event.workflow_run.run_attempt == 1",
+      "github.event.workflow_run.conclusion == 'failure'",
+      "github.event.workflow_run.pull_requests[0].number",
+      "!github.event.workflow_run.pull_requests[1]",
+    ] : []),
     "github_token:",
     "pr_number:",
     "expected_head_sha:",
@@ -4050,8 +4127,15 @@ const CANONICAL_CONTROLLER_MAPPING_PATHS = [
   "jobs.codex-review-gate-controller.steps.with.request_review",
   "jobs.codex-review-gate-controller.steps.with.limits_profile",
 ];
+const CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS = [
+  ...CANONICAL_CONTROLLER_MAPPING_PATHS.slice(0, 4),
+  "on.workflow_run",
+  "on.workflow_run.workflows",
+  "on.workflow_run.types",
+  ...CANONICAL_CONTROLLER_MAPPING_PATHS.slice(4),
+];
 
-function assertCanonicalControllerWorkflowStructure(value) {
+function assertCanonicalControllerWorkflowStructure(value, { workflowRun }) {
   if (value.startsWith("\uFEFF") || /\uFEFF|[\u0085\u2028\u2029\t]/u.test(value)) {
     throw new Error(
       "Canonical v2 controller workflow must use plain LF YAML without BOM, tabs, or non-ASCII line separators.",
@@ -4128,10 +4212,13 @@ function assertCanonicalControllerWorkflowStructure(value) {
   }
 
   const actualPaths = entries.map((entry) => entry.path);
+  const expectedPaths = workflowRun
+    ? CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS
+    : CANONICAL_CONTROLLER_MAPPING_PATHS;
   if (
-    actualPaths.length !== CANONICAL_CONTROLLER_MAPPING_PATHS.length ||
+    actualPaths.length !== expectedPaths.length ||
     actualPaths.some(
-      (path, index) => path !== CANONICAL_CONTROLLER_MAPPING_PATHS[index],
+      (path, index) => path !== expectedPaths[index],
     )
   ) {
     throw new Error(

@@ -144,9 +144,13 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
   assert.equal(templateVerifier.match(/^    if:/gmu)?.length ?? 0, 0);
 });
 
-test("canonical controller starts runners only for default-branch dispatches or exact Codex comments", () => {
+test("canonical controller starts runners only for dispatches, Codex comments, or opted-in failed verifier runs", () => {
   assert.match(templateController, /^name: Codex Review Gate Controller$/mu);
   assert.match(templateController, /^  issue_comment:\n    types: \[created\]$/mu);
+  assert.match(
+    templateController,
+    /^  workflow_run:\n    workflows: \[Codex Review Gate Verifier\]\n    types: \[completed\]$/mu,
+  );
   assert.match(templateController, /^  workflow_dispatch:$/mu);
   assert.doesNotMatch(
     templateController,
@@ -173,6 +177,19 @@ test("canonical controller starts runners only for default-branch dispatches or 
     /github\.event\.comment\.user\.login == 'chatgpt-codex-connector\[bot\]'/u,
   );
   assert.match(templateController, /github\.event\.comment\.user\.type == 'Bot'/u);
+  for (const required of [
+    "github.event_name == 'workflow_run'",
+    "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
+    "github.event.action == 'completed'",
+    "github.event.workflow_run.name == 'Codex Review Gate Verifier'",
+    "github.event.workflow_run.event == 'pull_request'",
+    "github.event.workflow_run.run_attempt == 1",
+    "github.event.workflow_run.conclusion == 'failure'",
+    "github.event.workflow_run.pull_requests[0].number",
+    "!github.event.workflow_run.pull_requests[1]",
+  ]) {
+    assert.ok(templateController.includes(required), `missing auto-request filter: ${required}`);
+  }
 
   const jobIfCount = templateController.match(/^    if:/gmu)?.length ?? 0;
   assert.equal(jobIfCount, 1);
@@ -262,7 +279,7 @@ test("canonical controller has only the adopted write authority and ledgerless i
   );
   assert.match(
     templateController,
-    /group: codex-review-gate-controller-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.issue\.number \|\| inputs\.pr_number \}\}/u,
+    /group: codex-review-gate-controller-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.workflow_run\.pull_requests\[0\]\.number \|\| github\.event\.issue\.number \|\| inputs\.pr_number \}\}/u,
   );
   assert.match(templateController, /^  cancel-in-progress: false$/mu);
   assert.match(templateController, /^    name: codex\/review-gate-controller$/mu);
@@ -282,23 +299,23 @@ test("canonical controller has only the adopted write authority and ledgerless i
   );
   assert.match(
     templateController,
-    /^          pr_number: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.pr_number \|\| github\.event\.issue\.number \}\}$/mu,
+    /^          pr_number: \$\{\{ github\.event_name == 'workflow_run' && github\.event\.workflow_run\.pull_requests\[0\]\.number \|\| github\.event_name == 'workflow_dispatch' && inputs\.pr_number \|\| github\.event\.issue\.number \}\}$/mu,
   );
   assert.match(
     templateController,
-    /^          expected_head_sha: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.expected_head_sha \|\| '' \}\}$/mu,
+    /^          expected_head_sha: \$\{\{ github\.event_name == 'workflow_run' && github\.event\.workflow_run\.head_sha \|\| github\.event_name == 'workflow_dispatch' && inputs\.expected_head_sha \|\| '' \}\}$/mu,
   );
   assert.match(
     templateController,
-    /^          operation: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.operation \|\| 'reconcile' \}\}$/mu,
+    /^          operation: \$\{\{ github\.event_name == 'workflow_run' && 'begin-review' \|\| github\.event_name == 'workflow_dispatch' && inputs\.operation \|\| 'reconcile' \}\}$/mu,
   );
   assert.match(
     templateController,
-    /^          request_comment_id: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.request_comment_id \|\| github\.event\.comment\.id \}\}$/mu,
+    /^          request_comment_id: \$\{\{ github\.event_name == 'issue_comment' && github\.event\.comment\.id \|\| github\.event_name == 'workflow_dispatch' && inputs\.request_comment_id \|\| '' \}\}$/mu,
   );
   assert.match(
     templateController,
-    /^          request_review: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.request_review \|\| false \}\}$/mu,
+    /^          request_review: \$\{\{ github\.event_name == 'workflow_run' \|\| github\.event_name == 'workflow_dispatch' && inputs\.request_review \|\| false \}\}$/mu,
   );
   assert.match(
     templateController,

@@ -76,12 +76,22 @@ uses: JoeyTeng/codex-review-gate-action@v2
 - read-only verifier 只接受 `pull_request` 的 `opened`、`reopened`、`synchronize`
   与 `ready_for_review`；它在 exact PR feature-head SHA 上的 native
   `codex/github-review-gate` CheckRun 是 required signal；
-- controller 自动 wake-up 只接受 `issue_comment` 的 `created`。编辑既有 comment 不会分配 runner；
+- controller 的 bot evidence 自动 wake-up 只接受 `issue_comment` 的 `created`。编辑既有 comment 不会分配 runner；
   若该 edited carrier 需要重新评估，走受保护 default branch 的手动 `reconcile`。它刻意不订阅
   `pull_request_review`：GitHub 把该 event 绑定到 PR merge ref，而 controller 保留了狭窄的
   write authority。只由 review 或 reaction 携带的 Codex 结果因此必须走受保护 default branch
   的手动 `reconcile`；
-- runner 分配前，event sender 与 comment author 都必须精确等于
+- 只有 organization 或 repository Actions variable 的生效值 `CODEX_REVIEW_GATE_AUTO_REQUEST`
+  精确等于 `true`，受保护 default branch 上的 controller 才额外通过 `workflow_run` 接受
+  canonical read-only `Codex Review Gate Verifier` 首次 attempt（`run_attempt=1`）的
+  failure，且只用于自动创建 request。变量缺失或任何其他值都视为
+  false，因此默认关闭。它必须验证来源是 canonical run，并重新读取 same-repository、open、
+  non-draft、target 为当前 default branch 的 PR，确认仍位于 source run 的 current head，且
+  不存在匹配的 canonical request。由 `opened`、`reopened`、`synchronize` 或
+  `ready_for_review` 启动的 verifier 失败后都可能触发此路径。此路径不会立即 rerun verifier；
+  后续合格的 Codex bot `issue_comment` 或手动 `reconcile` 才执行下一次评估。若 merge conflict
+  导致 verifier 无法运行，就不会自动发送 request；应使用手动恢复流程；
+- 对于 `issue_comment` wake-up，runner 分配前，event sender 与 comment author 都必须精确等于
   `chatgpt-codex-connector[bot]`，GitHub type 必须是 `Bot`；
 - 唯一手动入口是 `workflow_dispatch`，每次只处理一个 PR；
 - 手动 run 必须使用仓库默认分支上的 workflow；
@@ -91,6 +101,13 @@ uses: JoeyTeng/codex-review-gate-action@v2
   verifier 所需的窄 `pull-requests: write` 与 `actions: write`。它只面向 PR conversation
   comment；GitHub 的 issue-comment REST endpoint 对该目标接受 pull-request write。两者都
   没有 `issues: write`、`statuses: write`、`checks: write` 或 `contents: write`。
+
+自动 request 的 opt-in 不增加 GitHub App、ruleset 或 Action input/operation。普通 consumer
+应保持关闭，先在 `Joey-Tools/codex-private-workflows` 做 rollout canary，再扩大启用范围。
+此次 canary 应使用 `Joey-Tools` organisation Actions variable，并将 selected-repository
+visibility 仅限该仓库，不使用 repository-level override。
+公开仓库不使用可写 `pull_request_target` 自动 request 路径的 policy，是采用受保护
+`workflow_run` 入口的原因。
 
 默认情况下，普通用户发出的 exact `@codex review` 在 `any` policy 下、任意 repository
 permission 都只会作为 candidate 被纳入，而不是立刻成为 review-generation boundary。只有
@@ -1357,9 +1374,14 @@ runtime SHA 相同的 fresh PR read。受保护的 top-level `run-name` 还让 G
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` 暴露为 `display_title`；run
 唯一的 PR binding 必须携带 current feature head 与 default-branch base SHA。因此
 successful feature-head CheckRun 会在执行语义上绑定 exact current test-merge。为了避免 idle PR 消耗
-minutes，没有 cron 或可写 review event。verifier 在 `opened`、`reopened`、
-`synchronize` 与 `ready_for_review` 上启动；controller 与 verifier 使用独立 per-PR
-concurrency namespace。若要对同一 head deliberate re-review，先运行 `begin-review`，
+minutes，没有 cron、`pull_request_target` 或可写 review event。verifier 在 `opened`、
+`reopened`、`synchronize` 与 `ready_for_review` 上启动；controller 与 verifier 使用独立
+per-PR concurrency namespace。生效的 `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确等于 `true` 时，
+合格的失败 canonical verifier 可通过 `workflow_run` 唤醒受保护 controller，为当前 PR scope
+创建缺失的 canonical request。自动启动只创建 request，不会立即 rerun verifier。只有该自动路径
+可识别其他 controller run 留下、repository/PR/head/base 全部精确匹配的 canonical marker；
+手动 `begin-review` 保持 same-run binding。等待后续合格 Codex bot `issue_comment`，或手动
+`reconcile` 执行下一次评估。若要对同一 head deliberate re-review，先运行 `begin-review`，
 读回新 request 并观察严格更新的 verifier attempt。单独发 comment 不会 atomically
 invalidate 旧 success。
 

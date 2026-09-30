@@ -149,6 +149,17 @@ const CLOSED_JOB_IF = [
   "github.event.sender.type == 'Bot' &&",
   `github.event.comment.user.login == '${EXACT_BOT}' &&`,
   "github.event.comment.user.type == 'Bot'",
+  ") ||",
+  "(",
+  "github.event_name == 'workflow_run' &&",
+  "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' &&",
+  "github.event.action == 'completed' &&",
+  "github.event.workflow_run.name == 'Codex Review Gate Verifier' &&",
+  "github.event.workflow_run.event == 'pull_request' &&",
+  "github.event.workflow_run.run_attempt == 1 &&",
+  "github.event.workflow_run.conclusion == 'failure' &&",
+  "github.event.workflow_run.pull_requests[0].number &&",
+  "!github.event.workflow_run.pull_requests[1]",
   ")",
   "}}",
 ].join(" ");
@@ -227,16 +238,20 @@ test("source state-machine check names have a static non-reserved prefix", () =>
   assert.deepEqual(workflowSingleProducerPolicyViolations(sourceStateMachine), []);
 });
 
-test("automatic runner admission separates read-only PR verification from exact Codex comments", () => {
+test("automatic runner admission separates read-only PR verification from opted-in controller requests", () => {
   const verifier = parseVerifierWorkflow(templateConsumer);
   const workflow = parseControllerWorkflow(templateController);
   assert.deepEqual(blockDirectKeys(verifier.events), ["pull_request"]);
   assert.deepEqual(blockScalarMapping(verifier.pullRequest), {
     types: "[opened, reopened, synchronize, ready_for_review]",
   });
-  assert.deepEqual(blockDirectKeys(workflow.events), ["issue_comment", "workflow_dispatch"]);
+  assert.deepEqual(blockDirectKeys(workflow.events), ["issue_comment", "workflow_run", "workflow_dispatch"]);
   assert.deepEqual(blockScalarMapping(workflow.issueComment), {
     types: "[created]",
+  });
+  assert.deepEqual(blockScalarMapping(workflow.workflowRun), {
+    workflows: "[Codex Review Gate Verifier]",
+    types: "[completed]",
   });
 
   const jobIf = foldedScalarBody(workflow.job, "if");
@@ -251,6 +266,14 @@ test("automatic runner admission separates read-only PR verification from exact 
     "github.event.sender.type == 'Bot'",
     `github.event.comment.user.login == '${EXACT_BOT}'`,
     "github.event.comment.user.type == 'Bot'",
+    "github.event_name == 'workflow_run'",
+    "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
+    "github.event.workflow_run.name == 'Codex Review Gate Verifier'",
+    "github.event.workflow_run.event == 'pull_request'",
+    "github.event.workflow_run.run_attempt == 1",
+    "github.event.workflow_run.conclusion == 'failure'",
+    "github.event.workflow_run.pull_requests[0].number",
+    "!github.event.workflow_run.pull_requests[1]",
   ]) {
     assert.ok(jobIf.includes(expression), `missing pre-runner filter: ${expression}`);
   }
@@ -2509,15 +2532,15 @@ test("consumer routing fixes automatic reconciliation and permits only reviewed 
   assert.deepEqual(blockScalarMapping(controller.with), {
     github_token: "${{ github.token }}",
     pr_number:
-      "${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
+      "${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
     expected_head_sha:
-      "${{ github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
+      "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
     operation:
-      "${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
+      "${{ github.event_name == 'workflow_run' && 'begin-review' || github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
     request_comment_id:
-      "${{ github.event_name == 'workflow_dispatch' && inputs.request_comment_id || github.event.comment.id }}",
+      "${{ github.event_name == 'issue_comment' && github.event.comment.id || github.event_name == 'workflow_dispatch' && inputs.request_comment_id || '' }}",
     request_review:
-      "${{ github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
+      "${{ github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
     limits_profile:
       "${{ vars.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' || 'default' }}",
   });
@@ -2538,7 +2561,7 @@ test("verifier cancellation and controller serialization use separate PR concurr
   });
   assert.deepEqual(blockScalarMapping(controller.concurrency), {
     group:
-      "codex-review-gate-controller-${{ github.repository }}-${{ github.event.issue.number || inputs.pr_number }}",
+      "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}",
     "cancel-in-progress": "false",
   });
 });
@@ -2582,6 +2605,26 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
     templateController.replace(
       "github.event.action == 'created'",
       "github.event.action == 'created' || github.event.action == 'edited'",
+    ),
+    templateController.replace(
+      "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
+      "vars.CODEX_REVIEW_GATE_AUTO_REQUEST != 'false'",
+    ),
+    templateController.replace(
+      "github.event.workflow_run.event == 'pull_request'",
+      "github.event.workflow_run.event != 'push'",
+    ),
+    templateController.replace(
+      "github.event.workflow_run.run_attempt == 1",
+      "github.event.workflow_run.run_attempt >= 1",
+    ),
+    templateController.replace(
+      "github.event.workflow_run.conclusion == 'failure'",
+      "github.event.workflow_run.conclusion != 'cancelled'",
+    ),
+    templateController.replace(
+      "!github.event.workflow_run.pull_requests[1]",
+      "true",
     ),
   ];
   for (const mutation of verifierMutations) {
@@ -3030,10 +3073,12 @@ function parseControllerWorkflow(source) {
   ]);
   assert.equal(blockScalar(root, "name"), "Codex Review Gate Controller");
   const events = blockChild(root, "on");
-  assert.deepEqual(blockDirectKeys(events), ["issue_comment", "workflow_dispatch"]);
+  assert.deepEqual(blockDirectKeys(events), ["issue_comment", "workflow_run", "workflow_dispatch"]);
   const issueComment = blockChild(events, "issue_comment");
+  const workflowRun = blockChild(events, "workflow_run");
   const workflowDispatch = blockChild(events, "workflow_dispatch");
   assert.deepEqual(blockDirectKeys(issueComment), ["types"]);
+  assert.deepEqual(blockDirectKeys(workflowRun), ["workflows", "types"]);
   assert.deepEqual(blockDirectKeys(workflowDispatch), ["inputs"]);
   const dispatchInputs = blockChild(workflowDispatch, "inputs");
   const permissions = blockChild(root, "permissions");
@@ -3075,6 +3120,7 @@ function parseControllerWorkflow(source) {
     root,
     events,
     issueComment,
+    workflowRun,
     workflowDispatch,
     dispatchInputs,
     permissions,

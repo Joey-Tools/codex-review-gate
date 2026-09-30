@@ -81,27 +81,43 @@ describe this as cryptographic single-workflow provenance.
 
 Retain the verifier's closed `pull_request` activity types `opened`, `reopened`,
 `synchronize` and `ready_for_review`. It is read-only and has no authoritative
-write API. Retain the controller's closed `issue_comment` `created`
-and default-branch-only `workflow_dispatch` entries, exact pre-runner Codex
-sender/author filtering, and narrow `actions: write` plus `pull-requests: write`
-surface. GitHub accepts pull-request write authority for the issue-comment
+write API. Retain the controller's closed `issue_comment` `created`, protected
+`workflow_run` completion, and default-branch-only `workflow_dispatch` entries,
+exact pre-runner Codex sender/author filtering for bot comments, and narrow
+`actions: write` plus `pull-requests: write` surface. The `workflow_run` path
+is opt-in only when the repository or organisation Actions variable
+`CODEX_REVIEW_GATE_AUTO_REQUEST` is exactly `true`; missing or any other value
+is off. It handles only the failed first attempt (`run_attempt=1`) of the
+canonical `Codex Review Gate Verifier` workflow, after revalidating an
+open, ready, same-repository PR against the current feature head and default
+base. With no matching canonical request, it may create one request but does
+not immediately rerun the verifier or supply a verdict. A later qualifying
+Codex Bot `issue_comment` or protected manual reconcile performs that step.
+An uncertain request POST stays pending after evidence reread; it must not be
+blindly repeated, and marker adoption is not an exactly-once guarantee.
+This can follow any of the verifier's four PR activity types; a merge-conflicted
+PR without a verifier run has no automatic request path and needs manual
+recovery. GitHub accepts pull-request write authority for the issue-comment
 endpoints when their target is a pull request; the controller never targets a
 standalone issue. Neither workflow receives `issues: write`, `statuses: write`,
 `checks: write`, contents write, or OIDC authority. There is no
-`pull_request_target`, cron, runtime GitHub App, webhook or durable ledger.
-An edited provider comment does not allocate a canonical controller runner;
-recover it through protected manual reconcile instead.
+`pull_request_target`, cron, runtime GitHub App, webhook or durable ledger;
+the protected `workflow_run` boundary avoids the public-repository
+`pull_request_target` policy restriction without running PR code or adding an
+App or ruleset. An edited provider comment does not allocate a canonical
+controller runner; recover it through protected manual reconcile instead.
 
 Only the verifier job's GitHub-managed CheckRun on the exact current PR
 feature-head SHA is the protected signal. Its success is valid only when the
 run's merge-ref environment, event head/base scope (not event
 `merge_commit_sha`) and fresh PR read bind it to unchanged head, base and
-test-merge SHAs. The controller may create or adopt a
-review request and request one full rerun, but it cannot supply a verdict or
-rewrite that CheckRun. It must bind baseline attempt `A`, observe exact attempt
-`A+1` and its unique canonical job/CheckRun, and fail closed on ambiguous or
-invisible rerun state. Direct commit-status projection and its old ambiguous
-POST recovery are removed.
+test-merge SHAs. The controller may create or adopt a review request; its
+manual or bot-driven path may request one full rerun, but
+the opt-in automatic request path does not. It cannot supply a verdict or
+rewrite that CheckRun. For a rerun, it must bind baseline attempt `A`, observe
+exact attempt `A+1` and its unique canonical job/CheckRun, and fail closed on
+ambiguous or invisible rerun state. Direct commit-status projection and its old
+ambiguous POST recovery are removed.
 
 Every verifier performs an authoritative full scan of GitHub evidence. Manual
 selectors and event IDs are untrusted hints only: they may stop a backward scan

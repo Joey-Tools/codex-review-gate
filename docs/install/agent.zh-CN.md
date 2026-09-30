@@ -37,14 +37,18 @@ GitHub.com/default-branch PR scope 时停止。
 - `workflow_dispatch` 是唯一 manual entry；
 - 使用不带 feature ref 的 `gh workflow run`，随后 read back 并证明 run 来自
   `DEFAULT_BRANCH`；
-- 优先把直接发 `@codex review` 作为 provider-side attempt；它不授予 provider capability，
-  也不保证 Codex 会启动。只有 request creation 与更新 verifier attempt 需要 controller
-  协调时才用 `begin-review`；
+- 自动请求关闭（默认值）时，优先把直接发 `@codex review` 作为 provider-side attempt；
+  它不授予 provider capability，也不保证 Codex 会启动。只有 request creation 与更新
+  verifier attempt 需要 controller 协调时才手动用 `begin-review`；
 - 每个 exact-head review generation 只选择一个 request producer。只有该 head 上没有
-  `request_review=true` 的 active controller `begin-review` 时，才优先 direct request。
-  一旦该 run 已 dispatch、正在启动或已经发出 hidden marker，就不得再手动发送 direct
-  `@codex review`。不确定 producer ownership 时，先读取 controller run、canonical marker、
-  sticky diagnostic 与 provider evidence，再决定是否 mutation；
+  active automatic request 或 `request_review=true` 的 controller `begin-review` 时，才优先
+  direct request。一旦这类 run 已 dispatch、正在启动或已经发出 hidden marker，就不得再手动
+  发送 direct `@codex review`。不确定 producer ownership 时，先读取 controller run、
+  canonical marker、sticky diagnostic 与 provider evidence，再决定是否 mutation；
+- 自动创建请求只能显式 opt-in：受保护的 organization 或 repository variable
+  `CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于 `true`。缺失或任何其他值都视为 false。
+  先用 `Joey-Tools` organisation variable 将 selected-repository visibility 仅限
+  `codex-private-workflows` 做 canary，不使用 repository-level override；之后再考虑对其他仓库启用；
 - limit profile 只允许通过 protected repository variable
   `CODEX_REVIEW_GATE_LIMITS_PROFILE` 选择 `default` 与 `expanded`，不得增加 dispatch
   或 numeric override；
@@ -1079,8 +1083,10 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   `synchronize`、`ready_for_review`，以及 exact PR feature-head SHA 上的 required job
   `codex/github-review-gate`；
 - controller path `.github/workflows/codex-review-gate-controller.yml`、workflow
-  name `Codex Review Gate Controller`、exact Codex `issue_comment` `created`，以及
-  default-branch `workflow_dispatch`。编辑既有 comment 不会分配 runner；需要重新评估时走受保护的
+  name `Codex Review Gate Controller`、exact Codex `issue_comment` `created`、
+  canonical `Codex Review Gate Verifier` 首次 attempt（`run_attempt=1`）failure
+  完成后的 `workflow_run`，以及 default-branch `workflow_dispatch`。
+  编辑既有 comment 不会分配 runner；需要重新评估时走受保护的
   手动 `reconcile`。它刻意排除
   `pull_request_review`：GitHub 将 review event 绑定到 PR merge ref，因此具有狭窄 write
   authority 的 controller 不得在该 ref 执行。只由 review 或 reaction 承载的 evidence 必须通过
@@ -1096,6 +1102,21 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   controller operations 不 cancel；
 - 没有 cron、`repository_dispatch`、`pull_request_target`、可写
   `pull_request_review`、status bridge、runtime App 或 ledger。
+
+可选的自动请求路径让 canonical `pull_request` verifier 保持只读，并通过现有受保护的
+controller workflow，在 canonical verifier 首次 attempt 失败后的 `workflow_run` 事件上运行。
+重跑旧 verifier attempt 不会启动此路径。公开仓库的
+policy 不允许使用可写的 `pull_request_target` handler。controller 只接受 open、ready
+（非 draft）、same-repository、base 指向当前 default branch 的 PR；失败的 verifier 必须
+绑定其当前 exact head，且不能已有 matching canonical request，包括先前 controller run 中与
+相同 repository、PR、head 和 base 匹配的 canonical marker。`opened`、`reopened`、
+`synchronize` 或 `ready_for_review` 后的 verifier failure 都可能符合条件。仅当
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 精确等于 `true`，才用现有 `begin-review` operation 和
+`request_review=true` 进入 request-only mode（只发送请求，不立刻重跑 verifier）。之后由合格的
+Codex bot
+`issue_comment` event 或受保护的手动 exact-head `reconcile` 更新 gate。若 merge conflict
+使 verifier 无法运行，就没有可消费的 failed-verifier `workflow_run`：先解决冲突，或按文档走
+手动恢复路径。这项 opt-in 不增加第三个 workflow、新 Action input、runtime App 或 ruleset。
 
 controller Action step 的 underscore inputs 只有 `github_token`、`pr_number`、
 `expected_head_sha`、`operation`、`request_comment_id` 与 `request_review`。两份 Action
@@ -1193,6 +1214,11 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
 
 ## 阶段 3：创建独立 canary PR
 
+首次自动请求 canary 应在创建 canary PR 前设置受保护的 `Joey-Tools` organisation Actions
+variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visibility 仅限
+`codex-private-workflows`。不要为该 canary 设置 repository-level override。否则保持未设置，
+按下面的普通 direct-request 流程执行。
+
 1. 从已合并 `DEFAULT_BRANCH` 创建临时分支与一个无害可 review 变更，push 并开 non-draft
    PR。
 2. 读取权威 scope，把 exact `headRefOid` 记录为完整 head SHA：
@@ -1222,7 +1248,9 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    test -n "$CANARY_HEAD_REF"
    ```
 
-3. 优先发送 exact request。这个路径不需要仅为了请求 review 而分配 gate runner：
+3. 自动请求关闭时，优先发送 direct exact request。这个路径不需要仅为了请求 review 而分配
+   gate runner。开启 opt-in 时，不得执行下面的 direct-request command；应观察自动路径的结果，
+   不符合条件时再按手动流程恢复：
 
    ```bash
    REQUEST_COMMENT_ID="$(gh api --hostname github.com \
@@ -1233,9 +1261,13 @@ surfaces。若 active legacy/incomplete ruleset 已占用选定的 v2 name，必
    test -n "$REQUEST_COMMENT_ID"
    ```
 
-   发送前必须证明 `CANARY_HEAD` 上没有已经 active 的 `request_review=true` controller
-   `begin-review`，也不存在 matching canonical hidden marker。不得让这个低成本路径与
-   controller-owned request 发生 race。
+   发送前必须证明 `CANARY_HEAD` 上没有 active automatic request 或
+   `request_review=true` 的 controller `begin-review`，也不存在 matching canonical hidden
+   marker。不得让这个低成本路径与 controller-owned request 发生 race。如果已为
+   `Joey-Tools/codex-private-workflows` canary 开启受保护的 opt-in，先观察该 exact head 的
+   failed verifier 与 controller outcome；automatic ownership 仍在进行或已存在 matching
+   request 时，不得发送第二条请求。若 merge conflict 使 verifier 未运行，就无法自动创建请求；
+   解决冲突后手动恢复。
 
    GitHub 可能把这条单行 direct request 保存为末尾恰好一个 LF 或 CRLF；这两种存储
    形式与精确的 `@codex review` 等价。不得接受或发送其他空白、可见文字或 hidden comment。

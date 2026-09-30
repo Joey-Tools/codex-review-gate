@@ -48,7 +48,21 @@ V2 consumer 把两份 canonical workflows 复制到目标仓库的相同路径�
   CheckRun 绑定到 unchanged current head/base/test-merge scope。
 - `.github/workflows/codex-review-gate-controller.yml` 是受保护 default branch 上的
   controller；它接收 exact Codex events 与 typed manual operations、创建 review request，
-  并在需要 reconcile 时建立严格更新的 full verifier attempt。
+  并在需要 reconcile 时建立严格更新的 full verifier attempt。显式启用后，同一份
+  controller 也可在 canonical verifier 失败后请求评审；无需第三份 workflow。
+
+自动请求默认关闭。把 organisation 或 repository Actions variable
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的 `true` 才会启用；未设置或其他值都表示关闭，
+repository 值会覆盖 organisation 值。`opened`、`reopened`、`synchronize` 或
+`ready_for_review` 触发 verifier 后，一次完成且失败的 run 可以让受保护 controller
+处理 same-repository、open、ready、以当前 default branch 为 base 且 head 仍精确匹配的
+PR。它校验该 run，可能发送或采用当前 scope 的 canonical `@codex review` request；
+结果不确定时保持 pending。
+自动路径不会立即 rerun verifier；之后由 Codex bot comment 或受保护的 manual
+`reconcile` 处理结果。如果 merge conflict 阻止 verifier 运行，就不会触发自动请求；
+应先解决冲突，必要时再使用 manual recovery。Joey-Tools rollout 应先把 organisation
+variable 的 selected-repository visibility 仅设为 `codex-private-workflows` 作为
+canary，不设置 repository-level override；通过后再扩大范围。
 
 两份 workflows 都调用兼容的 floating major：
 

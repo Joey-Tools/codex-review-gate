@@ -3,6 +3,9 @@ name: Codex Review Gate Controller
 on:
   issue_comment:
     types: [created]
+  workflow_run:
+    workflows: [Codex Review Gate Verifier]
+    types: [completed]
   workflow_dispatch:
     inputs:
       operation:
@@ -38,7 +41,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.issue.number || inputs.pr_number }}
+  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
@@ -59,6 +62,17 @@ jobs:
           github.event.sender.type == 'Bot' &&
           github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
           github.event.comment.user.type == 'Bot'
+        ) ||
+        (
+          github.event_name == 'workflow_run' &&
+          vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' &&
+          github.event.action == 'completed' &&
+          github.event.workflow_run.name == 'Codex Review Gate Verifier' &&
+          github.event.workflow_run.event == 'pull_request' &&
+          github.event.workflow_run.run_attempt == 1 &&
+          github.event.workflow_run.conclusion == 'failure' &&
+          github.event.workflow_run.pull_requests[0].number &&
+          !github.event.workflow_run.pull_requests[1]
         )
       }}
     runs-on: ${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}
@@ -71,9 +85,9 @@ jobs:
           CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any
         with:
           github_token: ${{ github.token }}
-          pr_number: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}
-          expected_head_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}
-          operation: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}
-          request_comment_id: ${{ github.event_name == 'workflow_dispatch' && inputs.request_comment_id || github.event.comment.id }}
-          request_review: ${{ github.event_name == 'workflow_dispatch' && inputs.request_review || false }}
+          pr_number: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}
+          expected_head_sha: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}
+          operation: ${{ github.event_name == 'workflow_run' && 'begin-review' || github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}
+          request_comment_id: ${{ github.event_name == 'issue_comment' && github.event.comment.id || github.event_name == 'workflow_dispatch' && inputs.request_comment_id || '' }}
+          request_review: ${{ github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}
           limits_profile: ${{ vars.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' || 'default' }}
