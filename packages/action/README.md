@@ -351,7 +351,10 @@ authorised request `R0` (ordinary or canonical) must have had its
 first-generation gap closed by an official, unedited, current-head top-level
 issue-comment terminal clean `C0`. If `C0.created_at`
 is at or before the current `pull_request` verifier run's GitHub-server
-`created_at`, that clean alone remains pending. A new, independent, exact and
+`created_at`, that clean alone remains pending. This cutoff is specific to
+the top-level issue-comment clean: without `C0`, an earlier
+`APPROVED` pull-request review still follows the existing first-generation
+rules, but it cannot bypass a pre-run `C0`. A new, independent, exact and
 unedited ordinary `@codex review` issue comment `R1` must then have both
 `created_at` and `updated_at` strictly after that cutoff. A new official,
 unedited, current-head top-level issue-comment terminal clean `C1` must

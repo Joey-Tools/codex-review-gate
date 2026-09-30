@@ -1399,8 +1399,10 @@ invalidate 旧 success。
 另有一个更窄的 pending-current-head 情形。读取 exact current `pull_request`
 verifier run 在 GitHub 服务器上的 `created_at`；它是保守 cutoff，不是精确的 PR
 `synchronize` 时间，也不能用 Git commit date 回退。若 official、未编辑、绑定
-current head 的顶层 clean `C0` 不晚于此 cutoff，`C0` 单独不能 pass。没有 base
-epoch、较早 authorised request `R0`（ordinary 或 canonical）的 first-generation
+current head 的顶层 issue-comment clean `C0` 不晚于此 cutoff，`C0` 单独不能 pass。
+这个 cutoff 只针对顶层 issue-comment clean：没有 `C0` 时，较早的 `APPROVED`
+pull-request review 仍按既有 first-generation 规则判断；存在早于 run 的 `C0` 时，
+它不能绕过 pending。没有 base epoch、较早 authorised request `R0`（ordinary 或 canonical）的 first-generation
 gap 已由 `C0` 闭合、且没有其他相关 physical
 boundary 或未闭合 gap 时，恢复可使用一条**新建、独立**、未编辑的 ordinary
 `@codex review` issue comment `R1`；其创建与 revision 都必须严格晚于 cutoff。

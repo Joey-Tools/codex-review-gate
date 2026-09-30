@@ -15,10 +15,13 @@ superseded_by:
 ## Decision
 
 - The current `pull_request` verifier run's GitHub-server `created_at` is the
-  conservative cutoff for current-head clean evidence. It is not the exact
-  PR `synchronize` timestamp; Git commit dates and unverified event times are
-  not fallbacks. An official current-head terminal clean at or before that
-  cutoff remains pending on its own.
+  conservative cutoff for current-head top-level issue-comment clean evidence.
+  It is not the exact PR `synchronize` timestamp; Git commit dates and
+  unverified event times are not fallbacks. An official current-head top-level
+  issue-comment terminal clean `C0` at or before that cutoff remains pending on
+  its own. Without such a comment, an earlier `APPROVED` pull-request review
+  still follows first-generation rules; with a pre-run `C0`, it cannot bypass
+  pending.
 - The narrow recovery requires no base epoch and exactly two relevant physical
   request boundaries. An earlier authorised request `R0` (ordinary or
   canonical) has its first-generation gap closed by official, unedited,

@@ -1710,8 +1710,11 @@ There is one narrower pending-current-head case. Read the exact current
 `pull_request` verifier run's GitHub-server `created_at`; it is a conservative
 cutoff, not the exact PR `synchronize` time, and Git commit dates are not a
 fallback. An official, unedited, current-head top-level clean `C0` at or
-before that cutoff cannot itself pass. With no base epoch, if one earlier
-authorised request `R0` (ordinary or canonical) had its first-generation gap
+before that cutoff cannot itself pass. The cutoff is specific to this
+top-level issue-comment clean: absent `C0`, an earlier `APPROVED` pull-request
+review keeps its existing first-generation semantics, but cannot override a
+pre-run `C0`. With no base epoch, if one earlier authorised request `R0`
+(ordinary or canonical) had its first-generation gap
 closed by `C0` and there are no other relevant
 physical boundaries or unclosed gaps, recovery may use a **new independent**
 unedited ordinary `@codex review` issue comment `R1` whose creation and

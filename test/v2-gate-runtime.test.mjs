@@ -3893,6 +3893,47 @@ test("a prior clean cannot satisfy a newly created current-head verifier until a
   assert.deepEqual(recoveredGitHub.statusWrites, []);
 });
 
+test("a pre-run issue-comment clean cannot be bypassed by a pre-run APPROVED review", async (context) => {
+  const request = ordinaryRequest();
+  const review = approvedReview(HEAD, {
+    submitted_at: "2026-08-25T08:05:00Z",
+  });
+  const requestAcknowledgement = new Map([[String(request.id), [reaction({
+    content: "eyes",
+    created_at: "2026-08-25T08:00:30Z",
+  })]]]);
+  const selfVerifierRun = verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" });
+
+  const reviewOnlyGitHub = createGitHubMock({
+    issueComments: [request],
+    reviews: [review],
+    reactionsByCommentId: requestAcknowledgement,
+    selfVerifierRun,
+  });
+  const reviewOnlyEnvironment = runtimeEnvironment(context, {
+    suffix: "pre-run-approved-review-first-generation",
+  });
+  const { result: reviewOnly } = await runGate(reviewOnlyEnvironment, reviewOnlyGitHub);
+  assert.equal(reviewOnly.exitCode, 0, reviewOnly.report.reason);
+  assert.equal(reviewOnly.report.gateOutcome, "success");
+
+  const mixedGitHub = createGitHubMock({
+    issueComments: [request, cleanIssueComment(HEAD)],
+    reviews: [review],
+    reactionsByCommentId: requestAcknowledgement,
+    selfVerifierRun,
+  });
+  const mixedEnvironment = runtimeEnvironment(context, {
+    suffix: "pre-run-comment-plus-approved-review",
+  });
+  const { result: mixed } = await runGate(mixedEnvironment, mixedGitHub);
+  assert.equal(mixed.exitCode, 1);
+  assert.equal(mixed.report.executionHealth, "healthy");
+  assert.equal(mixed.report.gateOutcome, "pending", mixed.report.reason);
+  assert.notEqual(mixed.report.recoveryCode, "none");
+  assert.deepEqual(mixedGitHub.statusWrites, []);
+});
+
 test("an earlier canonical workflow request may close the historical generation before ordinary recovery", async (context) => {
   const github = createGitHubMock({
     issueComments: [

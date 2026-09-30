@@ -130,7 +130,8 @@ test-merge SHA。
 
 Verifier 通过 `GET /repos/{owner}/{repo}/actions/runs/{run_id}` 读取自身
 `pull_request` Actions run，并要求 GitHub 服务器记录的 `created_at`。它是 current
-run 的保守 head-clean cutoff，并非精确的 `synchronize` event time；不能回退到 Git
+run 中顶层 issue-comment clean 的保守 cutoff，并非精确的 `synchronize`
+event time；不能回退到 Git
 commit date 或未经校验的 event timestamp。因此 canonical verifier 需要只读
 `actions: read`，private repository 也不例外。floating `v2` release 在依赖这次
 读取前，必须先让已安装 consumer 更新 canonical permission；缺失权限时 fail closed。
@@ -384,7 +385,9 @@ pair；agent 不得主动创建。
 current head 的顶层 issue-comment terminal clean `C0` 闭合。如果
 `C0.created_at` 不晚于本次 `pull_request` verifier run
 在 GitHub 服务器上的 `created_at`，即使 reviewed SHA 指向 current head，`C0` 单独也
-保持 pending。若 `R0` 为 canonical，其 head、base SHA、base ref 和 base repository
+保持 pending。这个 cutoff 只针对顶层 issue-comment clean：没有 `C0` 时，较早的
+`APPROVED` pull-request review 仍按既有 first-generation 规则判断；存在早于 run 的
+`C0` 时，它不能绕过 pending。若 `R0` 为 canonical，其 head、base SHA、base ref 和 base repository
 binding 必须与当前 PR 完全一致；旧 base 的绑定不能进入此恢复。恢复必须有一条**新建、独立**、exact 且未编辑的 ordinary
 `@codex review` issue comment `R1`，其 `created_at` 和 `updated_at` 均严格晚于该
 cutoff；随后还须有一条严格晚于 `R1` 的新 official、未编辑、绑定 current head 的

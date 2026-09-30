@@ -1771,7 +1771,10 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    `synchronize` timestamp; never fall back to a Git commit date or an
    approximate event time. An official, unedited, current-head top-level
    issue-comment clean `C0` created at or before that cutoff cannot pass by
-   itself. A narrow recovery is available only with no base epoch and exactly
+   itself. The cutoff is specific to this top-level issue-comment clean:
+   without `C0`, an earlier `APPROVED` pull-request review retains its
+   existing first-generation semantics, but it cannot bypass a pre-run `C0`.
+   A narrow recovery is available only with no base epoch and exactly
    one earlier authorised request `R0` (ordinary or canonical) whose
    first-generation gap `C0` closed, with no other relevant physical boundary
    or unclosed gap. If no automatic/controller request producer is active,

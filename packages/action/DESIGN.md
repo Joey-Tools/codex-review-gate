@@ -150,12 +150,12 @@ belong to the test-merge SHA.
 The verifier reads its own `pull_request` Actions run through
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}` and requires the
 GitHub-server `created_at`. This is a conservative current-run cutoff for
-head-clean evidence, not an exact `synchronize` event time. There is no
-fallback to a Git commit date or unverified event timestamp. The canonical
-verifier therefore needs read-only `actions: read`, including in private
-repositories. Installed consumers must receive that canonical permission
-before a floating `v2` release requires this read; missing authority fails
-closed.
+top-level issue-comment clean evidence, not an exact `synchronize` event
+time. There is no fallback to a Git commit date or unverified event
+timestamp. The canonical verifier therefore needs read-only `actions: read`,
+including in private repositories. Installed consumers must receive that
+canonical permission before a floating `v2` release requires this read;
+missing authority fails closed.
 
 The controller admits `issue_comment` `created`, default-branch
 `workflow_dispatch`, and the opt-in `workflow_run` `completed` path for a failed
@@ -458,7 +458,10 @@ before this `pull_request` verifier run's GitHub-server `created_at`, `C0`
 alone remains pending even though its
 reviewed SHA names the current head. A canonical `R0` must match the current
 head, base SHA, base ref and base repository identity; an old-base binding
-cannot enter this recovery. Recovery requires a **new, independent** exact,
+cannot enter this recovery. The cutoff is specific to this top-level
+issue-comment clean: without `C0`, an earlier `APPROVED` pull-request review
+still follows the existing first-generation rules, but it cannot bypass an
+existing pre-run `C0`. Recovery requires a **new, independent** exact,
 unedited ordinary `@codex review` issue comment `R1`, with both its
 `created_at` and `updated_at` strictly after that cutoff, followed strictly
 later by a new official, unedited, current-head top-level issue-comment

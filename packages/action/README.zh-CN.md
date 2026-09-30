@@ -298,9 +298,11 @@ agent 不得故意创建这类请求对；它只恢复 GitHub immutable snapshot
 canonical）必须已由
 official、未编辑、绑定 current head 的顶层 issue-comment terminal clean `C0`
 闭合其 first-generation gap。如果 `C0.created_at` 不晚于当前 `pull_request` verifier run 在 GitHub
-服务器上的 `created_at`，该 clean 单独仍保持 pending。随后必须有一条新建、独立、
+服务器上的 `created_at`，该 clean 单独仍保持 pending。这个 cutoff 只针对顶层 issue-comment clean：
+没有 `C0` 时，较早的 `APPROVED` pull-request review 仍按既有 first-generation
+规则判断；存在早于 run 的 `C0` 时，它不能绕过 pending。随后必须有一条新建、独立、
 exact 且未编辑的 ordinary `@codex review` issue comment `R1`，其 `created_at`
-和 `updated_at` 均严格晚于该 cutoff；再有一条严格晚于 `R1` 的新 official、
+和 `updated_at` 均严格晚于该 cutoff；还需要一条严格晚于 `R1` 的新 official、
 未编辑、绑定 current head 的顶层 issue-comment terminal clean `C1`
 （`C1.created_at > R1.updated_at`）。不能存在
 后续 boundary 或未闭合 predecessor gap。编辑旧 comment、复用 `C0` 或以

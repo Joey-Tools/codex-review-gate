@@ -1483,7 +1483,10 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    `pull_request` verifier run，并要求 GitHub-server `created_at`。它是保守
    cutoff，不是精确 `synchronize` timestamp；绝不能回退到 Git commit date 或近似
    event time。若 official、未编辑、绑定 current head 的顶层 issue-comment clean
-   `C0` 不晚于该 cutoff，`C0` 单独不能 pass。狭窄恢复只在没有 base epoch、恰好一条
+   `C0` 不晚于该 cutoff，`C0` 单独不能 pass。这个 cutoff 只针对顶层 issue-comment
+   clean：没有 `C0` 时，较早的 `APPROVED` pull-request review 仍按既有
+   first-generation 规则判断；存在早于 run 的 `C0` 时，它不能绕过 pending。
+   狭窄恢复只在没有 base epoch、恰好一条
    较早 authorised request `R0`（ordinary 或 canonical）的 first-generation gap
    已由 `C0` 闭合、且没有其他相关 physical boundary 或未闭合 gap 时可用。确认没有
    active automatic/controller request producer 后，复用第 3 步的 direct issue-comment
