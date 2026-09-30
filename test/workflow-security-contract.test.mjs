@@ -279,6 +279,35 @@ test("automatic runner admission separates read-only PR verification from opted-
   }
 });
 
+test("controller forwards the raw auto-request variable for strict runtime admission", () => {
+  const workflow = parseControllerWorkflow(templateController);
+  assert.deepEqual(blockScalarMapping(workflow.env), {
+    CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: "any",
+    CODEX_REVIEW_GATE_AUTO_REQUEST:
+      "${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}",
+  });
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        templateController.replace(
+          "CODEX_REVIEW_GATE_AUTO_REQUEST: ${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}",
+          "CODEX_REVIEW_GATE_AUTO_REQUEST: true",
+        ),
+      ),
+    /unexpected jobs\.codex-review-gate-controller\.steps\.env\.CODEX_REVIEW_GATE_AUTO_REQUEST/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        templateController.replace(
+          "          CODEX_REVIEW_GATE_AUTO_REQUEST: ${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}\n",
+          "",
+        ),
+      ),
+    /closed event, permission, job, step, env, and input mappings/u,
+  );
+});
+
 test("manual dispatch is default-branch-only and exposes the closed typed business inputs", () => {
   const workflow = parseControllerWorkflow(templateController);
   assert.deepEqual(blockDirectKeys(workflow.workflowDispatch), ["inputs"]);
@@ -3115,6 +3144,9 @@ function parseControllerWorkflow(source) {
     "request_comment_id",
     "request_review",
     "limits_profile",
+  ], [
+    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
+    "CODEX_REVIEW_GATE_AUTO_REQUEST",
   ]);
   return {
     root,
@@ -3131,18 +3163,26 @@ function parseControllerWorkflow(source) {
   };
 }
 
-function parseClosedActionStep(job, expectedWithKeys) {
+function parseClosedActionStep(
+  job,
+  expectedWithKeys,
+  expectedEnvKeys = ["CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION"],
+) {
   const steps = listItemBlocks(blockChild(job, "steps"));
   assert.equal(steps.length, 1, "consumer workflow must contain exactly one step");
   assert.deepEqual(itemKeys(steps[0]), ["name", "id", "uses", "env", "with"]);
   const envBlock = itemChildBlock(steps[0], "env");
-  assert.deepEqual(blockDirectKeys(envBlock), [
-    "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION",
-  ]);
+  assert.deepEqual(blockDirectKeys(envBlock), expectedEnvKeys);
   assert.equal(
     blockScalar(envBlock, "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION"),
     "any",
   );
+  if (expectedEnvKeys.includes("CODEX_REVIEW_GATE_AUTO_REQUEST")) {
+    assert.equal(
+      blockScalar(envBlock, "CODEX_REVIEW_GATE_AUTO_REQUEST"),
+      "${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}",
+    );
+  }
   const withBlock = itemChildBlock(steps[0], "with");
   assert.deepEqual(blockDirectKeys(withBlock), expectedWithKeys);
   return {

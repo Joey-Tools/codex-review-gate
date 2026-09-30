@@ -63,8 +63,12 @@ repository:
 
 Automatic requests are off by default. Set the organisation or repository
 Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` to exactly `true` to enable
-them; an unset value or any other value disables them, and a repository value
-overrides the organisation value. After the verifier runs for `opened`,
+them; an unset value skips the automatic controller job, and any value
+other than literal lowercase `true` cannot authorise a review request. GitHub
+Actions compares strings case-insensitively in the job condition, so a case
+variant such as `TRUE` can still allocate a controller runner before the
+runtime rejects it without posting. A repository value overrides the
+organisation value. After the verifier runs for `opened`,
 `reopened`, `synchronize` or `ready_for_review`, a completed failed run can
 trigger the protected controller for an open, ready, same-repository PR on the
 current default base and exact current head. It verifies the run and may post

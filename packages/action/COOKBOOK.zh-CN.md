@@ -41,7 +41,9 @@ push、update-branch operation、base change、close/reopen transition，或 PR 
 
 现有 canonical controller 有一个受保护的 `workflow_run` 入口，默认关闭。将 repository 或
 organisation Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的 `true`
-才会启用；缺失或其他任何值均保持关闭。首次 canary 使用 `Joey-Tools` organisation variable，
+才授权自动发送 request；缺失或其他值都不能授权请求。GitHub Actions 的表达式字符串比较不区分
+大小写，所以 `TRUE` 等大小写变体仍可能启动 controller job；运行时的精确比较会在 POST 前拒绝。
+首次 canary 使用 `Joey-Tools` organisation variable，
 将 selected-repository visibility 仅限 `codex-private-workflows`，不使用 repository-level
 override；之后再考虑扩大启用范围。这不增加 workflow、GitHub App 或 ruleset；采用
 `workflow_run` 而非 `pull_request_target` 是为了遵守 public repository 的 policy 限制。

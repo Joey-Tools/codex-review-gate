@@ -41,9 +41,11 @@ each PR's independently read head.
 
 The existing canonical controller has a protected `workflow_run` entry that is
 off by default. Set the repository or organisation Actions variable
-`CODEX_REVIEW_GATE_AUTO_REQUEST` to exactly `true` to opt in; a missing value or
-any other value remains off. For rollout, set the `Joey-Tools` organisation
-variable with selected-repository visibility limited to
+`CODEX_REVIEW_GATE_AUTO_REQUEST` to literal `true` to authorise an automatic
+request; missing or other values cannot authorise one. GitHub Actions compares
+expression strings case-insensitively, so `TRUE` may start a controller job,
+but the runtime rejects it before posting. For rollout, set the `Joey-Tools`
+organisation variable with selected-repository visibility limited to
 `codex-private-workflows` for the first canary; do not use a repository-level
 override for that canary. This does not add a workflow, GitHub App or
 ruleset, and uses `workflow_run` rather than `pull_request_target` because of

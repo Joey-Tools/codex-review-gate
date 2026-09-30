@@ -83,6 +83,7 @@ jobs:
         uses: JoeyTeng/codex-review-gate-action@v2
         env:
           CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any
+          CODEX_REVIEW_GATE_AUTO_REQUEST: ${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}

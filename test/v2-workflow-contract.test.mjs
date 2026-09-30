@@ -293,6 +293,10 @@ test("canonical controller has only the adopted write authority and ledgerless i
       .length,
     1,
   );
+  assert.match(
+    templateController,
+    /^        env:\n          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any\n          CODEX_REVIEW_GATE_AUTO_REQUEST: \$\{\{ vars\.CODEX_REVIEW_GATE_AUTO_REQUEST \}\}$/mu,
+  );
   assert.doesNotMatch(
     templateController,
     /actions\/checkout|\.\/\.github\/workflows|secrets:\s*inherit|checks: write|contents: write|issues: write|statuses:|id-token:/u,

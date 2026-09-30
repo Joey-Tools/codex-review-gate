@@ -3907,6 +3907,11 @@ function validateV2ControllerWorkflowContent(value, {
       "on.workflow_run.types",
       "[completed]",
     );
+    assertControllerMappingScalar(
+      controllerMappings,
+      "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_AUTO_REQUEST",
+      "${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}",
+    );
   }
   const routedInputs = workflowRun
     ? {
@@ -4019,6 +4024,7 @@ function validateV2ControllerWorkflowContent(value, {
     "chatgpt-codex-connector[bot]",
     ...(workflowRun ? [
       "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
+      "CODEX_REVIEW_GATE_AUTO_REQUEST: ${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}",
       "github.event.workflow_run.event == 'pull_request'",
       "github.event.workflow_run.run_attempt == 1",
       "github.event.workflow_run.conclusion == 'failure'",
@@ -4132,7 +4138,14 @@ const CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS = [
   "on.workflow_run",
   "on.workflow_run.workflows",
   "on.workflow_run.types",
-  ...CANONICAL_CONTROLLER_MAPPING_PATHS.slice(4),
+  ...CANONICAL_CONTROLLER_MAPPING_PATHS.slice(4).flatMap((path) =>
+    path === "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION"
+      ? [
+          path,
+          "jobs.codex-review-gate-controller.steps.env.CODEX_REVIEW_GATE_AUTO_REQUEST",
+        ]
+      : [path],
+  ),
 ];
 
 function assertCanonicalControllerWorkflowStructure(value, { workflowRun }) {

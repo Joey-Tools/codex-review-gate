@@ -46,7 +46,9 @@ GitHub.com/default-branch PR scope 时停止。
   发送 direct `@codex review`。不确定 producer ownership 时，先读取 controller run、
   canonical marker、sticky diagnostic 与 provider evidence，再决定是否 mutation；
 - 自动创建请求只能显式 opt-in：受保护的 organization 或 repository variable
-  `CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于 `true`。缺失或任何其他值都视为 false。
+  `CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于 `true`。未设置时不会启动自动 request 路径；
+  其他值不能发送 request，但 `TRUE` 等大小写变体可能通过 GitHub Actions 不区分大小写的 job
+  条件并分配 controller runner；运行时会在任何 request POST 前拒绝它们。
   先用 `Joey-Tools` organisation variable 将 selected-repository visibility 仅限
   `codex-private-workflows` 做 canary，不使用 repository-level override；之后再考虑对其他仓库启用；
 - limit profile 只允许通过 protected repository variable

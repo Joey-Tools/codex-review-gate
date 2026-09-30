@@ -25,13 +25,16 @@ head. Neither workflow has cron, `repository_dispatch`, `pull_request_target`,
 an automatic `pull_request_review` job, a runtime GitHub App, or a ledger.
 
 Automatic requests are disabled unless the organisation or repository Actions
-variable `CODEX_REVIEW_GATE_AUTO_REQUEST` is exactly `true`; a missing or other
-value is false, and a repository value overrides the organisation value. The
-same protected controller revalidates the failed verifier run and exact current
-PR/head/base. For an open, ready, same-repository PR targeting the current
-default branch, it may post a canonical request if no current-scope match
-exists or adopt an existing match; uncertain outcomes remain pending. The
-automatic path is request-only: it does
+variable `CODEX_REVIEW_GATE_AUTO_REQUEST` is exactly lowercase `true`. An unset
+value skips the automatic controller job; other values cannot authorise a
+review request. GitHub Actions compares strings case-insensitively in the job
+condition, so a case variant such as `TRUE` can still allocate a controller
+runner, but the runtime rejects it before posting. A repository value overrides
+the organisation value. The same protected controller revalidates the failed
+verifier run and exact current PR/head/base. For an open, ready,
+same-repository PR targeting the current default branch, it may post a
+canonical request if no current-scope match exists or adopt an existing match;
+uncertain outcomes remain pending. The automatic path is request-only: it does
 not immediately rerun the verifier. A later Codex bot comment or protected
 manual `reconcile` processes the provider result. This may follow any of the
 four verifier PR events above, not just `synchronize`. If a merge conflict

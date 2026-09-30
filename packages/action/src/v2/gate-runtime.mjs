@@ -3115,6 +3115,7 @@ function validateV2Trigger(config) {
     const upstream = event?.workflow_run;
     const association = upstream?.pull_requests?.[0];
     if (
+      config.environment.CODEX_REVIEW_GATE_AUTO_REQUEST !== "true" ||
       event?.action !== "completed" ||
       event?.repository?.full_name !== config.repository ||
       !isPlainRecord(upstream) ||

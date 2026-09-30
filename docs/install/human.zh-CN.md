@@ -84,8 +84,10 @@ uses: JoeyTeng/codex-review-gate-action@v2
 - 只有 organization 或 repository Actions variable 的生效值 `CODEX_REVIEW_GATE_AUTO_REQUEST`
   精确等于 `true`，受保护 default branch 上的 controller 才额外通过 `workflow_run` 接受
   canonical read-only `Codex Review Gate Verifier` 首次 attempt（`run_attempt=1`）的
-  failure，且只用于自动创建 request。变量缺失或任何其他值都视为
-  false，因此默认关闭。它必须验证来源是 canonical run，并重新读取 same-repository、open、
+  failure，且只用于自动创建 request。只有字面量 `true` 才授权创建 request；变量未设置时，
+  此路径默认不启动。其他值不能发送 request，但 `TRUE` 等大小写变体可能通过 GitHub Actions
+  不区分大小写的 job 条件并分配 controller runner；运行时的精确值检查会在任何 request POST 前
+  拒绝它们。它必须验证来源是 canonical run，并重新读取 same-repository、open、
   non-draft、target 为当前 default branch 的 PR，确认仍位于 source run 的 current head，且
   不存在匹配的 canonical request。由 `opened`、`reopened`、`synchronize` 或
   `ready_for_review` 启动的 verifier 失败后都可能触发此路径。此路径不会立即 rerun verifier；

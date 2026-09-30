@@ -8172,6 +8172,38 @@ test("failed first-attempt workflow_run requests Codex once without rerunning th
   ));
 });
 
+test("auto request requires the exact lowercase true repository-variable mapping", async (context) => {
+  for (const value of ["true", "TRUE", "True", "false", "", undefined]) {
+    const github = createGitHubMock();
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-variable-${value ?? "unset"}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+    if (value === undefined) {
+      delete environment.CODEX_REVIEW_GATE_AUTO_REQUEST;
+    } else {
+      environment.CODEX_REVIEW_GATE_AUTO_REQUEST = value;
+    }
+
+    const { result } = await runGate(environment, github);
+
+    if (value === "true") {
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.report.executionHealth, "healthy");
+      assert.equal(result.report.gateOutcome, "pending");
+      assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+    } else {
+      assert.equal(result.exitCode, 1, String(value));
+      assert.equal(result.report.gateOutcome, "not_applicable", String(value));
+      assert.equal(result.report.recoveryCode, "unsupported_target", String(value));
+      assert.deepEqual(github.calls, [], String(value));
+      assert.deepEqual(github.requestBodies, [], String(value));
+    }
+    assert.deepEqual(github.rerunRequests, [], String(value));
+  }
+});
+
 test("auto request adopts an exact-head/base canonical marker from another run", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest({
@@ -10535,6 +10567,7 @@ function runtimeEnvironment(context, {
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   const environment = {
     GITHUB_TOKEN: "test-token",
+    ...(eventName === "workflow_run" ? { CODEX_REVIEW_GATE_AUTO_REQUEST: "true" } : {}),
     GITHUB_REPOSITORY: REPOSITORY,
     PR_NUMBER: String(PR),
     EXPECTED_HEAD_SHA: expectedHeadSha,

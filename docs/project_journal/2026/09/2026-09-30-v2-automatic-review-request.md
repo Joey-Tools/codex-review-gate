@@ -43,6 +43,13 @@ superseded_by:
   begin-review path retains its original same-run semantics. An uncertain POST
   remains fail-closed; small duplicate requests are acceptable, but a finding
   must never be converted into a pass.
+- GitHub Actions expression string comparisons are case-insensitive, so the
+  job-level `vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'` condition alone
+  also admits case variants such as `TRUE`. The controller passes the raw
+  variable to the Action, whose runtime requires the exact lowercase string
+  `true` before any GitHub API call. An incorrectly cased value can consume a
+  runner start but cannot authorize a review request; tests cover both sides
+  of this boundary.
 
 ## Delivery sequence
 

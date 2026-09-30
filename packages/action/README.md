@@ -144,14 +144,17 @@ authoritative verifier reconcile.
 
 Automatic review requests are off by default. The organisation or repository
 Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` must be exactly `true`;
-missing or other values are false, and a repository value overrides the
-organisation value. The same controller re-fetches the completed failed
-verifier and admits only its unique current-head PR association for an open,
-ready, same-repository PR on the current default base. It posts a canonical
-request if no exact repository/PR/head/base match exists, or adopts an existing
-match. The request is the entire automatic operation: there is no immediate
-verifier rerun. A later exact Codex bot comment or protected manual
-`reconcile` performs that rerun. This path may
+an unset value skips the automatic controller job, and no other value
+authorises a review request. GitHub Actions compares strings case-insensitively
+in the job condition, so a case variant such as `TRUE` can still allocate a
+controller runner; the runtime then rejects it before posting. A repository
+value overrides the organisation value. The same controller re-fetches the
+completed failed verifier and admits only its unique current-head PR
+association for an open, ready, same-repository PR on the current default
+base. It posts a canonical request if no exact repository/PR/head/base match
+exists, or adopts an existing match. The request is the entire automatic
+operation: there is no immediate verifier rerun. A later exact Codex bot
+comment or protected manual `reconcile` performs that rerun. This path may
 follow `opened`, `reopened`, `synchronize` or `ready_for_review`, not just a
 push. A merge conflict can prevent the `pull_request` verifier from running;
 without that run there is no automatic request, so resolve the conflict and

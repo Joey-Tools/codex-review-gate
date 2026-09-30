@@ -106,11 +106,15 @@ boundaries that an Action step cannot define:
   `CODEX_REVIEW_GATE_AUTO_REQUEST` is exactly `true`, the protected
   default-branch controller also accepts a failed first attempt
   (`run_attempt=1`) of the canonical read-only `Codex Review Gate Verifier`
-  through `workflow_run` for a request-only auto-start. A missing value or any
-  other value is false, so this path is off by default. It requires a verified
-  canonical source run and a fresh same-repository, open, non-draft PR targeting
-  the current default branch, still on the source run's current head, and no
-  matching canonical request. A verifier triggered by `opened`, `reopened`,
+  through `workflow_run` for a request-only auto-start. Only literal `true`
+  authorises a request, so the path is off by default when unset. Other values
+  cannot post a request, but case variants such as `TRUE` can pass GitHub
+  Actions' case-insensitive job condition and allocate a controller runner;
+  the runtime's exact-value check then rejects them before any request POST.
+  An authorized request also requires a verified canonical source run and a
+  fresh same-repository, open, non-draft PR targeting the current default
+  branch, still on the source run's current head, and no matching canonical
+  request. A verifier triggered by `opened`, `reopened`,
   `synchronize`, or `ready_for_review` can reach this path. It does not
   immediately rerun the verifier; a later qualifying Codex bot
   `issue_comment` or manual `reconcile` performs the next evaluation. A merge

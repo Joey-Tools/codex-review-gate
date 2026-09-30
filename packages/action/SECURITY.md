@@ -86,8 +86,11 @@ write API. Retain the controller's closed `issue_comment` `created`, protected
 exact pre-runner Codex sender/author filtering for bot comments, and narrow
 `actions: write` plus `pull-requests: write` surface. The `workflow_run` path
 is opt-in only when the repository or organisation Actions variable
-`CODEX_REVIEW_GATE_AUTO_REQUEST` is exactly `true`; missing or any other value
-is off. It handles only the failed first attempt (`run_attempt=1`) of the
+`CODEX_REVIEW_GATE_AUTO_REQUEST` is literally `true`. Missing or any other
+value cannot authorise a request. GitHub Actions expression comparison is
+case-insensitive, so a case variant such as `TRUE` may still allocate a
+controller job; the runtime's exact comparison rejects it before POST. It
+handles only the failed first attempt (`run_attempt=1`) of the
 canonical `Codex Review Gate Verifier` workflow, after revalidating an
 open, ready, same-repository PR against the current feature head and default
 base. With no matching canonical request, it may create one request but does

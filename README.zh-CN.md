@@ -52,7 +52,9 @@ V2 consumer 把两份 canonical workflows 复制到目标仓库的相同路径�
   controller 也可在 canonical verifier 失败后请求评审；无需第三份 workflow。
 
 自动请求默认关闭。把 organisation 或 repository Actions variable
-`CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的 `true` 才会启用；未设置或其他值都表示关闭，
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的小写 `true` 才能授权请求；未设置时会跳过
+自动 controller job，其他值均不能发出请求。GitHub Actions 的 job 条件不区分字符串大小写，
+因此 `TRUE` 等大小写变体仍可能分配 controller runner，但 runtime 会在发帖前拒绝。
 repository 值会覆盖 organisation 值。`opened`、`reopened`、`synchronize` 或
 `ready_for_review` 触发 verifier 后，一次完成且失败的 run 可以让受保护 controller
 处理 same-repository、open、ready、以当前 default branch 为 base 且 head 仍精确匹配的

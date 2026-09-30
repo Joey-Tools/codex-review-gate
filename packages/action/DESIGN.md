@@ -210,8 +210,11 @@ repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`. Dispatch has no profile
 or numeric override.
 
 The resolved organisation/repository variable `CODEX_REVIEW_GATE_AUTO_REQUEST`
-enables the `workflow_run` request path only when its value is exactly `true`.
-Missing or any other value means off; it is not a dispatch or Action input. The
+authorises an automatic request only when its value is literally `true`.
+Missing or any other value cannot authorise the request. The GitHub Actions
+job-level expression compares strings case-insensitively, so `TRUE` may still
+allocate a runner; the runtime checks the exact string before any request
+POST and fails closed. This variable is not a dispatch or Action input. The
 initial canary opt-in is `codex-private-workflows`, with other consumers off by
 default: scope the `Joey-Tools` organisation variable to that selected
 repository only, without a repository-level override. This adds no runtime

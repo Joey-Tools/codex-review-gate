@@ -56,7 +56,10 @@ Maintain these invariants:
   before mutating;
 - automatic request creation is opt-in only: a protected organization or
   repository variable `CODEX_REVIEW_GATE_AUTO_REQUEST` must be exactly `true`.
-  Missing or any other value means false. Canary with the `Joey-Tools`
+  An unset value does not start the request path. Other values cannot post a
+  request, but case variants such as `TRUE` may allocate a controller runner
+  because GitHub Actions job comparisons are case-insensitive; the runtime
+  rejects them before any request POST. Canary with the `Joey-Tools`
   organisation variable selected only for `codex-private-workflows`, not a
   repository-level override, before enabling it elsewhere;
 - select only `default` and `expanded` through protected repository variable

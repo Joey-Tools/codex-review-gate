@@ -126,7 +126,9 @@ canonical verifier 只有一个入口：
 reaction-only completion 由之后的 authoritative verifier reconcile 发现。
 
 自动评审请求默认关闭。organisation 或 repository Actions variable
-`CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于 `true`；未设置或其他值都视为 false，
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于小写 `true` 才能授权请求；未设置时会跳过
+自动 controller job，其他值均不能发出请求。GitHub Actions 的 job 条件不区分字符串大小写，
+因此 `TRUE` 等大小写变体仍可能分配 controller runner，但 runtime 会在发帖前拒绝。
 repository 值覆盖 organisation 值。同一份 controller 重新读取已完成且失败的 verifier，
 仅接受它唯一关联的 current-head PR；该 PR 必须 same-repository、open、ready，且以当前
 default branch 为 base。只有 exact repository/PR/head/base scope 还没有匹配的

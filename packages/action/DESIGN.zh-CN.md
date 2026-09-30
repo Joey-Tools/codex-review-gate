@@ -183,9 +183,11 @@ skip-reconcile controls 都不是 inputs。
 `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派生 `limits_profile=default|expanded`；dispatch
 没有 profile 或 numeric override。
 
-只有解析后的 organisation/repository variable `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确
-等于 `true`，才启用 `workflow_run` request 路径。缺失或任何其他值都视为关闭；它不是
-dispatch 或 Action input。首个 canary 通过 `Joey-Tools` organisation variable 的
+只有解析后的 organisation/repository variable `CODEX_REVIEW_GATE_AUTO_REQUEST` 字面
+精确等于 `true`，才授权自动 request；缺失或其他值都不能授权请求。但 GitHub Actions 的 job-level
+表达式字符串比较不区分大小写，`TRUE` 等变体仍可能分配 runner；运行时在 request POST 前按
+精确字符串比较并 fail-closed。该 variable 不是 dispatch 或 Action input。首个 canary 通过
+`Joey-Tools` organisation variable 的
 selected-repository visibility 仅向 `codex-private-workflows` opt in，不使用 repository-level
 override；其他 consumers 默认关闭。此功能不新增 runtime App 或 ruleset。
 
