@@ -6257,6 +6257,50 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     validateCanonicalV2ControllerWorkflowContent(CANONICAL_CONTROLLER_WORKFLOW),
     CANONICAL_CONTROLLER_WORKFLOW,
   );
+  assert.match(
+    CANONICAL_CONTROLLER_WORKFLOW,
+    /^  workflow_run:\n    workflows: \[Codex Review Gate Verifier\]\n    types: \[completed\]$/mu,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "workflows: [Codex Review Gate Verifier]",
+          "workflows: [Other Workflow]",
+        ),
+      ),
+    /Codex Review Gate Verifier workflow_run/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
+          "vars.CODEX_REVIEW_GATE_AUTO_REQUEST != 'false'",
+        ),
+      ),
+    /job\.if must exactly match/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number",
+          "github.event.issue.number || inputs.pr_number",
+        ),
+      ),
+    /unexpected concurrency\.group/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "github.event_name == 'issue_comment' && github.event.comment.id || github.event_name == 'workflow_dispatch' && inputs.request_comment_id || ''",
+          "github.event.comment.id || inputs.request_comment_id",
+        ),
+      ),
+    /unexpected jobs\.codex-review-gate-controller\.steps\.with\.request_comment_id/u,
+  );
   assert.throws(
     () =>
       validateCanonicalV2WorkflowContent(

@@ -61,6 +61,10 @@ Codex issue_comment created               protected workflow_dispatch
                                 +---- summary / best-effort sticky
 ```
 
+An optional protected `workflow_run` ingress also reaches the same controller
+after a canonical verifier completes with failure. It is request-only and does
+not immediately rerun the verifier.
+
 ### Consumer workflows
 
 The copied canonical verifier and controller are trusted repository
@@ -126,7 +130,8 @@ default-base scope. `edited` is deliberately absent: after a base retarget, a
 ready PR must be converted to draft and marked ready again, while an
 already-draft PR is marked ready. The new `ready_for_review` event creates a
 verifier for the current exact head/base/test-merge scope; rerunning the old
-event does not.
+event does not. A failed verifier from any of these four admitted events can
+feed the optional `workflow_run` ingress.
 
 GitHub records the verifier run/job/native CheckRun against the exact PR
 feature-head SHA even though the canonical `pull_request` workflow executes on
@@ -142,8 +147,9 @@ is the execution binding that lets a successful feature-head CheckRun prove
 evaluation of the exact current test-merge. The CheckRun itself does not
 belong to the test-merge SHA.
 
-The controller admits only `issue_comment` `created` and default-branch
-`workflow_dispatch`. Comment admission checks both event sender and comment
+The controller admits `issue_comment` `created`, default-branch
+`workflow_dispatch`, and the opt-in `workflow_run` `completed` path for a failed
+canonical verifier. Comment admission checks both event sender and comment
 author against exact login `chatgpt-codex-connector[bot]` and exact type `Bot`
 before runner allocation. The Action revalidates the admitted event because
 the two checks protect different boundaries. An edited Codex comment requires
@@ -157,7 +163,9 @@ writers with the native repository and Actions permission to dispatch are an
 explicit trust boundary; v2 does not maintain a hard-coded actor allowlist.
 
 There is no cron, `repository_dispatch`, `pull_request_target` or writable
-automatic `pull_request_review` job. The absence of cron avoids
+automatic `pull_request_review` job. The protected `workflow_run` path meets
+the public-repository policy against `pull_request_target` without running PR
+code in a writable context. The absence of cron avoids
 billable no-op runs in private repositories. Review-object and reaction
 changes, including edits to a qualifying issue comment, converge through manual
 reconcile unless they create a new qualifying issue comment.
@@ -201,6 +209,17 @@ Both Action steps derive `limits_profile=default|expanded` only from protected
 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`. Dispatch has no profile
 or numeric override.
 
+The resolved organisation/repository variable `CODEX_REVIEW_GATE_AUTO_REQUEST`
+authorises an automatic request only when its value is literally `true`.
+Missing or any other value cannot authorise the request. The GitHub Actions
+job-level expression compares strings case-insensitively, so `TRUE` may still
+allocate a runner; the runtime checks the exact string before any request
+POST and fails closed. This variable is not a dispatch or Action input. The
+initial canary opt-in is `codex-private-workflows`, with other consumers off by
+default: scope the `Joey-Tools` organisation variable to that selected
+repository only, without a repository-level override. This adds no runtime
+App or ruleset.
+
 `request_comment_id` is only a locator hint. The reducer may use it to avoid
 unnecessary backward requests, but must prove that every newer relevant
 request, finding, progress artifact, malformed artifact and conflict has been
@@ -215,11 +234,12 @@ default creates or safely adopts a fresh exact `@codex review` request with the
 canonical controller marker. The marker binds
 the v2 format, full head, current base repository/ref/SHA and workflow run.
 `request_review=false` skips posting; it is best effort and creates no special
-barrier. After exact request readback, the controller establishes a newer full
-verifier attempt.
+barrier. For manual and issue-comment entry, the controller establishes a newer
+full verifier attempt after exact request readback.
 
-A logical workflow-authored request attempt is bound to repository ID, PR,
-expected head and `GITHUB_RUN_ID`. A rerun may adopt its own exact, unedited,
+An issue-comment or manual workflow-authored request attempt is bound to
+repository ID, PR, expected head and `GITHUB_RUN_ID`. A rerun may adopt its own
+exact, unedited,
 matching marker. If the POST result is unknown, runtime first rereads GitHub;
 it does not blindly repeat the request. Continued uncertainty keeps pending and
 reports `retry_begin` with `retry_safe=false`, because GitHub issue-comment
@@ -233,12 +253,36 @@ but cannot prevent GitHub from replacing a not-yet-started pending run. A
 caller therefore observes the exact `begin-review` run complete before treating
 it as a barrier or posting a dependent request.
 
-Agents normally make a low-cost provider-side attempt with exact `@codex review`
-when the check is not already passing, avoiding an Actions runner while other
+Outside the opt-in automatic path, agents normally make a low-cost provider-side
+attempt with exact `@codex review` when the check is not already passing,
+avoiding an Actions runner while other
 checks run. The comment does not grant provider capability or guarantee
 delivery; absent official Codex evidence remains pending. `begin-review`
 remains the coordinated path, especially for a deliberate same-head re-review
 that must establish a newer verifier generation.
+
+### Opt-in automatic request after verifier failure
+
+A failed first attempt (`run_attempt=1`) of the canonical
+`Codex Review Gate Verifier` is a trigger, not authority for a review request.
+The protected `workflow_run` path rereads the completed failed verifier and PR,
+and requires the same-repository PR to remain open, ready, on the default base
+and at the verifier's exact current head. It requests exact `@codex review`
+with the canonical marker only when no matching canonical request already
+exists for that repository/PR/head/base scope; missing or ambiguous evidence
+remains blocking. An uncertain POST is reread and left pending without a blind
+second POST; cross-run adoption is not an exactly-once guarantee. Unlike
+manual same-run recovery, this automatic path may
+adopt an existing exact canonical marker from a prior run without matching its
+run ID; an existing match suppresses another POST for that scope. The controller uses
+`begin-review` with `request_review=true`, but derives its automatic trigger
+source from the event rather than a new Action
+input. In this path, request readback completes without establishing a newer
+verifier attempt or calling `reconcile`: a later Codex bot `issue_comment` or
+protected manual dispatch performs that reconciliation. If a merge conflict
+prevents the verifier from running, there is no `workflow_run` failure to
+consume, so recovery is manual. The feature is off unless explicitly enabled
+by the exact variable value above.
 
 ### `reconcile`
 

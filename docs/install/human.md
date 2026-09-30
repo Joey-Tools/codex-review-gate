@@ -95,16 +95,34 @@ boundaries that an Action step cannot define:
   `reopened`, `synchronize`, and `ready_for_review`; its native
   `codex/github-review-gate` CheckRun on the exact PR feature-head SHA is
   required;
-- controller automatic wake-ups use only the `issue_comment` activity type
+- controller bot-evidence wake-ups use only the `issue_comment` activity type
   `created`. Editing an existing comment does not allocate a runner; use the
   protected default-branch manual `reconcile` path when an edited carrier needs
   a new evaluation. It deliberately excludes `pull_request_review`:
   GitHub binds that event to the PR merge ref, while the controller holds
   narrow write authority. A Codex result carried only by a review or reaction
   therefore uses the protected default-branch manual `reconcile` path;
-- before a runner is allocated, both the event sender and comment author must
-  be the exact Codex bot, `chatgpt-codex-connector[bot]`, with GitHub type
-  `Bot`;
+- when the effective organization- or repository-level Actions variable
+  `CODEX_REVIEW_GATE_AUTO_REQUEST` is exactly `true`, the protected
+  default-branch controller also accepts a failed first attempt
+  (`run_attempt=1`) of the canonical read-only `Codex Review Gate Verifier`
+  through `workflow_run` for a request-only auto-start. Only literal `true`
+  authorises a request, so the path is off by default when unset. Other values
+  cannot post a request, but case variants such as `TRUE` can pass GitHub
+  Actions' case-insensitive job condition and allocate a controller runner;
+  the runtime's exact-value check then rejects them before any request POST.
+  An authorized request also requires a verified canonical source run and a
+  fresh same-repository, open, non-draft PR targeting the current default
+  branch, still on the source run's current head, and no matching canonical
+  request. A verifier triggered by `opened`, `reopened`,
+  `synchronize`, or `ready_for_review` can reach this path. It does not
+  immediately rerun the verifier; a later qualifying Codex bot
+  `issue_comment` or manual `reconcile` performs the next evaluation. A merge
+  conflict that prevents the verifier from running has no automatic request;
+  use manual recovery;
+- for `issue_comment` wake-ups, before a runner is allocated, both the event
+  sender and comment author must be the exact Codex bot,
+  `chatgpt-codex-connector[bot]`, with GitHub type `Bot`;
 - the only manual trigger is `workflow_dispatch`, and one run targets one pull
   request;
 - manual dispatches must use the workflow from the repository's default
@@ -118,6 +136,14 @@ boundaries that an Action step cannot define:
   which GitHub accepts pull-request write authority through the issue-comment
   REST endpoints. Neither workflow has `issues: write`, `statuses: write`,
   `checks: write`, or `contents: write`.
+
+The auto-request opt-in adds no GitHub App, ruleset, or Action input/operation.
+Keep it disabled for ordinary consumers until it has been exercised first on
+`Joey-Tools/codex-private-workflows` as the rollout canary. Use the `Joey-Tools`
+organisation Actions variable with selected-repository visibility limited to
+that canary, not a repository-level override. The public-repository
+policy against a writable `pull_request_target` auto-request path is why this
+uses the protected `workflow_run` entry.
 
 By default, an ordinary human-authored exact `@codex review` request is admitted
 as a candidate at any repository permission, not as an immediate
@@ -1653,11 +1679,19 @@ Event validation is limited to the PR head/base SHA, ref, and repository. Its
 `merge_commit_sha` may be missing or historical and is deliberately not a
 binding input.
 
-There is deliberately no cron or writable review event. The verifier starts on
-`opened`, `reopened`, `synchronize`, and `ready_for_review`; controller and
-verifier have separate per-PR concurrency namespaces. Before a deliberate
-same-head re-review, run `begin-review` so the new request is read back and a
-strictly newer verifier attempt becomes observable. A direct comment alone
+There is deliberately no cron, `pull_request_target`, or writable review event.
+The verifier starts on `opened`, `reopened`, `synchronize`, and
+`ready_for_review`; controller and verifier have separate per-PR concurrency
+namespaces. With exact `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, an eligible
+failed canonical verifier can wake the protected controller through
+`workflow_run` to create the missing canonical request for the current PR
+scope. That auto-start is request-only: it does not immediately rerun the
+verifier. Only this auto path may recognize an existing canonical marker from
+another controller run when repository, PR, head, and base all match exactly;
+manual `begin-review` keeps its same-run binding. Wait for a qualifying Codex
+bot `issue_comment` or use manual `reconcile` for the next evaluation. Before a
+deliberate same-head re-review, run `begin-review` so the new request is read
+back and a strictly newer verifier attempt becomes observable. A direct comment alone
 does not atomically invalidate an older success.
 
 If a base retarget leaves no verifier for the current exact

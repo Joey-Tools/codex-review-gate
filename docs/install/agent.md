@@ -43,16 +43,25 @@ Maintain these invariants:
 - `workflow_dispatch` is the sole manual entry point;
 - invoke `gh workflow run` without `--ref`, then read the created run back and
   prove that it used `DEFAULT_BRANCH`;
-- prefer a direct `@codex review` provider-side attempt; it does not grant
-  provider capability or guarantee that Codex starts. Use `begin-review` only
-  when request creation and a newer verifier attempt need controller
-  coordination;
+- with automatic requests disabled (the default), prefer a direct
+  `@codex review` provider-side attempt; it does not grant provider capability
+  or guarantee that Codex starts. Use manual `begin-review` only when request
+  creation and a newer verifier attempt need controller coordination;
 - select exactly one request producer for each exact-head review generation.
-  A direct request is preferred only while no controller `begin-review` with
-  `request_review=true` is active for that head. Once such a run has been
-  dispatched, is starting, or has emitted its hidden marker, do not also post
-  a direct `@codex review`. If ownership is uncertain, read the controller run,
-  canonical marker, sticky diagnostic, and provider evidence before mutating;
+  A direct request is preferred only while no automatic request or controller
+  `begin-review` with `request_review=true` is active for that head. Once such
+  a run has been dispatched, is starting, or has emitted its hidden marker, do
+  not also post a direct `@codex review`. If ownership is uncertain, read the
+  controller run, canonical marker, sticky diagnostic, and provider evidence
+  before mutating;
+- automatic request creation is opt-in only: a protected organization or
+  repository variable `CODEX_REVIEW_GATE_AUTO_REQUEST` must be exactly `true`.
+  An unset value does not start the request path. Other values cannot post a
+  request, but case variants such as `TRUE` may allocate a controller runner
+  because GitHub Actions job comparisons are case-insensitive; the runtime
+  rejects them before any request POST. Canary with the `Joey-Tools`
+  organisation variable selected only for `codex-private-workflows`, not a
+  repository-level override, before enabling it elsewhere;
 - select only `default` and `expanded` through protected repository variable
   `CODEX_REVIEW_GATE_LIMITS_PROFILE`, never dispatch or numeric overrides.
 - canonical workflows fix `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`.
@@ -1267,11 +1276,13 @@ The canonical workflows must have this contract after the merge:
   `codex/github-review-gate` on the exact PR feature-head SHA;
 - controller path `.github/workflows/codex-review-gate-controller.yml`, workflow
   name `Codex Review Gate Controller`, exact Codex `issue_comment` `created`,
-  and default-branch `workflow_dispatch`. An edited comment does not allocate a
-  runner; use protected manual `reconcile` if it needs evaluation. It intentionally
+  completed canonical `Codex Review Gate Verifier` first-attempt
+  (`run_attempt=1`) failure via `workflow_run`, and default-branch
+  `workflow_dispatch`. An edited comment does not allocate a runner; use
+  protected manual `reconcile` if it needs evaluation. It intentionally
   excludes `pull_request_review`: GitHub binds review events to the PR merge
-  ref, so a controller with narrow write authority must not execute that
-  ref. Reconcile review- or reaction-only evidence through the protected
+  ref, so a controller with narrow write authority must not execute that ref.
+  Reconcile review- or reaction-only evidence through the protected
   default-branch dispatch instead;
 - exact pre-runner sender and author checks for
   `chatgpt-codex-connector[bot]` with type `Bot`;
@@ -1284,6 +1295,27 @@ The canonical workflows must have this contract after the merge:
   cancellation and non-cancelling controller operations;
 - no cron, `repository_dispatch`, `pull_request_target`, writable
   `pull_request_review`, status bridge, runtime App, or ledger.
+
+The optional automatic request path keeps the canonical `pull_request`
+verifier read-only and runs in the existing protected controller workflow via
+`workflow_run` on a failed first canonical verifier attempt. Rerunning an old
+verifier attempt does not start this path. Public-repository policy rules
+out a writable `pull_request_target` handler. The controller accepts only an
+open, ready (non-draft), same-repository PR targeting the current default
+branch, with the failed verifier bound to its current exact head and no
+matching canonical request already present, including a marker from an earlier
+controller run that matches the same repository, PR, head, and base. A failure
+after `opened`,
+`reopened`, `synchronize`, or `ready_for_review` can qualify. With
+`CODEX_REVIEW_GATE_AUTO_REQUEST` exactly `true`, it uses the existing
+`begin-review` operation with `request_review=true` in request-only mode
+(post the request without immediately rerunning the verifier). A later
+qualifying Codex bot
+`issue_comment` event or protected manual exact-head `reconcile` updates the
+gate. A merge conflict that prevents the verifier from running has no failed
+verifier `workflow_run` to consume: resolve the conflict or use the documented
+manual recovery path. This opt-in adds no third workflow, new Action input,
+runtime App, or ruleset.
 
 Canonical workflows set
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly. This accepts an
@@ -1408,6 +1440,12 @@ legacy before v2 is Active and read back.
 
 ## Phase 3: create the separate canary PR
 
+For the first automatic-request canary, set the protected `Joey-Tools`
+organisation Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true` with
+selected-repository visibility limited to `codex-private-workflows` before
+opening the canary PR. Do not set a repository-level override for the canary.
+Otherwise leave it unset; the ordinary direct-request procedure below applies.
+
 1. From the merged `DEFAULT_BRANCH`, create a temporary branch with one
    harmless, reviewable change. Push it and open a non-draft PR.
 2. Record the authoritative PR number, base, and exact `headRefOid` as the full
@@ -1438,8 +1476,10 @@ legacy before v2 is Active and read back.
    test -n "$CANARY_HEAD_REF"
    ```
 
-3. Prefer a direct exact request. This path does not allocate a gate runner
-   merely to ask for review:
+3. With automatic requests off, prefer a direct exact request. This path does
+   not allocate a gate runner merely to ask for review. With the opt-in on, do
+   not execute this direct-request command; observe the automatic outcome and
+   use manual recovery if it is ineligible:
 
    ```bash
    REQUEST_COMMENT_ID="$(gh api --hostname github.com \
@@ -1450,10 +1490,15 @@ legacy before v2 is Active and read back.
    test -n "$REQUEST_COMMENT_ID"
    ```
 
-   Before posting, prove that no controller `begin-review` with
-   `request_review=true` is already active for `CANARY_HEAD` and that no
-   matching canonical hidden marker exists. Do not race a controller-owned
-   request with this low-cost path.
+   Before posting, prove that no automatic request or controller
+   `begin-review` with `request_review=true` is already active for
+   `CANARY_HEAD` and that no matching canonical hidden marker exists. Do not
+   race a controller-owned request with this low-cost path. If the protected
+   opt-in is enabled for the `Joey-Tools/codex-private-workflows` canary, first
+   observe the failed verifier and controller outcome for this exact head;
+   do not post a second request while automatic ownership is in flight or a
+   matching request exists. If no verifier ran because of a merge conflict,
+   automatic creation cannot start; recover manually after resolving it.
 
    Do not add prose to the request. GitHub may persist this one-line direct
    request with exactly one terminal LF or CRLF; those two storage forms are

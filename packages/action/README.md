@@ -131,13 +131,40 @@ The canonical verifier has one entry:
 
 The protected-default-branch controller has only these entries:
 
-- `issue_comment` with activity type `created`; and
+- `issue_comment` with activity type `created`;
+- `workflow_run` with activity type `completed`, admitted only for a failed
+  first attempt (`run_attempt=1`) of the canonical `Codex Review Gate Verifier`
+  `pull_request` workflow when the opt-in variable is enabled; and
 - `workflow_dispatch` for one explicitly selected pull request.
 
 There is no cron, `repository_dispatch`, `pull_request_target`, writable
 automatic `pull_request_review` job, runtime GitHub App or status writer.
 Review objects and reaction-only completion are discovered by a later
 authoritative verifier reconcile.
+
+Automatic review requests are off by default. The organisation or repository
+Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` must be exactly `true`;
+an unset value skips the automatic controller job, and no other value
+authorises a review request. GitHub Actions compares strings case-insensitively
+in the job condition, so a case variant such as `TRUE` can still allocate a
+controller runner; the runtime then rejects it before posting. A repository
+value overrides the organisation value. The same controller re-fetches the
+completed failed verifier and admits only its unique current-head PR
+association for an open, ready, same-repository PR on the current default
+base. It posts a canonical request if no exact repository/PR/head/base match
+exists, or adopts an existing match. The request is the entire automatic
+operation: there is no immediate verifier rerun. A later exact Codex bot
+comment or protected manual `reconcile` performs that rerun. This path may
+follow `opened`, `reopened`, `synchronize` or `ready_for_review`, not just a
+push. A merge conflict can prevent the `pull_request` verifier from running;
+without that run there is no automatic request, so resolve the conflict and
+use manual recovery if needed. `workflow_run` keeps the writable controller
+on the protected default branch without relying on the public-repository
+[default `pull_request_target` event policy](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target).
+No third workflow, new GitHub App or
+ruleset is needed. For the Joey-Tools rollout, set the organisation variable's
+selected-repository visibility first to only `codex-private-workflows` as a
+canary, without a repository-level override, before expanding it.
 
 The controller deliberately does not subscribe its `actions: write` and
 `pull-requests: write` authority to `pull_request_review`: GitHub binds that
@@ -183,10 +210,11 @@ The controller Action step uses the corresponding underscore-named inputs:
 `request_comment_id` and `request_review`. `github_token` and
 `pr_number` are required. A manual run must supply the full
 `expected_head_sha`; the automatic comment path may leave it empty so the
-runtime can bind the authoritative head at startup. Neither path may follow a
-later head change. Both Action steps receive `default` or `expanded` only from
-the protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`; dispatch
-callers cannot override it.
+runtime can bind the authoritative head at startup. The automatic verifier-run
+path supplies the upstream exact head, `begin-review`, and `request_review=true`.
+No path may follow a later head change. Both Action steps receive `default` or
+`expanded` only from the protected repository variable
+`CODEX_REVIEW_GATE_LIMITS_PROFILE`; dispatch callers cannot override it.
 
 ## Operations
 
@@ -194,15 +222,21 @@ callers cannot override it.
 
 `begin-review` validates the exact PR and expected head, and by default creates
 or safely adopts a fresh exact `@codex review` request with the canonical
-hidden binding. It reads that request back before requesting a full rerun of
-the exact current verifier. `request_review=false` is an advanced best-effort
-option and does not add a dedicated barrier.
+hidden binding. For manual dispatch, it reads that request back before
+requesting a full rerun of the exact current verifier. `request_review=false`
+is an advanced best-effort manual option and does not add a dedicated barrier.
+For the opt-in automatic verifier-run trigger, `begin-review` always requests
+review and returns after posting or adopting a current-scope canonical request;
+it does not rerun the verifier. Automatic adoption can reuse a matching
+request from an earlier controller run, while the manual path retains its
+same-run request binding. An uncertain request POST remains fail-closed; it
+does not make the required verifier CheckRun pass.
 
 Controller runs for the same PR are serialised with `cancel-in-progress: false`.
-The controller records verifier attempt `A`, requires no competing canonical
-attempt, requests one full rerun, and must observe exact attempt `A+1` plus its
-unique canonical job/CheckRun. An ambiguous POST or invisible attempt remains
-blocking; concurrency is scheduling, not a mutation fence.
+For a rerun, the controller records verifier attempt `A`, requires no competing
+canonical attempt, requests one full rerun, and must observe exact attempt
+`A+1` plus its unique canonical job/CheckRun. An ambiguous POST or invisible
+attempt remains blocking; concurrency is scheduling, not a mutation fence.
 
 For the usual low-cost path, an agent may post exact `@codex review` directly
 as a provider-side attempt while other checks run and invoke GHA only when

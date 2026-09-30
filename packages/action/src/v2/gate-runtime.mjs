@@ -13,6 +13,7 @@ import {
 
 export const V2_REQUIRED_CHECK_NAME = "codex/github-review-gate";
 export const V2_VERIFIER_WORKFLOW_PATH = "codex-review-gate.yml";
+const V2_VERIFIER_WORKFLOW_NAME = "Codex Review Gate Verifier";
 export const V2_GITHUB_ACTIONS_APP_ID = 15_368;
 export const V2_REQUEST_MARKER = "codex-review-gate-request-v2";
 export const V2_STICKY_MARKER = "codex-review-gate:v2:diagnostic";
@@ -1421,6 +1422,7 @@ export async function runV2GateCli({
       }, context, report, {
         diagnostic:
           config?.triggerKind === "controller" &&
+          config?.triggerSource !== "auto" &&
           context.headValidated &&
           !stale,
       });
@@ -1504,11 +1506,11 @@ async function runV2ControllerAction(client, config, context, {
     expectedHeadSha: config.expectedHeadSha || String(initialPr?.head?.sha || "").toLowerCase(),
   });
   if (
-    config.triggerSource === "provider" &&
+    (config.triggerSource === "provider" || config.triggerSource === "auto") &&
     !isOpenV2PullRequest(initialPr)
   ) {
     const report = staleV2Report(
-      "The provider event arrived after the pull request stopped being open",
+      "The controller event arrived after the pull request stopped being open",
     );
     await finalizeV2Report(client, config, context, report);
     return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
@@ -1532,6 +1534,9 @@ async function runV2ControllerAction(client, config, context, {
     );
   }
   context.headValidated = true;
+  if (config.triggerSource === "auto") {
+    await exactRefetchV2AutoVerifierRun(client, config, repository, initialPr);
+  }
   if (config.triggerSource === "provider") {
     await exactRefetchV2ControllerProviderEvent(client, config);
     if (providerEventIsStale(config.event, config.expectedHeadSha, {
@@ -1555,6 +1560,19 @@ async function runV2ControllerAction(client, config, context, {
       throw new V2RuntimeFailure(
         "The adopted or created review request has no canonical comment identity",
       );
+    }
+    if (config.triggerSource === "auto") {
+      const report = buildV2GateReport({
+        executionHealth: "healthy",
+        gateOutcome: "pending",
+        reason:
+          `Automatic Codex review request ${reviewRequest.commentId} is ${reviewRequest.kind}; ` +
+          "wait for the provider result before reconciling",
+        recoveryCode: "wait_provider",
+        retrySafe: false,
+      });
+      await finalizeV2Report(client, config, context, report);
+      return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
     }
   }
   const refresh = await rerunCurrentV2Verifier(client, config, context, initialPr, {
@@ -2252,6 +2270,110 @@ async function loadExactV2VerifierRun(client, config, pullRequest, runId, budget
   return data;
 }
 
+async function exactRefetchV2AutoVerifierRun(client, config, repository, pullRequest) {
+  const eventRun = config.event.workflow_run;
+  const budget = new V2SnapshotBudget(config);
+  const [{ data: workflow }, { data: run }] = await Promise.all([
+    client.request(
+      "GET",
+      `${config.repoPath}/actions/workflows/${V2_VERIFIER_WORKFLOW_PATH}`,
+      undefined,
+      { budget, safeRead: true },
+    ),
+    client.request(
+      "GET",
+      `${config.repoPath}/actions/runs/${config.autoUpstreamRunId}`,
+      undefined,
+      { budget, safeRead: true },
+    ),
+  ]);
+  budget.consumeObjects(2, "auto-request upstream workflow and run");
+  requireV2VerifierRunShape(run, `auto-request verifier run ${config.autoUpstreamRunId}`);
+  const association = run.pull_requests[0];
+  if (
+    !isPlainRecord(workflow) ||
+    !canonicalPositiveId(workflow.id) ||
+    workflow.name !== V2_VERIFIER_WORKFLOW_NAME ||
+    workflow.path !== `.github/workflows/${V2_VERIFIER_WORKFLOW_PATH}` ||
+    String(workflow.id) !== String(eventRun.workflow_id) ||
+    String(run.id) !== config.autoUpstreamRunId ||
+    String(run.workflow_id) !== String(workflow.id) ||
+    run.run_number !== eventRun.run_number ||
+    run.run_attempt !== eventRun.run_attempt ||
+    run.run_attempt !== 1 ||
+    run.event !== "pull_request" ||
+    run.status !== "completed" ||
+    run.conclusion !== "failure" ||
+    !isCanonicalV2VerifierWorkflowPath(run.path) ||
+    run.path !== eventRun.path ||
+    run.display_title !== expectedV2VerifierDisplayTitle(config, pullRequest) ||
+    String(run.head_sha).toLowerCase() !== config.expectedHeadSha ||
+    String(run.head_sha).toLowerCase() !==
+      String(eventRun.head_sha).toLowerCase() ||
+    run.head_branch !== pullRequest.head.ref ||
+    run.repository?.id !== repository.id ||
+    run.repository?.full_name !== config.repository ||
+    config.event.repository?.id !== repository.id ||
+    eventRun.repository?.id !== repository.id ||
+    run.head_repository?.id !== repository.id ||
+    run.head_repository?.full_name !== config.repository ||
+    run.pull_requests.length !== 1 ||
+    !isPlainRecord(association) ||
+    Number(association.number) !== config.prNumber ||
+    String(association.head?.sha || "").toLowerCase() !== config.expectedHeadSha ||
+    !matchesV2VerifierAssociationRepository(association.head?.repo, config, repository) ||
+    String(association.base?.sha || "").toLowerCase() !==
+      String(pullRequest.base.sha).toLowerCase() ||
+    association.base?.ref !== pullRequest.base.ref ||
+    !matchesV2VerifierAssociationRepository(association.base?.repo, config, repository)
+  ) {
+    throw new V2StaleFailure(
+      "The completed workflow_run is not the canonical failed verifier for the exact current PR head and base",
+    );
+  }
+  const eventAssociation = eventRun.pull_requests[0];
+  if (
+    Number(eventAssociation?.number) !== Number(association.number) ||
+    String(eventAssociation?.head?.sha || "").toLowerCase() !==
+      String(association.head.sha).toLowerCase() ||
+    !matchesV2VerifierAssociationRepository(eventAssociation?.head?.repo, config, repository) ||
+    String(eventAssociation?.base?.sha || "").toLowerCase() !==
+      String(association.base.sha).toLowerCase() ||
+    eventAssociation?.base?.ref !== association.base.ref ||
+    !matchesV2VerifierAssociationRepository(eventAssociation?.base?.repo, config, repository)
+  ) {
+    throw new V2StaleFailure(
+      "The workflow_run event PR association changed during exact verifier readback",
+    );
+  }
+  await assertV2AutoVerifierStillCurrent(client, config, pullRequest, budget);
+}
+
+function matchesV2VerifierAssociationRepository(candidate, config, repository) {
+  if (!isPlainRecord(candidate) || candidate.id !== repository.id) return false;
+  if (Object.hasOwn(candidate, "full_name")) {
+    return candidate.full_name === config.repository;
+  }
+  return candidate.name === config.repo &&
+    candidate.url === `${config.apiUrl}${config.repoPath}`;
+}
+
+async function assertV2AutoVerifierStillCurrent(client, config, pullRequest, budget) {
+  const inventory = await listCurrentV2VerifierRuns(client, config, budget);
+  const current = selectCurrentV2VerifierRun(inventory, config, pullRequest);
+  if (
+    !current ||
+    String(current.id) !== config.autoUpstreamRunId ||
+    current.run_attempt !== 1 ||
+    current.status !== "completed" ||
+    current.conclusion !== "failure"
+  ) {
+    throw new V2StaleFailure(
+      "The failed workflow_run is no longer the current canonical verifier for this PR head and base",
+    );
+  }
+}
+
 async function loadUniqueV2VerifierJob(client, config, run, attempt, budget) {
   const jobs = [];
   const seen = new Set();
@@ -2398,13 +2520,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
   }
 
   const matching = canonicalV2RequestComments(comments).filter(({ binding }) =>
-    binding.repositoryId === context.repositoryId &&
-    binding.prNumber === String(config.prNumber) &&
-    binding.headSha === context.expectedHeadSha &&
-    binding.baseSha === String(initialPr.base.sha).toLowerCase() &&
-    binding.baseRef === initialPr.base.ref &&
-    binding.baseRepositoryId === String(initialPr.base.repo.id) &&
-    binding.runId === config.runId
+    matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
   );
   if (matching.length > 0) {
     await assertV2BeginReviewScope(client, config, initialPr, budget);
@@ -2422,6 +2538,24 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       "Pull-request inventory changed before the review request could be posted",
       { recoveryCode: "wait_then_reconcile" },
     );
+  }
+  if (config.triggerSource === "auto") {
+    const prePostRepository = await loadV2Repository(client, config, budget);
+    const expected = config.snapshotScope;
+    if (
+      prePostRepository.id !== expected.repositoryId ||
+      prePostRepository.full_name !== expected.repositoryFullName ||
+      prePostRepository.default_branch !== expected.defaultBranch ||
+      prePostPr.head?.ref !== expected.headRef ||
+      prePostPr.head?.repo?.id !== expected.headRepositoryId ||
+      prePostPr.head?.repo?.full_name !== expected.headRepositoryFullName ||
+      prePostPr.base?.ref !== prePostRepository.default_branch
+    ) {
+      throw new V2StaleFailure(
+        "The auto-request PR or default-branch scope changed before review submission",
+      );
+    }
+    await assertV2AutoVerifierStillCurrent(client, config, prePostPr, budget);
   }
 
   const requestBody = buildCanonicalV2ReviewRequestBody({
@@ -2516,13 +2650,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         );
         context.issueComments = reread;
         const sameRun = canonicalV2RequestComments(reread).filter(({ binding }) =>
-          binding.repositoryId === context.repositoryId &&
-          binding.prNumber === String(config.prNumber) &&
-          binding.headSha === context.expectedHeadSha &&
-          binding.baseSha === String(initialPr.base.sha).toLowerCase() &&
-          binding.baseRef === initialPr.base.ref &&
-          binding.baseRepositoryId === String(initialPr.base.repo.id) &&
-          binding.runId === config.runId
+          matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
         );
         visible = postReturnedSuccessfully
           ? sameRun.filter(({ comment }) =>
@@ -2577,6 +2705,16 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       { recoveryCode: "retry_begin", retrySafe: false },
     );
   }
+}
+
+function matchesV2BeginReviewRequestScope(binding, config, context, pullRequest) {
+  return binding.repositoryId === context.repositoryId &&
+    binding.prNumber === String(config.prNumber) &&
+    binding.headSha === context.expectedHeadSha &&
+    binding.baseSha === String(pullRequest.base.sha).toLowerCase() &&
+    binding.baseRef === pullRequest.base.ref &&
+    binding.baseRepositoryId === String(pullRequest.base.repo.id) &&
+    (config.triggerSource === "auto" || binding.runId === config.runId);
 }
 
 async function loadV2IssueCommentsWithEditHistory(
@@ -2939,7 +3077,8 @@ function validateV2Trigger(config) {
   if (
     eventName !== "pull_request" &&
     eventName !== "issue_comment" &&
-    eventName !== "workflow_dispatch"
+    eventName !== "workflow_dispatch" &&
+    eventName !== "workflow_run"
   ) {
     throw new V2RuntimeFailure(`Unsupported v2 runtime event: ${eventName}`, {
       gateOutcome: "not_applicable",
@@ -2971,6 +3110,46 @@ function validateV2Trigger(config) {
       );
     }
     return { triggerKind: "verifier", triggerSource: "pull_request", event };
+  }
+  if (eventName === "workflow_run") {
+    const upstream = event?.workflow_run;
+    const association = upstream?.pull_requests?.[0];
+    if (
+      config.environment.CODEX_REVIEW_GATE_AUTO_REQUEST !== "true" ||
+      event?.action !== "completed" ||
+      event?.repository?.full_name !== config.repository ||
+      !isPlainRecord(upstream) ||
+      !canonicalPositiveId(upstream.id) ||
+      !canonicalPositiveId(upstream.workflow_id) ||
+      !Number.isSafeInteger(upstream.run_number) ||
+      upstream.run_number <= 0 ||
+      !Number.isSafeInteger(upstream.run_attempt) ||
+      upstream.run_attempt !== 1 ||
+      upstream.event !== "pull_request" ||
+      upstream.status !== "completed" ||
+      upstream.conclusion !== "failure" ||
+      !isCanonicalV2VerifierWorkflowPath(upstream.path) ||
+      String(upstream.head_sha || "").toLowerCase() !== config.expectedHeadSha ||
+      upstream.repository?.full_name !== config.repository ||
+      !Array.isArray(upstream.pull_requests) ||
+      upstream.pull_requests.length !== 1 ||
+      Number(association?.number) !== config.prNumber ||
+      String(association?.head?.sha || "").toLowerCase() !== config.expectedHeadSha ||
+      config.operation !== "begin-review" ||
+      config.requestReview !== true ||
+      config.requestCommentId !== ""
+    ) {
+      throw new V2RuntimeFailure(
+        "workflow_run trigger did not bind a completed failed canonical verifier and exact review request",
+        { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
+      );
+    }
+    return {
+      triggerKind: "controller",
+      triggerSource: "auto",
+      autoUpstreamRunId: String(upstream.id),
+      event,
+    };
   }
   if (eventName === "workflow_dispatch") {
     const inputs = event?.inputs;
@@ -3084,11 +3263,17 @@ function classifyUnsupportedV2Target(repository, pullRequest, config) {
   ) {
     return "Action v2 supports ordinary, non-bot same-repository branches only";
   }
-  if (config.triggerSource === "manual") {
+  if (config.triggerSource === "manual" || config.triggerSource === "auto") {
     const refType = String(config.environment.GITHUB_REF_TYPE || "");
     const refName = String(config.environment.GITHUB_REF_NAME || "");
-    if (refType !== "branch" || refName !== repository.default_branch) {
-      return "workflow_dispatch must run from the protected default branch";
+    if (
+      refType !== "branch" ||
+      refName !== repository.default_branch ||
+      (config.triggerSource === "auto" &&
+        config.environment.GITHUB_REF !== `refs/heads/${repository.default_branch}`)
+    ) {
+      return `${config.triggerSource === "auto" ? "workflow_run" : "workflow_dispatch"} ` +
+        "must run from the protected default branch";
     }
   }
   return null;

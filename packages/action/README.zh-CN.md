@@ -116,11 +116,32 @@ canonical verifier 只有一个入口：
 受保护 default branch 上的 controller 只有以下入口：
 
 - activity type 为 `created` 的 `issue_comment`；
+- activity type 为 `completed` 的 `workflow_run`，仅在启用 opt-in variable 且
+  canonical `Codex Review Gate Verifier` `pull_request` workflow 的首次 attempt
+  （`run_attempt=1`）失败时放行；
 - 为单个明确指定 PR 运行的 `workflow_dispatch`。
 
 没有 cron、`repository_dispatch`、`pull_request_target`、可写自动
 `pull_request_review` job、runtime GitHub App 或 status writer。review objects 和
 reaction-only completion 由之后的 authoritative verifier reconcile 发现。
+
+自动评审请求默认关闭。organisation 或 repository Actions variable
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于小写 `true` 才能授权请求；未设置时会跳过
+自动 controller job，其他值均不能发出请求。GitHub Actions 的 job 条件不区分字符串大小写，
+因此 `TRUE` 等大小写变体仍可能分配 controller runner，但 runtime 会在发帖前拒绝。
+repository 值覆盖 organisation 值。同一份 controller 重新读取已完成且失败的 verifier，
+仅接受它唯一关联的 current-head PR；该 PR 必须 same-repository、open、ready，且以当前
+default branch 为 base。只有 exact repository/PR/head/base scope 还没有匹配的
+canonical request 时，才发送新请求；否则采用已有请求。自动操作至此结束，不会立即
+rerun verifier。之后由 exact Codex bot comment 或受保护的 manual `reconcile` 发起
+rerun。此路径可跟在 `opened`、`reopened`、`synchronize` 或 `ready_for_review`
+之后，不限于 push。Merge conflict 可能阻止 `pull_request` verifier 运行；没有该 run
+就不会自动请求，应先解决冲突，必要时再手动恢复。`workflow_run` 使可写 controller
+保留在受保护 default branch 上，且不依赖 public repository 的
+[`pull_request_target` 默认 event policy](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)。
+无需第三份 workflow、新 GitHub App 或 ruleset。Joey-Tools rollout 应先
+把 organisation variable 的 selected-repository visibility 仅设为
+`codex-private-workflows`，不设置 repository-level override；canary 成功后再扩大范围。
 
 只有 event sender 和 comment author 都是 exact Codex provider
 `chatgpt-codex-connector[bot]`、GitHub type `Bot` 时，自动 comment job 才会在
@@ -156,7 +177,8 @@ controller Action step 使用对应的 underscore 命名 inputs：`github_token`
 `expected_head_sha`、`operation`、`request_comment_id` 与 `request_review`。
 `github_token` 与 `pr_number` 必填。manual run 必须提供完整
 `expected_head_sha`；自动 comment 路径可以留空，让 runtime 在启动时绑定
-authoritative head。两条路径都不能跟随之后发生的 head change。两份 Action steps 只从
+authoritative head。自动 verifier-run 路径传入 upstream exact head、`begin-review` 和
+`request_review=true`。任何路径都不能跟随之后发生的 head change。两份 Action steps 只从
 受保护 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 获得 `default` 或
 `expanded`；dispatch caller 不能覆盖该值。
 
@@ -165,13 +187,17 @@ authoritative head。两条路径都不能跟随之后发生的 head change。�
 ### `begin-review`
 
 `begin-review` 校验 exact PR 和 expected head，并默认创建或安全采用一条带 canonical
-hidden binding 的 fresh exact `@codex review` request。它先精确读回该 request，再请求
-exact current verifier 的 full rerun。`request_review=false` 是 advanced best-effort
-option，不会增加专用 barrier。
+hidden binding 的 fresh exact `@codex review` request。manual dispatch 会先精确读回
+该 request，再请求 exact current verifier 的 full rerun。`request_review=false` 仅是
+advanced best-effort manual option，不会增加专用 barrier。启用 opt-in 自动
+verifier-run trigger 时，`begin-review` 必须请求评审，并在发送或采用 current-scope
+canonical request 后结束，不会 rerun verifier。自动路径可以采用较早 controller run
+留下的匹配 request；manual 路径仍只采用同一次 run 绑定的 request。不确定的 request
+POST 保持 fail-closed，不会让 required verifier CheckRun 通过。
 
-同一 PR 的 controller runs 使用 `cancel-in-progress: false` 串行化。controller 记录
-verifier attempt `A`、要求没有 competing canonical attempt、只请求一次 full rerun，
-并必须观察 exact attempt `A+1` 及其唯一 canonical job/CheckRun。POST 不确定或新 attempt
+同一 PR 的 controller runs 使用 `cancel-in-progress: false` 串行化。执行 rerun 时，
+controller 记录 verifier attempt `A`、要求没有 competing canonical attempt、只请求一次
+full rerun，并必须观察 exact attempt `A+1` 及其唯一 canonical job/CheckRun。POST 不确定或新 attempt
 不可见时仍保持 blocking；concurrency 只是 scheduling，不是 mutation fence。
 
 普通低成本路径中，agent 可以在其他 checks 运行时直接发送 exact

@@ -8146,6 +8146,386 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
   assert.deepEqual(disabledGitHub.requestBodies, []);
 });
 
+test("failed first-attempt workflow_run requests Codex once without rerunning the verifier", async (context) => {
+  const github = createGitHubMock();
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-first-attempt",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+  assert.deepEqual(github.rerunRequests, []);
+  assert.equal(github.stickyCreates.length, 0);
+  assert.ok(github.calls.some(({ method, path }) =>
+    method === "GET" &&
+    path === `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml`
+  ));
+  assert.ok(github.calls.some(({ method, path }) =>
+    method === "GET" && path === `/repos/${REPOSITORY}/actions/runs/7001`
+  ));
+});
+
+test("auto request requires the exact lowercase true repository-variable mapping", async (context) => {
+  for (const value of ["true", "TRUE", "True", "false", "", undefined]) {
+    const github = createGitHubMock();
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-variable-${value ?? "unset"}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+    if (value === undefined) {
+      delete environment.CODEX_REVIEW_GATE_AUTO_REQUEST;
+    } else {
+      environment.CODEX_REVIEW_GATE_AUTO_REQUEST = value;
+    }
+
+    const { result } = await runGate(environment, github);
+
+    if (value === "true") {
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.report.executionHealth, "healthy");
+      assert.equal(result.report.gateOutcome, "pending");
+      assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+    } else {
+      assert.equal(result.exitCode, 1, String(value));
+      assert.equal(result.report.gateOutcome, "not_applicable", String(value));
+      assert.equal(result.report.recoveryCode, "unsupported_target", String(value));
+      assert.deepEqual(github.calls, [], String(value));
+      assert.deepEqual(github.requestBodies, [], String(value));
+    }
+    assert.deepEqual(github.rerunRequests, [], String(value));
+  }
+});
+
+test("auto request adopts an exact-head/base canonical marker from another run", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest({
+      body: canonicalRequestBody(HEAD, { runId: "77" }),
+    })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-cross-run-adoption",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.match(result.report.reason, /review request 101 is adopted/iu);
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("auto request adopts multiple cross-run markers without a third request", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [
+      workflowRequest({ id: 101, body: canonicalRequestBody(HEAD, { runId: "77" }) }),
+      workflowRequest({ id: 102, body: canonicalRequestBody(HEAD, { runId: "88" }) }),
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-cross-run-duplicates",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.retrySafe, false);
+  assert.match(result.report.reason, /review request 101 is duplicates/iu);
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("auto request rejects stale PR head and same-head base movement", async (context) => {
+  for (const [suffix, pullRequestOverrides] of [
+    ["head", { head: { sha: NEXT_HEAD } }],
+    ["base-sha", { base: { sha: NEXT_HEAD } }],
+  ]) {
+    const github = createGitHubMock({ pullRequestOverrides });
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-stale-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, suffix === "head" ? 1 : 0, suffix);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.equal(result.report.recoveryCode, "refresh_head", suffix);
+    assert.deepEqual(github.requestBodies, [], suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+  }
+});
+
+test("auto request rechecks branch and default-base scope immediately before POST", async (context) => {
+  for (const [suffix, options] of [
+    ["head-ref", { pullRequestSequence: [{}, { head: { ref: "replaced" } }] }],
+    ["default-branch", { repositorySequence: [{}, { default_branch: "release" }] }],
+  ]) {
+    const github = createGitHubMock(options);
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-pre-post-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.equal(result.report.recoveryCode, "refresh_head", suffix);
+    assert.deepEqual(github.requestBodies, [], suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+  }
+});
+
+test("auto request requires a protected default-branch controller launch", async (context) => {
+  const github = createGitHubMock();
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-unprotected-launch",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+  environment.GITHUB_REF = "refs/heads/feature";
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "unsupported_target");
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("auto request rejects wrong event source and non-first verifier attempts", async (context) => {
+  for (const [suffix, event] of [
+    ["wrong-action", workflowRunEvent(verifierRun(), { action: "requested" })],
+    ["wrong-event", workflowRunEvent(verifierRun({ event: "push" }))],
+    ["not-failure", workflowRunEvent(verifierRun({ conclusion: "success" }))],
+    ["rerun-attempt", workflowRunEvent(verifierRun({ run_attempt: 2 }))],
+    ["wrong-workflow", workflowRunEvent(verifierRun({ path: ".github/workflows/other.yml" }))],
+    ["wrong-repository", workflowRunEvent(verifierRun({
+      repository: { id: 9, full_name: "other/repo" },
+    }))],
+    ["two-prs", workflowRunEvent(verifierRun({
+      pull_requests: [verifierRun().pull_requests[0], {
+        ...verifierRun().pull_requests[0],
+        number: PR + 1,
+      }],
+    }))],
+    ["wrong-pr", workflowRunEvent(verifierRun({
+      pull_requests: [{ ...verifierRun().pull_requests[0], number: PR + 1 }],
+    }))],
+  ]) {
+    const github = createGitHubMock();
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-invalid-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+      event,
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.deepEqual(github.requestBodies, [], suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+  }
+});
+
+test("auto request refetch rejects changed workflow, run, and PR association", async (context) => {
+  for (const [suffix, options] of [
+    ["workflow-id", {
+      requestInterceptor: ({ method, path }) =>
+        method === "GET" &&
+        path === `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml`
+          ? jsonResponse({
+              id: 6002,
+              name: "Codex Review Gate Verifier",
+              path: ".github/workflows/codex-review-gate.yml",
+            })
+          : undefined,
+    }],
+    ["run-workflow-id", { verifierRuns: [verifierRun({ workflow_id: 6002 })] }],
+    ["run-source", { verifierRuns: [verifierRun({ event: "push" })] }],
+    ["run-attempt", { verifierRuns: [verifierRun({ run_attempt: 2 })] }],
+    ["live-association-advanced", { verifierRuns: [verifierRun({
+      pull_requests: [{
+        ...verifierRun().pull_requests[0],
+        head: { ...verifierRun().pull_requests[0].head, sha: NEXT_HEAD },
+      }],
+    })] }],
+    ["run-base-ref", { verifierRuns: [verifierRun({
+      pull_requests: [{
+        ...verifierRun().pull_requests[0],
+        base: { ...verifierRun().pull_requests[0].base, ref: "release" },
+      }],
+    })] }],
+    ["run-base-repository", { verifierRuns: [verifierRun({
+      pull_requests: [{
+        ...verifierRun().pull_requests[0],
+        base: {
+          ...verifierRun().pull_requests[0].base,
+          repo: { id: 9, full_name: "other/repo" },
+        },
+      }],
+    })] }],
+    ["run-base-repository-url", { verifierRuns: [verifierRun({
+      pull_requests: [{
+        ...verifierRun().pull_requests[0],
+        base: {
+          ...verifierRun().pull_requests[0].base,
+          repo: {
+            ...verifierRun().pull_requests[0].base.repo,
+            url: "https://api.github.com/repos/other/repo",
+          },
+        },
+      }],
+    })] }],
+  ]) {
+    const github = createGitHubMock(options);
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-refetch-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.deepEqual(github.requestBodies, [], suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+  }
+});
+
+test("late failed workflow_run cannot request after a newer same-head verifier", async (context) => {
+  const github = createGitHubMock({
+    verifierRuns: [
+      verifierRun(),
+      verifierRun({ id: 7002, run_number: 42, conclusion: "success" }),
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-superseded",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.match(result.report.reason, /no longer the current canonical verifier/iu);
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("newer verifier appearing only in the pre-POST inventory suppresses auto request", async (context) => {
+  let inventoryReads = 0;
+  const github = createGitHubMock({
+    requestInterceptor: ({ method, path }) => {
+      if (
+        method !== "GET" ||
+        path !== `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml/runs`
+      ) {
+        return undefined;
+      }
+      inventoryReads += 1;
+      return jsonResponse(inventoryReads === 1
+        ? { total_count: 1, workflow_runs: [verifierRun()] }
+        : {
+            total_count: 2,
+            workflow_runs: [
+              verifierRun(),
+              verifierRun({ id: 7002, run_number: 42, conclusion: "success" }),
+            ],
+          });
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-pre-post-newer-run",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(inventoryReads, 2);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.match(result.report.reason, /no longer the current canonical verifier/iu);
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("unknown auto-request POST is adopted only on exact readback and never reruns", async (context) => {
+  for (const [suffix, postUnknownReread, expectedExit] of [
+    ["visible", "visible", 0],
+    ["hidden", "hidden", 1],
+  ]) {
+    const github = createGitHubMock({ postUnknownAfterCreate: true, postUnknownReread });
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-post-unknown-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, expectedExit, suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, expectedExit === 0 ? "wait_provider" : "retry_begin");
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.equal(github.requestBodies.length, 1, suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+    assert.deepEqual(github.stickyCreates, [], suffix);
+  }
+});
+
+test("unknown auto POST can adopt another run's visible exact-scope marker without retry", async (context) => {
+  const github = createGitHubMock({
+    postUnknownAfterCreate: true,
+    postUnknownReread: "hidden",
+    postUnknownConcurrentComments: [workflowRequest({
+      body: canonicalRequestBody(HEAD, { runId: "77" }),
+    })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-unknown-other-run-visible",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.retrySafe, false);
+  assert.match(result.report.reason, /review request 101 is adopted-after-unknown/iu);
+  assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
 test("begin-review does not adopt an existing same-second edited canonical request", async (context) => {
   const edited = workflowRequest({
     last_edited_at: "2026-08-25T08:00:00.500Z",
@@ -10110,6 +10490,7 @@ function pullRequestEvent(action = "synchronize", overrides = {}) {
 function verifierRun(overrides = {}) {
   return {
     id: 7001,
+    workflow_id: 6001,
     run_number: 41,
     run_attempt: 1,
     event: "pull_request",
@@ -10120,10 +10501,24 @@ function verifierRun(overrides = {}) {
     status: "completed",
     conclusion: "failure",
     html_url: `https://github.com/${REPOSITORY}/actions/runs/7001`,
+    repository: { id: REPO_ID, full_name: REPOSITORY },
+    head_repository: { id: REPO_ID, full_name: REPOSITORY },
     pull_requests: [{
       number: PR,
-      head: { sha: HEAD },
-      base: { sha: BASE },
+      head: { sha: HEAD, repo: {
+        id: REPO_ID,
+        name: REPO,
+        url: `https://api.github.com/repos/${REPOSITORY}`,
+      } },
+      base: {
+        sha: BASE,
+        ref: "main",
+        repo: {
+          id: REPO_ID,
+          name: REPO,
+          url: `https://api.github.com/repos/${REPOSITORY}`,
+        },
+      },
     }],
     ...overrides,
   };
@@ -10159,7 +10554,9 @@ function runtimeEnvironment(context, {
   suffix = "default",
   operation = "reconcile",
   eventName = operation === "begin-review" ? "workflow_dispatch" : "pull_request",
-  requestReview = eventName === "workflow_dispatch" ? "true" : "false",
+  requestReview = eventName === "workflow_dispatch" || eventName === "workflow_run"
+    ? "true"
+    : "false",
   requestCommentId = "",
   limitsProfile = "default",
   expectedHeadSha = HEAD,
@@ -10170,6 +10567,7 @@ function runtimeEnvironment(context, {
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   const environment = {
     GITHUB_TOKEN: "test-token",
+    ...(eventName === "workflow_run" ? { CODEX_REVIEW_GATE_AUTO_REQUEST: "true" } : {}),
     GITHUB_REPOSITORY: REPOSITORY,
     PR_NUMBER: String(PR),
     EXPECTED_HEAD_SHA: expectedHeadSha,
@@ -10199,6 +10597,8 @@ function runtimeEnvironment(context, {
     environment.GITHUB_EVENT_PATH,
     `${JSON.stringify(event || (eventName === "pull_request"
       ? pullRequestEvent()
+      : eventName === "workflow_run"
+        ? workflowRunEvent()
       : workflowDispatchEvent({
           operation,
           expectedHeadSha,
@@ -10208,6 +10608,15 @@ function runtimeEnvironment(context, {
     "utf8",
   );
   return environment;
+}
+
+function workflowRunEvent(run = verifierRun(), overrides = {}) {
+  return {
+    action: "completed",
+    repository: { id: REPO_ID, full_name: REPOSITORY, default_branch: "main" },
+    workflow_run: structuredClone(run),
+    ...overrides,
+  };
 }
 
 function workflowDispatchEvent({
@@ -10286,6 +10695,7 @@ function createGitHubMock({
   reviewRefetchMutator = null,
   postUnknownAfterCreate = false,
   postUnknownReread = "visible",
+  postUnknownConcurrentComments = [],
   createdCommentOverrides = {},
   verifierRuns = [verifierRun()],
   verifierAttemptStatus = "queued",
@@ -10439,6 +10849,16 @@ function createGitHubMock({
     }
     if (method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}`) {
       return jsonResponse(pullRequest());
+    }
+    if (
+      method === "GET" &&
+      path === `/repos/${REPOSITORY}/actions/workflows/codex-review-gate.yml`
+    ) {
+      return jsonResponse({
+        id: 6001,
+        name: "Codex Review Gate Verifier",
+        path: ".github/workflows/codex-review-gate.yml",
+      });
     }
     if (
       method === "GET" &&
@@ -10647,6 +11067,7 @@ function createGitHubMock({
       if (body.body.startsWith("@codex review")) requestBodies.push(body.body);
       if (body.body.includes(`<!-- ${V2_STICKY_MARKER} -->`)) stickyCreates.push(body.body);
       if (postUnknownAfterCreate && !unknownPostUsed && body.body.startsWith("@codex review")) {
+        comments.push(...postUnknownConcurrentComments.map((comment) => structuredClone(comment)));
         unknownPostUsed = true;
         return jsonResponse({ message: "synthetic unknown POST" }, 500);
       }
