@@ -50,6 +50,11 @@ superseded_by:
   `true` before any GitHub API call. An incorrectly cased value can consume a
   runner start but cannot authorize a review request; tests cover both sides
   of this boundary.
+- The verifier has a static workflow name but a dynamic `run-name`. Comparing
+  `workflow_run.name` with the static name in the controller job condition
+  suppressed eligible completions before a runner could start. Keep the static
+  `on.workflow_run.workflows` subscription, remove that redundant comparison,
+  and retain runtime canonical workflow ID/path/run and PR-scope verification.
 
 ## Delivery sequence
 

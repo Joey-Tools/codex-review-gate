@@ -1299,7 +1299,11 @@ The canonical workflows must have this contract after the merge:
 The optional automatic request path keeps the canonical `pull_request`
 verifier read-only and runs in the existing protected controller workflow via
 `workflow_run` on a failed first canonical verifier attempt. Rerunning an old
-verifier attempt does not start this path. Public-repository policy rules
+verifier attempt does not start this path. Match the static verifier workflow
+in `on.workflow_run.workflows`, not by comparing `workflow_run.name` in the job
+condition: the verifier's `run-name` gives each run a dynamic name. The Action
+still verifies the exact canonical workflow ID, path, run, and PR scope.
+Public-repository policy rules
 out a writable `pull_request_target` handler. The controller accepts only an
 open, ready (non-draft), same-repository PR targeting the current default
 branch, with the failed verifier bound to its current exact head and no
