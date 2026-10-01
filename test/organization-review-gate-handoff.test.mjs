@@ -2778,16 +2778,37 @@ test("frozen organization handoff admission remains distinct from current contro
     }),
     frozenWorkflows,
   );
-  assert.throws(
-    () => validateCanonicalV2WorkflowInventory(inventory, frozenWorkflows, {
-      legacyBridge: true,
-    }),
-    /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any/u,
+  const currentPermissionFrozenVerifier = frozenWorkflows.verifier.replace(
+    "permissions:\n  contents: read\n",
+    "permissions:\n  actions: read\n  contents: read\n",
+  );
+  const currentPermissionFrozenWorkflows = {
+    ...frozenWorkflows,
+    verifier: currentPermissionFrozenVerifier,
+  };
+  const currentPermissionFrozenInventory = inventory.map((entry) =>
+    entry.path === CANONICAL_WORKFLOW_IDENTITIES.verifier.path
+      ? { ...entry, content: currentPermissionFrozenVerifier }
+      : entry,
   );
   assert.throws(
-    () => validateFrozenHandoffV2WorkflowInventory(inventory, currentWorkflows, {
-      legacyBridge: true,
-    }),
+    () => validateCanonicalV2WorkflowInventory(
+      currentPermissionFrozenInventory,
+      currentPermissionFrozenWorkflows,
+      { legacyBridge: true },
+    ),
+    /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any/u,
+  );
+  const frozenPermissionCurrentWorkflows = {
+    ...currentWorkflows,
+    verifier: currentWorkflows.verifier.replace("  actions: read\n", ""),
+  };
+  assert.throws(
+    () => validateFrozenHandoffV2WorkflowInventory(
+      inventory,
+      frozenPermissionCurrentWorkflows,
+      { legacyBridge: true },
+    ),
     /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: \$\{\{ vars\.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION/u,
   );
 });

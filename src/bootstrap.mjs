@@ -222,6 +222,11 @@ const FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES = "[created, edited]";
 const CANONICAL_REQUEST_AUTHOR_PERMISSION = "any";
 const FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION =
   "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}";
+const CANONICAL_VERIFIER_PERMISSION_MAPPING =
+  "permissions:\n  actions: read\n  contents: read\n  issues: read\n  pull-requests: read";
+// The immutable handoff predates the Actions run readback requirement.
+const FROZEN_HANDOFF_VERIFIER_PERMISSION_MAPPING =
+  "permissions:\n  contents: read\n  issues: read\n  pull-requests: read";
 
 const DEFAULT_REF_CONDITIONS = {
   ref_name: {
@@ -3723,17 +3728,20 @@ function validateLegacyBridgeWorkflowContent(value, {
 export function validateCanonicalV2VerifierWorkflowContent(value) {
   return validateV2VerifierWorkflowContent(value, {
     requestAuthorPermission: CANONICAL_REQUEST_AUTHOR_PERMISSION,
+    permissionMapping: CANONICAL_VERIFIER_PERMISSION_MAPPING,
   });
 }
 
 function validateFrozenHandoffV2VerifierWorkflowContent(value) {
   return validateV2VerifierWorkflowContent(value, {
     requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
+    permissionMapping: FROZEN_HANDOFF_VERIFIER_PERMISSION_MAPPING,
   });
 }
 
 function validateV2VerifierWorkflowContent(value, {
   requestAuthorPermission,
+  permissionMapping,
 }) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 verifier workflow must be non-empty UTF-8 text.");
@@ -3780,10 +3788,10 @@ function validateV2VerifierWorkflowContent(value, {
   if (!/^  cancel-in-progress: true$/m.test(value)) {
     throw new Error("Canonical v2 verifier workflow must cancel superseded attempts.");
   }
+  assertExactVerifierPermissionMapping(value, permissionMapping);
   for (const fragment of [
     "jobs:\n  codex-review-gate:",
     `name: ${DEFAULT_STATUS_CONTEXT}`,
-    "permissions:\n  contents: read\n  issues: read\n  pull-requests: read",
     "github.event.pull_request.number",
     "github.event.pull_request.head.sha",
     "operation: reconcile",
@@ -3805,6 +3813,32 @@ function validateV2VerifierWorkflowContent(value, {
     );
   }
   return value;
+}
+
+function assertExactVerifierPermissionMapping(value, expected) {
+  const lines = value.split("\n");
+  const starts = lines.flatMap((line, index) => {
+    const mapping = matchSimpleYamlMappingLine(line);
+    return mapping?.indent === 0 && mapping.key === "permissions" ? [index] : [];
+  });
+  if (starts.length !== 1) {
+    throw new Error("Canonical v2 verifier workflow must expose exactly one top-level permissions mapping.");
+  }
+  let end = starts[0] + 1;
+  while (end < lines.length) {
+    const mapping = matchSimpleYamlMappingLine(lines[end]);
+    if (mapping?.indent === 0) {
+      break;
+    }
+    end += 1;
+  }
+  const actual = lines
+    .slice(starts[0], end)
+    .filter((line) => line.trim() !== "")
+    .join("\n");
+  if (actual !== expected) {
+    throw new Error("Canonical v2 verifier workflow has an unexpected top-level permissions mapping.");
+  }
 }
 
 export function validateCanonicalV2ControllerWorkflowContent(value) {

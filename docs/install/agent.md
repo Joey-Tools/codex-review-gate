@@ -71,6 +71,11 @@ Maintain these invariants:
 - keep `CONTROL_PLANE_OWNER` explicit in every bootstrap invocation. It
   defaults to `@JoeyTeng`, but a non-Joey repository must substitute its own
   eligible GitHub user.
+- require `actions: read` on the canonical read-only verifier before adopting
+  a floating `v2` runtime that reads its own `pull_request` Actions run's
+  GitHub-server `created_at`. In a private repository, the self-run API read
+  fails without this permission. Upgrade installed consumer workflows before
+  release; do not substitute Git commit date or an approximate event time.
 
 ## Completed-cutover fresh audit
 
@@ -1512,8 +1517,11 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    does not; use manual `reconcile` when that carrier needs a later evaluation.
    A review or reaction alone does not have an automatic consumer job. Treat
    this direct comment as only a candidate until the official Codex Bot adds a
-   strictly post-revision `eyes` or `+1` reaction directly to it; a terminal
-   elsewhere on the PR is not a substitute for that receipt.
+   strictly post-revision `eyes` or `+1` reaction directly to it. A terminal
+   elsewhere on the PR is not a general substitute: only the documented
+   no-base-epoch first-generation receipt and current-head clean recovery (a
+   narrow path for a clean predating this verifier run) exceptions admit a
+   narrowly matched top-level clean.
 
    ### Dual-protection legacy-status recovery
 
@@ -1731,7 +1739,8 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    candidate as a generation boundary. Without a base epoch, unbound provider
    terminal evidence can close only the first gap; once any predecessor exists,
    every later gap and positive/superseding authority require a qualifying `+1`
-   directly on the corresponding canonical request.
+   directly on the corresponding canonical request, except for the exact
+   two-boundary current-head clean recovery below.
    With a base epoch, every gap requires direct `+1` evidence. Never attribute
    a later terminal to a newer generation merely by timestamp; it may be a
    delayed or duplicate carrier from an older flight. Treat edited unbound
@@ -1754,6 +1763,36 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    same-head re-review, use step 4 `begin-review` first and require a strictly
    newer verifier attempt. Do not rely on a direct comment to atomically
    invalidate the old success.
+
+   For a pending verifier whose current head already has a clean, read this
+   exact `pull_request` verifier run through
+   `GET /repos/{owner}/{repo}/actions/runs/{run_id}` and require its
+   GitHub-server `created_at`. It is a conservative cutoff, not the exact
+   `synchronize` timestamp; never fall back to a Git commit date or an
+   approximate event time. An official, unedited, current-head top-level
+   issue-comment clean `C0` created at or before that cutoff cannot pass by
+   itself. The cutoff is specific to this top-level issue-comment clean:
+   without `C0`, an earlier `APPROVED` pull-request review retains its
+   existing first-generation semantics, but it cannot bypass a pre-run `C0`.
+   A narrow recovery is available only with no base epoch and exactly
+   one earlier authorised request `R0` (ordinary or canonical) whose
+   first-generation gap `C0` closed, with no other relevant physical boundary
+   or unclosed gap. If no automatic/controller request producer is active,
+   use the direct issue-comment POST in step 3 to create a **new independent**
+   exact, unedited ordinary `@codex review` request `R1`; do not edit `R0` or
+   use `begin-review` for this exception. Read back `R1` and prove both
+   `created_at` and `updated_at` are strictly after the run cutoff. Wait for a
+   new official, unedited, current-head top-level issue-comment terminal clean
+   `C1` strictly after `R1` (`C1.created_at > R1.updated_at`), with no later
+   boundary; an inline-parent review
+   does not qualify. A comment alone does not prove provider start, and the
+   timestamps plus SHA do not prove causal origin. Require a later exact-head
+   verifier rerun on the same run ID, including all known finding,
+   provider-error, liveness,
+   exact-refetch and two-stable-snapshot checks. If these conditions cannot be
+   proved, this exception is unavailable; follow the ordinary request-bound
+   `+1` or replacement-PR path named by the summary. A new PR event creates a
+   new cutoff and does not guarantee reuse of `R1/C1`.
 
    If a base retarget leaves no verifier for the current exact
    head/base/test-merge scope, follow
@@ -1784,7 +1823,8 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
      branch/commits, run one canonical producer there, validate it, and close
      the ambiguous PR.
 
-   A later terminal clean is not request/base-lineage proof in these modes and
+   Outside the exact current-head clean recovery above, a later terminal clean
+   is not request/base-lineage proof in these modes and
    must not be treated as a pass; findings remain blocking.
 
 4. Use `begin-review` instead of step 3 only when the controller must coordinate

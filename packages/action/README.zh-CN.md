@@ -41,6 +41,13 @@ verifier 都不是决策 authority。
 - 附带的
   [disabled ruleset 模板](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json)。
 
+Canonical verifier workflow 授予只读 `actions: read`，让 Action 能通过
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}` 读取自身 `pull_request` run
+由 GitHub 服务器记录的 `created_at`。Private repository 必须具备此权限。
+发布依赖该读取的 floating `v2` runtime 前，先更新所有已安装 consumer 中经逐字校验的
+verifier workflow；缺少权限的旧 workflow 会 fail closed，不能回退使用 Git commit date
+或未经校验的 event timestamp。
+
 请使用 canonical
 [`bootstrap-codex-review-gate.mjs`](https://github.com/Joey-Tools/codex-review-gate/blob/master/scripts/bootstrap-codex-review-gate.mjs)
 helper 安装，并始终显式传入 `--control-plane-owner @USER`；不要手工重建 workflow
@@ -245,8 +252,9 @@ generation boundary。它有两类获得 provider confirmation 的方式：
 
 第二类是刻意收窄的最小 receipt。额外或 ambiguous request/physical boundary、request 或
 terminal 被编辑、terminal carrier 不匹配，或 head/SHA binding 有歧义时，普通 candidate
-路径都保持 pending；下述 duplicate cohort 是第二条 boundary 情形的唯一 recovery-only
-例外。terminal 指定 reviewed SHA 时，short SHA 只有被 GitHub 无歧义解析为 current PR
+路径都保持 pending；下述 duplicate cohort 与 current-head clean recovery
+（恢复早于本次 verifier run 的同 head clean 的狭窄路径）分别是严格限定的第二条
+boundary 例外。terminal 指定 reviewed SHA 时，short SHA 只有被 GitHub 无歧义解析为 current PR
 head 才接受。同一 comment 上 official `eyes`/`+1` 的直接 receipt 仍然受支持。这只决定
 gate 如何归因；不授予 commenter 调用或控制 Codex review 的权限，不会使 Codex 必然启动，
 也不意味着任何用户都能让 review 启动。是否真的启动 provider review 仍由 GitHub 与 Codex
@@ -284,6 +292,28 @@ official 顶层 `issue-comment` provider artifact、finding 或其他 successor 
 要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。
 agent 不得故意创建这类请求对；它只恢复 GitHub immutable snapshot 中已经存在的历史证据。
 
+另有 *current-head clean recovery*（恢复早于本次 verifier run 的同 head clean 的狭窄
+路径），用于一个特定的 same-head 情形：没有 base epoch，且 lineage 中恰好只有两个
+相关 physical request boundaries。较早的 authorised request `R0`（ordinary 或
+canonical）必须已由
+official、未编辑、绑定 current head 的顶层 issue-comment terminal clean `C0`
+闭合其 first-generation gap。如果 `C0.created_at` 不晚于当前 `pull_request` verifier run 在 GitHub
+服务器上的 `created_at`，该 clean 单独仍保持 pending。这个 cutoff 只针对顶层 issue-comment clean：
+没有 `C0` 时，较早的 `APPROVED` pull-request review 仍按既有 first-generation
+规则判断；存在早于 run 的 `C0` 时，它不能绕过 pending。随后必须有一条新建、独立、
+exact 且未编辑的 ordinary `@codex review` issue comment `R1`，其 `created_at`
+和 `updated_at` 均严格晚于该 cutoff；还需要一条严格晚于 `R1` 的新 official、
+未编辑、绑定 current head 的顶层 issue-comment terminal clean `C1`
+（`C1.created_at > R1.updated_at`）。不能存在
+后续 boundary 或未闭合 predecessor gap。编辑旧 comment、复用 `C0` 或以
+inline-parent review 代替都无效。Run timestamp 是保守 cutoff，不是精确的 PR
+`synchronize` 时间；绝不回退到 Git commit date。Timestamp 和 SHA 只能证明顺序与
+同 head scope，不能证明 `R1` 导致 `C1`，也不能证明发出 `R1` 后 Codex 就启动。
+此例外不能清除已知 finding、provider error 或仍在进行/有歧义的 review；完整
+inventory、exact refetch、两轮稳定 snapshot，以及 provider comment 或手动
+`reconcile` 后的 exact-head verifier rerun 仍然必需。其他 multi-generation 规则保持
+严格。
+
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base
 epoch；timestamp 相同属于歧义，保持 pending。provider terminal payload 不会标明
@@ -295,13 +325,14 @@ recovery rule：只有直接附着在 epoch 后、绑定当前 base 的 canonica
 不再可用。findings 在 epoch boundary 两侧始终保守阻塞；无法归因的 terminal clean 保持
 pending，runtime 不会猜测它属于新 generation。
 
-terminal clean 文本和符合条件的 provider `+1`，只有在没有 base epoch、single-flight
-lineage 的第一个物理 generation 中才具有相同 clean authority。唯一符合最小 receipt rule
+除 current-head clean recovery 外，terminal clean 文本和符合条件的 provider `+1`，
+只有在没有 base epoch、single-flight lineage 的第一个物理 generation 中才具有相同
+clean authority。唯一符合最小 receipt rule
 的 default-`any` ordinary request，其匹配的 official 顶层 issue-comment terminal clean，
 或上文所定义的 official exact-head `COMMENTED` inline-parent closed-grammar review，
 可以同时确认这个第一个 generation，并携带该 clean authority。后者不是 generic
 pull-request review clean：任意不满足该固定 parent grammar 的 review 都不能确认
-default-`any` candidate。recovery-only duplicate cohort 是唯一额外的顶层 clean 情形：它只
+default-`any` candidate。recovery-only duplicate cohort 是另一种额外的顶层 clean 情形：它只
 确认较晚的 ordinary request，不接受 inline-parent receipt；若存在 canonical successor，后者仍必须
 取得自身的 direct official `+1`。符合条件的 finding 独立阻塞，绝不充当 receipt。
 没有 receipt contender 的 candidate 不是 physical boundary。存在 terminal-clean contender
@@ -319,7 +350,8 @@ denied；判定后不再触发 reaction 或 exact-refetch fan-out。更早因 sh
 tuple 才有 authority。没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider
 terminal evidence 只能闭合第一个 gap。之后的每个 gap，以及任何前面已有物理 request
 的 generation 所需 positive clean/superseding authority，都必须来自直接附着于该
-request 的合格 `+1`。terminal payload 没有 originating request ID，无法证明它属于
+request 的合格 `+1`，唯一相关例外是上述精确限定的两条 boundary 的 current-head
+clean recovery。terminal payload 没有 originating request ID，无法证明它属于
 新 request，还是旧 generation 的延迟或重复 carrier，因此不能让新 generation pass
 或 supersede findings。出现 base epoch 后，连第一个 gap 也必须使用 request-bound
 `+1`。
@@ -341,7 +373,7 @@ single-flight rule 下严格晚于 candidate 的匹配未编辑 official 顶层 
 或 exact closed `COMMENTED` Codex inline-parent review。出现 base epoch、第二个或
 ambiguous request/boundary、任何 edit，或 terminal 的 identity、
 ordering/current-head binding 有歧义时，都不能使用该方式。上文只接受顶层 clean 的 duplicate
-cohort 是第二条 boundary 情形的唯一 recovery-only 例外：它只接受已经存在的两条 request
+cohort 是第二条 boundary 情形的另一条 recovery-only 例外：它只接受已经存在的两条 request
 snapshot，不能让 canonical successor 使用 terminal clean。direct-reaction upgrade 后，
 ordinary request reactions 才只用于 provider liveness；ordinary `+1` 本身仍不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会 veto candidate
@@ -358,7 +390,7 @@ resolved SHA 还必须与 review 原生 `commit_id` 一致。
 2. 随后出现符合上述 lineage rule、绑定该 generation 和 head 的 clean result：只有
    no-base-epoch 的第一个 generation 可以使用 terminal clean（对于 default-`any`
    ordinary candidate 还必须满足最小 terminal-receipt rule），其他情况必须使用合格的
-   request-bound `+1`。
+   request-bound `+1`。current-head clean recovery 不能 supersede finding。
 
 任意更晚的 clean 不能抹掉 findings。ordering 或 binding 有歧义时不能 pass。
 historical findings 仍保留在 diagnostics 中。

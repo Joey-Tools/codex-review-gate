@@ -46,6 +46,14 @@ required repository asset groups:
 - the supplied
   [disabled ruleset template](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json).
 
+The verifier's canonical workflow grants read-only `actions: read` so the
+Action can read its own `pull_request` run's GitHub-server `created_at` from
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}`. This permission is required
+for private repositories. Update every installed consumer's byte-verified
+verifier workflow before publishing a floating `v2` runtime that requires this
+read; an older workflow without it fails closed rather than using a Git commit
+date or an unverified event timestamp.
+
 Install them with the canonical
 [`bootstrap-codex-review-gate.mjs`](https://github.com/Joey-Tools/codex-review-gate/blob/master/scripts/bootstrap-codex-review-gate.mjs)
 helper, always passing an explicit `--control-plane-owner @USER`. Do not
@@ -336,6 +344,32 @@ it has a full-head binding.
 Agents must never intentionally create this pair; it only recovers one that
 already exists in the immutable GitHub snapshot.
 
+A separate *current-head clean recovery* (a narrow path for a clean that
+predates this verifier run) addresses one specific same-head case. With no
+base epoch and exactly two relevant physical request boundaries, an earlier
+authorised request `R0` (ordinary or canonical) must have had its
+first-generation gap closed by an official, unedited, current-head top-level
+issue-comment terminal clean `C0`. If `C0.created_at`
+is at or before the current `pull_request` verifier run's GitHub-server
+`created_at`, that clean alone remains pending. This cutoff is specific to
+the top-level issue-comment clean: without `C0`, an earlier
+`APPROVED` pull-request review still follows the existing first-generation
+rules, but it cannot bypass a pre-run `C0`. A new, independent, exact and
+unedited ordinary `@codex review` issue comment `R1` must then have both
+`created_at` and `updated_at` strictly after that cutoff. A new official,
+unedited, current-head top-level issue-comment terminal clean `C1` must
+follow strictly after `R1` (`C1.created_at > R1.updated_at`), with no later
+boundary or unclosed predecessor
+gap. Editing the old comment, reusing `C0`, or substituting an inline-parent
+review does not work. The run timestamp is a conservative cutoff, not the
+exact PR `synchronize` time; Git commit dates are never a fallback. The
+timestamps and SHA establish ordering and current-head scope, not proof that
+`R1` caused `C1` or that posting `R1` made Codex start. This exception cannot
+clear a known finding, provider error or live/ambiguous review. It still
+requires complete inventory, exact refetches, two stable snapshots, and a
+later exact-head verifier rerun after the provider comment or manual
+`reconcile`. Other multi-generation rules remain strict.
+
 Every snapshot also reads the latest GitHub PR timeline
 `BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
 authority must be strictly newer than that base epoch; equal timestamps are
@@ -350,9 +384,10 @@ forms above, but the terminal form is unavailable after a base epoch. Findings
 remain conservative across the epoch boundary, and an unlineaged terminal clean
 stays pending rather than being guessed into the new generation.
 
-Terminal clean text and a qualifying provider `+1` have equal clean authority
-only for the first physical generation of a no-base-epoch, single-flight
-lineage. For the one unique default-`any` ordinary request that satisfies the
+Apart from current-head clean recovery, terminal clean text and a qualifying
+provider `+1` have equal clean authority only for the first physical
+generation of a no-base-epoch, single-flight lineage. For the one unique
+default-`any` ordinary request that satisfies the
 minimal receipt rule—or the recovery-only duplicate cohort above—the matching
 official top-level issue-comment terminal clean can establish that first
 generation and carry its clean authority. The exact closed `COMMENTED`
@@ -383,7 +418,8 @@ head/base tuple grants authority. Without a base epoch, provider
 terminal evidence strictly between the first request and its successor may
 close only that first gap. Every later gap, and positive clean authority for any
 generation that has a physical predecessor, requires a qualifying `+1`
-directly on that request. An unbound terminal cannot prove whether it belongs
+directly on that request, except for the exact two-boundary current-head clean
+recovery above. An unbound terminal cannot prove whether it belongs
 to the newer request or is a delayed or duplicate carrier from an older one;
 it therefore cannot pass or supersede findings for the newer generation. With
 a base epoch, even the first gap requires request-bound `+1` evidence.
@@ -427,6 +463,7 @@ same head, an older finding can be superseded only by:
    rule above: a terminal clean only for the first no-base-epoch generation
    (and, for a default-`any` ordinary candidate, only when it satisfies the
    minimal terminal-receipt rule), otherwise a qualifying request-bound `+1`.
+   Current-head clean recovery cannot supersede a finding.
 
 An arbitrary later clean does not erase findings. Ambiguous order or binding
 cannot pass. Historical findings remain visible in diagnostics.

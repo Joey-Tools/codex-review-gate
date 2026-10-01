@@ -128,6 +128,14 @@ current feature head 与 default-branch base SHA。这个 execution binding 使 
 feature-head CheckRun 能证明它评估了 exact current test-merge；CheckRun 本身并不属于
 test-merge SHA。
 
+Verifier 通过 `GET /repos/{owner}/{repo}/actions/runs/{run_id}` 读取自身
+`pull_request` Actions run，并要求 GitHub 服务器记录的 `created_at`。它是 current
+run 中顶层 issue-comment clean 的保守 cutoff，并非精确的 `synchronize`
+event time；不能回退到 Git
+commit date 或未经校验的 event timestamp。因此 canonical verifier 需要只读
+`actions: read`，private repository 也不例外。floating `v2` release 在依赖这次
+读取前，必须先让已安装 consumer 更新 canonical permission；缺失权限时 fail closed。
+
 controller 接收 `issue_comment` `created`、default-branch `workflow_dispatch`，以及
 仅对 failed canonical verifier 开启的可选 `workflow_run` `completed` 路径。comment
 admission 在 runner 分配前，把 event sender 与 comment
@@ -332,8 +340,9 @@ closed grammar。inline-parent grammar 要求固定标题、`Reviewed commit` �
 匹配和固定 official disclosure；它只证明 parent 中不存在 non-inline finding payload，不证明
 任何 child/thread 存在或已 resolved。
 额外或 ambiguous request/physical boundary、任一 carrier 被编辑、terminal 不匹配，或 head/SHA binding 有歧义时，普通
-candidate 路径都保持 pending；下述 duplicate cohort 是第二条 boundary 情形的唯一
-recovery-only 例外。terminal 的 short SHA 只有被 GitHub 无歧义解析为 current PR head 才接受。
+candidate 路径都保持 pending；下述 duplicate cohort 与 current-head clean recovery
+（恢复早于本次 verifier run 的同 head clean 的狭窄路径）分别是严格限定的第二条
+boundary 例外。terminal 的 short SHA 只有被 GitHub 无歧义解析为 current PR head 才接受。
 同一 comment 上 official `eyes`/`+1` 的直接 receipt 仍然受支持。这只是 gate attribution：
 不授予 commenter 调用或控制 Codex review 的权限，不会使 Codex 启动，也不意味着每个用户
 都能导致 review；provider 是否真正启动仍由 GitHub/Codex 决定。没有 terminal-clean contender
@@ -370,18 +379,48 @@ provider artifact、该 exclusive window 中额外的 provider artifact 或不�
 property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。此规则只恢复不可变的历史
 pair；agent 不得主动创建。
 
+另有一条 *current-head clean recovery*（恢复早于本次 verifier run 的同 head clean 的狭窄
+路径），且只在没有 base epoch 时适用。先要有恰好一条较早的 authorised request
+`R0`（ordinary 或 canonical），其 first-generation gap 已由 official、未编辑、绑定
+current head 的顶层 issue-comment terminal clean `C0` 闭合。如果
+`C0.created_at` 不晚于本次 `pull_request` verifier run
+在 GitHub 服务器上的 `created_at`，即使 reviewed SHA 指向 current head，`C0` 单独也
+保持 pending。这个 cutoff 只针对顶层 issue-comment clean：没有 `C0` 时，较早的
+`APPROVED` pull-request review 仍按既有 first-generation 规则判断；存在早于 run 的
+`C0` 时，它不能绕过 pending。若 `R0` 为 canonical，其 head、base SHA、base ref 和 base repository
+binding 必须与当前 PR 完全一致；旧 base 的绑定不能进入此恢复。恢复必须有一条**新建、独立**、exact 且未编辑的 ordinary
+`@codex review` issue comment `R1`，其 `created_at` 和 `updated_at` 均严格晚于该
+cutoff；随后还须有一条严格晚于 `R1` 的新 official、未编辑、绑定 current head 的
+顶层 issue-comment terminal clean `C1`（`C1.created_at > R1.updated_at`）。
+lineage 中必须恰好只有这两个相关 physical
+request boundaries，且没有后续 boundary 或未闭合 predecessor gap。编辑 `R0`、复用
+`C0` 或使用 inline-parent review 都不能满足此例外。单独发出 request comment 不证明
+Codex 已启动；仅在此恢复路径中，`R0` 上严格早于 `C0` 的 official `eyes` 由该 terminal
+clean 结清，而与 `C0` 同时或更晚的 `eyes` 仍会阻塞。
+两个 timestamp 与 current-head SHA 只证明顺序和 scope，不能证明
+`C1` 是由 `R1` 因果触发。这只是受限的同 head 恢复，不是任意后续 generation 可使用
+terminal clean 的通则。已知 finding、provider error、同时或更晚的 liveness、
+exact-refetch failure，以及完整 inventory 和两轮稳定 snapshot 的检查仍会阻塞。
+必须由后续合格 Codex bot comment 或受保护的手动 reconcile 重新运行 exact current-head
+verifier，才能考虑 success。
+同一个 verifier run ID 的不同 attempt 使用不变的 cutoff；新的 PR 事件会创建新 run 和
+新 cutoff，因此这条恢复不保证 `R1/C1` 在新 run 中可复用。
+若已存在 `R1` 但 `C1` 尚未到来，gate 保持 pending 并提示 `wait_provider`；只要 `C0`
+已安全闭合旧 gap，这段等待本身不要求另开 replacement PR。
+
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。finding 绝不充当最小
 terminal receipt。generic pull-request review clean 不能充当该 receipt；只有上文限定的
 official exact-head `COMMENTED` inline-parent closed grammar 是窄例外。
 
-terminal clean text 与符合条件的 provider `+1`，只有在没有 base epoch、single-flight
-lineage 的第一个物理 generation 中才是同等 clean carriers。物理 boundary 识别与
+除上述 current-head clean recovery 外，terminal clean text 与符合条件的 provider
+`+1`，只有在没有 base epoch、single-flight lineage 的第一个物理 generation 中才是
+同等 clean carriers。物理 boundary 识别与
 positive authority 必须分开；唯一例外是狭窄的 default-`any` terminal-clean receipt，可以
 同时建立该第一个 generation 并携带其 clean authority；它必须是顶层 issue-comment terminal
 clean，或上文限定的 official exact-head `COMMENTED` inline-parent closed grammar。后者只
 观察 parent review，不能把 inline thread 或其 resolved 状态带入 reducer。
-recovery-only duplicate cohort 是唯一额外的顶层 clean 情形：它只确认较晚 ordinary request，
+recovery-only duplicate cohort 是另一种额外的顶层 clean 情形：它只确认较晚 ordinary request，
 不接受 inline-parent receipt，也不能确认 canonical successor。没有
 terminal-clean contender 的未确认 default-`any` ordinary candidate 才不是 physical boundary。存在 terminal-clean contender 但未
 满足狭窄 receipt 条件时，仍是 unresolved、fail-closed physical-only boundary。其他每条可能触发
@@ -401,12 +440,13 @@ boundary。没有 base epoch 时，严格位于第一个 request 与后继 reque
 terminal evidence 只能闭合第一个 gap。对于 default-`any` ordinary candidate，它也只能在
 满足上述唯一 single-flight rule 时作为第一个 request 的最小 receipt。之后的每个
 predecessor-to-successor gap，以及任何前面已有物理 request 的 generation 所需
-positive/superseding authority，都必须来自直接附着于该 request 的合格 `+1`。provider
+positive/superseding authority，都必须来自直接附着于该 request 的合格 `+1`，
+唯一相关例外是上文精确限定的两条 boundary 的 current-head clean recovery。provider
 terminal payload 没有 originating request ID；后到的 carrier 可能来自任一旧 generation，
 两个 stable snapshots 也无法使该归属唯一。出现 base epoch 后，provider terminal 连第一
 个 gap 或 ordinary candidate 的 receipt 都不能闭合。
 
-上文定义的 duplicate cohort 是该 ordinary 第二条 boundary 规则的唯一 recovery-only 例外：
+上文定义的 duplicate cohort 是该 ordinary 第二条 boundary 规则的另一条 recovery-only 例外：
 它的一条顶层 clean 只闭合已经存在的两条 request cohort，不能闭合或为 canonical successor
 提供 terminal-clean receipt。
 
@@ -436,7 +476,7 @@ single-flight rule 下，严格晚于 candidate 的匹配未编辑 official curr
 issue-comment terminal clean，或符合上文 closed grammar 的 official exact-head `COMMENTED`
 inline-parent review。出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的
 identity、ordering/head binding 有歧义时，该方式不可用。上文定义的 duplicate cohort 是第二条
-boundary 情形的唯一 recovery-only 例外：它只接受已经存在的两条 request snapshot 和顶层
+boundary 情形的另一条 recovery-only 例外：它只接受已经存在的两条 request snapshot 和顶层
 clean，绝不让 canonical successor 使用 terminal clean。升级后 ordinary request reactions
 才仅用于 provider liveness；ordinary `+1` 不能 head-bind clean。same-time/later official
 `eyes`/progress from Codex 会 veto candidate clean evidence。由于 reaction change 不触发
@@ -456,7 +496,7 @@ non-inline finding 只有同时证明以下两项时才被 supersede：
 2. 之后出现符合上述 lineage rule、属于该新 generation 且绑定该 head 的 clean：只有
    no-base-epoch 的第一个物理 generation 可以使用 terminal clean（对于 default-`any`
    ordinary candidate 还必须满足最小 terminal-receipt rule），其他情况必须使用合格的
-   request-bound `+1`。
+   request-bound `+1`。current-head clean recovery 不能 supersede finding。
 
 无关 later clean 不能清除 finding。temporal order、generation binding 或 head
 binding 有歧义时，仍为 failure 或 inconclusive。superseded finding 会作为
