@@ -3,7 +3,7 @@ id: 20260930-v2-automatic-review-request
 title: V2 Opt-In Automatic Review Requests
 status: active
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-02
 branch:
 pr:
 supersedes: []
@@ -55,6 +55,16 @@ superseded_by:
   suppressed eligible completions before a runner could start. Keep the static
   `on.workflow_run.workflows` subscription, remove that redundant comparison,
   and retain runtime canonical workflow ID/path/run and PR-scope verification.
+- GitHub's workflow-run object advances to its newest attempt when a same-run
+  rerun begins, so a benign later retry can race the first-failure event. Keep
+  admission bound to the event's completed failed attempt 1 and independently
+  verify that immutable attempt through the exact `/attempts/1` endpoint. A
+  later attempt on the same canonical run may remain eligible only while active
+  or after failure, and only with unchanged repository, PR, head, base, and
+  merge scope. A later success, cancellation, timeout, unknown state, changed
+  scope, or newer canonical run remains fail-closed. Existing marker reuse still
+  prevents duplicate requests; this recovery does not alter verifier findings
+  or required-check conclusions.
 
 ## Delivery sequence
 
@@ -90,6 +100,11 @@ superseded_by:
   failed run provenance, uncertain request POST, or provider silence never
   grants the required check. The existing exact-head manual begin-review and
   reconcile instructions remain the recovery path.
+- Regression coverage verifies exact attempt-1 failure with later same-run
+  attempts running or failed, rejects successful and inconclusive later
+  attempts and changed run/PR scope, and preserves marker deduplication.
+- On 2026-10-02, the v2 Action/workflow test suite, `npm run check`, and the
+  bundled project-journal validator passed for the source change.
 
 ## Evidence
 

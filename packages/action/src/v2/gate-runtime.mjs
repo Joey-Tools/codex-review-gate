@@ -2295,10 +2295,16 @@ async function loadExactV2VerifierRun(client, config, pullRequest, runId, budget
 async function exactRefetchV2AutoVerifierRun(client, config, repository, pullRequest) {
   const eventRun = config.event.workflow_run;
   const budget = new V2SnapshotBudget(config);
-  const [{ data: workflow }, { data: run }] = await Promise.all([
+  const [{ data: workflow }, { data: firstAttempt }, { data: currentRun }] = await Promise.all([
     client.request(
       "GET",
       `${config.repoPath}/actions/workflows/${V2_VERIFIER_WORKFLOW_PATH}`,
+      undefined,
+      { budget, safeRead: true },
+    ),
+    client.request(
+      "GET",
+      `${config.repoPath}/actions/runs/${config.autoUpstreamRunId}/attempts/${eventRun.run_attempt}`,
       undefined,
       { budget, safeRead: true },
     ),
@@ -2309,66 +2315,99 @@ async function exactRefetchV2AutoVerifierRun(client, config, repository, pullReq
       { budget, safeRead: true },
     ),
   ]);
-  budget.consumeObjects(2, "auto-request upstream workflow and run");
-  requireV2VerifierRunShape(run, `auto-request verifier run ${config.autoUpstreamRunId}`);
-  const association = run.pull_requests[0];
+  budget.consumeObjects(3, "auto-request upstream workflow and verifier attempts");
+  requireV2VerifierRunShape(
+    firstAttempt,
+    `auto-request verifier run ${config.autoUpstreamRunId} attempt ${eventRun.run_attempt}`,
+  );
+  requireV2VerifierRunShape(currentRun, `auto-request verifier run ${config.autoUpstreamRunId}`);
   if (
     !isPlainRecord(workflow) ||
     !canonicalPositiveId(workflow.id) ||
     workflow.name !== V2_VERIFIER_WORKFLOW_NAME ||
     workflow.path !== `.github/workflows/${V2_VERIFIER_WORKFLOW_PATH}` ||
     String(workflow.id) !== String(eventRun.workflow_id) ||
-    String(run.id) !== config.autoUpstreamRunId ||
-    String(run.workflow_id) !== String(workflow.id) ||
-    run.run_number !== eventRun.run_number ||
-    run.run_attempt !== eventRun.run_attempt ||
-    run.run_attempt !== 1 ||
-    run.event !== "pull_request" ||
-    run.status !== "completed" ||
-    run.conclusion !== "failure" ||
-    !isCanonicalV2VerifierWorkflowPath(run.path) ||
-    run.path !== eventRun.path ||
-    run.display_title !== expectedV2VerifierDisplayTitle(config, pullRequest) ||
-    String(run.head_sha).toLowerCase() !== config.expectedHeadSha ||
-    String(run.head_sha).toLowerCase() !==
-      String(eventRun.head_sha).toLowerCase() ||
-    run.head_branch !== pullRequest.head.ref ||
-    run.repository?.id !== repository.id ||
-    run.repository?.full_name !== config.repository ||
-    config.event.repository?.id !== repository.id ||
-    eventRun.repository?.id !== repository.id ||
-    run.head_repository?.id !== repository.id ||
-    run.head_repository?.full_name !== config.repository ||
-    run.pull_requests.length !== 1 ||
-    !isPlainRecord(association) ||
-    Number(association.number) !== config.prNumber ||
-    String(association.head?.sha || "").toLowerCase() !== config.expectedHeadSha ||
-    !matchesV2VerifierAssociationRepository(association.head?.repo, config, repository) ||
-    String(association.base?.sha || "").toLowerCase() !==
-      String(pullRequest.base.sha).toLowerCase() ||
-    association.base?.ref !== pullRequest.base.ref ||
-    !matchesV2VerifierAssociationRepository(association.base?.repo, config, repository)
+    repository.id !== config.snapshotScope.repositoryId ||
+    repository.full_name !== config.snapshotScope.repositoryFullName ||
+    !v2AutoVerifierRunMatchesSnapshotScope(firstAttempt, config) ||
+    firstAttempt.run_attempt !== 1 ||
+    firstAttempt.status !== "completed" ||
+    firstAttempt.conclusion !== "failure" ||
+    !v2AutoVerifierRunMatchesSnapshotScope(currentRun, config) ||
+    !isEligibleV2AutoVerifierAttempt(currentRun, firstAttempt)
   ) {
     throw new V2StaleFailure(
-      "The completed workflow_run is not the canonical failed verifier for the exact current PR head and base",
-    );
-  }
-  const eventAssociation = eventRun.pull_requests[0];
-  if (
-    Number(eventAssociation?.number) !== Number(association.number) ||
-    String(eventAssociation?.head?.sha || "").toLowerCase() !==
-      String(association.head.sha).toLowerCase() ||
-    !matchesV2VerifierAssociationRepository(eventAssociation?.head?.repo, config, repository) ||
-    String(eventAssociation?.base?.sha || "").toLowerCase() !==
-      String(association.base.sha).toLowerCase() ||
-    eventAssociation?.base?.ref !== association.base.ref ||
-    !matchesV2VerifierAssociationRepository(eventAssociation?.base?.repo, config, repository)
-  ) {
-    throw new V2StaleFailure(
-      "The workflow_run event PR association changed during exact verifier readback",
+      "The completed workflow_run or current verifier attempt is not eligible for the exact current PR head and base",
     );
   }
   await assertV2AutoVerifierStillCurrent(client, config, pullRequest, budget);
+}
+
+function v2AutoVerifierRunMatchesSnapshotScope(run, config) {
+  const expected = config.snapshotScope;
+  const eventRun = config.event.workflow_run;
+  const eventAssociation = eventRun.pull_requests?.[0];
+  const association = run.pull_requests[0];
+  const repository = {
+    id: expected.repositoryId,
+    full_name: expected.repositoryFullName,
+  };
+  return (
+    String(run.id) === config.autoUpstreamRunId &&
+    String(run.id) === String(eventRun.id) &&
+    String(run.workflow_id) === String(eventRun.workflow_id) &&
+    run.run_number === eventRun.run_number &&
+    run.event === "pull_request" &&
+    isCanonicalV2VerifierWorkflowPath(run.path) &&
+    run.path === eventRun.path &&
+    run.display_title === expectedV2VerifierDisplayTitle(config, {
+      merge_commit_sha: expected.testMergeSha,
+    }) &&
+    String(run.head_sha).toLowerCase() === config.expectedHeadSha &&
+    String(run.head_sha).toLowerCase() ===
+      String(eventRun.head_sha).toLowerCase() &&
+    run.head_branch === expected.headRef &&
+    run.repository?.id === expected.repositoryId &&
+    run.repository?.full_name === expected.repositoryFullName &&
+    run.head_repository?.id === expected.headRepositoryId &&
+    run.head_repository?.full_name === expected.headRepositoryFullName &&
+    config.event.repository?.id === expected.repositoryId &&
+    config.event.repository?.full_name === expected.repositoryFullName &&
+    eventRun.repository?.id === expected.repositoryId &&
+    eventRun.repository?.full_name === expected.repositoryFullName &&
+    eventRun.pull_requests.length === 1 &&
+    run.pull_requests.length === 1 &&
+    isPlainRecord(eventAssociation) &&
+    isPlainRecord(association) &&
+    Number(association.number) === config.prNumber &&
+    Number(eventAssociation.number) === config.prNumber &&
+    String(association.head?.sha || "").toLowerCase() === config.expectedHeadSha &&
+    String(eventAssociation.head?.sha || "").toLowerCase() === config.expectedHeadSha &&
+    matchesV2VerifierAssociationRepository(association.head?.repo, config, repository) &&
+    matchesV2VerifierAssociationRepository(eventAssociation.head?.repo, config, repository) &&
+    String(association.base?.sha || "").toLowerCase() === expected.baseSha &&
+    String(eventAssociation.base?.sha || "").toLowerCase() === expected.baseSha &&
+    association.base?.ref === expected.baseRef &&
+    eventAssociation.base?.ref === expected.baseRef &&
+    matchesV2VerifierAssociationRepository(association.base?.repo, config, repository) &&
+    matchesV2VerifierAssociationRepository(eventAssociation.base?.repo, config, repository)
+  );
+}
+
+function isEligibleV2AutoVerifierAttempt(currentRun, firstAttempt) {
+  if (
+    firstAttempt.run_attempt !== 1 ||
+    firstAttempt.status !== "completed" ||
+    firstAttempt.conclusion !== "failure" ||
+    currentRun.run_attempt < firstAttempt.run_attempt
+  ) {
+    return false;
+  }
+  if (currentRun.run_attempt === firstAttempt.run_attempt) {
+    return currentRun.status === "completed" && currentRun.conclusion === "failure";
+  }
+  return isActiveV2ActionsStatus(currentRun.status) ||
+    (currentRun.status === "completed" && currentRun.conclusion === "failure");
 }
 
 function matchesV2VerifierAssociationRepository(candidate, config, repository) {
@@ -2386,12 +2425,11 @@ async function assertV2AutoVerifierStillCurrent(client, config, pullRequest, bud
   if (
     !current ||
     String(current.id) !== config.autoUpstreamRunId ||
-    current.run_attempt !== 1 ||
-    current.status !== "completed" ||
-    current.conclusion !== "failure"
+    !v2AutoVerifierRunMatchesSnapshotScope(current, config) ||
+    !isEligibleV2AutoVerifierAttempt(current, config.event.workflow_run)
   ) {
     throw new V2StaleFailure(
-      "The failed workflow_run is no longer the current canonical verifier for this PR head and base",
+      "The failed workflow_run is no longer the current canonical verifier for an eligible auto-request on this PR head and base",
     );
   }
 }
