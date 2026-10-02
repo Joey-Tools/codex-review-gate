@@ -5,11 +5,11 @@ Languages: [British English (en-GB)](DESIGN.md) | [简体中文 (zh-CN)](DESIGN.
 ## Goal
 
 v2 supplies a low-cost, fail-closed native required CheckRun for one pull request at a
-time. It must not report success while qualifying Codex findings are present,
-while evidence is incomplete or unstable, or after the selected PR head has
-changed. It favours recovery from GitHub's current state over durable private
-state and tolerates small at-least-once duplicates when uncertainty follows a
-write.
+time. It must not report success while qualifying Codex findings or unresolved
+review threads are present, while evidence is incomplete or unstable, or after
+the selected PR head has changed. It favours recovery from GitHub's current
+state over durable private state and tolerates small at-least-once duplicates
+when uncertainty follows a write.
 
 Existing GitHub controls keep their native responsibilities:
 
@@ -18,13 +18,15 @@ Existing GitHub controls keep their native responsibilities:
   serialisation boundaries;
 - managed CODEOWNERS plus Code Owner review protect both workflows as part of
   the compound no-runtime-App control plane;
-- the Action reconstructs and reduces non-inline Codex evidence;
+- the Action reconstructs and reduces non-inline Codex evidence, and separately
+  verifies that every PR review thread is resolved;
 - the ruleset requires the status, branch freshness, resolved conversations
   and non-fast-forward protection; and
 - the merge agent closes the loop with an exact-current-head reconcile and
   final server-side reread.
 
-The Action is not a second conversation resolver or branch-protection system.
+The Action's thread read is an independent fail-closed gate, not a replacement
+for the ruleset's server-side “all conversations resolved” requirement.
 
 ## Architecture and trust boundaries
 
@@ -39,7 +41,8 @@ pull_request opened/reopened/synchronize/ready_for_review
           - validate refs/pull/N/merge, GITHUB_REF and GITHUB_SHA
           - refresh PR and require unchanged head/base/test-merge
           - fully paginate and reduce GitHub evidence
-          - require two stable snapshots for clean
+          - fully paginate PR review threads through GraphQL
+          - require two stable snapshots for clean and resolved threads
                                 |
                                 v
  native CheckRun codex/github-review-gate on exact feature head
@@ -341,9 +344,12 @@ sticky does not make the boundary harmless.
 The reducer consumes qualifying Codex top-level issue comments and pull-request
 review bodies. A closed official `COMMENTED` inline-parent review may be a
 terminal receipt only when its fixed grammar and native commit binding verify;
-it is treated as a clean non-inline parent payload. The reducer still does not
-query, count, fingerprint, or decide inline review threads or conversation
-resolution; the installed ruleset owns that condition.
+it is treated as a clean non-inline parent payload. Independently, each
+complete snapshot reads every pull-request review thread via GraphQL and
+requires every thread's `isResolved` value to be true. An unresolved thread
+blocks regardless of author, outdated status, or reviewed head; parent review
+receipts do not change that. The installed ruleset remains an independent
+server-side conversation-resolution guard.
 
 Provider carriers must bind exact bot identity. Similar names, copied text or
 user-authored claims have no authority. A finding's severity label does not
@@ -449,51 +455,38 @@ every listed terminal property; a historical terminal clean/finding is not
 preserved merely because it has a full-head binding. This recovers an immutable
 historical pair; agents must not deliberately create one.
 
-A separate *current-head clean recovery* (a narrow path for a clean that
-predates this verifier run) is available only without a base epoch. It starts
-with exactly one earlier authorised request `R0`, ordinary or canonical, whose
-first-generation gap was closed by an official, unedited, current-head
-top-level issue-comment terminal clean `C0`. If `C0.created_at` is at or
-before this `pull_request` verifier run's GitHub-server `created_at`, `C0`
-alone remains pending even though its
-reviewed SHA names the current head. A canonical `R0` must match the current
-head, base SHA, base ref and base repository identity; an old-base binding
-cannot enter this recovery. The cutoff is specific to this top-level
-issue-comment clean: without `C0`, an earlier `APPROVED` pull-request review
-still follows the existing first-generation rules, but it cannot bypass an
-existing pre-run `C0`. Recovery requires a **new, independent** exact,
-unedited ordinary `@codex review` issue comment `R1`, with both its
-`created_at` and `updated_at` strictly after that cutoff, followed strictly
-later by a new official, unedited, current-head top-level issue-comment
-terminal clean `C1` (`C1.created_at > R1.updated_at`). The lineage must have
-exactly these two relevant physical request boundaries, with no later boundary
-or unclosed predecessor
-gap. Editing `R0`, reusing `C0`, or using an inline-parent review does not
-satisfy this exception. A request comment alone does not prove Codex started;
-an official `eyes` on `R0` strictly before `C0` is settled by that terminal
-clean for this recovery only, while `eyes` at or after `C0` remains blocking.
-the two timestamps and current-head SHA establish ordering and scope, not
-causal attribution of `C1` to `R1`. This is deliberately limited head-scoped
-recovery, not a general later-generation terminal-clean rule. Known findings,
-provider errors, same-time or later liveness, exact-refetch failures and all
-complete-inventory and two-stable-snapshot checks remain blocking. A
-qualifying later Codex bot comment or protected manual reconcile must rerun
-the exact current-head verifier before success can be considered.
-The cutoff is fixed across attempts of that same verifier run ID; a new PR
-event creates a different run and a new cutoff, so this recovery does not
-promise to carry `R1/C1` into that new run.
-While `R1` exists but `C1` has not arrived, the gate remains pending with a
-`wait_provider` recovery instruction; that wait alone does not require a
-replacement PR when `C0` safely closed the earlier gap.
+A separate *current-head clean recovery* admits a fresh head-scoped witness
+when a trusted clean is already on the current head but predates this verifier
+run. This recovery is available only when there is no base epoch. Its cutoff
+`T` is the GitHub-server `created_at` of the original `pull_request` verifier
+run, fixed across attempts of that run ID; it is not the PR synchronize-event
+time. A witness consists of one eligible request `R`: either an exact,
+unedited ordinary `@codex review` from a `User`, or a verified, unedited
+canonical Actions request whose repository, PR, full head/base tuple, and
+workflow-run marker match the selected PR and verifier scope. Both forms are
+followed by a trusted, unedited top-level issue-comment terminal clean `C`
+whose resolved full SHA uniquely equals the current head. The order is strict:
+`T < R < C`; `R` is the latest physical request boundary before `C`, and no
+request boundary follows `C`. This is current-head attestation (the clean's
+unique full-SHA binding covers the selected head, not request-to-result
+causality); posting `R` does not prove Codex started.
+
+Historical ordinary requests before `T` remain in the complete lineage audit.
+Only attribution gaps attached to those historical requests may be ignored by
+this witness; the history is neither deleted nor relabeled as resolved. An
+older request's unresolved official `eyes` without its own later `+1` remains
+blocking under existing liveness rules. The recovery does not clear findings
+or provider errors and does not waive unknown, edited, deleted, forged,
+scope-drifted, live or ambiguous boundaries. It requires complete inventory,
+exact refetches and two stable snapshots. A new verifier run ID has a new
+cutoff and cannot inherit the witness.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
 permission. A finding never serves as the minimal terminal receipt. The exact
 closed Codex inline-parent form is a narrow receipt for its non-inline parent
-payload only: this REST-only reducer does not read its child threads or use
-their state as authority. The installed ruleset remains the sole enforcement
-for all conversations resolved; other pull-request review cleans remain
-ordinary evidence and cannot be that receipt.
+payload only; it does not itself prove that its threads are resolved. Other
+pull-request review cleans remain ordinary evidence and cannot be that receipt.
 
 Apart from the current-head clean recovery above, terminal clean text and a
 qualifying provider `+1` are equal clean carriers only for the first physical
@@ -532,11 +525,13 @@ candidate, it can also serve as that first request's minimal receipt only under
 the unique single-flight rule above. Every later predecessor-to-successor gap,
 and positive or superseding authority for any generation with a physical
 predecessor, requires a qualifying `+1` directly on that request, except for
-the exact two-boundary current-head clean recovery above. Provider
+the fresh current-head clean recovery above. Provider
 terminal payloads have no originating request ID, so a later carrier could be
 delayed or duplicated from any older generation; stable snapshots cannot make
-that attribution unique. After a base epoch, provider terminal evidence cannot
-close even the first gap or receipt an ordinary candidate.
+that attribution unique. After a base epoch, the current-head clean recovery
+does not apply: existing rules require an exact-current-tuple canonical
+Actions request with a direct provider `+1`, and a top-level terminal clean
+adds no authority.
 
 The separately defined duplicate cohort is the only other recovery-only
 exception to that ordinary second-boundary rule: its one top-level clean
@@ -613,6 +608,57 @@ letting positive evidence mask a finding silently.
 
 ## Complete snapshots and stable success
 
+### Review-thread completeness
+
+Each thread collection read enumerates `reviewThreads(first: 100, after: $cursor)` until
+GraphQL reports no next page. It retains each thread's identity and resolution
+state (`id`, `isResolved`), with location metadata used only for concise
+diagnostic links; it does not fetch nested thread comments or derive findings
+from them. Any unresolved thread blocks success, including a human-authored,
+outdated, or old-head thread. The `isOutdated` flag is diagnostic only and
+never discounts an unresolved thread. Resolve open conversations on GitHub,
+then use the protected exact-head manual `reconcile`; a new provider review
+request is not needed.
+
+This uses the existing read-only verifier token and workflow triggers; it adds
+no permission, event, cron schedule, or GitHub App.
+
+Pagination must be complete and non-overlapping (no thread ID is repeated
+across pages). Require stable `totalCount`
+across pages, each page's item count to agree with its `pageInfo` and available
+count, unique thread IDs whose final count equals `totalCount`, and valid
+cursor/page shapes. A cursor cycle, duplicate ID across pages, malformed or
+partial page, GraphQL error, cap, or count mismatch is incomplete evidence and
+fails closed. The deterministic snapshot fingerprint includes every thread's
+`id` and `isResolved`; clean requires the same thread set and states in both
+stable snapshots. This is not an atomic GitHub snapshot: non-overlap, count/ID
+consistency, and the existing two stable reads reduce pagination ambiguity but
+do not claim an atomic server-side transaction. The existing protocol brackets
+decision-carrier reads with opening and closing reads; two stable snapshots
+therefore perform at least four thread passes, each requiring
+`ceil(totalThreads / 100)` pages (at least one page for an empty connection).
+The thread check adds no extra sweep.
+
+Summary and sticky diagnostics expose `report.reviewThreads` separately from
+`report.counts`, with `status`, `unresolved`, `resolved`, `total`, and
+`diagnostics`. `status` is `not_read`, `complete`, or `incomplete`. Counts are
+numeric only for a complete collection; for `not_read` or `incomplete`, all
+three are `unknown`. `not_read` means this run did not collect thread evidence,
+not that the PR has zero threads. An incomplete collection remains fail-closed
+where a thread decision is required.
+They list the three thread counts separately from the four non-inline finding
+counts and provide at most five unresolved-thread paths plus the first comment
+URL when available. A partial read sets all three thread counts to `unknown`,
+never verified zero. The configured `default`/`expanded` resource profile and
+existing hard ceilings also bound thread pagination.
+
+Thread diagnostics are additive and preserve the report's existing recovery
+priority. In particular, `not_read` must not replace a more actionable finding,
+authorization, budget, replacement-PR, or begin-delivery recovery instruction
+with a thread-resolution hint. The resolve-threads-and-reconcile instruction
+applies when a complete collection reports unresolved threads; thread status
+does not mask findings, errors, or the report's primary recovery code.
+
 A “snapshot” is one independent, fully paginated set of GitHub API reads used
 to decide the fixed PR/head scope. It includes:
 
@@ -622,6 +668,7 @@ to decide the fixed PR/head scope. It includes:
 - review-request IDs, revisions, authors and candidate reactions;
 - qualifying Codex top-level comments and review bodies, including IDs,
   timestamps, actor/App identity and body digests;
+- every review thread's ID and resolution state, plus pagination completeness;
 - reviewed-commit resolution and native review `commit_id`; and
 - collection completeness and exact-object refetch results.
 

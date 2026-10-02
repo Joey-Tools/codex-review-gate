@@ -112,6 +112,7 @@ const V2_BASE_EPOCH_QUERY = `query CodexReviewGateBaseEpoch(
   }
 }`;
 const V2_DELETED_COMMENTS_PAGE_SIZE = 100;
+const V2_REVIEW_THREADS_PAGE_SIZE = 100;
 const V2_OBSERVED_HISTORY_POISON = Symbol("v2-observed-history-poison");
 const V2_OBSERVED_HISTORY_COUNT_FLOOR = Symbol("v2-observed-history-count-floor");
 const V2_OBSERVED_HISTORY_RAW_IDENTITIES = Symbol(
@@ -180,6 +181,30 @@ const V2_DELETED_COMMENTS_QUERY = `query CodexReviewGateDeletedComments(
           lastEditedAt
         }
         pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}`;
+const V2_REVIEW_THREADS_QUERY = `query CodexReviewGateReviewThreads(
+  $owner: String!
+  $repo: String!
+  $number: Int!
+  $cursor: String
+) {
+  repository(owner: $owner, name: $repo) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number
+      reviewThreads(first: ${V2_REVIEW_THREADS_PAGE_SIZE}, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          path
+          isOutdated
+          comments(first: 1) { nodes { url } }
+        }
       }
     }
   }
@@ -505,6 +530,7 @@ export function buildV2GateReport({
   findingsResolved = 0,
   findingsHistorical = 0,
   findingsIndeterminate = 0,
+  reviewThreads = null,
 } = {}) {
   if (executionHealth !== "healthy" && executionHealth !== "unhealthy") {
     throw new Error("executionHealth must be healthy or unhealthy");
@@ -528,10 +554,11 @@ export function buildV2GateReport({
   };
   for (const [name, value] of Object.entries(counts)) {
     if (value !== "unknown" && (!Number.isSafeInteger(value) || value < 0)) {
-      throw new Error(`findings ${name} must be a non-negative safe integer or unknown`);
+      throw new Error(`count ${name} must be a non-negative safe integer or unknown`);
     }
   }
   const normalizedReason = oneLine(reason, "No reason was reported").slice(0, 2_000);
+  const normalizedReviewThreads = normalizeV2ReviewThreadReport(reviewThreads);
   const normalizedRetrySafe = retrySafe ?? recoveryCode === "retry_reconcile";
   if (typeof normalizedRetrySafe !== "boolean") {
     throw new Error("retrySafe must be boolean");
@@ -547,6 +574,7 @@ export function buildV2GateReport({
     retrySafe: normalizedRetrySafe,
     requiresReplacementPr,
     counts: Object.freeze(counts),
+    reviewThreads: normalizedReviewThreads,
   });
 }
 
@@ -566,16 +594,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     : "unknown";
   const reason = formatV2DiagnosticText(report.reason, "No reason was reported");
   const nextAction = formatV2DiagnosticText(
-    context.verifierRunId
-      ? `Wait for verifier run ${context.verifierRunId} attempt ` +
-        `${context.verifierRunAttempt} to complete, then require its exact ` +
-        `${V2_REQUIRED_CHECK_NAME} result to be healthy/success before merge.`
-      : recoveryInstruction(
-          report.recoveryCode,
-          context.prNumber,
-          report.retrySafe,
-          report.requiresReplacementPr,
-        ),
+    v2ReportNextAction(report, context),
     "Inspect the workflow run and retry safely.",
   );
   const body = [
@@ -589,6 +608,9 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     `- Reason: ${reason}`,
     `- Recovery code: \`${report.recoveryCode}\``,
     `- Findings: ${formatV2FindingCounts(report.counts)}`,
+    `- Review threads: ${formatV2ReviewThreadCounts(report.reviewThreads)}`,
+    `- Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}`,
+    ...formatV2ReviewThreadDiagnostics(report.reviewThreads.diagnostics),
     ...(context.verifierRunId
       ? [
           `- Verifier run: ${formatV2DiagnosticText(context.verifierRunUrl || context.verifierRunId, "unknown", 500)}`,
@@ -610,16 +632,7 @@ export function buildV2StickyCommentBody(report, context = {}) {
   }
   const reason = formatV2DiagnosticText(report.reason, "No reason was reported");
   const nextAction = formatV2DiagnosticText(
-    context.verifierRunId
-      ? `Wait for verifier run ${context.verifierRunId} attempt ` +
-        `${context.verifierRunAttempt} to complete, then require its exact ` +
-        `${V2_REQUIRED_CHECK_NAME} result to be healthy/success before merge.`
-      : recoveryInstruction(
-          report.recoveryCode,
-          prNumber,
-          report.retrySafe,
-          report.requiresReplacementPr,
-        ),
+    v2ReportNextAction(report, { ...context, prNumber }),
     "Inspect the workflow run and retry safely.",
   );
   const hidden = canonicalJson({
@@ -637,6 +650,7 @@ export function buildV2StickyCommentBody(report, context = {}) {
     findingsResolved: report.counts.resolved,
     findingsHistorical: report.counts.historical,
     findingsIndeterminate: report.counts.indeterminate,
+    reviewThreads: report.reviewThreads,
   });
   return [
     "## Codex GitHub Review Gate",
@@ -644,6 +658,9 @@ export function buildV2StickyCommentBody(report, context = {}) {
     `**${report.gateOutcome}** — ${reason}`,
     "",
     `Findings: ${formatV2FindingCounts(report.counts)}.`,
+    `Review threads: ${formatV2ReviewThreadCounts(report.reviewThreads)}.`,
+    `Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}.`,
+    ...formatV2ReviewThreadDiagnostics(report.reviewThreads.diagnostics),
     "",
     `Recovery: \`${report.recoveryCode}\``,
     `Next action: ${nextAction}`,
@@ -662,10 +679,13 @@ function parseCanonicalV2StickyCommentBody(body) {
   if (typeof body !== "string") return null;
   const normalized = body.replace(/\r\n?/gu, "\n");
   const lines = normalized.split("\n");
-  if (lines.length !== 11 || lines[9] !== `<!-- ${V2_STICKY_MARKER} -->`) {
+  if (
+    lines.length < 11 ||
+    lines.at(-2) !== `<!-- ${V2_STICKY_MARKER} -->`
+  ) {
     return null;
   }
-  const hiddenMatch = /^<!-- (\{.*\}) -->$/u.exec(lines[10]);
+  const hiddenMatch = /^<!-- (\{.*\}) -->$/u.exec(lines.at(-1));
   if (!hiddenMatch) return null;
   let hidden;
   try {
@@ -673,7 +693,7 @@ function parseCanonicalV2StickyCommentBody(body) {
   } catch {
     return null;
   }
-  const expectedKeys = [
+  const oldExpectedKeys = [
     "executionHealth",
     "findingsHistorical",
     "findingsIndeterminate",
@@ -689,10 +709,14 @@ function parseCanonicalV2StickyCommentBody(body) {
     "retrySafe",
     "version",
   ];
+  const expectedKeys = [...oldExpectedKeys, "reviewThreads"].sort();
+  const actualKeys = canonicalJson(Object.keys(hidden ?? {}).sort());
+  const isNewShape = actualKeys === canonicalJson(expectedKeys);
+  const isLegacyShape = actualKeys === canonicalJson(oldExpectedKeys.sort());
   if (
     !isPlainRecord(hidden) ||
     canonicalJson(hidden) !== hiddenMatch[1] ||
-    canonicalJson(Object.keys(hidden).sort()) !== canonicalJson(expectedKeys) ||
+    (!isNewShape && !isLegacyShape) ||
     hidden.version !== 2 ||
     !Number.isSafeInteger(hidden.prNumber) ||
     hidden.prNumber <= 0 ||
@@ -720,12 +744,28 @@ function parseCanonicalV2StickyCommentBody(body) {
   )) {
     return null;
   }
+  let reviewThreads = null;
+  if (isNewShape) {
+    try {
+      reviewThreads = normalizeV2ReviewThreadReport(hidden.reviewThreads);
+    } catch {
+      return null;
+    }
+    if (canonicalJson(reviewThreads) !== canonicalJson(hidden.reviewThreads)) return null;
+  }
   const expected = [
     "## Codex GitHub Review Gate",
     "",
     `**${hidden.gateOutcome}** — ${hidden.reason}`,
     "",
     `Findings: ${formatV2FindingCounts(counts)}.`,
+    ...(isNewShape
+      ? [
+          `Review threads: ${formatV2ReviewThreadCounts(reviewThreads)}.`,
+          `Review-thread inventory: ${formatV2ReviewThreadStatus(reviewThreads.status)}.`,
+          ...formatV2ReviewThreadDiagnostics(reviewThreads.diagnostics),
+        ]
+      : []),
     "",
     `Recovery: \`${hidden.recoveryCode}\``,
     `Next action: ${hidden.nextAction}`,
@@ -777,8 +817,18 @@ function recoveryInstruction(
   prNumber,
   retrySafe = false,
   requiresReplacementPr = false,
+  counts = {},
 ) {
   const target = Number.isSafeInteger(Number(prNumber)) ? ` for PR #${prNumber}` : "";
+  if (counts.reviewThreadPrimaryCause === true && counts.unresolvedReviewThreads > 0) {
+    const findingAction = counts.unresolved > 0
+      ? ` and address ${counts.unresolved} reported Codex finding(s)`
+      : "";
+    return (
+      `Resolve all ${counts.unresolvedReviewThreads} unresolved pull-request review thread(s)` +
+      `${findingAction}, then dispatch reconcile${target} against the exact current head.`
+    );
+  }
   if (code === "fix_findings") {
     if (requiresReplacementPr) {
       return (
@@ -853,6 +903,135 @@ function formatV2FindingCounts(counts) {
     `${counts.historical} historical`,
     `${counts.indeterminate} indeterminate`,
   ].join(", ");
+}
+
+function formatV2ReviewThreadCounts(counts) {
+  return `${counts.unresolved} unresolved, ${counts.resolved} resolved, ${counts.total} total`;
+}
+
+function formatV2ReviewThreadStatus(status) {
+  if (status === "complete") return "complete";
+  if (status === "incomplete") return "incomplete";
+  return "not read";
+}
+
+function v2ReportNextAction(report, context = {}) {
+  const reviewThreads = report.reviewThreads;
+  const unresolvedThreadCause =
+    reviewThreads.status === "complete" &&
+    reviewThreads.unresolved > 0 &&
+    report.recoveryCode === "wait_then_reconcile" &&
+    /^GitHub reports [0-9]+ unresolved pull-request review thread\(s\)/u.test(
+      report.reason,
+    );
+  const primaryAction = unresolvedThreadCause
+    ? recoveryInstruction(
+        report.recoveryCode,
+        context.prNumber,
+        report.retrySafe,
+        report.requiresReplacementPr,
+        {
+          ...report.counts,
+          unresolvedReviewThreads: reviewThreads.unresolved,
+          reviewThreadPrimaryCause: true,
+        },
+      )
+    : context.verifierRunId
+    ? `Wait for verifier run ${context.verifierRunId} attempt ` +
+      `${context.verifierRunAttempt} to complete, then require its exact ` +
+      `${V2_REQUIRED_CHECK_NAME} result to be healthy/success before merge.`
+    : recoveryInstruction(
+        report.recoveryCode,
+        context.prNumber,
+        report.retrySafe,
+        report.requiresReplacementPr,
+      );
+
+  if (reviewThreads.status === "incomplete") {
+    return `${primaryAction} Review-thread inventory is incomplete; once the primary action is complete, rerun reconcile and wait for two stable snapshots before relying on thread counts.`;
+  }
+  if (
+    reviewThreads.status === "complete" &&
+    reviewThreads.unresolved > 0 &&
+    !unresolvedThreadCause
+  ) {
+    const target = Number.isSafeInteger(Number(context.prNumber))
+      ? ` on PR #${context.prNumber}`
+      : "";
+    return `${primaryAction} Also resolve all ${reviewThreads.unresolved} unresolved pull-request review thread(s)${target}, then reconcile the exact current head.`;
+  }
+  return primaryAction;
+}
+
+function normalizeV2ReviewThreadReport(value) {
+  const counts = {
+    unresolved: value?.unresolved ?? "unknown",
+    resolved: value?.resolved ?? "unknown",
+    total: value?.total ?? "unknown",
+  };
+  for (const [name, count] of Object.entries(counts)) {
+    if (count !== "unknown" && (!Number.isSafeInteger(count) || count < 0)) {
+      throw new Error(`review-thread ${name} count must be a non-negative safe integer or unknown`);
+    }
+  }
+  if (
+    counts.unresolved !== "unknown" &&
+    counts.resolved !== "unknown" &&
+    counts.total !== "unknown" &&
+    counts.unresolved + counts.resolved !== counts.total
+  ) {
+    throw new Error("review-thread unresolved and resolved counts must equal the total");
+  }
+  const status = value?.status ?? (
+    Object.values(counts).every((count) => Number.isSafeInteger(count))
+      ? "complete"
+      : "not_read"
+  );
+  if (!new Set(["not_read", "complete", "incomplete"]).has(status)) {
+    throw new Error("review-thread status must be not_read, complete, or incomplete");
+  }
+  if (
+    status === "complete" &&
+    !Object.values(counts).every((count) => Number.isSafeInteger(count))
+  ) {
+    throw new Error("complete review-thread inventory requires all verified counts");
+  }
+  if (
+    status === "not_read" &&
+    Object.values(counts).some((count) => count !== "unknown")
+  ) {
+    throw new Error("not-read review-thread inventory cannot claim verified counts");
+  }
+  return Object.freeze({
+    ...counts,
+    status,
+    diagnostics: Object.freeze(normalizeV2ReviewThreadDiagnostics(value?.diagnostics)),
+  });
+}
+
+function normalizeV2ReviewThreadDiagnostics(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 5).flatMap((thread) => {
+    if (!isPlainRecord(thread) || typeof thread.isOutdated !== "boolean") return [];
+    const path = typeof thread.path === "string"
+      ? oneLine(thread.path, "unknown path").slice(0, 300)
+      : "";
+    return [{
+      path,
+      isOutdated: thread.isOutdated,
+      url: normalizeV2ReviewThreadCommentUrl(thread.url),
+    }];
+  });
+}
+
+function formatV2ReviewThreadDiagnostics(diagnostics) {
+  return (diagnostics ?? []).map((thread) => {
+    const safePath = oneLine(thread.path, "unknown path")
+      .replaceAll("`", "\\`")
+      .slice(0, 300);
+    const location = `\`${safePath}\`${thread.isOutdated ? " (outdated)" : ""}`;
+    return `  - ${location}${thread.url ? ` ([first comment](<${thread.url}>))` : ""}`;
+  });
 }
 
 function canonicalJson(value) {
@@ -971,6 +1150,7 @@ class V2RuntimeFailure extends Error {
     responsePhase = "none",
     retrySafe = undefined,
     requiresReplacementPr = false,
+    reviewThreadsStatus = null,
   } = {}) {
     super(message);
     this.name = "V2RuntimeFailure";
@@ -983,6 +1163,7 @@ class V2RuntimeFailure extends Error {
     this.responsePhase = responsePhase;
     this.retrySafe = retrySafe;
     this.requiresReplacementPr = requiresReplacementPr === true;
+    this.reviewThreadsStatus = reviewThreadsStatus;
   }
 }
 
@@ -1414,6 +1595,9 @@ export async function runV2GateCli({
       findingsResolved: counts.resolved,
       findingsHistorical: counts.historical,
       findingsIndeterminate: counts.indeterminate,
+      reviewThreads: error?.reviewThreadsStatus === "incomplete"
+        ? { status: "incomplete" }
+        : null,
     });
     try {
       report = await finalizeV2Report(client, config || {
@@ -1443,6 +1627,9 @@ export async function runV2GateCli({
         findingsResolved: counts.resolved,
         findingsHistorical: counts.historical,
         findingsIndeterminate: counts.indeterminate,
+        reviewThreads: error?.reviewThreadsStatus === "incomplete"
+          ? { status: "incomplete" }
+          : null,
       });
       try {
         persistV2ReportFiles(config || {
@@ -2958,6 +3145,7 @@ async function publishV2SnapshotDecision(client, config, context, snapshot) {
     findingsResolved: snapshot.counts.resolved,
     findingsHistorical: snapshot.counts.historical,
     findingsIndeterminate: snapshot.counts.indeterminate,
+    reviewThreads: snapshot.reviewThreads,
   });
   await finalizeV2Report(client, config, context, report);
   return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
@@ -2979,6 +3167,13 @@ async function publishV2UnstablePending(client, config, context, snapshot, detai
     findingsResolved: snapshot?.counts?.resolved ?? "unknown",
     findingsHistorical: snapshot?.counts?.historical ?? "unknown",
     findingsIndeterminate: snapshot?.counts?.indeterminate ?? "unknown",
+    reviewThreads: {
+      status: "incomplete",
+      unresolved: snapshot?.reviewThreads?.unresolved ?? "unknown",
+      resolved: "unknown",
+      total: "unknown",
+      diagnostics: snapshot?.reviewThreads?.diagnostics ?? [],
+    },
   });
   await finalizeV2Report(client, config, context, report);
   return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
@@ -3423,9 +3618,186 @@ async function loadCompleteV2Snapshot(client, config, {
     baseSha: after.base.sha.toLowerCase(),
     fingerprint: fingerprintV2Snapshot(fingerprintPayload),
     issueComments: closing.issueComments,
+    reviewThreads: closing.decisionEvidence.reviewThreads,
     counts: closing.decisionEvidence.counts,
     decision: closing.decisionEvidence.decision,
   };
+}
+
+async function loadV2ReviewThreads(client, config, budget) {
+  const threads = [];
+  const seenIds = new Set();
+  const seenCursors = new Set();
+  let cursor = null;
+  let expectedTotalCount = null;
+  while (true) {
+    const { data } = await client.request(
+      "POST",
+      "/graphql",
+      {
+        query: V2_REVIEW_THREADS_QUERY,
+        variables: {
+          owner: config.owner,
+          repo: config.repo,
+          number: config.prNumber,
+          cursor,
+        },
+      },
+      { budget, safeRead: true },
+    );
+    const label = "pull-request review threads";
+    budget.consumePage(label);
+    if (
+      !isPlainRecord(data) ||
+      (data.errors !== undefined &&
+        (!Array.isArray(data.errors) || data.errors.length > 0)) ||
+      !isPlainRecord(data.data) ||
+      !isPlainRecord(data.data.repository) ||
+      !sameV2GraphQlRepositoryName(
+        data.data.repository.nameWithOwner,
+        config.repository,
+      ) ||
+      !isPlainRecord(data.data.repository.pullRequest) ||
+      data.data.repository.pullRequest.number !== config.prNumber
+    ) {
+      throw new V2RuntimeFailure(
+        "GitHub GraphQL review-thread response was incomplete or inconsistent",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+
+    const connection = data.data.repository.pullRequest.reviewThreads;
+    const pageInfo = connection?.pageInfo;
+    if (
+      !isPlainRecord(connection) ||
+      !isNonNegativeSafeInteger(connection.totalCount) ||
+      !Array.isArray(connection.nodes) ||
+      connection.nodes.length > V2_REVIEW_THREADS_PAGE_SIZE ||
+      !isPlainRecord(pageInfo) ||
+      typeof pageInfo.hasNextPage !== "boolean" ||
+      !(
+        pageInfo.endCursor === null ||
+        (typeof pageInfo.endCursor === "string" && pageInfo.endCursor.trim() !== "")
+      ) ||
+      (pageInfo.hasNextPage &&
+        (connection.nodes.length === 0 || typeof pageInfo.endCursor !== "string"))
+    ) {
+      throw new V2RuntimeFailure(
+        "GitHub GraphQL review-thread connection was incomplete or inconsistent",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    if (expectedTotalCount === null) {
+      expectedTotalCount = connection.totalCount;
+    } else if (connection.totalCount !== expectedTotalCount) {
+      throw new V2RuntimeFailure(
+        "GitHub GraphQL review-thread total count changed during pagination",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    if (connection.nodes.length > expectedTotalCount - threads.length) {
+      throw new V2RuntimeFailure(
+        "GitHub GraphQL review-thread page exceeds its declared total count",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+
+    const pageThreads = [];
+    let diagnosticCommentNodes = 0;
+    for (const [index, thread] of connection.nodes.entries()) {
+      if (
+        !isPlainRecord(thread) ||
+        typeof thread.id !== "string" ||
+        thread.id.trim() === "" ||
+        typeof thread.isResolved !== "boolean" ||
+        typeof thread.isOutdated !== "boolean" ||
+        !(thread.path === null || typeof thread.path === "string")
+      ) {
+        throw new V2RuntimeFailure(
+          `GitHub GraphQL review-thread item ${threads.length + index + 1} was malformed`,
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      if (seenIds.has(thread.id)) {
+        throw new V2RuntimeFailure(
+          `GitHub GraphQL review-thread identity ${thread.id} appeared more than once`,
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      seenIds.add(thread.id);
+      const firstComment = Array.isArray(thread.comments?.nodes)
+        ? thread.comments.nodes[0]
+        : null;
+      if (firstComment !== null && typeof firstComment === "object") {
+        diagnosticCommentNodes += 1;
+      }
+      pageThreads.push({
+        id: thread.id,
+        isResolved: thread.isResolved,
+        path: typeof thread.path === "string" ? thread.path : null,
+        isOutdated: thread.isOutdated,
+        url: normalizeV2ReviewThreadCommentUrl(firstComment?.url),
+      });
+    }
+    // Count the repository, pull request, connection, thread nodes, and the
+    // optional first-comment nodes that supply diagnostic links. Nested thread
+    // comments are never enumerated or interpreted.
+    budget.consumeObjects(
+      3 + connection.nodes.length + diagnosticCommentNodes,
+      label,
+    );
+    threads.push(...pageThreads);
+
+    if (!pageInfo.hasNextPage) break;
+    const nextCursor = pageInfo.endCursor;
+    if (nextCursor === cursor || seenCursors.has(nextCursor)) {
+      throw new V2RuntimeFailure(
+        "GitHub GraphQL review-thread pagination did not advance its cursor",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  if (threads.length !== expectedTotalCount) {
+    throw new V2RuntimeFailure(
+      `GitHub GraphQL review-thread inventory was incomplete: ` +
+        `${threads.length} of ${expectedTotalCount}`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  return {
+    threads,
+    fingerprint: threads.map(({ id, isResolved }) => ({ id, isResolved })),
+    diagnostics: threads
+      .filter((thread) => !thread.isResolved)
+      .slice(0, 5)
+      .map(({ path, isOutdated, url }) => ({ path, isOutdated, url })),
+  };
+}
+
+function sameV2GraphQlRepositoryName(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  const leftParts = left.split("/");
+  const rightParts = right.split("/");
+  return leftParts.length === 2 && rightParts.length === 2 &&
+    leftParts.every((part, index) => part.toLowerCase() === rightParts[index].toLowerCase());
+}
+
+function normalizeV2ReviewThreadCommentUrl(value) {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.hostname !== "github.com" ||
+      parsed.username !== "" ||
+      parsed.password !== ""
+    ) return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
 }
 
 async function loadV2DecisionCarriers(
@@ -3496,9 +3868,15 @@ async function loadV2DecisionCarriers(
       observedDeletedCommentEvents,
       observedIssueCommentEdits,
     ),
+    loadV2ReviewThreads(client, config, budget),
   ]);
-  const [issueCommentRead, reviewRead, baseEpochRead, commentHistoryRead] =
-    carrierReads;
+  const [
+    issueCommentRead,
+    reviewRead,
+    baseEpochRead,
+    commentHistoryRead,
+    reviewThreadRead,
+  ] = carrierReads;
   let latchError = null;
   let missingPendingReviews = [];
   if (issueCommentRead.status === "fulfilled") {
@@ -3572,13 +3950,25 @@ async function loadV2DecisionCarriers(
       latchError ??= error;
     }
   }
-  if (latchError) throw latchError;
+  const reviewThreadsIncomplete = reviewThreadRead.status === "rejected";
+  if (latchError) {
+    if (reviewThreadsIncomplete) {
+      throw copyV2FailureWithReviewThreadStatus(latchError, "incomplete");
+    }
+    throw latchError;
+  }
   const failedRead = carrierReads.find((read) => read.status === "rejected");
-  if (failedRead) throw failedRead.reason;
+  if (failedRead) {
+    if (reviewThreadsIncomplete) {
+      throw copyV2FailureWithReviewThreadStatus(failedRead.reason, "incomplete");
+    }
+    throw failedRead.reason;
+  }
   const issueComments = issueCommentRead.value;
   const reviews = reviewRead.value;
   const baseEpoch = baseEpochRead.value;
   const { deletedCommentEvents, issueCommentEdits } = commentHistoryRead.value;
+  const reviewThreadEvidence = reviewThreadRead.value;
   const requestAuthority = await collectAuthorizedV2Requests(
     client,
     config,
@@ -3705,6 +4095,8 @@ async function loadV2DecisionCarriers(
     baseSha,
     baseRef: pullRequest.base.ref,
     baseRepositoryId: String(pullRequest.base.repo.id),
+    repositoryId: String(config.repositoryId),
+    prNumber: config.prNumber,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
   });
   const decisionEvidence = reduceV2Evidence({
@@ -3721,6 +4113,7 @@ async function loadV2DecisionCarriers(
     providerErrors: providerEvidence.errors,
     deletedCommentEvents,
     headCleanRecovery: effectiveRequestAuthority.headCleanRecovery,
+    reviewThreadEvidence,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
   });
   const carrierPayload = {
@@ -3767,6 +4160,7 @@ async function loadV2DecisionCarriers(
     issueCommentEdits,
     commitResolutions: providerEvidence.commitResolutions,
     providerErrors: providerEvidence.errors,
+    reviewThreads: reviewThreadEvidence.fingerprint,
     exactRefetch: true,
     decision: decisionEvidence.decision,
     counts: decisionEvidence.counts,
@@ -3774,8 +4168,33 @@ async function loadV2DecisionCarriers(
   return {
     fingerprint: fingerprintV2Snapshot(carrierPayload),
     issueComments,
+    reviewThreadEvidence,
     decisionEvidence,
   };
+}
+
+function copyV2FailureWithReviewThreadStatus(error, status) {
+  if (error instanceof V2RuntimeFailure) {
+    return new V2RuntimeFailure(error.message, {
+      executionHealth: error.executionHealth,
+      recoveryCode: error.recoveryCode,
+      gateOutcome: error.gateOutcome,
+      counts: error.counts,
+      httpStatus: error.httpStatus,
+      responseReceived: error.responseReceived,
+      responsePhase: error.responsePhase,
+      retrySafe: error.retrySafe,
+      requiresReplacementPr: error.requiresReplacementPr,
+      reviewThreadsStatus: status,
+    });
+  }
+  return new V2RuntimeFailure(
+    error?.message || "GitHub review-thread evidence could not be acquired",
+    {
+      recoveryCode: "wait_then_reconcile",
+      reviewThreadsStatus: status,
+    },
+  );
 }
 
 function reduceV2Evidence({
@@ -3792,6 +4211,7 @@ function reduceV2Evidence({
   providerErrors,
   deletedCommentEvents,
   headCleanRecovery,
+  reviewThreadEvidence,
   verifierRunCreatedMs,
 }) {
   const deletedBoundaries = (deletedCommentEvents ?? []).map(v2DeletedCommentBoundary);
@@ -4117,6 +4537,14 @@ function reduceV2Evidence({
       .reduce((total, artifact) => total + normalizedV2FindingCount(artifact), 0),
     indeterminate,
   };
+  const reviewThreads = {
+    unresolved: (reviewThreadEvidence?.threads ?? [])
+      .filter((thread) => thread.isResolved === false).length,
+    resolved: (reviewThreadEvidence?.threads ?? [])
+      .filter((thread) => thread.isResolved === true).length,
+    total: (reviewThreadEvidence?.threads ?? []).length,
+    diagnostics: reviewThreadEvidence?.diagnostics ?? [],
+  };
   const latestPhysicalBoundary = generationLineage.generations.at(-1) ?? null;
   const latestBoundaryCannotBeContinued = latestPhysicalBoundary !== null &&
     latestPhysicalBoundary.authorized !== true &&
@@ -4149,7 +4577,11 @@ function reduceV2Evidence({
         `${oneLine(blockingErrors[0], "unknown error")}`,
       recoveryCode: "request_clean_generation",
     };
-  } else if (selectedClean && requestEpoch.selected) {
+  } else if (
+    selectedClean &&
+    requestEpoch.selected &&
+    reviewThreads.unresolved === 0
+  ) {
     decision = {
       gateOutcome: "success",
       reason:
@@ -4163,6 +4595,14 @@ function reduceV2Evidence({
         ? "An official Codex pull-request review remains pending"
         : "Codex activity at or after the latest clean evidence indicates review is still in progress",
       recoveryCode: "wait_provider",
+    };
+  } else if (reviewThreads.unresolved > 0) {
+    decision = {
+      gateOutcome: "pending",
+      reason:
+        `GitHub reports ${reviewThreads.unresolved} unresolved pull-request review ` +
+        `thread(s); resolve them, then reconcile this exact head`,
+      recoveryCode: "wait_then_reconcile",
     };
   } else if (hasUnattributableEpochTerminalClean) {
     decision = {
@@ -4197,7 +4637,7 @@ function reduceV2Evidence({
     };
   }
   decision.requiresReplacementPr = requiresReplacementPr;
-  return { counts, decision };
+  return { counts, reviewThreads, decision };
 }
 
 function selectCurrentV2RequestGenerations({
@@ -4286,6 +4726,8 @@ function confirmV2DefaultAnyRequestCandidates({
   baseSha,
   baseRef,
   baseRepositoryId,
+  repositoryId,
+  prNumber,
   verifierRunCreatedMs,
 }) {
   const confirmedIds = new Set();
@@ -4335,10 +4777,11 @@ function confirmV2DefaultAnyRequestCandidates({
       confirmedIds.add(request.id);
     }
   }
-  const headCleanRecovery = selectV2PostRunHeadCleanRecovery({
+  const recoveryInputs = {
     authorized,
     physicalBoundaries,
     baseEpoch,
+    requestReactions,
     providerArtifacts,
     providerErrors,
     opaqueTopLevelProviderActivities,
@@ -4347,8 +4790,12 @@ function confirmV2DefaultAnyRequestCandidates({
     baseSha,
     baseRef,
     baseRepositoryId,
+    repositoryId,
+    prNumber,
     verifierRunCreatedMs,
-  });
+  };
+  const headCleanRecovery = selectV2PostRunHeadCleanRecovery(recoveryInputs) ??
+    selectV2CurrentHeadCleanRecovery(recoveryInputs);
   if (headCleanRecovery) confirmedIds.add(headCleanRecovery.requestId);
   const include = (request) =>
     request?.requiresProviderConfirmation !== true || confirmedIds.has(request.id);
@@ -4490,6 +4937,151 @@ function selectV2PostRunHeadCleanRecovery({
     priorCleanMs,
     requestId: recovery.id,
     cleanId: recoveryCleans[0].artifact.id,
+  };
+}
+
+function selectV2CurrentHeadCleanRecovery({
+  authorized,
+  physicalBoundaries,
+  baseEpoch,
+  requestReactions,
+  providerArtifacts,
+  opaqueTopLevelProviderActivities,
+  providerErrors,
+  headSha,
+  baseSha,
+  baseRef,
+  baseRepositoryId,
+  repositoryId,
+  prNumber,
+  verifierRunCreatedMs,
+}) {
+  // This witness attests the current head, not which request caused the clean.
+  // It only bypasses the old ordinary-request attribution gap on a degraded
+  // no-base-epoch lineage; the normal reducer still owns findings and liveness.
+  if (
+    !Number.isFinite(verifierRunCreatedMs) ||
+    (baseEpoch?.event !== null && baseEpoch?.event !== undefined) ||
+    (providerErrors ?? []).length > 0 ||
+    (physicalBoundaries ?? []).some((boundary) =>
+      !Number.isFinite(boundary?.revisionMs)
+    )
+  ) {
+    return null;
+  }
+  const authorizedById = new Map((authorized ?? []).map((request) => [
+    request.id,
+    request,
+  ]));
+  const physical = [...(physicalBoundaries ?? [])]
+    .filter((boundary) => isV2CurrentHeadPhysicalBoundary(boundary, headSha))
+    .sort((left, right) =>
+      left.revisionMs - right.revisionMs ||
+      compareV2LineageBoundaryIdsAscending(left, right)
+    );
+  const preRun = physical.filter((boundary) =>
+    boundary.revisionMs <= verifierRunCreatedMs
+  );
+  const postRun = physical.filter((boundary) =>
+    boundary.revisionMs > verifierRunCreatedMs
+  );
+  if (preRun.length === 0 || postRun.length !== 1) return null;
+
+  const isAuthorizedOrdinaryBoundary = (boundary) => {
+    const request = authorizedById.get(boundary?.id);
+    return request !== undefined &&
+      request.headBound !== true &&
+      request.binding === null &&
+      request.comment?.id !== undefined &&
+      isExactV2OrdinaryReviewRequestBody(request.comment.body) &&
+      request.comment.user?.type === "User" &&
+      typeof request.comment.user?.login === "string" &&
+      request.comment.user.login.trim() !== "" &&
+      isCanonicalUtcTimestamp(request.comment.created_at) &&
+      isCanonicalUtcTimestamp(request.comment.updated_at) &&
+      Date.parse(request.comment.created_at) === boundary.revisionMs &&
+      Date.parse(request.comment.updated_at) === boundary.revisionMs &&
+      !hasV2ObservedIssueCommentEdit(request.comment);
+  };
+  if (!preRun.every(isAuthorizedOrdinaryBoundary)) return null;
+
+  const requestBoundary = postRun[0];
+  const request = authorizedById.get(requestBoundary.id);
+  if (!request || request.revisionMs <= verifierRunCreatedMs) return null;
+  const comment = request.comment;
+  if (
+    !isCanonicalUtcTimestamp(comment?.created_at) ||
+    !isCanonicalUtcTimestamp(comment?.updated_at) ||
+    Date.parse(comment.created_at) !== request.revisionMs ||
+    Date.parse(comment.updated_at) !== request.revisionMs ||
+    hasV2ObservedIssueCommentEdit(comment)
+  ) {
+    return null;
+  }
+  if (request.headBound === true) {
+    const binding = parseCanonicalV2ReviewRequestBody(comment.body);
+    if (
+      request.permission !== "workflow" ||
+      !binding ||
+      binding.repositoryId !== String(repositoryId) ||
+      binding.prNumber !== String(prNumber) ||
+      binding.headSha !== headSha ||
+      binding.baseSha !== baseSha ||
+      binding.baseRef !== baseRef ||
+      binding.baseRepositoryId !== baseRepositoryId ||
+      canonicalJson(binding) !== canonicalJson(request.binding)
+    ) {
+      return null;
+    }
+  } else if (!isAuthorizedOrdinaryBoundary(requestBoundary)) {
+    return null;
+  }
+
+  // An exact-head direct +1 already has the ordinary request-bound route and
+  // must retain that route's normal finding/error supersession semantics.
+  if (
+    request.headBound === true &&
+    hasV2DirectProviderReactionAfterRequest(request, requestReactions)
+  ) {
+    return null;
+  }
+
+  const cleans = (providerArtifacts ?? [])
+    .filter((artifact) =>
+      isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(
+        artifact,
+        headSha,
+      )
+    )
+    .map((artifact) => ({
+      artifact,
+      window: v2ProviderActivityWindow(artifact),
+    }))
+    .filter(({ artifact, window }) =>
+      window !== null &&
+      window.carrierCreatedMs > request.revisionMs &&
+      window.carrierCreatedMs > verifierRunCreatedMs &&
+      isCanonicalUtcTimestamp(artifact.createdAt) &&
+      Date.parse(artifact.createdAt) === window.carrierCreatedMs
+    )
+    .sort((left, right) =>
+      right.window.carrierCreatedMs - left.window.carrierCreatedMs ||
+      compareV2CanonicalIdsAscending(left.artifact, right.artifact)
+    );
+  if (cleans.length === 0) return null;
+  const selected = cleans[0];
+  if ((opaqueTopLevelProviderActivities ?? []).some((activity) => {
+    const window = v2ProviderActivityWindow(activity);
+    return !window || window.revisionMs >= selected.window.carrierCreatedMs;
+  })) {
+    return null;
+  }
+  return {
+    kind: "current-head-attestation",
+    requestId: request.id,
+    cleanId: selected.artifact.id,
+    verifierRunCreatedMs,
+    preRunOrdinaryRequestIds: preRun.map((boundary) => boundary.id),
   };
 }
 
@@ -4913,6 +5505,9 @@ function v2CleanLineageError({
       );
     }
   }
+  if (isV2CurrentHeadCleanRecoveryWitness(clean, generation, generationLineage)) {
+    return null;
+  }
   const nextGeneration = generationLineage.generations[generationIndex + 1];
   if (clean.source === "request-reaction") {
     if (nextGeneration) {
@@ -4967,6 +5562,34 @@ function v2CleanLineageError({
     );
   }
   return null;
+}
+
+function isV2CurrentHeadCleanRecoveryWitness(
+  clean,
+  generation,
+  generationLineage,
+) {
+  const recovery = generationLineage?.headCleanRecovery;
+  if (
+    recovery?.kind !== "current-head-attestation" ||
+    clean?.source !== "issue-comment" ||
+    String(clean?.id) !== String(recovery.cleanId) ||
+    String(generation?.id) !== String(recovery.requestId)
+  ) {
+    return false;
+  }
+  const generations = generationLineage.generations ?? [];
+  const generationIndex = generationLineage.indexById?.get(generation.id);
+  if (
+    !Number.isSafeInteger(generationIndex) ||
+    generationIndex !== generations.length - 1
+  ) {
+    return false;
+  }
+  const allowedPriorIds = new Set(recovery.preRunOrdinaryRequestIds ?? []);
+  return generations.slice(0, generationIndex).every((prior) =>
+    allowedPriorIds.has(prior.id)
+  );
 }
 
 function buildV2GenerationLineage({

@@ -16,12 +16,14 @@ finding、证据不完整或不稳定，或者所选 PR head 已变化时，它�
   serialisation boundary；
 - 受管 CODEOWNERS 与 Code Owner review 保护两份 workflows，作为 compound
   no-runtime-App control plane；
-- Action 重建并归约 non-inline Codex evidence；
+- Action 重建并归约 non-inline Codex evidence，并独立确认所有 PR review
+  threads 均已 resolved；
 - ruleset 要求 status、branch freshness、resolved conversations 和
   non-fast-forward protection；
 - merge agent 通过 exact-current-head reconcile 和 final server-side reread 闭环。
 
-Action 不是第二套 conversation resolver 或 branch-protection system。
+Action 的 thread read 是独立的 fail-closed gate，不取代 ruleset 对 “all conversations
+resolved” 的 server-side 要求。
 
 ## 架构和 trust boundaries
 
@@ -36,7 +38,8 @@ pull_request opened/reopened/synchronize/ready_for_review
           - validate refs/pull/N/merge, GITHUB_REF and GITHUB_SHA
           - refresh PR and require unchanged head/base/test-merge
           - fully paginate and reduce GitHub evidence
-          - require two stable snapshots for clean
+          - fully paginate PR review threads through GraphQL
+          - require two stable snapshots for clean and resolved threads
                                 |
                                 v
  native CheckRun codex/github-review-gate on exact feature head
@@ -290,12 +293,13 @@ replacement PR；同时存在另一条 valid sticky 也不能使它变得 harmle
 ### Admitted evidence
 
 reducer 只消费符合条件的 Codex top-level issue comments 和 PR review bodies。
-它不读取、判断、计数或 fingerprint inline review threads 或 conversation resolution。
 唯一的窄例外是：符合 fixed closed grammar（枚举式固定格式，而非自由文本猜测）的官方
 exact-head `COMMENTED` inline-parent review 可作为 non-inline terminal-clean receipt；
-runtime 仍只观察 immutable parent review，绝不从它的 child/thread 得出 authority。
-installed ruleset 的 “all conversations resolved” 仍是 inline conversation 的唯一
-enforcement authority。
+runtime 仍只观察 immutable parent review，不从它的 child/thread 推导 receipt authority。
+另外，每个完整 snapshot 都通过 GraphQL 读取所有 PR review threads，并要求每个
+`isResolved` 均为 true。任何未解决 thread 都会阻塞，不论作者、outdated 状态或 reviewed
+head；parent receipt 不会改变该要求。installed ruleset 仍提供独立的 server-side
+conversation-resolution guard。
 
 provider carriers 必须绑定 exact bot identity。相似 name、复制的文本或 user-authored
 claim 都没有 authority。finding severity label 不影响 blocking：任何符合条件的
@@ -379,34 +383,24 @@ provider artifact、该 exclusive window 中额外的 provider artifact 或不�
 property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。此规则只恢复不可变的历史
 pair；agent 不得主动创建。
 
-另有一条 *current-head clean recovery*（恢复早于本次 verifier run 的同 head clean 的狭窄
-路径），且只在没有 base epoch 时适用。先要有恰好一条较早的 authorised request
-`R0`（ordinary 或 canonical），其 first-generation gap 已由 official、未编辑、绑定
-current head 的顶层 issue-comment terminal clean `C0` 闭合。如果
-`C0.created_at` 不晚于本次 `pull_request` verifier run
-在 GitHub 服务器上的 `created_at`，即使 reviewed SHA 指向 current head，`C0` 单独也
-保持 pending。这个 cutoff 只针对顶层 issue-comment clean：没有 `C0` 时，较早的
-`APPROVED` pull-request review 仍按既有 first-generation 规则判断；存在早于 run 的
-`C0` 时，它不能绕过 pending。若 `R0` 为 canonical，其 head、base SHA、base ref 和 base repository
-binding 必须与当前 PR 完全一致；旧 base 的绑定不能进入此恢复。恢复必须有一条**新建、独立**、exact 且未编辑的 ordinary
-`@codex review` issue comment `R1`，其 `created_at` 和 `updated_at` 均严格晚于该
-cutoff；随后还须有一条严格晚于 `R1` 的新 official、未编辑、绑定 current head 的
-顶层 issue-comment terminal clean `C1`（`C1.created_at > R1.updated_at`）。
-lineage 中必须恰好只有这两个相关 physical
-request boundaries，且没有后续 boundary 或未闭合 predecessor gap。编辑 `R0`、复用
-`C0` 或使用 inline-parent review 都不能满足此例外。单独发出 request comment 不证明
-Codex 已启动；仅在此恢复路径中，`R0` 上严格早于 `C0` 的 official `eyes` 由该 terminal
-clean 结清，而与 `C0` 同时或更晚的 `eyes` 仍会阻塞。
-两个 timestamp 与 current-head SHA 只证明顺序和 scope，不能证明
-`C1` 是由 `R1` 因果触发。这只是受限的同 head 恢复，不是任意后续 generation 可使用
-terminal clean 的通则。已知 finding、provider error、同时或更晚的 liveness、
-exact-refetch failure，以及完整 inventory 和两轮稳定 snapshot 的检查仍会阻塞。
-必须由后续合格 Codex bot comment 或受保护的手动 reconcile 重新运行 exact current-head
-verifier，才能考虑 success。
-同一个 verifier run ID 的不同 attempt 使用不变的 cutoff；新的 PR 事件会创建新 run 和
-新 cutoff，因此这条恢复不保证 `R1/C1` 在新 run 中可复用。
-若已存在 `R1` 但 `C1` 尚未到来，gate 保持 pending 并提示 `wait_provider`；只要 `C0`
-已安全闭合旧 gap，这段等待本身不要求另开 replacement PR。
+另有 *current-head clean recovery*，仅在没有 base epoch 时允许用新鲜的 head-scoped witness
+恢复已经指向 current head、但早于本次 verifier run 的可信 clean。cutoff `T` 是原始 `pull_request`
+verifier run 的 GitHub-server `created_at`，并在同一 run ID 的 retries 中固定；它不是 PR
+synchronize event 的精确时间。request `R` 可为一条符合条件、exact、未编辑的 ordinary
+`@codex review`（`User` 作者），或一条已验证、未编辑的 canonical Actions request，其 repository、PR、
+完整 head/base tuple 和 workflow-run marker 与所选 PR/verifier scope 完全匹配。随后必须有一条可信、未编辑的 top-level issue-comment terminal clean `C`，
+其 resolved full SHA 唯一等于 current head。时间顺序严格为 `T < R < C`；`R` 必须是 `C`
+之前最新的 physical request boundary，`C` 之后不能有新的 request boundary。这是 current-head
+attestation（证明 clean 指向所选 current head，不证明 request 与 clean 的因果关系），而不是
+因果匹配：timestamps 与 head binding 不证明 `R` 导致 `C`，也不证明发出
+`R` 会启动 Codex。
+
+`T` 之前的 ordinary requests 仍完整保留在 lineage audit 中。恢复见证只忽略附着于这些历史
+request 的归因缺口，不删除或改写其历史状态。旧 request 上尚未由该 request 自身后续 `+1`
+结清的 official `eyes` 仍按既有 liveness 规则阻塞。恢复不清除 findings 或 provider errors，
+也不豁免 unknown、edited、deleted、forged、scope-drifted、live 或 ambiguous boundaries。仍须
+完成 inventory、exact refetch 和两轮稳定 snapshot。新的 verifier run ID 使用自己的 cutoff，不
+继承旧 witness。
 
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。finding 绝不充当最小
@@ -441,10 +435,11 @@ terminal evidence 只能闭合第一个 gap。对于 default-`any` ordinary cand
 满足上述唯一 single-flight rule 时作为第一个 request 的最小 receipt。之后的每个
 predecessor-to-successor gap，以及任何前面已有物理 request 的 generation 所需
 positive/superseding authority，都必须来自直接附着于该 request 的合格 `+1`，
-唯一相关例外是上文精确限定的两条 boundary 的 current-head clean recovery。provider
+唯一相关例外是上文的新鲜 current-head clean recovery。provider
 terminal payload 没有 originating request ID；后到的 carrier 可能来自任一旧 generation，
-两个 stable snapshots 也无法使该归属唯一。出现 base epoch 后，provider terminal 连第一
-个 gap 或 ordinary candidate 的 receipt 都不能闭合。
+两个 stable snapshots 也无法使该归属唯一。出现 base epoch 后，current-head clean recovery 不适用：
+现有规则要求 exact-current-tuple canonical Actions request 上的 direct provider `+1`，top-level
+terminal clean 不增加 authority。
 
 上文定义的 duplicate cohort 是该 ordinary 第二条 boundary 规则的另一条 recovery-only 例外：
 它的一条顶层 clean 只闭合已经存在的两条 request cohort，不能闭合或为 canonical successor
@@ -516,13 +511,47 @@ scope。它包括：
 - review-request IDs、revisions、authors 和 candidate reactions；
 - 符合条件的 Codex top-level comments/review bodies，包括 IDs、timestamps、
   actor/App identity 和 body digests；
+- 每条 review thread 的 ID、resolution state 与分页完整性；
 - reviewed-commit resolution 与 native review `commit_id`；
 - collection completeness 与 exact-object refetch results。
 
-inline threads、其 child 和 conversation resolution 不在上述集合中，因而不会进入
-diagnostic finding counts 或 fingerprint。若一个 inline-parent closed-grammar receipt 被接受，
-只有它的 parent review 作为普通 provider carrier 进入 snapshot；ruleset 单独决定其 threads
-是否均已 resolved。
+thread comments/replies 不进入 diagnostic finding counts；但 thread IDs 与 resolution state
+进入 fingerprint。若接受 inline-parent closed-grammar receipt，只有其 parent review 作为普通
+provider carrier 进入 snapshot，其 child thread 是否 resolved 由上述独立 collection 判断；ruleset
+也会独立执行对应 requirement。
+
+### Review-thread completeness
+
+每次 thread collection read 使用 GraphQL 的 `reviewThreads(first: 100, after: $cursor)` 查询完整枚举 PR
+threads。决策 fingerprint 纳入每条 thread 的 `id` 与 `isResolved`；不会读取 nested thread
+comments，也不会从其正文归约 findings。只要有任一未解决 thread 就不能 success，无论它是
+人工编写、outdated 还是指向旧 head。在 GitHub 解决 open conversations 后，对同一 exact head
+运行受保护的手动 `reconcile`；不需要重新请求 provider review。
+
+该检查复用现有只读 verifier token 和 workflow triggers；不增加 permission、event、cron schedule
+或 GitHub App。
+
+分页必须完整且无重叠（跨页不重复 thread ID）：每页 `totalCount` 一致，item count 与 `pageInfo`/可用 count 相符，thread
+ID 唯一且总 unique ID 数等于 `totalCount`，cursor/page shape 合法。cursor 循环、跨页重复 ID、
+malformed 或 partial page、GraphQL error、cap hit 或 count mismatch 都代表 evidence 不完整，
+fail closed。Clean 要求两轮 stable snapshots 中的 thread 集合和状态一致。这不是 atomic
+GitHub snapshot：无重叠分页、count/ID 一致性与两轮稳定读取用于降低分页歧义，不声称服务端提供
+atomic transaction。现有 snapshot protocol 在 decision-carrier reads 前后各读取一次；两轮 stable
+snapshots 因此至少执行四次 thread pass，每次需要 `ceil(totalThreads / 100)` 页（空 connection
+也至少读取一页），thread check 不额外增加 sweep。
+
+摘要和 sticky diagnostic 通过独立 `reviewThreads` 节点报告 `status`、`unresolved`、`resolved`、
+`total` 和 `diagnostics`，不混入四项 `findings` counts。`status` 为 `not_read`、`complete` 或
+`incomplete`；只有完整 collection 的 counts 才是可信数字，`not_read` 或 `incomplete` 时三项均为
+`unknown`。`not_read` 表示本次没有读取 thread evidence，不代表 PR 没有 thread；需要据此作出 thread
+决策时，不完整 collection 仍 fail closed。最多提供五条未解决 thread 的 path 与首条 comment URL
+（若可用）以便处理，outdated 标记仅供诊断。扫描使用既有 `default`/`expanded` limits profile 和
+hard ceilings。
+
+Thread diagnostics 只作补充，并保留 report 既有 recovery 优先级。特别是 `not_read` 不得用解决 thread
+提示覆盖更具行动性的 finding、授权、预算、replacement-PR 或 begin-delivery recovery instruction。
+只有完整 collection 确认存在未解决 thread 时，才给出“解决 thread 后 reconcile”的操作提示；thread
+状态不得掩盖 findings、errors 或 report 的主要 recovery code。
 
 fingerprint 是 snapshot 中每个 decision-relevant value 的 deterministic
 representation。它只是两次 fresh reads 之间的 equality check，不是 durable
@@ -623,10 +652,12 @@ result。direct status projection 与 `statusProjection` 已删除。
 指令。Only `wait_provider` 是 pure wait。
 
 无需额外 evidence query 时，summary 和 sticky 会报告 `findings_unresolved`、`findings_resolved`、
-`findings_historical` 与 `findings_indeterminate`。pagination 不完整、API failure
-或 cap hit 会使受影响值为 `unknown`，而不是 zero。这些只是 normalized
-non-inline findings 的 diagnostics，不是 public Action outputs 或 inline-thread
-authority。
+`findings_historical` 与 `findings_indeterminate`。review-thread diagnostics 另放在
+`report.reviewThreads`，分别包含 `unresolved`、`resolved`、`total` 和 `diagnostics`，不混入
+`report.counts`。summary/sticky 独立列出三项 thread counts，并最多给出五条未解决 thread 的
+path 与首条 comment URL（若可用）；outdated 标记只供诊断。thread 扫描不完整时三项 counts
+均为 `unknown`，不能写成 zero。Findings counts 仍只涵盖 normalized non-inline findings；thread
+counts 不是 public Action outputs。
 
 summary 和 sticky 包含 bounded reason、recovery code 与具体 next action。必要时会
 暴露 object identities、digests、bounded escaped excerpts 和 links，但绝不暴露

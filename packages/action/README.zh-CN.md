@@ -224,12 +224,9 @@ controller 不提供 verdict，也不改写 CheckRun；只有只读 verifier 收
 conclusion 承载 required result。
 
 reducer 读取符合条件的 Codex top-level issue comments 和 PR review bodies。
-inline review thread 有意留在 reducer 外：即使一个官方 exact-head `COMMENTED`
-inline-parent（只含固定闭合语法的 review parent）可作为下文所述的窄
-terminal-clean receipt，runtime 也只观察其 immutable parent 身份、正文、终态和
-native commit binding，不查询、判断、计数或 fingerprint 任何 child/thread resolution。
-ruleset 的 “all conversations resolved” 要求仍是 inline conversation 的唯一
-enforcement authority。
+另外，每个完整 evidence snapshot 都通过 GitHub GraphQL 读取 PR 的全部 review
+threads，并要求所有 thread 均已 resolved。ruleset 仍须独立要求 “all conversations
+resolved”，作为 server-side merge guard。
 
 ## Evidence 语义
 
@@ -292,27 +289,26 @@ official 顶层 `issue-comment` provider artifact、finding 或其他 successor 
 要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。
 agent 不得故意创建这类请求对；它只恢复 GitHub immutable snapshot 中已经存在的历史证据。
 
-另有 *current-head clean recovery*（恢复早于本次 verifier run 的同 head clean 的狭窄
-路径），用于一个特定的 same-head 情形：没有 base epoch，且 lineage 中恰好只有两个
-相关 physical request boundaries。较早的 authorised request `R0`（ordinary 或
-canonical）必须已由
-official、未编辑、绑定 current head 的顶层 issue-comment terminal clean `C0`
-闭合其 first-generation gap。如果 `C0.created_at` 不晚于当前 `pull_request` verifier run 在 GitHub
-服务器上的 `created_at`，该 clean 单独仍保持 pending。这个 cutoff 只针对顶层 issue-comment clean：
-没有 `C0` 时，较早的 `APPROVED` pull-request review 仍按既有 first-generation
-规则判断；存在早于 run 的 `C0` 时，它不能绕过 pending。随后必须有一条新建、独立、
-exact 且未编辑的 ordinary `@codex review` issue comment `R1`，其 `created_at`
-和 `updated_at` 均严格晚于该 cutoff；还需要一条严格晚于 `R1` 的新 official、
-未编辑、绑定 current head 的顶层 issue-comment terminal clean `C1`
-（`C1.created_at > R1.updated_at`）。不能存在
-后续 boundary 或未闭合 predecessor gap。编辑旧 comment、复用 `C0` 或以
-inline-parent review 代替都无效。Run timestamp 是保守 cutoff，不是精确的 PR
-`synchronize` 时间；绝不回退到 Git commit date。Timestamp 和 SHA 只能证明顺序与
-同 head scope，不能证明 `R1` 导致 `C1`，也不能证明发出 `R1` 后 Codex 就启动。
-此例外不能清除已知 finding、provider error 或仍在进行/有歧义的 review；完整
-inventory、exact refetch、两轮稳定 snapshot，以及 provider comment 或手动
-`reconcile` 后的 exact-head verifier rerun 仍然必需。其他 multi-generation 规则保持
-严格。
+另有 *current-head clean recovery*，仅在没有 base epoch 时用于恢复已指向 current head、
+但早于本次 verifier run 的可信 clean。cutoff `T` 是原始 `pull_request` verifier run 的 GitHub-server
+`created_at`；同一 run 的 retries 固定使用该值。恢复见证由一条新鲜且符合条件、exact、未编辑的
+request `R`：可为 `User` 发出的 exact、未编辑 ordinary `@codex review`，或一条已验证且未编辑的
+canonical Actions request，其 repository、PR、完整 head/base tuple 和 workflow-run marker 与所选
+PR/verifier scope 完全匹配。随后必须有一条可信、未编辑的 top-level issue-comment terminal clean，
+且其 reviewed SHA 唯一解析为 current full head SHA。时间顺序必须严格为
+`T < R < C`。`R` 必须是 `C` 之前最新的 physical request boundary，且 `C` 之后不能有
+request boundary。这只是 head attestation（证明 clean 指向所选 current head，不证明 request
+与 clean 的因果关系），不证明 `R` 导致 `C`，也不证明发出 `R` 会启动
+Codex。`T` 之前的 ordinary requests 仍须接受完整 lineage audit；但只附着于这些历史 request
+的归因缺口，不会单独使此恢复见证失效。旧 request 上尚未由其自身后续 `+1` 结清的 official
+`eyes` 仍按现有 liveness 规则阻塞。
+
+该保守 cutoff 不是 PR `synchronize` 的精确时间；Git commit date 和未经验证的 event timestamp
+都不能作为 fallback。此恢复不能清除 finding 或 provider error，也不豁免 edited、deleted、scope
+drift、live 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮稳定 snapshot。
+成功还要求两轮稳定 snapshot 中的所有 review thread 都已 resolved；GitHub 明确标为 resolved
+的旧 head 或人工 thread 也可接受。provider comment 或手动 `reconcile` 之后仍须 rerun
+exact-head verifier。新 verifier run ID 不继承这个 cutoff。
 
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base
@@ -350,11 +346,12 @@ denied；判定后不再触发 reaction 或 exact-refetch fan-out。更早因 sh
 tuple 才有 authority。没有 base epoch 时，严格位于第一个 request 与后继 request 之间的 provider
 terminal evidence 只能闭合第一个 gap。之后的每个 gap，以及任何前面已有物理 request
 的 generation 所需 positive clean/superseding authority，都必须来自直接附着于该
-request 的合格 `+1`，唯一相关例外是上述精确限定的两条 boundary 的 current-head
-clean recovery。terminal payload 没有 originating request ID，无法证明它属于
+request 的合格 `+1`，唯一相关例外是上述新鲜 current-head clean recovery。terminal
+payload 没有 originating request ID，无法证明它属于
 新 request，还是旧 generation 的延迟或重复 carrier，因此不能让新 generation pass
-或 supersede findings。出现 base epoch 后，连第一个 gap 也必须使用 request-bound
-`+1`。
+或 supersede findings。出现 base epoch 后，current-head clean recovery 不适用：现有规则要求
+exact-current-tuple canonical Actions request 上的 direct provider `+1`，top-level terminal clean
+不会增加 authority。
 
 同一个或更晚的 official `eyes`/provider activity 如果不晚于后继 boundary，会让前一个
 generation 保持 open；与后继 boundary 同时属于 timestamp-ordering ambiguity，不能
@@ -476,9 +473,16 @@ direct status projection 与 `status_projection` 已删除。finding counts 仍�
 - `findings_historical`；
 - `findings_indeterminate`。
 
-API 读取、pagination 不完整或 cap hit 会使受影响 counts 为 `unknown`，绝不能写成
-`0`。这些 counts 只覆盖 normalized non-inline reducer findings，不能替代
-conversation-resolution enforcement。
+Review-thread diagnostics 独立于 findings。`report.reviewThreads.status` 为 `not_read`、`complete` 或
+`incomplete`；只有 `complete` 时 resolved/unresolved/total 才是可信数字，否则均为 `unknown`，不能
+当作已验证的 zero。Thread diagnostics 是补充信息，必须保留主要 recovery instruction（包括 finding、
+permission、budget、replacement-PR 或 begin-delivery 指引）；只有完整读取确认存在未解决 thread 时，
+才提示在 GitHub 解决 open conversations 并对同一 exact head 运行受保护的手动 `reconcile`。
+该修复不需要重新请求 provider review。
+
+API 读取、pagination 不完整、cap hit 或不稳定 thread state 会使受影响 counts 为 `unknown`，
+绝不能写成 `0`。Finding counts 只覆盖 normalized non-inline findings；thread counts 来自
+GraphQL review-thread state。两者都不能替代 branch-protection 对 conversation resolution 的独立要求。
 
 authority 和 consistency 模型见 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)，恢复操作见
 [COOKBOOK.zh-CN.md](COOKBOOK.zh-CN.md)。
