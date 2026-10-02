@@ -8606,6 +8606,11 @@ test("auto request adopts an exact-head/base canonical marker from another run",
     issueComments: [workflowRequest({
       body: canonicalRequestBody(HEAD, { runId: "77" }),
     })],
+    verifierRuns: [verifierRun({
+      run_attempt: 2,
+      status: "in_progress",
+      conclusion: null,
+    })],
   });
   const environment = runtimeEnvironment(context, {
     suffix: "auto-request-cross-run-adoption",
@@ -8761,7 +8766,12 @@ test("auto request refetch rejects changed workflow, run, and PR association", a
     }],
     ["run-workflow-id", { verifierRuns: [verifierRun({ workflow_id: 6002 })] }],
     ["run-source", { verifierRuns: [verifierRun({ event: "push" })] }],
-    ["run-attempt", { verifierRuns: [verifierRun({ run_attempt: 2 })] }],
+    ["first-attempt-success", {
+      verifierRunAttempts: [verifierRun({ conclusion: "success" })],
+    }],
+    ["current-merge-changed", {
+      pullRequestOverrides: { merge_commit_sha: NEXT_HEAD },
+    }],
     ["live-association-advanced", { verifierRuns: [verifierRun({
       pull_requests: [{
         ...verifierRun().pull_requests[0],
@@ -8799,6 +8809,59 @@ test("auto request refetch rejects changed workflow, run, and PR association", a
     const github = createGitHubMock(options);
     const environment = runtimeEnvironment(context, {
       suffix: `auto-request-refetch-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.deepEqual(github.requestBodies, [], suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+  }
+});
+
+test("auto request preserves an exact failed attempt 1 across same-run retries", async (context) => {
+  for (const [suffix, latestAttempt] of [
+    ["running", { run_attempt: 2, status: "in_progress", conclusion: null }],
+    ["failed", { run_attempt: 2, status: "completed", conclusion: "failure" }],
+  ]) {
+    const github = createGitHubMock({
+      verifierRuns: [verifierRun(latestAttempt)],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-same-run-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.deepEqual(github.requestBodies, [canonicalRequestBody()], suffix);
+    assert.deepEqual(github.rerunRequests, [], suffix);
+    assert.ok(github.calls.some(({ method, path }) =>
+      method === "GET" &&
+      path === `/repos/${REPOSITORY}/actions/runs/7001/attempts/1`
+    ), suffix);
+  }
+});
+
+test("auto request fails closed when a later same-run attempt succeeds or is inconclusive", async (context) => {
+  for (const [suffix, latestAttempt] of [
+    ["success", { run_attempt: 2, status: "completed", conclusion: "success" }],
+    ["cancelled", { run_attempt: 2, status: "completed", conclusion: "cancelled" }],
+    ["timed-out", { run_attempt: 2, status: "completed", conclusion: "timed_out" }],
+    ["unknown-status", { run_attempt: 2, status: "unknown", conclusion: null }],
+  ]) {
+    const github = createGitHubMock({
+      verifierRuns: [verifierRun(latestAttempt)],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-request-same-run-${suffix}`,
       eventName: "workflow_run",
       operation: "begin-review",
     });
@@ -11131,6 +11194,7 @@ function createGitHubMock({
   postUnknownConcurrentComments = [],
   createdCommentOverrides = {},
   verifierRuns = [verifierRun()],
+  verifierRunAttempts = [verifierRun()],
   selfVerifierRun = verifierSelfRun(),
   verifierAttemptStatus = "queued",
   verifierRerunAdvances = true,
@@ -11313,6 +11377,15 @@ function createGitHubMock({
             : run.conclusion,
         })),
       });
+    }
+    const exactAttempt = /^\/repos\/owner\/repo\/actions\/runs\/(\d+)\/attempts\/(\d+)$/u.exec(path);
+    if (method === "GET" && exactAttempt) {
+      const attempt = Number(exactAttempt[2]);
+      const run = verifierRunAttempts.find((value) =>
+        String(value.id) === exactAttempt[1] && value.run_attempt === attempt
+      );
+      if (!run) return jsonResponse({ message: "not found" }, 404);
+      return jsonResponse(structuredClone(run));
     }
     const exactRun = /^\/repos\/owner\/repo\/actions\/runs\/(\d+)$/u.exec(path);
     if (method === "GET" && exactRun) {
