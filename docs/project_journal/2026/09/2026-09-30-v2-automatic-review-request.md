@@ -71,8 +71,10 @@ superseded_by:
 1. Implement, validate, review, and merge the Action runtime, canonical
    controller template, installer contract, tests, and documentation without
    changing the release manifest.
-2. The separate release intent selects Action `v2.1.4` after the dynamic
+2. The separate release intent selected Action `v2.1.4` after the dynamic
    verifier run-name fix (#93), advancing the manifest from `v2.1.3` without
+   changing publisher controls. Following the #96 same-run retry fix, the
+   next separate release intent selects `v2.1.5` from `v2.1.4`, again without
    changing publisher controls. Publish through the existing Environment
    approval boundary, then verify the floating `v2` alias points to the
    released runtime.
