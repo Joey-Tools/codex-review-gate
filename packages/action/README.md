@@ -267,8 +267,10 @@ never supplies a verdict or rewrites a CheckRun; the read-only verifier alone
 collects evidence and its native job conclusion carries the required result.
 
 The reducer reads qualifying Codex top-level issue comments and pull-request
-review bodies. Inline review threads are deliberately outside the reducer;
-the ruleset's “all conversations resolved” requirement is their authority.
+review bodies. Separately, each complete evidence snapshot reads every PR
+review thread through GitHub GraphQL and requires all threads to be resolved.
+The ruleset must still require “all conversations resolved” as an independent
+server-side merge guard.
 
 ## Evidence semantics
 
@@ -344,31 +346,38 @@ it has a full-head binding.
 Agents must never intentionally create this pair; it only recovers one that
 already exists in the immutable GitHub snapshot.
 
-A separate *current-head clean recovery* (a narrow path for a clean that
-predates this verifier run) addresses one specific same-head case. With no
-base epoch and exactly two relevant physical request boundaries, an earlier
-authorised request `R0` (ordinary or canonical) must have had its
-first-generation gap closed by an official, unedited, current-head top-level
-issue-comment terminal clean `C0`. If `C0.created_at`
-is at or before the current `pull_request` verifier run's GitHub-server
-`created_at`, that clean alone remains pending. This cutoff is specific to
-the top-level issue-comment clean: without `C0`, an earlier
-`APPROVED` pull-request review still follows the existing first-generation
-rules, but it cannot bypass a pre-run `C0`. A new, independent, exact and
-unedited ordinary `@codex review` issue comment `R1` must then have both
-`created_at` and `updated_at` strictly after that cutoff. A new official,
-unedited, current-head top-level issue-comment terminal clean `C1` must
-follow strictly after `R1` (`C1.created_at > R1.updated_at`), with no later
-boundary or unclosed predecessor
-gap. Editing the old comment, reusing `C0`, or substituting an inline-parent
-review does not work. The run timestamp is a conservative cutoff, not the
-exact PR `synchronize` time; Git commit dates are never a fallback. The
-timestamps and SHA establish ordering and current-head scope, not proof that
-`R1` caused `C1` or that posting `R1` made Codex start. This exception cannot
-clear a known finding, provider error or live/ambiguous review. It still
-requires complete inventory, exact refetches, two stable snapshots, and a
-later exact-head verifier rerun after the provider comment or manual
-`reconcile`. Other multi-generation rules remain strict.
+A separate *current-head clean recovery* handles a trusted clean that is
+already on the current head but predates this verifier run. This recovery is
+available only when there is no base epoch. The cutoff `T` is the GitHub-server
+`created_at` of the original `pull_request` verifier run; retries keep that
+same cutoff. A witness consists of one eligible request `R`: either an exact,
+unedited ordinary `@codex review` from a `User`, or a verified canonical
+Actions request whose repository, PR, full head/base tuple, and workflow-run
+marker match the selected PR and verifier scope. Both forms are followed by a
+trusted, unedited top-level issue-comment terminal clean `C` that resolves
+uniquely to the current full head SHA. The receipt order is strict:
+`T < R < C`. `R` must be the latest physical request boundary before `C`,
+and no request boundary may follow `C`. This is head attestation (the clean's
+unique full-SHA binding covers the selected head, not request-to-result
+causality); posting `R` does not prove Codex started.
+After a base epoch, this recovery does not apply: the existing rule still
+requires an exact-current-tuple canonical Actions request with a direct
+provider `+1`; a top-level terminal clean adds no authority. Older ordinary
+requests before `T` remain in the full lineage audit, but attribution gaps
+attached only to those historical requests do not invalidate this recovery
+witness.
+
+The conservative cutoff is not the exact PR `synchronize` time; Git commit
+dates and unverified event timestamps are never fallbacks. This recovery does
+not clear findings or provider errors, nor does it forgive edited, deleted,
+scope-drifted, live or ambiguous evidence. It still requires complete
+inventory, exact refetches and two stable snapshots. Recovery does not waive
+unsettled provider liveness: for example, an older request's official `eyes`
+without its own later `+1` remains blocking. Recovery success also requires
+every review thread to be resolved in both stable snapshots; an unresolved
+human-authored, outdated, or old-head thread still blocks. A later exact-head
+verifier rerun after the provider comment or manual `reconcile` remains
+required. The cutoff does not carry to a new verifier run ID.
 
 Every snapshot also reads the latest GitHub PR timeline
 `BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
@@ -394,9 +403,10 @@ generation and carry its clean authority. The exact closed `COMMENTED`
 inline-parent form remains available only for the unique-request path. Other
 pull-request review cleans remain ordinary evidence and cannot confirm a
 default-`any` candidate.
-The inline-parent form attests only the absence of a non-inline parent payload:
-the reducer neither reads nor decides its child threads, and the installed
-ruleset remains the sole authority requiring all conversations to be resolved.
+The inline-parent form attests only the absence of a non-inline parent payload;
+it does not itself attest thread resolution. The verifier independently reads
+thread state, while the installed ruleset remains a separate authority requiring
+all conversations to be resolved.
 A qualifying finding is
 independently blocking and never acts as a receipt. A candidate with no receipt
 contender is not a physical boundary. A terminal-clean contender that fails a
@@ -418,11 +428,13 @@ head/base tuple grants authority. Without a base epoch, provider
 terminal evidence strictly between the first request and its successor may
 close only that first gap. Every later gap, and positive clean authority for any
 generation that has a physical predecessor, requires a qualifying `+1`
-directly on that request, except for the exact two-boundary current-head clean
-recovery above. An unbound terminal cannot prove whether it belongs
+directly on that request, except for the fresh current-head clean recovery
+above. An unbound terminal cannot prove whether it belongs
 to the newer request or is a delayed or duplicate carrier from an older one;
 it therefore cannot pass or supersede findings for the newer generation. With
-a base epoch, even the first gap requires request-bound `+1` evidence.
+a base epoch, the current-head clean recovery does not apply: the existing
+rule requires an exact-current-tuple canonical Actions request with a direct
+provider `+1`, and a top-level terminal clean adds no authority.
 
 A same-or-later official `eyes` or provider activity signal no later than a
 successor keeps the predecessor open; equality with the successor is
@@ -528,7 +540,13 @@ unsupported_target
 create_verifier_run
 ```
 
-Findings normally produce `healthy/failure`, not an execution error.
+Qualifying findings normally produce `healthy/failure`, not an execution
+error. When Codex evidence otherwise qualifies for success, a complete
+review-thread inventory with unresolved threads blocks that success as
+`healthy/pending` with `wait_then_reconcile`. If Codex evidence still requires a
+request, wait, or finding-fix recovery, keep that Codex action primary and add
+thread resolution plus exact-head reconcile as a follow-up; resolving threads
+alone does not establish qualifying Codex evidence.
 `unhealthy/success` is invalid. In the verifier workflow, only a proved stable
 `healthy/success` may conclude successfully; findings, pending evidence,
 unsupported scope, cancellation, timeout and every unhealthy result remain
@@ -554,9 +572,20 @@ and Actions summary report:
 - `findings_historical`;
 - `findings_indeterminate`.
 
+Review-thread diagnostics are reported separately from findings. The
+`report.reviewThreads.status` is `not_read`, `complete`, or `incomplete`; only
+`complete` has trusted numeric resolved/unresolved/total counts. Otherwise
+counts are `unknown`, not verified zero. Thread diagnostics are additive and
+must preserve the primary recovery instruction (including finding, permission,
+budget, replacement-PR, or begin-delivery guidance); only a complete read that
+finds unresolved threads calls for resolving them and running protected
+exact-head manual `reconcile`. A new provider review request is not required
+for that repair.
+
 Incomplete API reads, pagination or cap hits make affected counts `unknown`,
-never `0`. These counts cover only normalised non-inline reducer findings and
-do not replace conversation-resolution enforcement.
+never `0`. Finding counts cover only normalised non-inline findings; thread
+counts cover GraphQL review-thread state. Neither summary replaces the
+independent branch-protection conversation-resolution requirement.
 
 See [DESIGN.md](DESIGN.md) for the authority and consistency model and
 [COOKBOOK.md](COOKBOOK.md) for recovery procedures.

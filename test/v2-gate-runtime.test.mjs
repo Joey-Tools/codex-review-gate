@@ -55,7 +55,7 @@ const V2_RUNTIME_PATH = fileURLToPath(
   new URL("../packages/action/src/v2/gate-runtime.mjs", import.meta.url),
 );
 
-test("normalizers, profiles, result vocabulary, and production constants are closed", () => {
+test("normalizers, profiles, result vocabulary, and production constants are closed", (context) => {
   assert.equal(normalizeV2Operation(undefined), "reconcile");
   assert.equal(normalizeV2Operation("begin-review"), "begin-review");
   assert.throws(() => normalizeV2Operation("scan"), /reconcile or begin-review/u);
@@ -135,6 +135,479 @@ test("normalizers, profiles, result vocabulary, and production constants are clo
     gateOutcome: "pending",
     recoveryCode: "retry_reconcile",
   }).retrySafe, true);
+  const incompleteReport = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    recoveryCode: "wait_provider",
+    reviewThreads: {
+      status: "incomplete",
+      unresolved: 1,
+      resolved: 2,
+      total: 3,
+    },
+  });
+  assert.deepEqual(incompleteReport.reviewThreads, {
+    status: "incomplete",
+    unresolved: "unknown",
+    resolved: "unknown",
+    total: "unknown",
+    diagnostics: [],
+  });
+  const incompleteEnvironment = runtimeEnvironment(context, {
+    suffix: "incomplete-thread-count-normalization",
+  });
+  appendV2GateSummary(incompleteEnvironment.GITHUB_STEP_SUMMARY, incompleteReport, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const incompleteSummary = readFileSync(
+    incompleteEnvironment.GITHUB_STEP_SUMMARY,
+    "utf8",
+  );
+  assert.match(
+    incompleteSummary,
+    /Review threads: unknown unresolved, unknown resolved, unknown total/u,
+  );
+  const incompleteSticky = buildV2StickyCommentBody(incompleteReport, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  assert.match(
+    incompleteSticky,
+    /Review threads: unknown unresolved, unknown resolved, unknown total\./u,
+  );
+  const incompleteHidden = /^<!-- (\{.*\}) -->$/mu.exec(incompleteSticky);
+  assert.ok(incompleteHidden, "sticky report includes its machine-readable payload");
+  assert.deepEqual(JSON.parse(incompleteHidden[1]).reviewThreads, {
+    unresolved: "unknown",
+    resolved: "unknown",
+    total: "unknown",
+    status: "incomplete",
+    diagnostics: [],
+  });
+});
+
+test("review-thread inventory uses non-overlapping 100-node pages until complete", async (context) => {
+  const threads = Array.from({ length: 201 }, (_, index) => reviewThread({
+    id: `PRRT_node_${index + 1}`,
+  }));
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: threads,
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-pages",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.gateOutcome, "success");
+  const pages = github.calls.filter(({ method, path, body }) =>
+    method === "POST" && path === "/graphql" &&
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  );
+  assert.equal(pages.length % 3, 0);
+  for (let index = 0; index < pages.length; index += 3) {
+    assert.deepEqual(pages.slice(index, index + 3).map(({ body }) => body.variables.cursor), [
+      null,
+      "review-thread:100",
+      "review-thread:200",
+    ]);
+  }
+  for (const { body } of pages) {
+    assert.deepEqual(body.variables, {
+      owner: OWNER,
+      repo: REPO,
+      number: PR,
+      cursor: body.variables.cursor,
+    });
+    assert.match(body.query, /reviewThreads\(\s*first:\s*100/su);
+    assert.match(body.query, /isResolved/u);
+    assert.match(body.query, /isOutdated/u);
+    assert.doesNotMatch(body.query, /nodes\s*\{\s*id\s+isResolved\s+path\s+url/u);
+  }
+});
+
+test("unresolved outdated and human-authored review threads remain blocking", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: [
+      reviewThread({ id: "PRRT_old", isResolved: false, isOutdated: true }),
+      reviewThread({
+        id: "PRRT_human",
+        isResolved: false,
+        path: "docs/design.md",
+        url: `https://github.com/${REPOSITORY}/pull/${PR}#discussion_human`,
+      }),
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-blockers",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.reviewThreads.unresolved, 2);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("resolved review threads are counted without preventing a clean gate", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: [
+      reviewThread({ id: "PRRT_resolved", isResolved: true }),
+      reviewThread({ id: "PRRT_outdated-resolved", isResolved: true, isOutdated: true }),
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-resolved-count",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.deepEqual(result.report.reviewThreads, {
+    status: "complete",
+    unresolved: 0,
+    resolved: 2,
+    total: 2,
+    diagnostics: [],
+  });
+});
+
+test("an empty review-thread connection is complete and reports zero inventory", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-empty-inventory",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.deepEqual(result.report.reviewThreads, {
+    status: "complete",
+    unresolved: 0,
+    resolved: 0,
+    total: 0,
+    diagnostics: [],
+  });
+});
+
+test("review-thread resolution and reopening changes across snapshots fail closed", async (context) => {
+  for (const [suffix, before, after] of [
+    ["resolved-then-reopened", true, false],
+    ["unresolved-then-resolved", false, true],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+      reviewThreads: [reviewThread({ id: `PRRT_stability_${suffix}` })],
+      reviewThreadResponseMutator: (response, { snapshotIndex }) => {
+        response.body.data.repository.pullRequest.reviewThreads.nodes[0].isResolved =
+          snapshotIndex % 2 === 0 ? before : after;
+        return response;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `review-thread-stability-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      suffix,
+    );
+  }
+});
+
+test("unstable review-thread inventory hides counts from the prior complete snapshot", async (context) => {
+  const resolvedThread = reviewThread({
+    id: "PRRT_unstable_pending_counts",
+    isResolved: true,
+  });
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: [resolvedThread],
+    reviewThreadResponseMutator: (response, { snapshotIndex }) => {
+      response.body.data.repository.pullRequest.reviewThreads.nodes[0].id =
+        `PRRT_unstable_pending_${snapshotIndex}`;
+      return response;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "unstable-pending-thread-counts",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 5,
+  });
+
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["unknown", "unknown", "unknown"],
+  );
+  assert.equal(result.report.reviewThreads.status, "incomplete");
+
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /Review threads: unknown unresolved, unknown resolved, unknown total/u);
+  assert.match(summary, /Review-thread inventory: incomplete/u);
+});
+
+test("a review-thread resolution transition may pass after stable convergence", async (context) => {
+  const unresolved = reviewThread({ id: "PRRT_converges", isResolved: false });
+  const resolved = { ...unresolved, isResolved: true };
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreadSnapshots: [[unresolved], [resolved], [resolved], [resolved]],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-stable-convergence",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+});
+
+test("same-count thread identity swaps remain unstable", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: [reviewThread({ id: "PRRT_identity_seed", isResolved: true })],
+    reviewThreadResponseMutator: (response, { snapshotIndex }) => {
+      response.body.data.repository.pullRequest.reviewThreads.nodes[0].id =
+        `PRRT_identity_${snapshotIndex}`;
+      return response;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-id-fingerprint-instability",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("incomplete review-thread GraphQL histories fail closed", async (context) => {
+  const malformed = (response) => {
+    response.body.data.repository.pullRequest.reviewThreads.nodes[0].id = "";
+    return response;
+  };
+  const nullConnection = (response) => {
+    response.body.data.repository.pullRequest.reviewThreads = null;
+    return response;
+  };
+  const partialErrors = (response) => {
+    response.body.errors = [{ message: "synthetic partial thread inventory" }];
+    return response;
+  };
+  const repeatedCursor = (response, { cursor }) => {
+    const connection = response.body.data.repository.pullRequest.reviewThreads;
+    connection.pageInfo.hasNextPage = true;
+    connection.pageInfo.endCursor = cursor;
+    return response;
+  };
+  const underCount = (response) => {
+    const connection = response.body.data.repository.pullRequest.reviewThreads;
+    connection.totalCount = connection.nodes.length + 1;
+    return response;
+  };
+  const emptyNextPage = (response) => {
+    const connection = response.body.data.repository.pullRequest.reviewThreads;
+    connection.nodes = [];
+    connection.pageInfo.hasNextPage = true;
+    connection.pageInfo.endCursor = "review-thread:empty";
+    return response;
+  };
+  const repositoryMismatch = (response) => {
+    response.body.data.repository.nameWithOwner = "someone-else/repo";
+    return response;
+  };
+  const pullRequestMismatch = (response) => {
+    response.body.data.repository.pullRequest.number = PR + 1;
+    return response;
+  };
+  const cases = [
+    ["malformed node identity", malformed],
+    ["null connection", nullConnection],
+    ["partial GraphQL errors", partialErrors],
+    ["repeated cursor", repeatedCursor],
+    ["totalCount under-count", underCount],
+    ["empty next page", emptyNextPage],
+    ["repository mismatch", repositoryMismatch],
+    ["pull request number mismatch", pullRequestMismatch],
+  ];
+
+  for (const [label, mutator] of cases) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+      reviewThreads: [reviewThread()],
+      reviewThreadResponseMutator: (response, contextValue) =>
+        mutator(structuredClone(response), contextValue),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `review-thread-incomplete-${label.replaceAll(" ", "-")}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.notEqual(result.report.gateOutcome, "success", label);
+    assert.deepEqual(
+      [
+        result.report.reviewThreads.unresolved,
+        result.report.reviewThreads.resolved,
+        result.report.reviewThreads.total,
+      ],
+      ["unknown", "unknown", "unknown"],
+      label,
+    );
+    assert.equal(result.report.reviewThreads.status, "incomplete", label);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, label);
+  }
+});
+
+test("review-thread totals must stay stable across pages", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: Array.from({ length: 101 }, (_, index) => reviewThread({
+      id: `PRRT_total_${index + 1}`,
+    })),
+    reviewThreadResponseMutator: (response, { cursor }) => {
+      if (cursor === null) return response;
+      response.body.data.repository.pullRequest.reviewThreads.totalCount += 1;
+      return response;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-totalcount-drift",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("duplicate review-thread IDs and inventory budget exhaustion fail closed", async (context) => {
+  const duplicateGithub = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: Array.from({ length: 101 }, (_, index) => reviewThread({
+      id: index === 0 || index === 100
+        ? "PRRT_duplicate_across_pages"
+        : `PRRT_unique_${index}`,
+    })),
+  });
+  const duplicateEnvironment = runtimeEnvironment(context, {
+    suffix: "review-thread-duplicate-id",
+  });
+  const duplicate = await runGate(duplicateEnvironment, duplicateGithub);
+  assert.notEqual(duplicate.result.report.gateOutcome, "success");
+  assert.equal(
+    duplicateGithub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+
+  const budgetGithub = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: Array.from({ length: 2_001 }, (_, index) => reviewThread({
+      id: `PRRT_budget_${index + 1}`,
+    })),
+  });
+  const budgetEnvironment = runtimeEnvironment(context, {
+    suffix: "review-thread-budget-exhaustion",
+  });
+  const budget = await runGate(budgetEnvironment, budgetGithub);
+  assert.notEqual(budget.result.report.gateOutcome, "success");
+  assert.equal(budgetGithub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("review-thread permission failure keeps permission repair as the primary action", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    requestInterceptor: ({ method, path, body }) =>
+      method === "POST" && path === "/graphql" &&
+        body?.query?.includes("CodexReviewGateReviewThreads")
+        ? jsonResponse({ message: "synthetic review-thread permission failure" }, 403)
+        : undefined,
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-permission-primary-action",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.reviewThreads.status, "incomplete");
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["unknown", "unknown", "unknown"],
+  );
+  assert.equal(result.report.recoveryCode, "repair_permissions");
+  assert.match(
+    readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
+    /Next action: Repair the canonical workflow permissions or installation/u,
+  );
+  assert.ok(github.calls.some(({ method, path, body }) =>
+    method === "POST" && path === "/graphql" &&
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ));
+});
+
+test("review-thread inventory budget exhaustion keeps expanded limits as the primary action", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: Array.from({ length: 2_001 }, (_, index) => reviewThread({
+      id: `PRRT_primary_budget_${index + 1}`,
+    })),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-thread-budget-primary-action",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.reviewThreads.status, "incomplete");
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["unknown", "unknown", "unknown"],
+  );
+  assert.equal(result.report.recoveryCode, "use_expanded_limits");
+  assert.match(result.report.reason, /soft limit exceeded.*pull-request review threads/iu);
+  assert.match(
+    readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
+    /Next action: Rerun reconcile.*limits\\_profile=expanded.*Review-thread inventory is incomplete/isu,
+  );
+
+  const protectedBudgetGithub = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: Array.from({ length: 10_001 }, (_, index) => reviewThread({
+      id: `PRRT_protected_budget_${index + 1}`,
+    })),
+  });
+  const protectedBudgetEnvironment = runtimeEnvironment(context, {
+    suffix: "review-thread-protected-budget-primary-action",
+    limitsProfile: "expanded",
+  });
+  const protectedBudget = await runGate(protectedBudgetEnvironment, protectedBudgetGithub);
+
+  assert.notEqual(protectedBudget.result.report.gateOutcome, "success");
+  assert.equal(protectedBudget.result.report.reviewThreads.status, "incomplete");
+  assert.equal(protectedBudget.result.report.recoveryCode, "raise_protected_limit");
+  assert.match(
+    readFileSync(protectedBudgetEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
+    /Next action: Review the evidence volume and raise the protected runtime limit before reconciling.*Review-thread inventory is incomplete/isu,
+  );
 });
 
 test("canonical workflow request binds repository, PR, head, base epoch, and run exactly", () => {
@@ -3893,6 +4366,430 @@ test("a prior clean cannot satisfy a newly created current-head verifier until a
   assert.deepEqual(recoveredGitHub.statusWrites, []);
 });
 
+test("a new-head top-level clean recovers across multiple pre-run boundaries and an old parent review", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const oldRequests = [
+    ordinaryRequest({
+      id: 501,
+      created_at: "2026-08-25T07:30:00Z",
+      updated_at: "2026-08-25T07:30:00Z",
+    }),
+    ordinaryRequest({
+      id: 502,
+      created_at: "2026-08-25T07:40:00Z",
+      updated_at: "2026-08-25T07:40:00Z",
+    }),
+    ordinaryRequest({
+      id: 503,
+      created_at: "2026-08-25T07:50:00Z",
+      updated_at: "2026-08-25T07:50:00Z",
+    }),
+  ];
+  const oldParent = inlineParentReview(OLD_HEAD, {
+    id: 504,
+    submitted_at: "2026-08-25T08:00:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [...oldRequests, recoveryRequest(), recoveryClean()],
+    reviews: [oldParent],
+    reviewThreads: [reviewThread({ id: "PRRT_recovered", isResolved: true })],
+    selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "post-run-current-head-clean-recovery",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a pre-run request's unclosed eyes activity blocks current-head clean recovery", async (context) => {
+  const oldRequest = ordinaryRequest({
+    id: 511,
+    created_at: "2026-08-25T07:50:00Z",
+    updated_at: "2026-08-25T07:50:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [oldRequest, recoveryRequest(), recoveryClean()],
+    reactionsByCommentId: new Map([[String(oldRequest.id), [reaction({
+      content: "eyes",
+      created_at: "2026-08-25T07:51:00Z",
+    })]]]),
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "post-run-recovery-preserves-old-eyes",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("current-head clean recovery preserves findings and provider provenance errors", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const cases = [
+    {
+      suffix: "current-head-finding",
+      comments: [
+        ordinaryRequest({
+          id: 561,
+          created_at: "2026-08-25T07:50:00Z",
+          updated_at: "2026-08-25T07:50:00Z",
+        }),
+        recoveryRequest(),
+        findingIssueComment(HEAD, {
+          id: 562,
+          created_at: "2026-08-25T08:11:30Z",
+          updated_at: "2026-08-25T08:11:30Z",
+        }),
+        recoveryClean(),
+      ],
+    },
+    {
+      suffix: "provider-provenance-error",
+      comments: [
+        ordinaryRequest({
+          id: 563,
+          created_at: "2026-08-25T07:50:00Z",
+          updated_at: "2026-08-25T07:50:00Z",
+        }),
+        recoveryRequest(),
+        opaqueProviderIssueComment({
+          id: 564,
+          created_at: "2026-08-25T08:11:30Z",
+          updated_at: "2026-08-25T08:11:30Z",
+          performed_via_github_app: { slug: "untrusted-app" },
+        }),
+        recoveryClean(),
+      ],
+    },
+  ];
+
+  for (const { suffix, comments } of cases) {
+    const github = createGitHubMock({
+      issueComments: comments,
+      selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `post-run-recovery-preserved-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("an APPROVED review cannot replace a post-run current-head top-level clean", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest({
+      id: 521,
+      created_at: "2026-08-25T07:50:00Z",
+      updated_at: "2026-08-25T07:50:00Z",
+    }), recoveryRequest()],
+    reviews: [approvedReview(HEAD, {
+      id: 522,
+      submitted_at: "2026-08-25T08:12:00Z",
+    })],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "post-run-recovery-approved-not-comment-clean",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("an inline-parent review cannot replace a post-run current-head top-level clean", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [
+      ordinaryRequest({
+        id: 523,
+        created_at: "2026-08-25T07:50:00Z",
+        updated_at: "2026-08-25T07:50:00Z",
+      }),
+      recoveryRequest(),
+    ],
+    reviews: [inlineParentReview(HEAD, {
+      id: 524,
+      submitted_at: "2026-08-25T08:12:00Z",
+    })],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "post-run-recovery-inline-parent-not-comment-clean",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a post-run canonical Actions request recovers only for the exact current tuple", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const exact = workflowRequest({
+    id: 531,
+    body: canonicalRequestBody(),
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+  });
+  const clean = recoveryClean();
+  const github = createGitHubMock({
+    issueComments: [exact, clean],
+    selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "post-run-exact-canonical-request",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+
+  const staleBaseRequest = workflowRequest({
+    id: 532,
+    body: canonicalRequestBody(HEAD, { baseSha: OLD_HEAD }),
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+  });
+  const staleBaseGithub = createGitHubMock({
+    issueComments: [staleBaseRequest, clean],
+    selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+  });
+  const staleBaseEnvironment = runtimeEnvironment(context, {
+    suffix: "post-run-canonical-stale-base",
+  });
+  const { result: staleBase } = await runGate(staleBaseEnvironment, staleBaseGithub);
+  assert.notEqual(staleBase.report.gateOutcome, "success");
+  assert.equal(staleBaseGithub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const postEpochGithub = createGitHubMock({
+    issueComments: [exact, clean],
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+    selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+  });
+  const postEpochEnvironment = runtimeEnvironment(context, {
+    suffix: "post-run-canonical-after-base-epoch-needs-direct-receipt",
+  });
+  const { result: postEpoch } = await runGate(postEpochEnvironment, postEpochGithub);
+  assert.notEqual(postEpoch.report.gateOutcome, "success");
+  assert.equal(postEpochGithub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("current-head clean recovery requires strict verifier, request, and clean ordering", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const cases = [
+    {
+      suffix: "request-equals-cutoff",
+      request: recoveryRequest({
+        created_at: cutoff,
+        updated_at: cutoff,
+      }),
+      clean: recoveryClean(),
+    },
+    {
+      suffix: "clean-equals-request",
+      request: recoveryRequest(),
+      clean: recoveryClean({
+        created_at: "2026-08-25T08:11:00Z",
+        updated_at: "2026-08-25T08:11:00Z",
+      }),
+    },
+    {
+      suffix: "clean-equals-cutoff",
+      request: recoveryRequest({
+        created_at: "2026-08-25T08:09:00Z",
+        updated_at: "2026-08-25T08:09:00Z",
+      }),
+      clean: recoveryClean({
+        created_at: cutoff,
+        updated_at: cutoff,
+      }),
+    },
+  ];
+
+  for (const { suffix, request, clean } of cases) {
+    const github = createGitHubMock({
+      issueComments: [
+        ordinaryRequest({
+          id: 541,
+          created_at: "2026-08-25T07:30:00Z",
+          updated_at: "2026-08-25T07:30:00Z",
+        }),
+        ordinaryRequest({
+          id: 542,
+          created_at: "2026-08-25T07:40:00Z",
+          updated_at: "2026-08-25T07:40:00Z",
+        }),
+        ordinaryRequest({
+          id: 543,
+          created_at: "2026-08-25T07:50:00Z",
+          updated_at: "2026-08-25T07:50:00Z",
+        }),
+        request,
+        clean,
+      ],
+      selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `post-run-recovery-order-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("edited recovery carriers, ambiguous SHAs, and same-time activity fail closed", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const currentRequest = recoveryRequest();
+  const currentClean = recoveryClean();
+  const cases = [
+    {
+      suffix: "edited-request",
+      comments: [
+        ordinaryRequest({
+          id: 551,
+          created_at: "2026-08-25T07:50:00Z",
+          updated_at: "2026-08-25T07:50:00Z",
+        }),
+        { ...currentRequest, updated_at: "2026-08-25T08:11:30Z" },
+        currentClean,
+      ],
+    },
+    {
+      suffix: "edited-clean",
+      comments: [
+        ordinaryRequest({
+          id: 552,
+          created_at: "2026-08-25T07:50:00Z",
+          updated_at: "2026-08-25T07:50:00Z",
+        }),
+        currentRequest,
+        { ...currentClean, updated_at: "2026-08-25T08:13:00Z" },
+      ],
+    },
+    {
+      suffix: "same-time-provider-progress",
+      comments: [
+        ordinaryRequest({
+          id: 553,
+          created_at: "2026-08-25T07:50:00Z",
+          updated_at: "2026-08-25T07:50:00Z",
+        }),
+        currentRequest,
+        currentClean,
+        progressIssueComment({
+          id: 554,
+          created_at: currentClean.created_at,
+          updated_at: currentClean.created_at,
+        }),
+      ],
+    },
+    {
+      suffix: "same-time-opaque-activity",
+      comments: [
+        ordinaryRequest({
+          id: 555,
+          created_at: "2026-08-25T07:50:00Z",
+          updated_at: "2026-08-25T07:50:00Z",
+        }),
+        currentRequest,
+        currentClean,
+        opaqueProviderIssueComment({
+          id: 556,
+          created_at: currentClean.created_at,
+          updated_at: currentClean.created_at,
+        }),
+      ],
+    },
+  ];
+
+  const ambiguousClean = recoveryClean({
+    body: `Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** \`${HEAD.slice(0, 10)}\``,
+  });
+  cases.push({
+    suffix: "ambiguous-clean-sha",
+    comments: [
+      ordinaryRequest({
+        id: 557,
+        created_at: "2026-08-25T07:50:00Z",
+        updated_at: "2026-08-25T07:50:00Z",
+      }),
+      currentRequest,
+      ambiguousClean,
+    ],
+    commitResolution: () => ({ status: 422, message: "short SHA is ambiguous" }),
+  });
+  cases.push({
+    suffix: "deleted-post-run-boundary",
+    comments: [
+      ordinaryRequest({
+        id: 558,
+        created_at: "2026-08-25T07:50:00Z",
+        updated_at: "2026-08-25T07:50:00Z",
+      }),
+      currentRequest,
+      currentClean,
+    ],
+    deletedEvents: [deletedCommentEvent({
+      id: "CDE_post_run_boundary",
+      createdAt: "2026-08-25T08:11:30Z",
+    })],
+  });
+  cases.push({
+    suffix: "ordinary-request-after-base-epoch",
+    comments: [
+      ordinaryRequest({
+        id: 559,
+        created_at: "2026-08-25T07:50:00Z",
+        updated_at: "2026-08-25T07:50:00Z",
+      }),
+      currentRequest,
+      currentClean,
+    ],
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+  });
+  cases.push({
+    suffix: "later-request-after-clean",
+    comments: [
+      ordinaryRequest({
+        id: 560,
+        created_at: "2026-08-25T07:50:00Z",
+        updated_at: "2026-08-25T07:50:00Z",
+      }),
+      currentRequest,
+      currentClean,
+      ordinaryRequest({
+        id: 565,
+        created_at: "2026-08-25T08:13:00Z",
+        updated_at: "2026-08-25T08:13:00Z",
+      }),
+    ],
+  });
+
+  for (const { suffix, comments, commitResolution, deletedEvents, baseEpoch } of cases) {
+    const github = createGitHubMock({
+      issueComments: comments,
+      commitResolution,
+      deletedCommentEvents: deletedEvents,
+      baseEpoch,
+      selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `post-run-recovery-unsafe-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
 test("a pre-run issue-comment clean cannot be bypassed by a pre-run APPROVED review", async (context) => {
   const request = ordinaryRequest();
   const review = approvedReview(HEAD, {
@@ -3982,13 +4879,6 @@ test("verifier clean recovery needs both a fresh request and a newer clean", asy
       body: cleanIssueComment(OLD_HEAD).body,
     })]],
     ["non-provider-clean", [...prior, recoveryRequest(), recoveryClean({ user: HUMAN })]],
-    ["canonical-second-request", [...prior, workflowRequest({
-      id: 301,
-      body: canonicalRequestBody(HEAD, { runId: "124" }),
-      created_at: "2026-08-25T08:11:00Z",
-      updated_at: "2026-08-25T08:11:00Z",
-      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-301`,
-    }), recoveryClean()]],
   ];
   for (const [suffix, issueComments] of cases) {
     const github = createGitHubMock({
@@ -4001,6 +4891,27 @@ test("verifier clean recovery needs both a fresh request and a newer clean", asy
     assert.notEqual(result.report.gateOutcome, "success", suffix);
     assert.deepEqual(github.statusWrites, [], suffix);
   }
+});
+
+test("an exact canonical second request can recover after a pre-run generation", async (context) => {
+  const canonical = workflowRequest({
+    id: 301,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-301`,
+  });
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD), canonical, recoveryClean()],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "recovery-canonical-second-request",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
 });
 
 test("a post-run ordinary request without a new clean waits without requiring a replacement PR", async (context) => {
@@ -4016,6 +4927,79 @@ test("a post-run ordinary request without a new clean waits without requiring a 
   assert.equal(result.report.recoveryCode, "wait_provider", result.report.reason);
   assert.equal(result.report.requiresReplacementPr, false);
   assert.deepEqual(github.statusWrites, []);
+});
+
+test("unresolved threads stay additive unless Codex evidence otherwise qualifies for success", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const unresolvedThread = reviewThread({
+    id: "PRRT_primary_codex_recovery",
+    isResolved: false,
+    path: "src/review.mjs",
+    url: `https://github.com/${REPOSITORY}/pull/${PR}#discussion_primary`,
+  });
+  const cases = [
+    {
+      suffix: "prerun-clean",
+      issueComments: [
+        ordinaryRequest(),
+        cleanIssueComment(HEAD, {
+          created_at: "2026-08-25T08:02:00Z",
+          updated_at: "2026-08-25T08:02:00Z",
+        }),
+      ],
+      expectedRecovery: "request_clean_generation",
+      expectedReason: /current-head Codex clean predates this verifier run/u,
+    },
+    {
+      suffix: "postrun-request-awaiting-result",
+      issueComments: [ordinaryRequest(), cleanIssueComment(HEAD), recoveryRequest()],
+      expectedRecovery: "wait_provider",
+      expectedReason: /new @codex review request exists.*no qualifying.*terminal clean/u,
+    },
+    {
+      suffix: "no-terminal-result",
+      issueComments: [],
+      expectedRecovery: "wait_provider",
+      expectedReason: /No complete Codex terminal result is bound to the current head/u,
+    },
+  ];
+
+  for (const scenario of cases) {
+    const github = createGitHubMock({
+      issueComments: scenario.issueComments,
+      reviewThreads: [unresolvedThread],
+      selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `unresolved-thread-${scenario.suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.executionHealth, "healthy", scenario.suffix);
+    assert.equal(result.report.gateOutcome, "pending", scenario.suffix);
+    assert.equal(result.report.recoveryCode, scenario.expectedRecovery, scenario.suffix);
+    assert.match(result.report.reason, scenario.expectedReason, scenario.suffix);
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.match(summary, /Also resolve all 1 unresolved pull-request review thread/u);
+    assert.match(summary, /then reconcile the exact current head/u);
+  }
+
+  const qualifyingGitHub = createGitHubMock({
+    issueComments: recoveryEvidence(),
+    reviewThreads: [unresolvedThread],
+    selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+  });
+  const qualifyingEnvironment = runtimeEnvironment(context, {
+    suffix: "unresolved-thread-otherwise-qualifying-clean",
+  });
+  const { result: qualifying } = await runGate(qualifyingEnvironment, qualifyingGitHub);
+  assert.equal(qualifying.report.gateOutcome, "pending");
+  assert.equal(qualifying.report.recoveryCode, "wait_then_reconcile");
+  assert.match(qualifying.report.reason, /GitHub reports 1 unresolved pull-request review thread/u);
+  assert.match(
+    readFileSync(qualifyingEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
+    /Resolve all 1 unresolved pull-request review thread.*dispatch reconcile/u,
+  );
 });
 
 test("verifier clean recovery requires request and terminal to be strictly after their boundaries", async (context) => {
@@ -4209,25 +5193,10 @@ test("verifier clean recovery does not reopen ambiguous request lineage", async 
     updated_at: "2026-08-25T08:13:00Z",
     html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
   });
-  const duplicatePriorClean = cleanIssueComment(HEAD, {
-    id: 202,
-    created_at: "2026-08-25T08:02:00Z",
-    updated_at: "2026-08-25T08:02:00Z",
-    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
-  });
   const cases = [
     ["unclosed-prior-gap", {
       issueComments: [
         workflowRequest({ body: canonicalRequestBody(HEAD, { runId: "122" }) }),
-        recoveryRequest(),
-        recoveryClean(),
-      ],
-    }],
-    ["extra-prior-clean", {
-      issueComments: [
-        ordinaryRequest(),
-        cleanIssueComment(HEAD),
-        duplicatePriorClean,
         recoveryRequest(),
         recoveryClean(),
       ],
@@ -4249,6 +5218,30 @@ test("verifier clean recovery does not reopen ambiguous request lineage", async 
     assert.notEqual(result.report.gateOutcome, "success", suffix);
     assert.deepEqual(github.statusWrites, [], suffix);
   }
+});
+
+test("additional pre-run clean carriers do not invalidate the current-head witness", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [
+      ordinaryRequest(),
+      cleanIssueComment(HEAD),
+      cleanIssueComment(HEAD, {
+        id: 202,
+        created_at: "2026-08-25T08:02:00Z",
+        updated_at: "2026-08-25T08:02:00Z",
+        html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+      }),
+      recoveryRequest(),
+      recoveryClean(),
+    ],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "recovery-additional-pre-run-clean",
+  });
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.gateOutcome, "success");
 });
 
 test("default-any ordinary requests accept an official terminal clean receipt", async (context) => {
@@ -5284,7 +6277,7 @@ test("a generic pull-request review clean cannot promote a default-any request",
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("a closed Codex inline-parent review can promote one default-any request", async (context) => {
+test("a closed Codex inline-parent review can promote one default-any request with clear threads", async (context) => {
   const request = ordinaryRequest({ user: READER });
   const review = inlineParentReview(HEAD, {
     submitted_at: "2026-08-25T08:02:00Z",
@@ -5301,12 +6294,21 @@ test("a closed Codex inline-parent review can promote one default-any request", 
   assert.equal(result.report.gateOutcome, "success");
   assert.equal(result.report.recoveryCode, "none");
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
-  assert.equal(
-    github.calls.some(({ path, body }) =>
-      path === "/graphql" && /reviewThreads/iu.test(String(body?.query || ""))
-    ),
-    false,
-    "the REST-only reducer must not inspect inline review threads",
+  assert.deepEqual(result.report.reviewThreads, {
+    status: "complete",
+    unresolved: 0,
+    resolved: 0,
+    total: 0,
+    diagnostics: [],
+  });
+  const threadInventoryQuery = github.calls.find(({ path, body }) =>
+    path === "/graphql" && /reviewThreads/iu.test(String(body?.query || ""))
+  );
+  assert.ok(threadInventoryQuery, "the gate must inspect the complete review-thread inventory");
+  assert.doesNotMatch(
+    threadInventoryQuery.body.query,
+    /comments\s*\([^)]*\)\s*\{[\s\S]*?\bbody\b/u,
+    "thread inspection may fetch only a minimal diagnostic URL, not comment bodies",
   );
 });
 
@@ -10396,6 +11398,53 @@ test("summary and sticky diagnostics are bounded Markdown, HTML, and mention saf
   }
 });
 
+test("review-thread paths use code-span delimiters beyond embedded backticks", (context) => {
+  const paths = [
+    "src/internal`tick.mjs",
+    "`leading-backtick.mjs",
+    "trailing-backtick.mjs`",
+    "src/multiple``runs```inside.mjs",
+    "src/`[active](https://attacker.example)<script>@codex review</script>`",
+  ];
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "Unresolved review threads",
+    recoveryCode: "wait_then_reconcile",
+    reviewThreads: {
+      status: "complete",
+      unresolved: paths.length,
+      resolved: 0,
+      total: paths.length,
+      diagnostics: paths.map((path) => ({ path, isOutdated: false, url: null })),
+    },
+  });
+  const sticky = buildV2StickyCommentBody(report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const environment = runtimeEnvironment(context, { suffix: "thread-path-code-spans" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  // Verify source-level CommonMark code-span framing; this fixture does not invoke GitHub's renderer.
+  for (const path of paths) {
+    const longestRun = Math.max(0, ...[...path.matchAll(/`+/gu)].map(([run]) => run.length));
+    const delimiter = "`".repeat(longestRun + 1);
+    const framedPath = `${delimiter} ${path} ${delimiter}`;
+    for (const output of [summary, sticky]) {
+      assert.ok(output.includes(framedPath), `path is enclosed by a longer delimiter: ${path}`);
+      assert.ok(
+        delimiter.length > longestRun,
+        `delimiter cannot close inside the path: ${path}`,
+      );
+    }
+  }
+});
+
 test("recovery diagnostics route request-clean and finding fixes by proven lineage", async (context) => {
   const generationB = workflowRequest({
     id: 102,
@@ -11184,6 +12233,10 @@ function createGitHubMock({
   deletedCommentEventSnapshots = null,
   deletedCommentResponseMutator = null,
   deletedCommentPageSize = 100,
+  reviewThreads = [],
+  reviewThreadSnapshots = null,
+  reviewThreadResponseMutator = null,
+  reviewThreadPageSize = 100,
   permissionByLogin = new Map([[HUMAN.login, "write"]]),
   permissionMissingLogins = new Set(),
   commitResolution = null,
@@ -11211,6 +12264,9 @@ function createGitHubMock({
   const deletedComments = deletedCommentEvents.map((value) => structuredClone(value));
   const deletedCommentSnapshots = deletedCommentEventSnapshots?.map((snapshotEvents) =>
     snapshotEvents.map((value) => structuredClone(value))) || null;
+  const reviewThreadList = reviewThreads.map((value) => structuredClone(value));
+  const reviewThreadSnapshotList = reviewThreadSnapshots?.map((snapshotThreads) =>
+    snapshotThreads.map((value) => structuredClone(value))) || null;
   const calls = [];
   const statusWrites = [];
   const requestBodies = [];
@@ -11224,6 +12280,7 @@ function createGitHubMock({
   let repositoryIndex = 0;
   let baseEpochIndex = 0;
   let deletedCommentSnapshotIndex = 0;
+  let reviewThreadSnapshotIndex = 0;
   const reactionSnapshotIndexes = new Map();
   let activeComments = comments;
   let activeReviews = reviewList;
@@ -11245,6 +12302,13 @@ function createGitHubMock({
     if (!deletedCommentSnapshots) return deletedComments;
     return deletedCommentSnapshots[
       Math.min(deletedCommentSnapshotIndex, deletedCommentSnapshots.length - 1)
+    ] || [];
+  }
+
+  function currentReviewThreads() {
+    if (!reviewThreadSnapshotList) return reviewThreadList;
+    return reviewThreadSnapshotList[
+      Math.min(reviewThreadSnapshotIndex, reviewThreadSnapshotList.length - 1)
     ] || [];
   }
 
@@ -11433,6 +12497,26 @@ function createGitHubMock({
     if (
       method === "POST" &&
       path === "/graphql" &&
+      body?.query?.includes("CodexReviewGateReviewThreads")
+    ) {
+      const cursor = body.variables?.cursor ?? null;
+      const threads = currentReviewThreads();
+      const response = reviewThreadGraphQlResponse(threads, {
+        cursor,
+        pageSize: reviewThreadPageSize,
+      });
+      const mutated = typeof reviewThreadResponseMutator === "function"
+        ? reviewThreadResponseMutator(response, {
+            cursor,
+            snapshotIndex: reviewThreadSnapshotIndex,
+          })
+        : response;
+      if (!response.hasNext) reviewThreadSnapshotIndex += 1;
+      return jsonResponse(mutated.body || mutated);
+    }
+    if (
+      method === "POST" &&
+      path === "/graphql" &&
       body?.query?.includes("CodexReviewGateDeletedComments")
     ) {
       const cursor = body.variables?.cursor ?? null;
@@ -11603,6 +12687,48 @@ function createGitHubMock({
     stickyCreates,
     stickyPatches,
     rerunRequests,
+  };
+}
+
+function reviewThreadGraphQlResponse(threads, { cursor = null, pageSize = 100 } = {}) {
+  const match = cursor === null ? null : /^review-thread:(\d+)$/u.exec(String(cursor));
+  const start = match ? Number(match[1]) : 0;
+  const size = Math.max(1, Number(pageSize) || 1);
+  const nodes = threads.slice(start, start + size).map((thread) => structuredClone(thread));
+  const nextOffset = start + nodes.length;
+  const hasNextPage = nextOffset < threads.length;
+  return {
+    body: {
+      data: {
+        repository: {
+          nameWithOwner: REPOSITORY,
+          pullRequest: {
+            number: PR,
+            reviewThreads: {
+              totalCount: threads.length,
+              nodes,
+              pageInfo: {
+                hasNextPage,
+                endCursor: hasNextPage ? `review-thread:${nextOffset}` : null,
+              },
+            },
+          },
+        },
+      },
+    },
+    hasNext: hasNextPage,
+  };
+}
+
+function reviewThread(overrides = {}) {
+  const url = `https://github.com/${REPOSITORY}/pull/${PR}#discussion_r1`;
+  return {
+    id: "PRRT_node_1",
+    isResolved: true,
+    path: "src/example.mjs",
+    isOutdated: false,
+    comments: { nodes: [{ url, author: { ...HUMAN } }] },
+    ...overrides,
   };
 }
 

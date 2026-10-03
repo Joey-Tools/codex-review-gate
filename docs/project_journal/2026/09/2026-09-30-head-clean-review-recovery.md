@@ -1,9 +1,9 @@
 ---
 id: 20260930-head-clean-review-recovery
 title: Current-Head Clean Review Recovery
-status: active
+status: completed
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-03
 branch:
 pr:
 supersedes: []
@@ -14,39 +14,70 @@ superseded_by:
 
 ## Decision
 
-- The current `pull_request` verifier run's GitHub-server `created_at` is the
-  conservative cutoff for current-head top-level issue-comment clean evidence.
-  It is not the exact PR `synchronize` timestamp; Git commit dates and
-  unverified event times are not fallbacks. An official current-head top-level
-  issue-comment terminal clean `C0` at or before that cutoff remains pending on
-  its own. Without such a comment, an earlier `APPROVED` pull-request review
-  still follows first-generation rules; with a pre-run `C0`, it cannot bypass
-  pending.
-- The narrow recovery requires no base epoch and exactly two relevant physical
-  request boundaries. An earlier authorised request `R0` (ordinary or
-  canonical) has its first-generation gap closed by official, unedited,
-  current-head top-level issue-comment clean `C0` at or before the cutoff.
-  A canonical `R0` must match the current head/base SHA, base ref and base
-  repository identity; an old-base request is not eligible.
-  A new independent, unedited ordinary `@codex review` issue comment `R1`
-  must have both creation and revision strictly after the cutoff. A new
-  official, unedited, current-head top-level issue-comment clean `C1` must
-  follow strictly after `R1` (`C1.created_at > R1.updated_at`), with no later
-  boundary or unclosed gap.
-- Editing an old request, reusing `C0`, or substituting an inline-parent
-  review cannot recover this case. A request comment alone does not prove
-  Codex started; timestamps and head SHA establish ordering and scope, not
-  causality from `R1` to `C1`. An official `eyes` on `R0` strictly before
-  `C0` is settled by `C0` only for this recovery; one at or after `C0` blocks.
-  This exception does not clear known findings,
-  provider errors, liveness or ambiguous evidence. Complete inventory,
-  exact refetches, two stable snapshots, and a later exact-head verifier run
-  still gate success. Other multi-generation rules remain strict.
-  The cutoff is fixed for attempts of one verifier run ID; a new PR event
-  creates a new run and cutoff, so this recovery does not promise that
-  `R1/C1` carries forward into a separate run.
-  While `R1` has no `C1` yet, remain pending with `wait_provider`, not a
-  replacement-PR instruction, when `C0` safely closed the prior gap.
+- Define the new current-head clean recovery as a head-attestation witness
+  (the clean resolves to the selected current head, without proving which
+  request caused it), not request/response causal attribution. It applies only
+  without a base epoch. `T` is the GitHub-server `created_at` for the original `pull_request`
+  verifier run, fixed across retries of that run ID; it is not the exact
+  `synchronize` time. Do not substitute commit dates or unverified event
+  timestamps.
+- The witness is one eligible request `R`: either an exact, unedited ordinary
+  `@codex review` from a `User`, or a verified, unedited canonical Actions
+  request whose repository, PR, full head/base tuple, and workflow-run marker
+  match the selected PR/verifier scope. It is followed by a trusted, unedited
+  top-level issue-comment terminal clean `C` whose resolved full SHA uniquely
+  equals the current PR head. Require strict `T < R < C`; `R` must be the
+  latest physical request boundary before `C`, and no request boundary may
+  follow `C`. The timestamps
+  and SHA attest freshness and head scope, not that `R` caused `C` or started
+  Codex.
+- Keep all pre-`T` ordinary requests in the complete lineage audit, but ignore
+  attribution gaps attached only to those historical requests for this
+  witness. Do not rewrite those requests as resolved or as proven old-head
+  work. An older request's official `eyes` without its own later `+1` remains
+  unsettled and blocks under existing liveness rules. Findings, provider
+  errors, unknown/edited/deleted/forged boundaries, scope drift, other live
+  activity, exact-refetch failures and incomplete inventory remain blocking;
+  the recovery does not supersede or clear findings/errors.
+- A base epoch remains on its existing path: only an exact-current-tuple
+  canonical Actions request with a direct provider `+1` can provide the
+  required later authority. A top-level terminal clean does not extend the
+  new head-attestation exception past a base epoch.
+- Every PR review thread must be resolved in both stable snapshots, regardless
+  of author, outdated flag, or reviewed head. The installed ruleset's
+  `all conversations resolved` requirement remains an independent server-side
+  guard. Thread IDs and `isResolved` enter the snapshot fingerprint; no nested
+  thread comments are scanned for findings.
+- Thread reads use paginated GraphQL `reviewThreads(first: 100, after: $cursor)`.
+  Require complete, non-overlapping pages, consistent `totalCount`, valid
+  page/cursor structure, and a unique ID count equal to the reported total.
+  Cycles, duplicates, malformed/partial pages, GraphQL errors, caps, or count
+  mismatches fail closed. Two stable reads are not an atomic GitHub guarantee;
+  count/ID checks and stability reduce, but do not eliminate, cross-page
+  visibility races. Report review-thread status (`not_read`, `complete`, or
+  `incomplete`) and counts separately from non-inline finding counts; counts
+  are numeric only when complete, otherwise `unknown`, not zero. Thread
+  diagnostics remain additive and preserve primary finding, authorization,
+  budget, replacement-PR, or begin-delivery recovery instructions; only a
+  complete read with unresolved threads blocks an otherwise-qualified clean.
+  When Codex evidence is not yet qualified, preserve its request/wait/fix
+  recovery as primary and add thread resolution plus reconcile as follow-up.
+  If stable-snapshot convergence later exhausts, mark the inventory
+  incomplete and redact unresolved, resolved, and total counts, including
+  counts retained from an earlier complete snapshot. Include at most five
+  unresolved paths and first-comment URLs when available.
+
+## Incident Context
+
+- The debug-triage #20 evidence had an older ordinary request and an old-head
+  parent review that prevented the duplicate-cohort exception. A later trusted
+  current-head clean with zero finding counts still remained `wait_provider`:
+  zero findings did not prove request attribution or resolve outstanding
+  provider liveness. The prior narrow recovery also required an exact-current-
+  head top-level clean before the run cutoff, so that history did not qualify.
+- The new exception addresses only that head-attestation gap. It does not make
+  the provider result causal, clear findings/errors, forgive unresolved
+  threads, or waive existing liveness and full-snapshot checks.
 
 ## Rollout Dependency
 
@@ -57,10 +88,17 @@ superseded_by:
 
 ## Next Steps
 
-- Complete the runtime, focused tests, and documentation validation for this
-  narrow rule.
-- Coordinate installed-consumer workflow updates before the floating release.
+- No implementation work remains in this workstream. Consumer updates, package
+  version/release changes, and organization rollout or repository-visibility
+  expansion are separate work and require separate approval. The change adds no
+  permission, workflow event, cron schedule, or GitHub App.
 
 ## Evidence
 
-- Source baseline: `08c4448`.
+- Original narrow-rule baseline: `08c4448`.
+- Head-attestation and complete-thread implementation base:
+  `8f19ae307eb461c9bda6a25346746ac4ab518491`.
+- Runtime/tests: `packages/action/src/v2/gate-runtime.mjs` and
+  `test/v2-gate-runtime.test.mjs`; focused review-thread/recovery tests passed.
+- Validation: runtime/test `node --check`, focused tests, documentation
+  `git diff --check`, and project-journal validation passed.
