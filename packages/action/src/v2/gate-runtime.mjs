@@ -964,11 +964,22 @@ function v2ReportNextAction(report, context = {}) {
 }
 
 function normalizeV2ReviewThreadReport(value) {
-  const counts = {
+  let counts = {
     unresolved: value?.unresolved ?? "unknown",
     resolved: value?.resolved ?? "unknown",
     total: value?.total ?? "unknown",
   };
+  const status = value?.status ?? (
+    Object.values(counts).every((count) => Number.isSafeInteger(count))
+      ? "complete"
+      : "not_read"
+  );
+  if (!new Set(["not_read", "complete", "incomplete"]).has(status)) {
+    throw new Error("review-thread status must be not_read, complete, or incomplete");
+  }
+  if (status === "incomplete") {
+    counts = { unresolved: "unknown", resolved: "unknown", total: "unknown" };
+  }
   for (const [name, count] of Object.entries(counts)) {
     if (count !== "unknown" && (!Number.isSafeInteger(count) || count < 0)) {
       throw new Error(`review-thread ${name} count must be a non-negative safe integer or unknown`);
@@ -981,14 +992,6 @@ function normalizeV2ReviewThreadReport(value) {
     counts.unresolved + counts.resolved !== counts.total
   ) {
     throw new Error("review-thread unresolved and resolved counts must equal the total");
-  }
-  const status = value?.status ?? (
-    Object.values(counts).every((count) => Number.isSafeInteger(count))
-      ? "complete"
-      : "not_read"
-  );
-  if (!new Set(["not_read", "complete", "incomplete"]).has(status)) {
-    throw new Error("review-thread status must be not_read, complete, or incomplete");
   }
   if (
     status === "complete" &&
@@ -3169,7 +3172,7 @@ async function publishV2UnstablePending(client, config, context, snapshot, detai
     findingsIndeterminate: snapshot?.counts?.indeterminate ?? "unknown",
     reviewThreads: {
       status: "incomplete",
-      unresolved: snapshot?.reviewThreads?.unresolved ?? "unknown",
+      unresolved: "unknown",
       resolved: "unknown",
       total: "unknown",
       diagnostics: snapshot?.reviewThreads?.diagnostics ?? [],

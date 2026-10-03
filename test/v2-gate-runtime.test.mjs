@@ -55,7 +55,7 @@ const V2_RUNTIME_PATH = fileURLToPath(
   new URL("../packages/action/src/v2/gate-runtime.mjs", import.meta.url),
 );
 
-test("normalizers, profiles, result vocabulary, and production constants are closed", () => {
+test("normalizers, profiles, result vocabulary, and production constants are closed", (context) => {
   assert.equal(normalizeV2Operation(undefined), "reconcile");
   assert.equal(normalizeV2Operation("begin-review"), "begin-review");
   assert.throws(() => normalizeV2Operation("scan"), /reconcile or begin-review/u);
@@ -135,6 +135,56 @@ test("normalizers, profiles, result vocabulary, and production constants are clo
     gateOutcome: "pending",
     recoveryCode: "retry_reconcile",
   }).retrySafe, true);
+  const incompleteReport = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    recoveryCode: "wait_provider",
+    reviewThreads: {
+      status: "incomplete",
+      unresolved: 1,
+      resolved: 2,
+      total: 3,
+    },
+  });
+  assert.deepEqual(incompleteReport.reviewThreads, {
+    status: "incomplete",
+    unresolved: "unknown",
+    resolved: "unknown",
+    total: "unknown",
+    diagnostics: [],
+  });
+  const incompleteEnvironment = runtimeEnvironment(context, {
+    suffix: "incomplete-thread-count-normalization",
+  });
+  appendV2GateSummary(incompleteEnvironment.GITHUB_STEP_SUMMARY, incompleteReport, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const incompleteSummary = readFileSync(
+    incompleteEnvironment.GITHUB_STEP_SUMMARY,
+    "utf8",
+  );
+  assert.match(
+    incompleteSummary,
+    /Review threads: unknown unresolved, unknown resolved, unknown total/u,
+  );
+  const incompleteSticky = buildV2StickyCommentBody(incompleteReport, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  assert.match(
+    incompleteSticky,
+    /Review threads: unknown unresolved, unknown resolved, unknown total\./u,
+  );
+  const incompleteHidden = /^<!-- (\{.*\}) -->$/mu.exec(incompleteSticky);
+  assert.ok(incompleteHidden, "sticky report includes its machine-readable payload");
+  assert.deepEqual(JSON.parse(incompleteHidden[1]).reviewThreads, {
+    unresolved: "unknown",
+    resolved: "unknown",
+    total: "unknown",
+    status: "incomplete",
+    diagnostics: [],
+  });
 });
 
 test("review-thread inventory uses non-overlapping 100-node pages until complete", async (context) => {
@@ -270,6 +320,45 @@ test("review-thread resolution and reopening changes across snapshots fail close
       suffix,
     );
   }
+});
+
+test("unstable review-thread inventory hides counts from the prior complete snapshot", async (context) => {
+  const resolvedThread = reviewThread({
+    id: "PRRT_unstable_pending_counts",
+    isResolved: true,
+  });
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    reviewThreads: [resolvedThread],
+    reviewThreadResponseMutator: (response, { snapshotIndex }) => {
+      response.body.data.repository.pullRequest.reviewThreads.nodes[0].id =
+        `PRRT_unstable_pending_${snapshotIndex}`;
+      return response;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "unstable-pending-thread-counts",
+  });
+  const { result } = await runGate(environment, github, {
+    stabilityWindowMs: 5,
+  });
+
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["unknown", "unknown", "unknown"],
+  );
+  assert.equal(result.report.reviewThreads.status, "incomplete");
+
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /Review threads: unknown unresolved, unknown resolved, unknown total/u);
+  assert.match(summary, /Review-thread inventory: incomplete/u);
 });
 
 test("a review-thread resolution transition may pass after stable convergence", async (context) => {

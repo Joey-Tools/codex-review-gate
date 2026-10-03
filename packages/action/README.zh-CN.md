@@ -451,7 +451,9 @@ unsupported_target
 create_verifier_run
 ```
 
-finding 通常得到 `healthy/failure`，而不是 execution error；`unhealthy/success` 非法。
+符合条件的 finding 通常得到 `healthy/failure`，而不是 execution error。完整的
+review-thread 清单若仍有未解决项，则得到 `healthy/pending` 和
+`wait_then_reconcile`；这也是 gate 决策，而非 execution error。`unhealthy/success` 非法。
 在 verifier workflow 中，只有被证明稳定的 `healthy/success` 可以成功结束；findings、
 pending evidence、unsupported scope、cancel、timeout 与全部 unhealthy 结果都保持
 blocking。required verifier CheckRun 属于 exact current PR feature-head SHA；它的

@@ -540,8 +540,10 @@ unsupported_target
 create_verifier_run
 ```
 
-Findings and unresolved review threads normally produce `healthy/failure`, not
-an execution error.
+Qualifying findings normally produce `healthy/failure`, not an execution
+error. A complete review-thread inventory with unresolved threads produces
+`healthy/pending` with `wait_then_reconcile`; it is also a gate decision, not an
+execution error.
 `unhealthy/success` is invalid. In the verifier workflow, only a proved stable
 `healthy/success` may conclude successfully; findings, pending evidence,
 unsupported scope, cancellation, timeout and every unhealthy result remain

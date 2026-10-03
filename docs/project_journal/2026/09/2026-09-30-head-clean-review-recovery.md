@@ -3,7 +3,7 @@ id: 20260930-head-clean-review-recovery
 title: Current-Head Clean Review Recovery
 status: completed
 created: 2026-09-30
-updated: 2026-10-02
+updated: 2026-10-03
 branch:
 pr:
 supersedes: []
@@ -60,8 +60,10 @@ superseded_by:
   diagnostics remain additive and preserve primary finding, authorization,
   budget, replacement-PR, or begin-delivery recovery instructions; only a
   complete read with unresolved threads supplies the resolve-and-reconcile
-  hint. Include at most five unresolved paths and first-comment URLs when
-  available.
+  hint. If stable-snapshot convergence later exhausts, mark the inventory
+  incomplete and redact unresolved, resolved, and total counts, including
+  counts retained from an earlier complete snapshot. Include at most five
+  unresolved paths and first-comment URLs when available.
 
 ## Incident Context
 
