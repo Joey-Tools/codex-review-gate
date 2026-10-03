@@ -59,8 +59,10 @@ superseded_by:
   are numeric only when complete, otherwise `unknown`, not zero. Thread
   diagnostics remain additive and preserve primary finding, authorization,
   budget, replacement-PR, or begin-delivery recovery instructions; only a
-  complete read with unresolved threads supplies the resolve-and-reconcile
-  hint. If stable-snapshot convergence later exhausts, mark the inventory
+  complete read with unresolved threads blocks an otherwise-qualified clean.
+  When Codex evidence is not yet qualified, preserve its request/wait/fix
+  recovery as primary and add thread resolution plus reconcile as follow-up.
+  If stable-snapshot convergence later exhausts, mark the inventory
   incomplete and redact unresolved, resolved, and total counts, including
   counts retained from an earlier complete snapshot. Include at most five
   unresolved paths and first-comment URLs when available.

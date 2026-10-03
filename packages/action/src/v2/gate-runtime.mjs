@@ -1030,11 +1030,19 @@ function normalizeV2ReviewThreadDiagnostics(value) {
 function formatV2ReviewThreadDiagnostics(diagnostics) {
   return (diagnostics ?? []).map((thread) => {
     const safePath = oneLine(thread.path, "unknown path")
-      .replaceAll("`", "\\`")
       .slice(0, 300);
-    const location = `\`${safePath}\`${thread.isOutdated ? " (outdated)" : ""}`;
+    const location = `${inlineV2CodeSpan(safePath)}${thread.isOutdated ? " (outdated)" : ""}`;
     return `  - ${location}${thread.url ? ` ([first comment](<${thread.url}>))` : ""}`;
   });
+}
+
+function inlineV2CodeSpan(value) {
+  const longestBacktickRun = Math.max(
+    0,
+    ...[...value.matchAll(/`+/gu)].map(([run]) => run.length),
+  );
+  const delimiter = "`".repeat(longestBacktickRun + 1);
+  return `${delimiter} ${value} ${delimiter}`;
 }
 
 function canonicalJson(value) {
@@ -4599,7 +4607,7 @@ function reduceV2Evidence({
         : "Codex activity at or after the latest clean evidence indicates review is still in progress",
       recoveryCode: "wait_provider",
     };
-  } else if (reviewThreads.unresolved > 0) {
+  } else if (selectedClean && requestEpoch.selected && reviewThreads.unresolved > 0) {
     decision = {
       gateOutcome: "pending",
       reason:

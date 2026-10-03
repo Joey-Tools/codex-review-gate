@@ -541,9 +541,12 @@ create_verifier_run
 ```
 
 Qualifying findings normally produce `healthy/failure`, not an execution
-error. A complete review-thread inventory with unresolved threads produces
-`healthy/pending` with `wait_then_reconcile`; it is also a gate decision, not an
-execution error.
+error. When Codex evidence otherwise qualifies for success, a complete
+review-thread inventory with unresolved threads blocks that success as
+`healthy/pending` with `wait_then_reconcile`. If Codex evidence still requires a
+request, wait, or finding-fix recovery, keep that Codex action primary and add
+thread resolution plus exact-head reconcile as a follow-up; resolving threads
+alone does not establish qualifying Codex evidence.
 `unhealthy/success` is invalid. In the verifier workflow, only a proved stable
 `healthy/success` may conclude successfully; findings, pending evidence,
 unsupported scope, cancellation, timeout and every unhealthy result remain

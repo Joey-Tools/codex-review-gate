@@ -4929,6 +4929,79 @@ test("a post-run ordinary request without a new clean waits without requiring a 
   assert.deepEqual(github.statusWrites, []);
 });
 
+test("unresolved threads stay additive unless Codex evidence otherwise qualifies for success", async (context) => {
+  const cutoff = "2026-08-25T08:10:00Z";
+  const unresolvedThread = reviewThread({
+    id: "PRRT_primary_codex_recovery",
+    isResolved: false,
+    path: "src/review.mjs",
+    url: `https://github.com/${REPOSITORY}/pull/${PR}#discussion_primary`,
+  });
+  const cases = [
+    {
+      suffix: "prerun-clean",
+      issueComments: [
+        ordinaryRequest(),
+        cleanIssueComment(HEAD, {
+          created_at: "2026-08-25T08:02:00Z",
+          updated_at: "2026-08-25T08:02:00Z",
+        }),
+      ],
+      expectedRecovery: "request_clean_generation",
+      expectedReason: /current-head Codex clean predates this verifier run/u,
+    },
+    {
+      suffix: "postrun-request-awaiting-result",
+      issueComments: [ordinaryRequest(), cleanIssueComment(HEAD), recoveryRequest()],
+      expectedRecovery: "wait_provider",
+      expectedReason: /new @codex review request exists.*no qualifying.*terminal clean/u,
+    },
+    {
+      suffix: "no-terminal-result",
+      issueComments: [],
+      expectedRecovery: "wait_provider",
+      expectedReason: /No complete Codex terminal result is bound to the current head/u,
+    },
+  ];
+
+  for (const scenario of cases) {
+    const github = createGitHubMock({
+      issueComments: scenario.issueComments,
+      reviewThreads: [unresolvedThread],
+      selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `unresolved-thread-${scenario.suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.executionHealth, "healthy", scenario.suffix);
+    assert.equal(result.report.gateOutcome, "pending", scenario.suffix);
+    assert.equal(result.report.recoveryCode, scenario.expectedRecovery, scenario.suffix);
+    assert.match(result.report.reason, scenario.expectedReason, scenario.suffix);
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.match(summary, /Also resolve all 1 unresolved pull-request review thread/u);
+    assert.match(summary, /then reconcile the exact current head/u);
+  }
+
+  const qualifyingGitHub = createGitHubMock({
+    issueComments: recoveryEvidence(),
+    reviewThreads: [unresolvedThread],
+    selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+  });
+  const qualifyingEnvironment = runtimeEnvironment(context, {
+    suffix: "unresolved-thread-otherwise-qualifying-clean",
+  });
+  const { result: qualifying } = await runGate(qualifyingEnvironment, qualifyingGitHub);
+  assert.equal(qualifying.report.gateOutcome, "pending");
+  assert.equal(qualifying.report.recoveryCode, "wait_then_reconcile");
+  assert.match(qualifying.report.reason, /GitHub reports 1 unresolved pull-request review thread/u);
+  assert.match(
+    readFileSync(qualifyingEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
+    /Resolve all 1 unresolved pull-request review thread.*dispatch reconcile/u,
+  );
+});
+
 test("verifier clean recovery requires request and terminal to be strictly after their boundaries", async (context) => {
   const cases = [
     ["request-before-cutoff", "2026-08-25T08:09:00Z", "2026-08-25T08:12:00Z"],
@@ -11322,6 +11395,53 @@ test("summary and sticky diagnostics are bounded Markdown, HTML, and mention saf
     assert.doesNotMatch(diagnostic, /<script>/iu);
     assert.match(diagnostic, /&lt;script&gt;&#64;codex review/u);
     assert.equal(diagnostic.length < 5_000, true);
+  }
+});
+
+test("review-thread paths use code-span delimiters beyond embedded backticks", (context) => {
+  const paths = [
+    "src/internal`tick.mjs",
+    "`leading-backtick.mjs",
+    "trailing-backtick.mjs`",
+    "src/multiple``runs```inside.mjs",
+    "src/`[active](https://attacker.example)<script>@codex review</script>`",
+  ];
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "Unresolved review threads",
+    recoveryCode: "wait_then_reconcile",
+    reviewThreads: {
+      status: "complete",
+      unresolved: paths.length,
+      resolved: 0,
+      total: paths.length,
+      diagnostics: paths.map((path) => ({ path, isOutdated: false, url: null })),
+    },
+  });
+  const sticky = buildV2StickyCommentBody(report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const environment = runtimeEnvironment(context, { suffix: "thread-path-code-spans" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  // Verify source-level CommonMark code-span framing; this fixture does not invoke GitHub's renderer.
+  for (const path of paths) {
+    const longestRun = Math.max(0, ...[...path.matchAll(/`+/gu)].map(([run]) => run.length));
+    const delimiter = "`".repeat(longestRun + 1);
+    const framedPath = `${delimiter} ${path} ${delimiter}`;
+    for (const output of [summary, sticky]) {
+      assert.ok(output.includes(framedPath), `path is enclosed by a longer delimiter: ${path}`);
+      assert.ok(
+        delimiter.length > longestRun,
+        `delimiter cannot close inside the path: ${path}`,
+      );
+    }
   }
 });
 
