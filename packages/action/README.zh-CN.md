@@ -123,32 +123,57 @@ canonical verifier 只有一个入口：
 受保护 default branch 上的 controller 只有以下入口：
 
 - activity type 为 `created` 的 `issue_comment`；
-- activity type 为 `completed` 的 `workflow_run`，仅在启用 opt-in variable 且
-  canonical `Codex Review Gate Verifier` `pull_request` workflow 的首次 attempt
-  （`run_attempt=1`）失败时放行；
+- activity type 为 `completed` 的 `workflow_run`；canonical verifier 的
+  `pull_request` run 在 PR association 为空或唯一时可进入；
 - 为单个明确指定 PR 运行的 `workflow_dispatch`。
 
 没有 cron、`repository_dispatch`、`pull_request_target`、可写自动
 `pull_request_review` job、runtime GitHub App 或 status writer。review objects 和
 reaction-only completion 由之后的 authoritative verifier reconcile 发现。
 
+每个 eligible 的 canonical verifier completion 都会触发仅用于诊断的 controller
+operation，与自动 request variable 是否启用无关。它重验 exact verifier run/attempt 与当前
+PR/check scope，再写入 best-effort diagnostic snapshot；不会扫描 provider evidence、reconcile、
+rerun verifier 或请求评审。Snapshot 可编辑，只是诊断输出，不是 evidence 或 gate authority；
+过时的 run/scope report 会被忽略。当前 native `codex/github-review-gate` CheckRun 仍是
+required signal。每次 completion 都可能多分配一笔 controller runner，并消耗可计费分钟。
+若存在且仅存在一条严格绑定的 canonical Actions diagnostic，operation 会更新它；若不存在则
+新建一条；若存在多条则跳过写入并报告 warning。隐藏 payload 保留类型为 `unknown` 的值，但
+更新后的 controller diagnostic 格式省略可见 unknown counts 与 thread detail，并将正文标为
+snapshot-only。
+
 自动评审请求默认关闭。organisation 或 repository Actions variable
-`CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于小写 `true` 才能授权请求；未设置时会跳过
-自动 controller job，其他值均不能发出请求。GitHub Actions 的 job 条件不区分字符串大小写，
-因此 `TRUE` 等大小写变体仍可能分配 controller runner，但 runtime 会在发帖前拒绝。
-repository 值覆盖 organisation 值。同一份 controller 重新读取已完成且失败的 verifier，
-仅接受它唯一关联的 current-head PR；该 PR 必须 same-repository、open、ready，且以当前
-default branch 为 base。只有 exact repository/PR/head/base scope 还没有匹配的
-canonical request 时，才发送新请求；否则采用已有请求。自动操作至此结束，不会立即
-rerun verifier。之后由 exact Codex bot comment 或受保护的 manual `reconcile` 发起
-rerun。此路径可跟在 `opened`、`reopened`、`synchronize` 或 `ready_for_review`
-之后，不限于 push。Merge conflict 可能阻止 `pull_request` verifier 运行；没有该 run
-就不会自动请求，应先解决冲突，必要时再手动恢复。`workflow_run` 使可写 controller
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 必须精确等于小写 `true` 才能授权请求；未设置时自动 request
+path 关闭，但 completion snapshot job 仍会运行。其他值均不能发出 request。GitHub Actions 的
+表达式比较不区分字符串大小写，因此 `TRUE` 等变体仍可能选择 `begin-review`，但 runtime
+会在 POST 前拒绝。repository 值覆盖 organisation 值。既有 request 行为保持不变：只有
+PR association 唯一的首次失败（`run_attempt=1`）才会在 opt-in 开启时重新读取 completed
+verifier 和 current PR；PR 必须 same-repository、open、ready，且以当前 default branch 为
+base。只有 exact repository/PR/head/base scope 还没有匹配的 canonical request 时，才发送新
+request；否则采用已有请求。自动操作至此结束，不会立即 rerun verifier。之后由 exact Codex
+bot comment 或受保护的 manual `reconcile` 发起 rerun。此路径可跟在 `opened`、`reopened`、
+`synchronize` 或 `ready_for_review` 之后，不限于 push。Merge conflict 可能阻止
+`pull_request` verifier 运行；没有该 run 就不会自动请求，应先解决冲突，必要时再手动恢复。
+`workflow_run` 使可写 controller
 保留在受保护 default branch 上，且不依赖 public repository 的
 [`pull_request_target` 默认 event policy](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)。
 无需第三份 workflow、新 GitHub App 或 ruleset。Joey-Tools rollout 应先
 把 organisation variable 的 selected-repository visibility 仅设为
 `codex-private-workflows`，不设置 repository-level override；canary 成功后再扩大范围。
+
+如果 completed run 的 GitHub metadata 没有 PR association，controller 只接受空 association
+list，并从 exact canonical verifier `display_title` 派生 PR/test-merge。此时内部
+`pr_number: 0` sentinel 仅对 `report-completion` 有效；runtime 会重验派生出的 PR 与 exact
+run/attempt/check scope。该 fallback 使用 repository-scoped empty-suffix concurrency group，
+而非通常的 per-PR group；因此写入前的 point-in-time revalidation（写入前瞬时重验）不能保证
+该 PR 的所有 controller runs 完全串行。Diagnostic comment 本身永远不是 merge authority。
+
+先发布支持 `report-completion` 的 Action runtime，再安装更新后的 controller workflow；不要将
+此 operation 暴露给 v2.1.6 等旧 runtime。它不是公开的 manual dispatch option，runtime 与
+canonical workflow 应按顺序对齐 rollout。本源码仓库是 self-hosting 例外，因为 controller
+与源码 PR 同时变更：Action release 可用前，可选的 diagnostic controller run 可能因旧 runtime
+不认识该 operation 而失败。Required verifier CheckRun 与现有 manual operations 不变；外部
+consumer 必须先 runtime、后 workflow。
 
 只有 event sender 和 comment author 都是 exact Codex provider
 `chatgpt-codex-connector[bot]`、GitHub type `Bot` 时，自动 comment job 才会在

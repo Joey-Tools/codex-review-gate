@@ -39,8 +39,16 @@ each PR's independently read head.
 
 ### Optional automatic request after verifier failure
 
-The existing canonical controller has a protected `workflow_run` entry that is
-off by default. Set the repository or organisation Actions variable
+The canonical controller runs a diagnostic-only completion operation after
+eligible canonical verifier runs. This path is independent of automatic review
+requests: it does not scan provider evidence, reconcile, rerun the verifier or
+request review. Snapshots are editable diagnostics, never evidence or gate
+authority; stale run/scope reports are ignored. Each completion can consume
+additional billable controller runner minutes. The current native
+`codex/github-review-gate` CheckRun remains the required signal.
+
+The automatic request branch of the protected `workflow_run` entry is off by
+default. Set the repository or organisation Actions variable
 `CODEX_REVIEW_GATE_AUTO_REQUEST` to literal `true` to authorise an automatic
 request; missing or other values cannot authorise one. GitHub Actions compares
 expression strings case-insensitively, so `TRUE` may start a controller job,
@@ -66,6 +74,15 @@ start this automatic path; use manual `begin-review` or `reconcile` as appropria
 If a request POST has an uncertain outcome, reread its evidence and leave the
 gate pending rather than blindly posting again. Cross-run marker adoption is
 not an exactly-once guarantee.
+
+The same completion entry reports successful reruns and other eligible
+completed attempts as diagnostics, including when automatic requests are off.
+An empty PR association is resolved only from the exact canonical verifier
+`display_title`; a `pr_number: 0` sentinel is internal to `report-completion`.
+That fallback uses a repository-scoped empty concurrency suffix and relies on
+the runtime's final point-in-time scope revalidation, not complete per-PR
+serialization. Publish the compatible runtime before installing this
+controller update; do not send `report-completion` to v2.1.6 or older runtime.
 
 Before using either manual request path below with this option enabled, inspect
 the exact-head controller run and canonical marker so a pending automatic
@@ -461,12 +478,16 @@ not another same-PR boundary.
 
 ## Sticky diagnostic recovery
 
-The sticky is a best-effort report, not a receipt. Runtime uses create-once
-semantics: immediately before any write it reads the complete issue-comment
-inventory and posts one canonical diagnostic only when none exists. It never
-patches an existing canonical diagnostic and never posts a replacement while
-one exists. Multiple canonical diagnostics are left untouched and diagnosed
-with a bounded warning.
+The sticky is a best-effort report, not a receipt. The `report-completion`
+operation reads the complete issue-comment inventory before writing. It patches
+the one strictly bound canonical Actions diagnostic when exactly one exists,
+posts one when none exists, and skips the write with a bounded warning when
+multiple diagnostics exist. Other operations may create a diagnostic when none
+exists, but do not update an existing one. The current controller diagnostic
+format omits visible unknown counts and thread detail while retaining typed
+`unknown` values in its hidden payload; it labels itself as a snapshot and
+identifies the authoritative verifier CheckRun. Older canonical payloads,
+including v2.1.6 payloads without `reviewThreads`, remain readable.
 
 Only an exact, unedited, official canonical sticky is exempt from physical
 request lineage. An edited, invalid, forged or wrong-provenance marker-looking
@@ -480,13 +501,15 @@ If the sticky is missing or stale, its write failed, or duplicates exist:
 2. reread the current head;
 3. run one exact-head reconcile; and
 4. trust the new verifier CheckRun and summary reconstructed from GitHub, then
-   follow its reason and lineage. Do not edit or delete sticky comments to
-   repair the result; use a replacement PR when the reported boundary cannot
-   close.
+   follow its reason and lineage. The completed verifier run also invokes
+   `report-completion` when the compatible controller is installed. Do not edit
+   or delete sticky comments to repair the result; use a replacement PR when
+   the reported boundary cannot close.
 
-Sticky write failure does not clear findings. Reconcile does not update or
-replace an existing canonical diagnostic; the verifier CheckRun and summary are
-the authoritative current result.
+Sticky write failure does not clear findings. Only the separate completion
+operation updates or creates the diagnostic; the verifier CheckRun and summary
+remain the authoritative current result. A comment edit is never provider
+review evidence, and an old run/scope snapshot does not represent current state.
 
 ## Exact-head merge closure
 

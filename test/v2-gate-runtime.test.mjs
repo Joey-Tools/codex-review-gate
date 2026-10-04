@@ -58,7 +58,8 @@ const V2_RUNTIME_PATH = fileURLToPath(
 test("normalizers, profiles, result vocabulary, and production constants are closed", (context) => {
   assert.equal(normalizeV2Operation(undefined), "reconcile");
   assert.equal(normalizeV2Operation("begin-review"), "begin-review");
-  assert.throws(() => normalizeV2Operation("scan"), /reconcile or begin-review/u);
+  assert.equal(normalizeV2Operation("report-completion"), "report-completion");
+  assert.throws(() => normalizeV2Operation("scan"), /reconcile, begin-review, or report-completion/u);
   assert.equal(normalizeV2RequestReview(undefined), true);
   assert.equal(normalizeV2RequestReview("TRUE"), true);
   assert.equal(normalizeV2RequestReview("false"), false);
@@ -1294,6 +1295,17 @@ test("issue_comment created and edited require exact sender and author before ve
     assert.equal(result.report.gateOutcome, "pending", action);
     assert.deepEqual(github.rerunRequests, ["7001"], action);
     assert.equal(github.stickyCreates.length, 1, action);
+    const sticky = github.stickyCreates[0];
+    assert.match(
+      sticky,
+      /Verifier run 7001 attempt 2 https:\/\/github\.com\/owner\/repo\/actions\/runs\/7001 was observed at /u,
+      action,
+    );
+    const observedAt = /was observed at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z);/u.exec(sticky)?.[1];
+    assert.ok(observedAt, action);
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.match(summary, /Verifier attempt: \*\*2\*\*/u, action);
+    assert.ok(summary.includes(`Observation time: **${observedAt}**`), action);
   }
 
   const terminal = cleanIssueComment(HEAD);
@@ -7081,7 +7093,7 @@ test("edited-away trusted request comments remain unknown physical boundaries", 
   }
 });
 
-test("only exact unedited Actions sticky diagnostics are outside physical lineage", async (context) => {
+test("canonical Actions sticky diagnostics stay outside physical lineage after a timestamp update", async (context) => {
   const generationA = workflowRequest({ id: 101 });
   const terminalA = cleanIssueComment(HEAD, {
     id: 201,
@@ -7109,6 +7121,7 @@ test("only exact unedited Actions sticky diagnostics are outside physical lineag
         created_at: "2026-08-25T08:00:30Z",
         updated_at: "2026-08-25T08:02:00Z",
       }),
+      expectedOutcome: "success",
     },
     {
       suffix: "wrong-actions-provenance",
@@ -7149,7 +7162,7 @@ test("only exact unedited Actions sticky diagnostics are outside physical lineag
     user: HUMAN,
   });
 
-  for (const { suffix, comment } of cases) {
+  for (const { suffix, comment, expectedOutcome = "pending" } of cases) {
     const github = createGitHubMock({
       issueComments: [generationA, terminalA, comment],
     });
@@ -7157,6 +7170,12 @@ test("only exact unedited Actions sticky diagnostics are outside physical lineag
       suffix: `sticky-physical-boundary-${suffix}`,
     });
     const { result } = await runGate(environment, github);
+    if (expectedOutcome === "success") {
+      assert.equal(result.exitCode, 0, suffix);
+      assert.equal(result.report.executionHealth, "healthy", suffix);
+      assert.equal(result.report.gateOutcome, "success", suffix);
+      continue;
+    }
     assert.equal(result.exitCode, 1, suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
     assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
@@ -9543,6 +9562,214 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
   const { result: disabled } = await runGate(disabledEnvironment, disabledGitHub);
   assert.equal(disabled.report.gateOutcome, "pending");
   assert.deepEqual(disabledGitHub.requestBodies, []);
+});
+
+test("report-completion is an exact diagnostic-only snapshot and upserts one sticky comment", async (context) => {
+  for (const [runConclusion, checkConclusion, expectedOutcome] of [
+    ["success", "success", "success"],
+    ["failure", "failure", "failure"],
+    ["cancelled", "cancelled", "failure"],
+  ]) {
+    const fixture = completionRuntimeFixture({ runConclusion, checkConclusion });
+    const environment = runtimeEnvironment(context, {
+      suffix: `report-completion-${runConclusion}`,
+      operation: "report-completion",
+      eventName: "workflow_run",
+      requestReview: "false",
+      prNumber: 0,
+      event: fixture.event,
+    });
+
+    const { result, sleeps } = await runGate(environment, fixture.github);
+
+    assert.equal(result.exitCode, 0, runConclusion);
+    assert.equal(result.report.executionHealth, "healthy", runConclusion);
+    assert.equal(result.report.gateOutcome, expectedOutcome, runConclusion);
+    assert.deepEqual(result.report.counts, {
+      unresolved: "unknown",
+      resolved: "unknown",
+      historical: "unknown",
+      indeterminate: "unknown",
+    });
+    assert.equal(result.report.reviewThreads.status, "not_read");
+    assert.deepEqual(sleeps, []);
+    assert.deepEqual(fixture.github.requestBodies, []);
+    assert.deepEqual(fixture.github.rerunRequests, []);
+    assert.deepEqual(fixture.github.statusWrites, []);
+    assert.equal(fixture.github.stickyCreates.length, 1);
+    assert.equal(fixture.github.stickyPatches.length, 0);
+    const sticky = fixture.github.stickyCreates[0];
+    assert.match(sticky, /Diagnostic-only verifier observation/u);
+    assert.match(sticky, /not the current gating result/u);
+    assert.match(sticky, /PR Checks and verifier summary are authoritative/u);
+    assert.match(sticky, /Exact head: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`/u);
+    assert.match(sticky, /Verifier run 7001 attempt 2 https:\/\/github\.com\/owner\/repo\/actions\/runs\/7001/u);
+    assert.match(sticky, /completed at 2026-10-04T10:15:30Z/u);
+    assert.doesNotMatch(sticky, /Findings:|Review threads:|unknown unresolved/u);
+    assert.doesNotMatch(sticky, /@codex review/u);
+    assert.equal(
+      fixture.github.calls.some(({ path }) =>
+        path === "/graphql" || path.includes("/reviews") || path.includes("/reactions")
+      ),
+      false,
+      runConclusion,
+    );
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.match(summary, /diagnostic-only snapshot, not the current gating result/u);
+    assert.match(summary, /Verifier attempt: \*\*2\*\*/u);
+    assert.match(summary, /Observation time: \*\*2026-10-04T10:15:30Z\*\*/u);
+    assert.doesNotMatch(summary, /Findings: unknown|Review threads: unknown/u);
+  }
+});
+
+test("report-completion does not infer a pass from missing or nonunique required checks", async (context) => {
+  for (const [suffix, jobCount] of [["missing", 0], ["nonunique", 2]]) {
+    const fixture = completionRuntimeFixture({ jobCount });
+    const environment = runtimeEnvironment(context, {
+      suffix: `report-completion-${suffix}-check`,
+      operation: "report-completion",
+      eventName: "workflow_run",
+      requestReview: "false",
+      prNumber: 0,
+      event: fixture.event,
+    });
+
+    const { result } = await runGate(environment, fixture.github);
+
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.counts.unresolved, "unknown", suffix);
+    assert.equal(result.report.reviewThreads.status, "not_read", suffix);
+    assert.equal(fixture.github.stickyCreates.length, 1, suffix);
+    assert.deepEqual(fixture.github.stickyPatches, [], suffix);
+    assert.equal(
+      fixture.github.calls.some(({ path }) => path.includes("/check-runs/")),
+      false,
+      suffix,
+    );
+    assert.match(fixture.github.stickyCreates[0], /not the current gating result/u);
+    assert.doesNotMatch(fixture.github.stickyCreates[0], /Findings:|Review threads:/u);
+  }
+});
+
+test("report-completion patches one old canonical diagnostic but never trusts a malformed marker", async (context) => {
+  const historical = canonicalStickyComment({ id: 301 });
+  const fixture = completionRuntimeFixture({
+    issueComments: [historical],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "report-completion-patch-old",
+    operation: "report-completion",
+    eventName: "workflow_run",
+    requestReview: "false",
+    prNumber: 0,
+    event: fixture.event,
+  });
+
+  const { result } = await runGate(environment, fixture.github);
+
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(fixture.github.stickyCreates.length, 0);
+  assert.equal(fixture.github.stickyPatches.length, 1);
+  assert.equal(fixture.github.stickyPatches[0].id, "301");
+  assert.match(fixture.github.stickyPatches[0].body, /Diagnostic-only verifier observation/u);
+  assert.doesNotMatch(fixture.github.stickyPatches[0].body, /Findings:|Review threads:/u);
+
+  const malformed = {
+    ...historical,
+    body: historical.body.replace(
+      `\n\n<!-- ${V2_STICKY_MARKER} -->`,
+      `\n\nEdited visible presentation\n\n<!-- ${V2_STICKY_MARKER} -->`,
+    ),
+  };
+  const malformedFixture = completionRuntimeFixture({ issueComments: [malformed] });
+  const malformedEnvironment = runtimeEnvironment(context, {
+    suffix: "report-completion-malformed-marker",
+    operation: "report-completion",
+    eventName: "workflow_run",
+    requestReview: "false",
+    prNumber: 0,
+    event: malformedFixture.event,
+  });
+  const { result: malformedResult } = await runGate(
+    malformedEnvironment,
+    malformedFixture.github,
+  );
+  assert.equal(malformedResult.report.gateOutcome, "success");
+  assert.deepEqual(malformedFixture.github.stickyCreates, []);
+  assert.deepEqual(malformedFixture.github.stickyPatches, []);
+
+  const associated = completionRuntimeFixture({
+    pullRequests: verifierRun().pull_requests,
+  });
+  const associatedEnvironment = runtimeEnvironment(context, {
+    suffix: "report-completion-associated-repo-ref",
+    operation: "report-completion",
+    eventName: "workflow_run",
+    requestReview: "false",
+    event: associated.event,
+  });
+  const { result: associatedResult } = await runGate(
+    associatedEnvironment,
+    associated.github,
+  );
+  assert.equal(associatedResult.report.gateOutcome, "success");
+  assert.equal(associated.github.stickyCreates.length, 1);
+});
+
+test("report-completion rejects dispatch and does not persist a stale head/base/attempt", async (context) => {
+  const dispatchGithub = createGitHubMock();
+  const dispatchEnvironment = runtimeEnvironment(context, {
+    suffix: "report-completion-dispatch-rejected",
+    operation: "report-completion",
+    eventName: "workflow_dispatch",
+    requestReview: "false",
+  });
+  const { result: dispatch } = await runGate(dispatchEnvironment, dispatchGithub);
+  assert.equal(dispatch.report.gateOutcome, "not_applicable");
+  assert.deepEqual(dispatchGithub.calls, []);
+
+  const staleCases = [
+    ["head", { pullRequestSequence: [{}, { head: { sha: NEXT_HEAD } }] }],
+    ["base", { pullRequestSequence: [{}, { base: { sha: NEXT_HEAD } }] }],
+  ];
+  for (const [suffix, githubOptions] of staleCases) {
+    const fixture = completionRuntimeFixture(githubOptions);
+    const environment = runtimeEnvironment(context, {
+      suffix: `report-completion-stale-${suffix}`,
+      operation: "report-completion",
+      eventName: "workflow_run",
+      requestReview: "false",
+      prNumber: 0,
+      event: fixture.event,
+    });
+    const { result } = await runGate(environment, fixture.github);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.deepEqual(fixture.github.stickyCreates, [], suffix);
+    assert.deepEqual(fixture.github.stickyPatches, [], suffix);
+    assert.deepEqual(fixture.github.requestBodies, [], suffix);
+    assert.deepEqual(fixture.github.rerunRequests, [], suffix);
+  }
+
+  const oldSuccess = completionRuntimeFixture({
+    currentRunOverrides: {
+      run_attempt: 3,
+      status: "in_progress",
+      conclusion: null,
+      updated_at: "2026-10-04T10:20:00Z",
+    },
+  });
+  const oldSuccessEnvironment = runtimeEnvironment(context, {
+    suffix: "report-completion-stale-attempt",
+    operation: "report-completion",
+    eventName: "workflow_run",
+    requestReview: "false",
+    prNumber: 0,
+    event: oldSuccess.event,
+  });
+  const { result: staleAttempt } = await runGate(oldSuccessEnvironment, oldSuccess.github);
+  assert.equal(staleAttempt.report.gateOutcome, "not_applicable");
+  assert.deepEqual(oldSuccess.github.stickyCreates, []);
+  assert.deepEqual(oldSuccess.github.stickyPatches, []);
 });
 
 test("failed first-attempt workflow_run requests Codex once without rerunning the verifier", async (context) => {
@@ -12083,13 +12310,19 @@ function verifierJob({ runId = 7001, runAttempt = 2, status = "queued", ...overr
   };
 }
 
-function verifierCheckRun({ status = "queued", ...overrides } = {}) {
+function verifierCheckRun({
+  status = "queued",
+  conclusion = null,
+  completed_at = null,
+  ...overrides
+} = {}) {
   return {
     id: 9001,
     name: V2_REQUIRED_CHECK_NAME,
     head_sha: HEAD,
     status,
-    conclusion: null,
+    conclusion,
+    completed_at,
     app: { id: 15_368, slug: "github-actions" },
     ...overrides,
   };
@@ -12099,6 +12332,7 @@ function runtimeEnvironment(context, {
   suffix = "default",
   operation = "reconcile",
   eventName = operation === "begin-review" ? "workflow_dispatch" : "pull_request",
+  prNumber = PR,
   requestReview = eventName === "workflow_dispatch" || eventName === "workflow_run"
     ? "true"
     : "false",
@@ -12112,9 +12346,11 @@ function runtimeEnvironment(context, {
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   const environment = {
     GITHUB_TOKEN: "test-token",
-    ...(eventName === "workflow_run" ? { CODEX_REVIEW_GATE_AUTO_REQUEST: "true" } : {}),
+    ...(eventName === "workflow_run" && operation === "begin-review"
+      ? { CODEX_REVIEW_GATE_AUTO_REQUEST: "true" }
+      : {}),
     GITHUB_REPOSITORY: REPOSITORY,
-    PR_NUMBER: String(PR),
+    PR_NUMBER: String(prNumber),
     EXPECTED_HEAD_SHA: expectedHeadSha,
     OPERATION_INPUT: operation,
     REQUEST_COMMENT_ID: requestCommentId,
@@ -12180,6 +12416,80 @@ function workflowDispatchEvent({
       request_comment_id: requestCommentId,
       request_review: requestReview,
     },
+  };
+}
+
+function completionRuntimeFixture({
+  runAttempt = 2,
+  runConclusion = "success",
+  checkStatus = "completed",
+  checkConclusion = runConclusion,
+  jobCount = 1,
+  pullRequests = [],
+  issueComments = [],
+  pullRequestSequence = null,
+  currentRunOverrides = {},
+  attemptOverrides = {},
+  eventRunOverrides = {},
+} = {}) {
+  const completedAt = "2026-10-04T10:15:30Z";
+  const sourceRun = verifierRun({
+    run_attempt: runAttempt,
+    status: "completed",
+    conclusion: runConclusion,
+    updated_at: completedAt,
+    pull_requests: structuredClone(pullRequests),
+  });
+  const currentRun = { ...sourceRun, ...currentRunOverrides };
+  const attemptRun = { ...sourceRun, ...attemptOverrides };
+  const github = createGitHubMock({
+    issueComments,
+    pullRequestSequence,
+    verifierRuns: [currentRun],
+    verifierRunAttempts: [attemptRun],
+    verifierAttemptStatus: checkStatus,
+    requestInterceptor: ({ method, path }) => {
+      if (
+        method === "GET" &&
+        path === `/repos/${REPOSITORY}/commits/${TEST_MERGE}`
+      ) {
+        return jsonResponse({
+          sha: TEST_MERGE,
+          parents: [{ sha: BASE }, { sha: HEAD }],
+        });
+      }
+      if (
+        method === "GET" &&
+        path === `/repos/${REPOSITORY}/actions/runs/7001/attempts/${runAttempt}/jobs`
+      ) {
+        const jobs = Array.from({ length: jobCount }, (_, index) => verifierJob({
+          id: 8_001 + index,
+          runId: 7_001,
+          runAttempt,
+          status: checkStatus,
+          conclusion: checkConclusion,
+          check_run_url:
+            `https://api.github.com/repos/${REPOSITORY}/check-runs/${9_001 + index}`,
+        }));
+        return jsonResponse({ total_count: jobs.length, jobs });
+      }
+      const check = /^\/repos\/owner\/repo\/check-runs\/(\d+)$/u.exec(path);
+      if (method === "GET" && check) {
+        return jsonResponse(verifierCheckRun({
+          id: Number(check[1]),
+          status: checkStatus,
+          conclusion: checkConclusion,
+          completed_at: checkStatus === "completed" ? completedAt : null,
+        }));
+      }
+      return undefined;
+    },
+  });
+  return {
+    github,
+    event: workflowRunEvent({ ...sourceRun, ...eventRunOverrides }),
+    completedAt,
+    sourceRun,
   };
 }
 

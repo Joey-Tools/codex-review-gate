@@ -189,12 +189,9 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
     ) ||
     (
       github.event_name == 'workflow_run' &&
-      vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' &&
       github.event.action == 'completed' &&
+      github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' &&
       github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.run_attempt == 1 &&
-      github.event.workflow_run.conclusion == 'failure' &&
-      github.event.workflow_run.pull_requests[0].number &&
       !github.event.workflow_run.pull_requests[1]
     )
   }}
@@ -3951,15 +3948,15 @@ function validateV2ControllerWorkflowContent(value, {
         concurrencyGroup:
           "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}",
         prNumber:
-          "${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
+          "${{ github.event_name == 'workflow_run' && (github.event.workflow_run.pull_requests[0].number || '0') || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
         expectedHeadSha:
           "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
         operation:
-          "${{ github.event_name == 'workflow_run' && 'begin-review' || github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
+          "${{ github.event_name == 'workflow_run' && vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.pull_requests[0].number && !github.event.workflow_run.pull_requests[1] && 'begin-review' || github.event_name == 'workflow_run' && 'report-completion' || github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
         requestCommentId:
           "${{ github.event_name == 'issue_comment' && github.event.comment.id || github.event_name == 'workflow_dispatch' && inputs.request_comment_id || '' }}",
         requestReview:
-          "${{ github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
+          "${{ github.event_name == 'workflow_run' && vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.pull_requests[0].number && !github.event.workflow_run.pull_requests[1] || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
       }
     : {
         concurrencyGroup:

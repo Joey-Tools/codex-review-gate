@@ -48,8 +48,9 @@ V2 consumer 把两份 canonical workflows 复制到目标仓库的相同路径�
   CheckRun 绑定到 unchanged current head/base/test-merge scope。
 - `.github/workflows/codex-review-gate-controller.yml` 是受保护 default branch 上的
   controller；它接收 exact Codex events 与 typed manual operations、创建 review request，
-  并在需要 reconcile 时建立严格更新的 full verifier attempt。显式启用后，同一份
-  controller 也可在 canonical verifier 失败后请求评审；无需第三份 workflow。
+  并在需要 reconcile 时建立严格更新的 full verifier attempt。它还会在 eligible verifier
+  run 完成后记录 best-effort diagnostic snapshot。显式启用后，同一份 controller 也可在
+  canonical verifier 失败后请求评审；无需第三份 workflow。
 
 自动请求默认关闭。把 organisation 或 repository Actions variable
 `CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的小写 `true` 才能授权请求；未设置时会跳过
@@ -65,6 +66,29 @@ PR。它校验该 run，可能发送或采用当前 scope 的 canonical `@codex 
 应先解决冲突，必要时再使用 manual recovery。Joey-Tools rollout 应先把 organisation
 variable 的 selected-repository visibility 仅设为 `codex-private-workflows` 作为
 canary，不设置 repository-level override；通过后再扩大范围。
+
+受保护的 `workflow_run` completion path 会在 canonical verifier 完成后运行仅用于诊断的
+operation，包括成功的 rerun，以及自动请求关闭时的完成事件。既有自动 request 行为保持不变：
+只有 PR association 唯一的首次失败、且 opt-in variable 精确匹配时，才使用
+`begin-review` 并请求评审。其他 eligible completion 不会扫描 provider evidence、reconcile、
+rerun verifier 或发送 request。额外的 controller run 会消耗可计费 runner minutes。
+Snapshot 是可编辑的诊断输出，不是 review evidence 或 gate authority；过时 run/scope 的
+snapshot 会被忽略。当前 native `codex/github-review-gate` CheckRun 仍是 required signal。
+
+偶尔 GitHub run metadata 没有 PR association 时，controller 只接受空 association list，并从
+exact canonical verifier `display_title` 派生 PR/test-merge binding。此时内部传入的
+`pr_number: 0` 是 sentinel；runtime 写入前会重读并校验 exact current PR、run、attempt 和
+CheckRun。该事件会落入 repository-scoped 的空后缀 concurrency group，而不是通常的
+PR-specific group，因此最终的 point-in-time revalidation（写入前瞬时重验）不能保证与该 PR
+的所有其他 controller run 全局串行。这个 snapshot 永远不会使 PR 获得 mergeability。
+
+按顺序 rollout：先发布支持 `report-completion` 的 Action runtime，再向 consumer 安装匹配的
+canonical controller workflow。不要让此 operation 暴露给 v2.1.6 等较旧 runtime；公开的手动
+dispatch 仍仅允许 `reconcile` 与 `begin-review`。
+本源码仓库是 self-hosting 例外，因为其 controller workflow 与源码 PR 一起变更：兼容的
+Action release 可用前，旧 runtime 可能因不认识该 operation 而使可选的 diagnostic controller
+run 失败。但这不会改变 required verifier CheckRun，也不影响现有手动 `reconcile`/
+`begin-review` operations。外部 consumer 仍必须先 runtime、后 workflow。
 
 两份 workflows 都调用兼容的 floating major：
 

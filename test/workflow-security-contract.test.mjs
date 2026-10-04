@@ -152,12 +152,9 @@ const CLOSED_JOB_IF = [
   ") ||",
   "(",
   "github.event_name == 'workflow_run' &&",
-  "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' &&",
   "github.event.action == 'completed' &&",
+  "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' &&",
   "github.event.workflow_run.event == 'pull_request' &&",
-  "github.event.workflow_run.run_attempt == 1 &&",
-  "github.event.workflow_run.conclusion == 'failure' &&",
-  "github.event.workflow_run.pull_requests[0].number &&",
   "!github.event.workflow_run.pull_requests[1]",
   ")",
   "}}",
@@ -237,7 +234,7 @@ test("source state-machine check names have a static non-reserved prefix", () =>
   assert.deepEqual(workflowSingleProducerPolicyViolations(sourceStateMachine), []);
 });
 
-test("automatic runner admission separates read-only PR verification from opted-in controller requests", () => {
+test("automatic runner admission separates read-only PR verification from verifier completions", () => {
   const verifier = parseVerifierWorkflow(templateConsumer);
   const workflow = parseControllerWorkflow(templateController);
   assert.deepEqual(blockDirectKeys(verifier.events), ["pull_request"]);
@@ -266,16 +263,16 @@ test("automatic runner admission separates read-only PR verification from opted-
     `github.event.comment.user.login == '${EXACT_BOT}'`,
     "github.event.comment.user.type == 'Bot'",
     "github.event_name == 'workflow_run'",
-    "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
+    "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml'",
     "github.event.workflow_run.event == 'pull_request'",
-    "github.event.workflow_run.run_attempt == 1",
-    "github.event.workflow_run.conclusion == 'failure'",
-    "github.event.workflow_run.pull_requests[0].number",
     "!github.event.workflow_run.pull_requests[1]",
   ]) {
     assert.ok(jobIf.includes(expression), `missing pre-runner filter: ${expression}`);
   }
-  assert.doesNotMatch(jobIf, /github\.event\.workflow_run\.name/u);
+  assert.doesNotMatch(
+    jobIf,
+    /CODEX_REVIEW_GATE_AUTO_REQUEST|workflow_run\.run_attempt|workflow_run\.conclusion|pull_requests\[0\]\.number/u,
+  );
 });
 
 test("controller forwards the raw auto-request variable for strict runtime admission", () => {
@@ -2561,15 +2558,15 @@ test("consumer routing fixes automatic reconciliation and permits only reviewed 
   assert.deepEqual(blockScalarMapping(controller.with), {
     github_token: "${{ github.token }}",
     pr_number:
-      "${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
+      "${{ github.event_name == 'workflow_run' && (github.event.workflow_run.pull_requests[0].number || '0') || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
     expected_head_sha:
       "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event_name == 'workflow_dispatch' && inputs.expected_head_sha || '' }}",
     operation:
-      "${{ github.event_name == 'workflow_run' && 'begin-review' || github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
+      "${{ github.event_name == 'workflow_run' && vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.pull_requests[0].number && !github.event.workflow_run.pull_requests[1] && 'begin-review' || github.event_name == 'workflow_run' && 'report-completion' || github.event_name == 'workflow_dispatch' && inputs.operation || 'reconcile' }}",
     request_comment_id:
       "${{ github.event_name == 'issue_comment' && github.event.comment.id || github.event_name == 'workflow_dispatch' && inputs.request_comment_id || '' }}",
     request_review:
-      "${{ github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
+      "${{ github.event_name == 'workflow_run' && vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.pull_requests[0].number && !github.event.workflow_run.pull_requests[1] || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
     limits_profile:
       "${{ vars.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' || 'default' }}",
   });
@@ -2636,20 +2633,12 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
       "github.event.action == 'created' || github.event.action == 'edited'",
     ),
     templateController.replace(
-      "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
-      "vars.CODEX_REVIEW_GATE_AUTO_REQUEST != 'false'",
+      "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml'",
+      "github.event.workflow_run.path == '.github/workflows/other.yml'",
     ),
     templateController.replace(
       "github.event.workflow_run.event == 'pull_request'",
       "github.event.workflow_run.event != 'push'",
-    ),
-    templateController.replace(
-      "github.event.workflow_run.run_attempt == 1",
-      "github.event.workflow_run.run_attempt >= 1",
-    ),
-    templateController.replace(
-      "github.event.workflow_run.conclusion == 'failure'",
-      "github.event.workflow_run.conclusion != 'cancelled'",
     ),
     templateController.replace(
       "!github.event.workflow_run.pull_requests[1]",

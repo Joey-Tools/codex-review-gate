@@ -61,8 +61,10 @@ Codex issue_comment created               protected workflow_dispatch
                                 +---- summary / best-effort sticky
 ```
 
-可选的受保护 `workflow_run` 入口也会在 canonical verifier 以 failure 完成后进入同一
-controller。该入口只发送 review request，不会立即 rerun verifier。
+受保护的 `workflow_run` completion ingress 也会在 canonical verifier 完成后进入同一
+controller。只有现有的 opt-in 首次失败且 PR association 唯一的路径继续使用
+`begin-review`；其他 eligible completion 使用 `report-completion` 输出 diagnostics，不会
+rerun verifier。
 
 ### Consumer workflows
 
@@ -139,8 +141,9 @@ commit date 或未经校验的 event timestamp。因此 canonical verifier 需�
 `actions: read`，private repository 也不例外。floating `v2` release 在依赖这次
 读取前，必须先让已安装 consumer 更新 canonical permission；缺失权限时 fail closed。
 
-controller 接收 `issue_comment` `created`、default-branch `workflow_dispatch`，以及
-仅对 failed canonical verifier 开启的可选 `workflow_run` `completed` 路径。comment
+controller 接收 `issue_comment` `created`、default-branch `workflow_dispatch`，以及 canonical
+verifier `pull_request` event 的 `workflow_run` `completed` 路径。Completion path 接受空或唯一
+PR association；多个 association 会被拒绝。comment
 admission 在 runner 分配前，把 event sender 与 comment
 author 都精确校验为 login `chatgpt-codex-connector[bot]`、type `Bot`。Action 在
 admission 后再次校验，因为两次校验保护不同边界。edited Codex comment 需要受保护的
@@ -186,7 +189,8 @@ issue-comment path 可以不提供；runtime 会在启动时绑定 authoritative
 
 controller Action 使用 underscore 命名 inputs：`github_token`、`pr_number`、
 `expected_head_sha`、`operation`、`request_comment_id` 与 `request_review`。
-`operation` closed to `reconcile|begin-review`，`request_review` 是 boolean。
+公开 manual `operation` 仍只有 `reconcile|begin-review`；仅受保护
+`workflow_run` ingress 可以选择内部的 `report-completion`，`request_review` 仍为 boolean。
 verdicts、identities、status context、stale overrides、numeric limits 和
 skip-reconcile controls 都不是 inputs。
 
@@ -256,6 +260,34 @@ dispatch 才执行 reconcile。如果 merge conflict 阻止 verifier 运行，�
 `workflow_run` failure，必须 manual recovery。只有上述 variable 精确启用时，此功能才
 生效。
 
+### `report-completion`
+
+除了保留的自动 request 路径外，每个 eligible canonical verifier completion 都选择
+`report-completion`，包括成功的 rerun、failed/cancelled completion，以及未设置
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 时的 run。该 operation 只允许来自 `workflow_run`，没有
+dispatch option。它会在写入 best-effort diagnostic snapshot 前重验 exact canonical
+workflow/run/attempt、所选 PR 的 current head/base/test-merge scope、最新 exact-head verifier
+run 与当前 CheckRun。它不会扫描 provider evidence、reconcile、rerun verifier 或请求评审。
+每次 completion 会额外消耗可计费的 controller runner minutes。
+
+GitHub 未提供 PR association 时，workflow 使用内部 sentinel `pr_number: 0`。Runtime 只在
+association list 确实为空时接受该值，从 exact canonical dynamic `display_title` 解析 PR 与
+test-merge SHA，并将解析结果绑定到 current PR 与 exact run scope。多个 PR association 会被拒绝；
+旧的自动 `begin-review` 路径仍要求唯一 association，不使用此 fallback。
+
+Diagnostic 是可编辑的 output projection，不是 review evidence 或 gate authority。过时的
+run/scope snapshot 会被忽略；current successful native `codex/github-review-gate` CheckRun
+仍是唯一 required signal。空 association event 会沿用现有 controller concurrency expression，
+使 group 后缀为空并落入 repository-scoped group，而非通常的 PR number。Runtime 写前会进行
+point-in-time recheck（写入前瞬时重验），但该 fallback 不保证与该 PR 的所有其他 controller
+run 按 PR 完全串行。Snapshot 不能授权 merge。
+
+必须先发布兼容的 Action runtime，再安装调用 `report-completion` 的 controller workflow；
+不要让新 operation 暴露给 v2.1.6 或更旧 runtime。Action release 与 canonical workflow 应按顺序
+对齐 rollout。本源码仓库是 self-hosting 例外，因为 controller workflow 与源码 PR 同时变更。
+Action release 可用前，可选的 diagnostic controller run 可能因旧 runtime 不认识 operation
+而失败；required verifier CheckRun 与现有 manual operations 不受影响。
+
 ### `reconcile`
 
 manual reconcile 要求 caller 提供完整 `expected_head_sha`；automatic path 在启动时
@@ -277,11 +309,15 @@ Actions-artifact ledger、central controller、cached receipt 或 sticky-comment
 authority。runtime 不上传 artifacts，也不保留 raw API payloads。
 
 best-effort sticky diagnostic 只是 output projection。其 v2 marker 与 request
-markers 不同，且不包含 `@codex review`。只有 `github-actions[bot]` marker comment
-中严格 canonical 的 comment 才符合条件。runtime 在写入前立即读取完整的
-issue-comment inventory；只有不存在 canonical diagnostic 时才 POST 一条。已有
-canonical diagnostic 永不 PATCH；只要已存在一条，也绝不 POST replacement。多条
-canonical diagnostics 会原样保留，并产生 bounded warning。
+markers 不同，且不包含 `@codex review`。只有带匹配 PR binding 的严格 canonical
+`github-actions[bot]` marker comment 才符合条件。`report-completion` 在写入前读取完整
+issue-comment inventory：只有一条严格绑定 canonical diagnostic 时 PATCH 为新的 completion
+snapshot；不存在时 POST；有多条时跳过写入并报告 bounded warning。只有
+`report-completion` 会 PATCH 已有 diagnostic；其他 operation 在没有 diagnostic 时仍可新建一条，
+但不会更新已有 comment。该 controller diagnostic 格式的可见内容省略 unknown counts 与 thread
+detail，但 hidden payload 保留 `unknown` 类型；它说明自己是 snapshot 而非 current gate result，
+并携带 PR/head、run/attempt/link/time 和 authoritative verifier CheckRun 摘要。旧的 canonical
+payload（包括 v2.1.6 缺少 `reviewThreads` 的格式）仍可读取。
 
 写入抑制范围比 evidence exemption 更宽。只有原始正文 exact canonical、hidden fields
 类型正确、具有 official Actions provenance、timestamps canonical 且没有 edit proof 的
@@ -664,12 +700,12 @@ summary 和 sticky 包含 bounded reason、recovery code 与具体 next action�
 tokens、headers、raw payload dumps 或 untrusted workflow commands。
 
 at-least-once recovery 在 write result unknown 后可能生成少量 duplicate requests、
-verifier attempts 或 diagnostic comments。sticky writer 不会 fold、PATCH 或删除已有
-canonical diagnostics：它在创建前 fresh-read，原样保留 duplicates 并报告。只有每一条
-exact、未编辑、official canonical sticky 才获得狭窄的 physical-lineage exemption；不符合
-条件的 marker-looking duplicate 仍是 conservative boundary。物理 review requests 同样
-保持为彼此独立的 generation boundaries。任何 duplicate 都不能授权选择一个方便的 clean
-或漏掉 finding。
+verifier attempts 或 diagnostic comments。`report-completion` 在 update/create 前 fresh-read，
+有多个 diagnostics 时原样保留并报告；它不 fold 或删除 comments。只有满足 exact official
+canonical binding 的 sticky 才能获得狭窄的 physical-lineage exemption；不符合条件的
+marker-looking duplicate 仍是 conservative boundary。被编辑或过时的 diagnostic 永远不是
+review evidence。物理 review requests 同样保持为彼此独立的 generation boundaries。任何
+duplicate 都不能授权选择一个方便的 clean 或漏掉 finding。
 
 ## Exact-head merge closure
 
