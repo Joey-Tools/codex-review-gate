@@ -212,8 +212,14 @@ const V2_REVIEW_THREADS_QUERY = `query CodexReviewGateReviewThreads(
 
 export function normalizeV2Operation(raw) {
   const operation = String(raw ?? "").trim() || "reconcile";
-  if (operation !== "reconcile" && operation !== "begin-review") {
-    throw new Error("OPERATION_INPUT must be exactly reconcile or begin-review");
+  if (
+    operation !== "reconcile" &&
+    operation !== "begin-review" &&
+    operation !== "report-completion"
+  ) {
+    throw new Error(
+      "OPERATION_INPUT must be exactly reconcile, begin-review, or report-completion",
+    );
   }
   return operation;
 }
@@ -597,6 +603,20 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     v2ReportNextAction(report, context),
     "Inspect the workflow run and retry safely.",
   );
+  const diagnosticMetadata = context.diagnosticObservation
+    ? [
+        "- Interpretation: **diagnostic-only snapshot, not the current gating result**",
+        "- Authority: PR Checks and the verifier summary",
+        ...(context.verifierObservedAt
+          ? [`- Observation time: **${context.verifierObservedAt}**`]
+          : []),
+      ]
+    : [
+        `- Findings: ${formatV2FindingCounts(report.counts)}`,
+        `- Review threads: ${formatV2ReviewThreadCounts(report.reviewThreads)}`,
+        `- Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}`,
+        ...formatV2ReviewThreadDiagnostics(report.reviewThreads.diagnostics),
+      ];
   const body = [
     "## Codex GitHub Review Gate",
     "",
@@ -607,10 +627,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     `- Test-merge commit: ${testMerge}`,
     `- Reason: ${reason}`,
     `- Recovery code: \`${report.recoveryCode}\``,
-    `- Findings: ${formatV2FindingCounts(report.counts)}`,
-    `- Review threads: ${formatV2ReviewThreadCounts(report.reviewThreads)}`,
-    `- Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}`,
-    ...formatV2ReviewThreadDiagnostics(report.reviewThreads.diagnostics),
+    ...diagnosticMetadata,
     ...(context.verifierRunId
       ? [
           `- Verifier run: ${formatV2DiagnosticText(context.verifierRunUrl || context.verifierRunId, "unknown", 500)}`,
@@ -652,6 +669,17 @@ export function buildV2StickyCommentBody(report, context = {}) {
     findingsIndeterminate: report.counts.indeterminate,
     reviewThreads: report.reviewThreads,
   });
+  if (context.diagnosticObservation === true) {
+    return buildV2DiagnosticStickyBody({
+      prNumber,
+      headSha,
+      gateOutcome: report.gateOutcome,
+      reason,
+      recoveryCode: report.recoveryCode,
+      nextAction,
+      hidden,
+    });
+  }
   return [
     "## Codex GitHub Review Gate",
     "",
@@ -670,6 +698,32 @@ export function buildV2StickyCommentBody(report, context = {}) {
   ].join("\n");
 }
 
+function buildV2DiagnosticStickyBody({
+  prNumber,
+  headSha,
+  reason,
+  recoveryCode,
+  nextAction,
+  hidden,
+}) {
+  return [
+    "## Codex GitHub Review Gate",
+    "",
+    "**Diagnostic-only verifier observation**",
+    "",
+    "This is not the current gating result. PR Checks and verifier summary are authoritative.",
+    "",
+    `Pull request: #${prNumber}`,
+    `Exact head: \`${headSha}\``,
+    `Observation: ${reason}`,
+    `Recovery: \`${recoveryCode}\``,
+    `Next action: ${nextAction}`,
+    "",
+    `<!-- ${V2_STICKY_MARKER} -->`,
+    `<!-- ${hidden} -->`,
+  ].join("\n");
+}
+
 export function isV2StickyCommentBody(body) {
   return typeof body === "string" &&
     body.replace(/\r\n?/gu, "\n").split("\n").includes(`<!-- ${V2_STICKY_MARKER} -->`);
@@ -681,7 +735,8 @@ function parseCanonicalV2StickyCommentBody(body) {
   const lines = normalized.split("\n");
   if (
     lines.length < 11 ||
-    lines.at(-2) !== `<!-- ${V2_STICKY_MARKER} -->`
+    lines.at(-2) !== `<!-- ${V2_STICKY_MARKER} -->` ||
+    lines.filter((line) => line === `<!-- ${V2_STICKY_MARKER} -->`).length !== 1
   ) {
     return null;
   }
@@ -773,7 +828,19 @@ function parseCanonicalV2StickyCommentBody(body) {
     `<!-- ${V2_STICKY_MARKER} -->`,
     `<!-- ${hiddenMatch[1]} -->`,
   ].join("\n");
-  return body === expected ? hidden : null;
+  const completionExpected = buildV2DiagnosticStickyBody({
+    prNumber: hidden.prNumber,
+    headSha: hidden.headSha,
+    reason: formatV2DiagnosticText(hidden.reason, "No reason was reported"),
+    recoveryCode: hidden.recoveryCode,
+    nextAction: formatV2DiagnosticText(
+      hidden.nextAction,
+      "Inspect the workflow run and retry safely.",
+    ),
+    hidden: hiddenMatch[1],
+  });
+  if (body === expected || body === completionExpected) return hidden;
+  return null;
 }
 
 function reportOutputValues(report) {
@@ -916,6 +983,9 @@ function formatV2ReviewThreadStatus(status) {
 }
 
 function v2ReportNextAction(report, context = {}) {
+  if (context.diagnosticObservation === true) {
+    return "This verifier observation is a diagnostic snapshot, not the current gating result; PR Checks and the verifier summary are authoritative.";
+  }
   const reviewThreads = report.reviewThreads;
   const unresolvedThreadCause =
     reviewThreads.status === "complete" &&
@@ -1560,11 +1630,13 @@ export async function runV2GateCli({
     issueComments: [],
     triggerKind: "",
     headValidated: false,
+    completionSnapshotValidated: false,
+    diagnosticObservation: false,
   };
   try {
     config = readV2Config(environment);
-    context.prNumber = config.prNumber;
     Object.assign(config, validateV2Trigger(config));
+    context.prNumber = config.prNumber;
     context.triggerKind = config.triggerKind;
     client = new V2GitHubClient(config, fetchImpl);
     if (config.triggerKind === "verifier") {
@@ -1584,6 +1656,7 @@ export async function runV2GateCli({
   } catch (error) {
     const counts = normalizeV2FailureCounts(error?.counts);
     const stale = error instanceof V2StaleFailure;
+    const completionSnapshot = config?.operation === "report-completion";
     const safeBeginRetry =
       config?.triggerKind === "controller" &&
       config?.operation === "begin-review" &&
@@ -1602,11 +1675,13 @@ export async function runV2GateCli({
           : error?.recoveryCode ?? (config ? "wait_then_reconcile" : "unsupported_target"),
       retrySafe: error?.retrySafe,
       requiresReplacementPr: error?.requiresReplacementPr === true,
-      findingsUnresolved: counts.unresolved,
-      findingsResolved: counts.resolved,
-      findingsHistorical: counts.historical,
-      findingsIndeterminate: counts.indeterminate,
-      reviewThreads: error?.reviewThreadsStatus === "incomplete"
+      findingsUnresolved: completionSnapshot ? "unknown" : counts.unresolved,
+      findingsResolved: completionSnapshot ? "unknown" : counts.resolved,
+      findingsHistorical: completionSnapshot ? "unknown" : counts.historical,
+      findingsIndeterminate: completionSnapshot ? "unknown" : counts.indeterminate,
+      reviewThreads: completionSnapshot
+        ? { status: "not_read" }
+        : error?.reviewThreadsStatus === "incomplete"
         ? { status: "incomplete" }
         : null,
     });
@@ -1619,6 +1694,7 @@ export async function runV2GateCli({
           config?.triggerKind === "controller" &&
           config?.triggerSource !== "auto" &&
           context.headValidated &&
+          !completionSnapshot &&
           !stale,
       });
     } catch (reportError) {
@@ -1754,6 +1830,9 @@ async function runV2ControllerAction(client, config, context, {
     );
   }
   context.headValidated = true;
+  if (config.triggerSource === "completion") {
+    return runV2CompletionReport(client, config, context, repository, initialPr);
+  }
   if (config.triggerSource === "auto") {
     await exactRefetchV2AutoVerifierRun(client, config, repository, initialPr);
   }
@@ -1804,12 +1883,15 @@ async function runV2ControllerAction(client, config, context, {
   context.verifierRunId = refresh.runId;
   context.verifierRunAttempt = refresh.runAttempt;
   context.verifierRunUrl = refresh.runUrl;
+  context.verifierObservedAt = new Date().toISOString();
+  context.diagnosticObservation = true;
   const report = buildV2GateReport({
     executionHealth: "healthy",
     gateOutcome: "pending",
     reason:
-      `Verifier run ${refresh.runId} attempt ${refresh.runAttempt} is observable ` +
-      `with its unique ${V2_REQUIRED_CHECK_NAME} CheckRun queued or in progress`,
+      `Verifier run ${refresh.runId} attempt ${refresh.runAttempt} ${refresh.runUrl} ` +
+      `was observed at ${context.verifierObservedAt}; its unique ${V2_REQUIRED_CHECK_NAME} ` +
+      "CheckRun is queued or in progress",
     recoveryCode: "wait_provider",
     retrySafe: false,
     findingsUnresolved: "unknown",
@@ -1819,6 +1901,419 @@ async function runV2ControllerAction(client, config, context, {
   });
   await finalizeV2Report(client, config, context, report, { diagnostic: true });
   return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+}
+
+async function runV2CompletionReport(client, config, context, repository, initialPr) {
+  const budget = new V2SnapshotBudget(config);
+  assertV2ControllerRerunScopeSnapshot(initialPr, config);
+  const workflow = await loadV2CompletionWorkflow(client, config, budget);
+  let snapshot = await loadV2CompletionSnapshot(
+    client,
+    config,
+    repository,
+    initialPr,
+    workflow,
+    budget,
+  );
+  await assertV2CompletionTestMergeParents(client, config, initialPr, budget);
+
+  context.verifierRunId = snapshot.run.id;
+  context.verifierRunAttempt = snapshot.run.run_attempt;
+  context.verifierRunUrl = snapshot.run.html_url;
+  context.verifierCheckRunId = snapshot.check?.id ?? null;
+  context.verifierObservedAt = snapshot.completedAt;
+  context.diagnosticObservation = true;
+  context.completionSnapshotValidated = true;
+
+  const report = buildV2CompletionReport(snapshot, context);
+  await finalizeV2Report(client, config, context, report, {
+    diagnostic: true,
+    beforeDiagnosticWrite: async () => {
+      const finalBudget = new V2SnapshotBudget(config);
+      const [finalRepository, finalPr] = await Promise.all([
+        loadV2Repository(client, config, finalBudget),
+        loadV2PullRequest(client, config, finalBudget),
+      ]);
+      assertV2ControllerRerunScopeSnapshot(finalPr, config);
+      if (
+        finalRepository.id !== repository.id ||
+        finalRepository.full_name !== repository.full_name
+      ) {
+        throw new V2StaleFailure(
+          "Repository identity changed before completion diagnostics were written",
+        );
+      }
+      const finalSnapshot = await loadV2CompletionSnapshot(
+        client,
+        config,
+        finalRepository,
+        finalPr,
+        workflow,
+        finalBudget,
+      );
+      if (
+        canonicalV2CompletionSnapshotFingerprint(finalSnapshot) !==
+        canonicalV2CompletionSnapshotFingerprint(snapshot)
+      ) {
+        throw new V2StaleFailure(
+          "The current verifier completion snapshot changed before diagnostics were written",
+        );
+      }
+      snapshot = finalSnapshot;
+      return true;
+    },
+  });
+  return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+}
+
+async function loadV2CompletionWorkflow(client, config, budget) {
+  const { data } = await client.request(
+    "GET",
+    `${config.repoPath}/actions/workflows/${V2_VERIFIER_WORKFLOW_PATH}`,
+    undefined,
+    { budget, safeRead: true },
+  );
+  budget.consumeObjects(1, "canonical completion verifier workflow");
+  const eventRun = config.event.workflow_run;
+  if (
+    !isPlainRecord(data) ||
+    !canonicalPositiveId(data.id) ||
+    data.name !== V2_VERIFIER_WORKFLOW_NAME ||
+    data.path !== `.github/workflows/${V2_VERIFIER_WORKFLOW_PATH}` ||
+    String(data.id) !== String(eventRun.workflow_id)
+  ) {
+    throw new V2StaleFailure(
+      "The completed workflow_run is not bound to the canonical verifier workflow",
+    );
+  }
+  return data;
+}
+
+async function loadV2CompletionSnapshot(
+  client,
+  config,
+  repository,
+  pullRequest,
+  workflow,
+  budget,
+) {
+  const eventRun = config.event.workflow_run;
+  assertV2ControllerRerunScopeSnapshot(pullRequest, config);
+  const title = parseCanonicalV2VerifierDisplayTitle(eventRun.display_title);
+  if (
+    !title ||
+    title.prNumber !== config.prNumber ||
+    title.testMergeSha !== config.testMergeSha ||
+    !isPlainRecord(workflow) ||
+    String(workflow.id) !== String(eventRun.workflow_id)
+  ) {
+    throw new V2StaleFailure(
+      "The completion event no longer names this exact PR and test-merge snapshot",
+    );
+  }
+
+  const [currentResponse, attemptResponse] = await Promise.all([
+    client.request(
+      "GET",
+      `${config.repoPath}/actions/runs/${eventRun.id}`,
+      undefined,
+      { budget, safeRead: true },
+    ),
+    client.request(
+      "GET",
+      `${config.repoPath}/actions/runs/${eventRun.id}/attempts/${eventRun.run_attempt}`,
+      undefined,
+      { budget, safeRead: true },
+    ),
+  ]);
+  const currentRun = currentResponse.data;
+  const attempt = attemptResponse.data;
+  budget.consumeObjects(2, "current completion verifier run and exact attempt");
+  requireV2VerifierRunShape(currentRun, "current completion verifier run");
+  requireV2VerifierRunShape(attempt, "exact completion verifier attempt");
+  if (
+    !v2CompletionVerifierRunMatchesScope(currentRun, config, repository, pullRequest) ||
+    !v2CompletionVerifierRunMatchesScope(attempt, config, repository, pullRequest) ||
+    String(currentRun.id) !== String(eventRun.id) ||
+    String(attempt.id) !== String(eventRun.id) ||
+    String(currentRun.workflow_id) !== String(eventRun.workflow_id) ||
+    String(attempt.workflow_id) !== String(eventRun.workflow_id) ||
+    currentRun.run_number !== eventRun.run_number ||
+    attempt.run_number !== eventRun.run_number ||
+    currentRun.run_attempt !== eventRun.run_attempt ||
+    attempt.run_attempt !== eventRun.run_attempt ||
+    currentRun.status !== "completed" ||
+    attempt.status !== "completed" ||
+    currentRun.conclusion !== eventRun.conclusion ||
+    attempt.conclusion !== eventRun.conclusion ||
+    currentRun.path !== eventRun.path ||
+    attempt.path !== eventRun.path ||
+    currentRun.display_title !== eventRun.display_title ||
+    attempt.display_title !== eventRun.display_title
+  ) {
+    throw new V2StaleFailure(
+      "The completed workflow_run is stale or no longer the exact current verifier attempt",
+    );
+  }
+
+  const inventory = await listCurrentV2VerifierRuns(client, config, budget);
+  const currentCandidates = inventory
+    .filter((run) =>
+      v2CompletionVerifierRunMatchesScope(run, config, repository, pullRequest)
+    )
+    .sort((left, right) =>
+      right.run_number - left.run_number || right.id - left.id
+    );
+  if (
+    currentCandidates.length > 1 &&
+    currentCandidates[0].run_number === currentCandidates[1].run_number
+  ) {
+    throw new V2RuntimeFailure(
+      "Current completion verifier run ordering is ambiguous",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  const latest = currentCandidates[0];
+  if (
+    !latest ||
+    String(latest.id) !== String(eventRun.id) ||
+    latest.run_attempt !== eventRun.run_attempt ||
+    latest.status !== "completed" ||
+    latest.conclusion !== eventRun.conclusion
+  ) {
+    throw new V2StaleFailure(
+      "A newer or pending canonical verifier superseded this completion event",
+    );
+  }
+
+  const expectedRunUrl =
+    `${config.serverUrl}/${config.owner}/${config.repo}/actions/runs/${eventRun.id}`;
+  if (currentRun.html_url !== expectedRunUrl) {
+    throw new V2StaleFailure(
+      "The completion verifier run URL does not match its canonical repository identity",
+    );
+  }
+
+  let job = null;
+  let check = null;
+  let checkReadIssue = "";
+  try {
+    job = await loadUniqueV2VerifierJob(
+      client,
+      config,
+      attempt,
+      attempt.run_attempt,
+      budget,
+    );
+    if (job) {
+      check = await loadV2VerifierCheckRun(client, config, job, budget);
+      const checkId = canonicalPositiveId(check.id);
+      const urlCheckId = /\/check-runs\/([1-9][0-9]*)$/u.exec(job.check_run_url)?.[1];
+      if (!checkId || checkId !== urlCheckId) {
+        throw new V2StaleFailure(
+          "The required verifier job CheckRun identity changed during readback",
+        );
+      }
+    } else {
+      checkReadIssue = `No ${V2_REQUIRED_CHECK_NAME} job was found in this verifier attempt`;
+    }
+  } catch (error) {
+    if (
+      error instanceof V2RuntimeFailure &&
+      error.gateOutcome === "pending" &&
+      error.message.includes("canonical jobs")
+    ) {
+      checkReadIssue = error.message;
+      job = null;
+      check = null;
+    } else {
+      throw error;
+    }
+  }
+
+  const eventTimestamp = [
+    eventRun.updated_at,
+    attempt.updated_at,
+    currentRun.updated_at,
+    check?.completed_at,
+  ].find(isCanonicalUtcTimestamp);
+  if (!eventTimestamp) {
+    throw new V2RuntimeFailure(
+      "The completed verifier run has no canonical completion timestamp",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  return {
+    run: currentRun,
+    attempt,
+    job,
+    check,
+    checkReadIssue,
+    completedAt: eventTimestamp,
+    workflowId: String(workflow.id),
+  };
+}
+
+function v2CompletionVerifierRunMatchesScope(run, config, repository, pullRequest) {
+  if (
+    !isPlainRecord(run) ||
+    run.event !== "pull_request" ||
+    !isCanonicalV2VerifierWorkflowPath(run.path) ||
+    run.display_title !== expectedV2VerifierDisplayTitle(config, pullRequest) ||
+    String(run.head_sha || "").toLowerCase() !== config.expectedHeadSha ||
+    String(run.workflow_id || "") !== String(config.event.workflow_run.workflow_id) ||
+    run.repository?.id !== repository.id ||
+    run.repository?.full_name !== repository.full_name ||
+    run.head_repository?.id !== pullRequest.head.repo.id ||
+    run.head_repository?.full_name !== pullRequest.head.repo.full_name ||
+    run.head_branch !== pullRequest.head.ref ||
+    !Array.isArray(run.pull_requests) ||
+    run.pull_requests.length > 1
+  ) {
+    return false;
+  }
+  const title = parseCanonicalV2VerifierDisplayTitle(run.display_title);
+  if (
+    !title ||
+    title.prNumber !== config.prNumber ||
+    title.testMergeSha !== config.testMergeSha
+  ) {
+    return false;
+  }
+  if (run.pull_requests.length === 0) return true;
+  const association = run.pull_requests[0];
+  return (
+    Number(association?.number) === config.prNumber &&
+    String(association?.head?.sha || "").toLowerCase() === config.expectedHeadSha &&
+    String(association?.base?.sha || "").toLowerCase() === config.snapshotScope.baseSha &&
+    association?.base?.ref === config.snapshotScope.baseRef &&
+    matchesV2VerifierAssociationRepository(
+      association?.head?.repo,
+      config,
+      repository,
+    ) &&
+    association?.head?.repo?.id === pullRequest.head.repo.id &&
+    matchesV2VerifierAssociationRepository(
+      association?.base?.repo,
+      config,
+      repository,
+    ) &&
+    association?.base?.repo?.id === pullRequest.base.repo.id
+  );
+}
+
+async function assertV2CompletionTestMergeParents(client, config, pullRequest, budget) {
+  const mergeSha = String(pullRequest.merge_commit_sha || "").toLowerCase();
+  const { data } = await client.request(
+    "GET",
+    `${config.repoPath}/commits/${mergeSha}`,
+    undefined,
+    { budget, safeRead: true },
+  );
+  budget.consumeObjects(1, "exact pull-request test-merge commit");
+  const parents = Array.isArray(data?.parents)
+    ? data.parents.map((parent) => String(parent?.sha || "").toLowerCase())
+    : [];
+  const uniqueParents = new Set(parents);
+  if (
+    !isPlainRecord(data) ||
+    String(data.sha || "").toLowerCase() !== mergeSha ||
+    parents.length !== 2 ||
+    uniqueParents.size !== 2 ||
+    !uniqueParents.has(config.expectedHeadSha) ||
+    !uniqueParents.has(config.snapshotScope.baseSha)
+  ) {
+    throw new V2StaleFailure(
+      "The test-merge commit does not prove the current PR head and base scope",
+    );
+  }
+}
+
+function canonicalV2CompletionSnapshotFingerprint(snapshot) {
+  return canonicalJson({
+    run: {
+      id: snapshot.run.id,
+      workflowId: snapshot.run.workflow_id,
+      runNumber: snapshot.run.run_number,
+      runAttempt: snapshot.run.run_attempt,
+      status: snapshot.run.status,
+      conclusion: snapshot.run.conclusion ?? null,
+      path: snapshot.run.path,
+      displayTitle: snapshot.run.display_title,
+      headSha: snapshot.run.head_sha,
+      htmlUrl: snapshot.run.html_url,
+      updatedAt: snapshot.run.updated_at ?? null,
+    },
+    attempt: {
+      runAttempt: snapshot.attempt.run_attempt,
+      status: snapshot.attempt.status,
+      conclusion: snapshot.attempt.conclusion ?? null,
+      updatedAt: snapshot.attempt.updated_at ?? null,
+    },
+    job: snapshot.job
+      ? {
+          id: snapshot.job.id,
+          runId: snapshot.job.run_id,
+          runAttempt: snapshot.job.run_attempt,
+          name: snapshot.job.name,
+          headSha: snapshot.job.head_sha,
+          status: snapshot.job.status,
+          conclusion: snapshot.job.conclusion ?? null,
+          checkRunUrl: snapshot.job.check_run_url,
+        }
+      : null,
+    check: snapshot.check
+      ? {
+          id: snapshot.check.id,
+          name: snapshot.check.name,
+          headSha: snapshot.check.head_sha,
+          status: snapshot.check.status,
+          conclusion: snapshot.check.conclusion ?? null,
+          completedAt: snapshot.check.completed_at ?? null,
+          appId: snapshot.check.app?.id ?? null,
+          appSlug: snapshot.check.app?.slug ?? null,
+        }
+      : null,
+    checkReadIssue: snapshot.checkReadIssue,
+    completedAt: snapshot.completedAt,
+  });
+}
+
+function buildV2CompletionReport(snapshot, context) {
+  const passed = snapshot.run.status === "completed" &&
+    snapshot.run.conclusion === "success" &&
+    snapshot.attempt.status === "completed" &&
+    snapshot.attempt.conclusion === "success" &&
+    snapshot.job?.status === "completed" &&
+    snapshot.job?.conclusion === "success" &&
+    snapshot.check?.status === "completed" &&
+    snapshot.check?.conclusion === "success";
+  const checkDescription = snapshot.check
+    ? `required check ${V2_REQUIRED_CHECK_NAME} status ${snapshot.check.status}, conclusion ${snapshot.check.conclusion ?? "unknown"}`
+    : snapshot.checkReadIssue || `required check ${V2_REQUIRED_CHECK_NAME} was not observed`;
+  const exactUrl = String(context.verifierRunUrl || snapshot.run.html_url);
+  const reason =
+    `Diagnostic-only completion snapshot; not the current gating result. Verifier run ` +
+    `${snapshot.run.id} attempt ${snapshot.run.run_attempt} ${exactUrl} completed at ` +
+    `${snapshot.completedAt}; run conclusion ${snapshot.run.conclusion ?? "unknown"}; ` +
+    `${checkDescription}. PR Checks and verifier summary are authoritative.`;
+  return buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: passed
+      ? "success"
+      : snapshot.check?.status === "completed" ||
+          snapshot.run.conclusion !== "success"
+        ? "failure"
+        : "pending",
+    reason,
+    recoveryCode: passed ? "none" : "wait_then_reconcile",
+    retrySafe: false,
+    findingsUnresolved: "unknown",
+    findingsResolved: "unknown",
+    findingsHistorical: "unknown",
+    findingsIndeterminate: "unknown",
+    reviewThreads: { status: "not_read" },
+  });
 }
 
 function initializeV2Scope(
@@ -1890,6 +2385,7 @@ function assertV2VerifierLaunchScope(config, pullRequest) {
 
 async function finalizeV2Report(client, config, context, report, {
   diagnostic = false,
+  beforeDiagnosticWrite = null,
 } = {}) {
   persistV2ReportFiles(config || {
     outputPath: "",
@@ -1902,7 +2398,11 @@ async function finalizeV2Report(client, config, context, report, {
     Number.isSafeInteger(context.prNumber) &&
     FULL_SHA.test(context.headSha)
   ) {
-    await writeV2StickyBestEffort(client, config, context, report);
+    await writeV2StickyBestEffort(client, config, context, report, {
+      allowUpdate: config.operation === "report-completion" &&
+        context.completionSnapshotValidated === true,
+      beforeWrite: beforeDiagnosticWrite,
+    });
   }
   return report;
 }
@@ -2445,6 +2945,15 @@ function expectedV2VerifierDisplayTitle(config, pullRequest) {
   return `codex-review-gate-verifier/${config.prNumber}/${String(
     pullRequest.merge_commit_sha || "",
   ).toLowerCase()}`;
+}
+
+function parseCanonicalV2VerifierDisplayTitle(value) {
+  if (typeof value !== "string") return null;
+  const match = /^codex-review-gate-verifier\/([1-9][0-9]*)\/([0-9a-f]{40})$/u.exec(value);
+  if (!match) return null;
+  const prNumber = Number(match[1]);
+  if (!Number.isSafeInteger(prNumber)) return null;
+  return { prNumber, testMergeSha: match[2] };
 }
 
 function isCanonicalV2VerifierWorkflowPath(path) {
@@ -3263,12 +3772,20 @@ function readV2Config(environment) {
   const repository = requiredValue(environment, "GITHUB_REPOSITORY");
   const [owner, repo, extra] = repository.split("/");
   if (!owner || !repo || extra) throw new Error("GITHUB_REPOSITORY must be OWNER/REPO");
+  const operation = normalizeV2Operation(runtimeValue(
+    environment,
+    "OPERATION_INPUT",
+    "INPUT_OPERATION",
+  ));
   const prNumberRaw = runtimeValue(environment, "PR_NUMBER", "INPUT_PR_NUMBER");
-  if (!POSITIVE_DECIMAL.test(prNumberRaw)) {
+  const completionPrSentinel = operation === "report-completion" &&
+    environment.GITHUB_EVENT_NAME === "workflow_run" &&
+    prNumberRaw === "0";
+  if (!completionPrSentinel && !POSITIVE_DECIMAL.test(prNumberRaw)) {
     throw new Error("PR_NUMBER must be one canonical positive decimal integer");
   }
   const prNumber = Number(prNumberRaw);
-  if (!Number.isSafeInteger(prNumber)) {
+  if (!Number.isSafeInteger(prNumber) || (prNumber <= 0 && !completionPrSentinel)) {
     throw new Error("PR_NUMBER must be a positive safe integer");
   }
   const expectedHeadSha = runtimeValue(
@@ -3320,11 +3837,7 @@ function readV2Config(environment) {
     runUrl: `${serverUrl}/${owner}/${repo}/actions/runs/${runId}`,
     outputPath: requiredValue(environment, "GITHUB_OUTPUT"),
     summaryPath: environment.GITHUB_STEP_SUMMARY || "",
-    operation: normalizeV2Operation(runtimeValue(
-      environment,
-      "OPERATION_INPUT",
-      "INPUT_OPERATION",
-    )),
+    operation,
     requestReview: normalizeV2RequestReview(runtimeValue(
       environment,
       "REQUEST_REVIEW_INPUT",
@@ -3379,6 +3892,81 @@ function validateV2Trigger(config) {
   }
   if (eventName === "workflow_run") {
     const upstream = event?.workflow_run;
+    if (config.operation === "report-completion") {
+      const completionTitle = parseCanonicalV2VerifierDisplayTitle(
+        upstream?.display_title,
+      );
+      const associations = upstream?.pull_requests;
+      const association = Array.isArray(associations) && associations.length === 1
+        ? associations[0]
+        : null;
+      const emptyAssociationSentinel = config.prNumber === 0 &&
+        Array.isArray(associations) && associations.length === 0;
+      const prNumber = emptyAssociationSentinel
+        ? completionTitle?.prNumber
+        : config.prNumber;
+      const conclusionIsTerminal = new Set([
+        "success",
+        "failure",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+      ]).has(upstream?.conclusion);
+      if (
+        event?.action !== "completed" ||
+        event?.repository?.full_name !== config.repository ||
+        !isPlainRecord(upstream) ||
+        !canonicalPositiveId(upstream.id) ||
+        !canonicalPositiveId(upstream.workflow_id) ||
+        !Number.isSafeInteger(upstream.run_number) ||
+        upstream.run_number <= 0 ||
+        !Number.isSafeInteger(upstream.run_attempt) ||
+        upstream.run_attempt <= 0 ||
+        upstream.event !== "pull_request" ||
+        upstream.status !== "completed" ||
+        !conclusionIsTerminal ||
+        !isCanonicalV2VerifierWorkflowPath(upstream.path) ||
+        !completionTitle ||
+        completionTitle.prNumber !== prNumber ||
+        String(upstream.head_sha || "") !== config.expectedHeadSha ||
+        upstream.repository?.full_name !== config.repository ||
+        !Array.isArray(associations) ||
+        associations.length > 1 ||
+        (associations.length === 1 && (
+          Number(association?.number) !== prNumber ||
+          String(association?.head?.sha || "") !== config.expectedHeadSha ||
+          !FULL_SHA.test(String(association?.base?.sha || "")) ||
+          typeof association?.base?.ref !== "string" ||
+          association.base.ref.trim() === "" ||
+          (Object.hasOwn(association?.head?.repo || {}, "full_name") &&
+            association.head.repo.full_name !== config.repository) ||
+          (Object.hasOwn(association?.base?.repo || {}, "full_name") &&
+            association.base.repo.full_name !== config.repository)
+        )) ||
+        !Number.isSafeInteger(prNumber) ||
+        prNumber <= 0 ||
+        (config.prNumber !== 0 && config.prNumber !== prNumber) ||
+        config.requestReview !== false ||
+        config.requestCommentId !== ""
+      ) {
+        throw new V2RuntimeFailure(
+          "workflow_run did not bind a completed canonical verifier snapshot to the exact PR and head",
+          { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
+        );
+      }
+      config.prNumber = prNumber;
+      return {
+        triggerKind: "controller",
+        triggerSource: "completion",
+        completionRunId: String(upstream.id),
+        completionRunAttempt: upstream.run_attempt,
+        event,
+      };
+    }
     const association = upstream?.pull_requests?.[0];
     if (
       config.environment.CODEX_REVIEW_GATE_AUTO_REQUEST !== "true" ||
@@ -3418,6 +4006,12 @@ function validateV2Trigger(config) {
     };
   }
   if (eventName === "workflow_dispatch") {
+    if (config.operation === "report-completion") {
+      throw new V2RuntimeFailure(
+        "report-completion is accepted only for a completed canonical workflow_run",
+        { gateOutcome: "not_applicable", recoveryCode: "unsupported_target" },
+      );
+    }
     const inputs = event?.inputs;
     let eventRequestReview;
     try {
@@ -6180,7 +6774,7 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
   const permissionByLogin = new Map();
   for (const comment of issueComments) {
     if (hasExactProviderIdentity(comment)) continue;
-    if (isV2ImmutableStickyDiagnostic(comment, config)) continue;
+    if (isV2CanonicalActionsSticky(comment, config)) continue;
     if (isV2StickyCommentBody(comment?.body)) {
       boundaries.push(v2PhysicalOnlyRequestBoundary(
         comment,
@@ -8138,7 +8732,10 @@ function isOpenV2PullRequest(pullRequest) {
     pullRequest.merged_at === null;
 }
 
-async function writeV2StickyBestEffort(client, config, context, report) {
+async function writeV2StickyBestEffort(client, config, context, report, {
+  allowUpdate = false,
+  beforeWrite = null,
+} = {}) {
   try {
     const budget = new V2SnapshotBudget(config);
     const comments = await client.paginate(
@@ -8154,21 +8751,42 @@ async function writeV2StickyBestEffort(client, config, context, report) {
         canonicalPositiveId(comment?.id) && isV2CanonicalActionsSticky(comment, config)
       )
       .sort(compareV2CanonicalIdsAscending);
+    const stickyMarkers = comments.filter((comment) =>
+      isV2StickyCommentBody(comment?.body)
+    );
     if (stickyCandidates.length > 1) {
       console.warn(
         `Found ${stickyCandidates.length} canonical v2 sticky diagnostics; ` +
           "preserving them without mutation",
       );
+      return;
     }
-    if (stickyCandidates.length > 0) return;
+    if (stickyCandidates.length === 0 && stickyMarkers.length > 0) {
+      console.warn(
+        "Found sticky-looking diagnostics without canonical Actions binding; preserving them without mutation",
+      );
+      return;
+    }
+    if (stickyCandidates.length === 1 && !allowUpdate) return;
     const body = buildV2StickyCommentBody(report, context);
-    await client.request(
-      "POST",
-      `${config.repoPath}/issues/${config.prNumber}/comments`,
-      { body },
-      { safeRead: false },
-    );
+    if (typeof beforeWrite === "function") await beforeWrite();
+    if (stickyCandidates.length === 1) {
+      await client.request(
+        "PATCH",
+        `${config.repoPath}/issues/comments/${stickyCandidates[0].id}`,
+        { body },
+        { safeRead: false },
+      );
+    } else {
+      await client.request(
+        "POST",
+        `${config.repoPath}/issues/${config.prNumber}/comments`,
+        { body },
+        { safeRead: false },
+      );
+    }
   } catch (error) {
+    if (error instanceof V2StaleFailure) throw error;
     console.warn(`best-effort sticky report was not persisted: ${error.message}`);
   }
 }

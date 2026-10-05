@@ -64,9 +64,11 @@ Codex issue_comment created               protected workflow_dispatch
                                 +---- summary / best-effort sticky
 ```
 
-An optional protected `workflow_run` ingress also reaches the same controller
-after a canonical verifier completes with failure. It is request-only and does
-not immediately rerun the verifier.
+The protected `workflow_run` completion ingress also reaches the same
+controller for completed canonical verifier runs. Only the existing opted-in
+first-attempt failure with one PR association remains `begin-review`; other
+eligible completions use `report-completion` for diagnostics and do not rerun
+the verifier.
 
 ### Consumer workflows
 
@@ -161,8 +163,9 @@ canonical permission before a floating `v2` release requires this read;
 missing authority fails closed.
 
 The controller admits `issue_comment` `created`, default-branch
-`workflow_dispatch`, and the opt-in `workflow_run` `completed` path for a failed
-canonical verifier. Comment admission checks both event sender and comment
+`workflow_dispatch`, and `workflow_run` `completed` for the canonical verifier's
+`pull_request` event. The completion path accepts an empty or unique PR
+association; multiple associations are rejected. Comment admission checks both event sender and comment
 author against exact login `chatgpt-codex-connector[bot]` and exact type `Bot`
 before runner allocation. The Action revalidates the admitted event because
 the two checks protect different boundaries. An edited Codex comment requires
@@ -214,7 +217,9 @@ remainder of the run.
 
 The controller Action uses underscore-named inputs `github_token`, `pr_number`,
 `expected_head_sha`, `operation`, `request_comment_id` and `request_review`.
-`operation` is closed to `reconcile|begin-review`, and `request_review` is boolean.
+Manual `operation` choices remain `reconcile|begin-review`; the protected
+`workflow_run` ingress alone may select internal `report-completion`, and
+`request_review` remains boolean.
 Verdicts, identities, status context, stale overrides, numeric limits and
 skip-reconcile controls are not inputs.
 
@@ -297,6 +302,42 @@ prevents the verifier from running, there is no `workflow_run` failure to
 consume, so recovery is manual. The feature is off unless explicitly enabled
 by the exact variable value above.
 
+### `report-completion`
+
+Every eligible canonical verifier completion other than the preserved
+auto-request branch selects `report-completion`, including successful reruns,
+failed/cancelled completions and runs when `CODEX_REVIEW_GATE_AUTO_REQUEST` is
+unset. The operation is `workflow_run`-only and has no dispatch option. It
+revalidates the exact canonical workflow/run/attempt, the selected PR's current
+head/base/test-merge scope, the latest exact-head verifier run and its current
+CheckRun before writing a best-effort diagnostic snapshot. It performs no
+provider-evidence scan, reconciliation, verifier rerun or review request. The
+extra controller run consumes billable runner minutes.
+
+When GitHub supplies no PR association, the workflow passes `pr_number: 0` as
+an internal sentinel. Runtime accepts it only for an empty association list,
+parses the PR and test-merge SHA from the exact canonical dynamic `display_title`,
+and binds that result to the current PR and exact run scope. A multi-PR
+association is rejected; the old automatic `begin-review` path still requires
+the unique association and does not use this fallback.
+
+The diagnostic is an editable output projection, not review evidence or gate
+authority. A stale run/scope snapshot is ignored; the current successful
+native `codex/github-review-gate` CheckRun remains the only required signal.
+For an empty-association event, the unchanged controller concurrency
+expression has an empty repository-scoped suffix rather than the usual PR
+number. Runtime performs a final point-in-time recheck before the write, but
+this fallback does not guarantee per-PR serialization with every other
+controller run. The snapshot cannot authorise a merge.
+
+Publish the compatible Action runtime before installing a controller workflow
+that calls `report-completion`; do not expose the operation to v2.1.6 or older
+runtime code. Keep the Action release and canonical workflow rollout aligned.
+The source repository is the self-hosting exception because its controller
+workflow changes in the same source PR. Until the Action release is available,
+the optional diagnostic controller run may fail on the unknown operation; the
+required verifier CheckRun and existing manual operations are unchanged.
+
 ### `reconcile`
 
 Manual reconcile requires the caller's full `expected_head_sha`; the automatic
@@ -324,12 +365,19 @@ not retained.
 
 The best-effort sticky diagnostic is an output projection only. Its v2 marker
 is distinct from request markers and contains no `@codex review`. Only a
-strict canonical comment from `github-actions[bot]` qualifies. Immediately
-before writing, runtime reads the complete issue-comment inventory. It posts one
-canonical diagnostic only when none exists; it never patches an existing
-canonical diagnostic or posts a replacement while one exists. Multiple
-canonical diagnostics are preserved untouched and diagnosed with a bounded
-warning.
+strict canonical comment from `github-actions[bot]` with the matching PR
+binding qualifies. The `report-completion` operation reads the complete
+issue-comment inventory before writing: it patches the one strictly bound
+canonical diagnostic when exactly one exists, posts one when none exists, and
+skips the write with a bounded warning when multiple canonical diagnostics
+exist. Only `report-completion` patches an existing diagnostic; another
+operation may still create one when absent. The updated controller diagnostic
+format omits visible unknown counts and thread detail while its hidden payload
+preserves typed `unknown` fields; it labels itself as a snapshot rather than
+the current gate result and includes the PR/head, run/attempt/link/time, and
+authoritative verifier/Checks summary. Older canonical payloads, including the
+v2.1.6 shape without `reviewThreads`, remain readable. An edited presentation
+never becomes review evidence.
 
 Write suppression is broader than the evidence exemption. Only an exact raw
 canonical body with the required hidden-field types, official Actions
@@ -794,14 +842,15 @@ links when useful, but never tokens, headers, raw payload dumps or untrusted
 workflow commands.
 
 At-least-once recovery may create small duplicate requests, verifier attempts
-or diagnostic comments after an unknown write result. The sticky writer does
-not fold, patch or delete existing canonical diagnostics: it fresh-reads before
-creation, leaves duplicates untouched and reports them. Only each exact,
-unedited, official canonical sticky receives the narrow physical-lineage
-exemption; a non-qualifying marker-looking duplicate remains a conservative
-boundary. Physical review requests likewise remain separate generation
-boundaries. No duplicate authorises selection of a convenient clean or omission
-of a finding.
+or diagnostic comments after an unknown write result. `report-completion`
+fresh-reads before updating or creating the single diagnostic; it leaves
+duplicates untouched and reports them. It never folds or deletes comments.
+Only each exact, official canonical sticky with the required binding receives
+the narrow physical-lineage exemption; a non-qualifying marker-looking
+duplicate remains a conservative boundary. An edited or stale diagnostic is
+never review evidence. Physical review requests likewise remain separate
+generation boundaries. No duplicate authorises selection of a convenient clean
+or omission of a finding.
 
 ## Exact-head merge closure
 

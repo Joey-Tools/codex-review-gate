@@ -140,9 +140,8 @@ The canonical verifier has one entry:
 The protected-default-branch controller has only these entries:
 
 - `issue_comment` with activity type `created`;
-- `workflow_run` with activity type `completed`, admitted only for a failed
-  first attempt (`run_attempt=1`) of the canonical `Codex Review Gate Verifier`
-  `pull_request` workflow when the opt-in variable is enabled; and
+- `workflow_run` with activity type `completed`, admitted for the canonical
+  verifier's `pull_request` run when its PR association is empty or unique; and
 - `workflow_dispatch` for one explicitly selected pull request.
 
 There is no cron, `repository_dispatch`, `pull_request_target`, writable
@@ -150,29 +149,63 @@ automatic `pull_request_review` job, runtime GitHub App or status writer.
 Review objects and reaction-only completion are discovered by a later
 authoritative verifier reconcile.
 
-Automatic review requests are off by default. The organisation or repository
-Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` must be exactly `true`;
-an unset value skips the automatic controller job, and no other value
-authorises a review request. GitHub Actions compares strings case-insensitively
-in the job condition, so a case variant such as `TRUE` can still allocate a
-controller runner; the runtime then rejects it before posting. A repository
-value overrides the organisation value. The same controller re-fetches the
-completed failed verifier and admits only its unique current-head PR
-association for an open, ready, same-repository PR on the current default
-base. It posts a canonical request if no exact repository/PR/head/base match
-exists, or adopts an existing match. The request is the entire automatic
-operation: there is no immediate verifier rerun. A later exact Codex bot
-comment or protected manual `reconcile` performs that rerun. This path may
-follow `opened`, `reopened`, `synchronize` or `ready_for_review`, not just a
-push. A merge conflict can prevent the `pull_request` verifier from running;
-without that run there is no automatic request, so resolve the conflict and
-use manual recovery if needed. `workflow_run` keeps the writable controller
-on the protected default branch without relying on the public-repository
+A new diagnostic-only controller operation runs for each eligible completed
+canonical verifier run, independently of the automatic-request variable. It
+revalidates the exact verifier run/attempt and current PR/check scope before
+writing a best-effort diagnostic snapshot. It does not scan provider evidence,
+reconcile, rerun the verifier or request review. Snapshots are editable output,
+not evidence or gate authority; stale run/scope reports are ignored. The
+current native `codex/github-review-gate` CheckRun remains the required signal.
+Each completion can allocate an extra controller runner and consume billable
+minutes. The operation updates one strictly bound canonical Actions diagnostic
+when exactly one exists, creates one when absent, and skips the write with a
+warning when multiple diagnostics are present. It retains typed `unknown`
+values in the hidden payload; the updated controller diagnostic format omits
+visible unknown counts and thread detail and labels its body snapshot-only.
+
+Automatic review requests remain off by default. The organisation or
+repository Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` must be exactly
+`true`; an unset value disables the request path, and no other value authorises
+a review request. GitHub Actions compares strings case-insensitively in the
+operation selector, so a case variant such as `TRUE` can still select
+`begin-review`; the runtime rejects it before posting. A repository value
+overrides the organisation value. The existing request path is unchanged: only
+a first-attempt failure (`run_attempt=1`) with a unique PR association triggers
+the protected controller to re-fetch the completed verifier and current
+same-repository, open, ready PR on the default base. It posts a canonical
+request if no exact repository/PR/head/base match exists, or adopts an existing
+match. The request is the entire automatic operation: there is no immediate
+verifier rerun. A later exact Codex bot comment or protected manual
+`reconcile` performs that rerun. This path may follow `opened`, `reopened`,
+`synchronize` or `ready_for_review`, not just a push. A merge conflict can
+prevent the `pull_request` verifier from running; without that run there is no
+automatic request, so resolve the conflict and use manual recovery if needed.
+`workflow_run` keeps the writable controller on the protected default branch
+without relying on the public-repository
 [default `pull_request_target` event policy](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target).
 No third workflow, new GitHub App or
 ruleset is needed. For the Joey-Tools rollout, set the organisation variable's
 selected-repository visibility first to only `codex-private-workflows` as a
 canary, without a repository-level override, before expanding it.
+
+If a completed run has no PR association in GitHub's run metadata, the
+controller accepts only an empty association list and derives PR/test-merge
+from the exact canonical verifier `display_title`. The internal `pr_number: 0`
+sentinel is allowed only for `report-completion`; runtime revalidates the
+derived PR and exact run/attempt/check scope. This fallback uses the
+repository-scoped empty-suffix concurrency group rather than the normal
+per-PR group, so a final point-in-time recheck does not guarantee complete
+per-PR serialization. The diagnostic comment itself never authorises a merge.
+
+Publish a compatible Action runtime before installing the controller update
+that uses `report-completion`. Do not expose the operation to v2.1.6 or another
+older runtime; it is not a manual dispatch option. Keep the runtime and
+canonical workflow rollout aligned. This source repository is the self-hosting
+exception because its controller changes in the same source PR: until the
+Action release is available, its optional diagnostic controller run may fail
+on the unsupported operation. The required verifier CheckRun and existing
+manual operations remain unchanged; external consumers must remain
+runtime-first.
 
 The controller deliberately does not subscribe its `actions: write` and
 `pull-requests: write` authority to `pull_request_review`: GitHub binds that

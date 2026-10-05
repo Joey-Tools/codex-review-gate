@@ -1,5 +1,5 @@
 name: Codex Review Gate
-description: Verify Codex review evidence or refresh the canonical pull-request verifier.
+description: Verify Codex review evidence, refresh the canonical verifier, or report a completion snapshot.
 author: JoeyTeng
 branding:
   icon: shield
@@ -17,7 +17,7 @@ inputs:
     required: false
     default: ""
   operation:
-    description: "Closed controller operation: reconcile or begin-review; pull_request verification is always reconcile."
+    description: "Closed operation: reconcile, begin-review, or workflow_run-only report-completion; pull_request verification is always reconcile."
     required: false
     default: reconcile
   request_comment_id:

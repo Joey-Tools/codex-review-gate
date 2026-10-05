@@ -39,7 +39,13 @@ push、update-branch operation、base change、close/reopen transition，或 PR 
 
 ### 可选：verifier 失败后自动发送 request
 
-现有 canonical controller 有一个受保护的 `workflow_run` 入口，默认关闭。将 repository 或
+Canonical controller 会在 eligible verifier 完成后运行仅用于诊断的
+completion operation。该路径独立于自动 review request：不会扫描 provider evidence、
+reconcile、rerun verifier 或请求评审。Snapshot 可编辑，只是诊断输出，不是 evidence 或 gate
+authority；过时的 run/scope report 会被忽略。每次 completion 都可能额外消耗可计费的
+controller runner minutes。当前 native `codex/github-review-gate` CheckRun 仍是 required signal。
+
+受保护 `workflow_run` 的自动 request 分支默认关闭。将 repository 或
 organisation Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的 `true`
 才授权自动发送 request；缺失或其他值都不能授权请求。GitHub Actions 的表达式字符串比较不区分
 大小写，所以 `TRUE` 等大小写变体仍可能启动 controller job；运行时的精确比较会在 POST 前拒绝。
@@ -60,6 +66,13 @@ canonical 只读 PR workflow `Codex Review Gate Verifier` 的首次 attempt
 应按情况手动使用 `begin-review` 或 `reconcile`。
 如果 request POST 的结果不确定，应重新读取证据并保持 gate pending，不得盲目再发一条。
 跨 run 采用 canonical marker 不构成严格的 exactly-once 保证。
+
+同一 completion ingress 也会把成功 rerun 与其他 eligible completed attempts 作为 diagnostics
+处理，包括自动 request 关闭时。空 PR association 只从 exact canonical verifier
+`display_title` 派生；`pr_number: 0` sentinel 仅供内部 `report-completion` 使用。该 fallback
+落入 repository-scoped empty concurrency suffix，并依赖 runtime 写前的 point-in-time scope
+revalidation，而不是完整 per-PR serialization。应先发布兼容 runtime，再安装这份 controller
+更新；不要把 `report-completion` 传给 v2.1.6 或更早 runtime。
 
 启用此选项时，在使用下面任何一条手动 request 路径前，先检查 exact-head controller
 run 与 canonical marker，避免尚在进行的自动 request 与 direct 或手动 controller request
@@ -398,10 +411,13 @@ summary 明确要求时，才创建恰好一个 generation。不可闭合的 his
 
 ## Sticky diagnostic 恢复
 
-sticky 是 best-effort report，不是 receipt。runtime 使用 create-once 语义：每次写入前
-立即读取完整 issue-comment inventory；只有不存在 canonical diagnostic 时才 POST 一条。
-已有 canonical diagnostic 永不 PATCH；只要已存在一条，也绝不 POST replacement。多条
-canonical diagnostics 会原样保留，并产生 bounded warning。
+sticky 是 best-effort report，不是 receipt。`report-completion` 在写入前读取完整
+issue-comment inventory：若存在且仅存在一条严格绑定的 canonical Actions diagnostic，就
+PATCH 为当前 snapshot；若不存在就 POST；若有多条则跳过写入并报告 bounded warning。其他
+其他 operations 在没有 sticky 时仍可新建，但不会更新已有 comment。当前 controller diagnostic
+格式的可见内容省略 unknown counts 和 thread detail；hidden
+payload 保留类型为 `unknown` 的值，并标明这是 snapshot、不是当前 gate result，还包含
+authoritative verifier CheckRun。v2.1.6 等旧格式（缺少 `reviewThreads`）仍可读取。
 
 只有 exact、未编辑、official canonical sticky 才能从 physical request lineage 中排除。
 edited、invalid、forged 或 wrong-provenance 的 marker-looking comment 都会 fail closed，
@@ -415,11 +431,13 @@ replacement PR。
 2. 重读 current head；
 3. 运行一次 exact-head reconcile；
 4. 信任从 GitHub 重建的新 verifier CheckRun 与 summary，再按其 reason 和 lineage 操作。
-   不要通过编辑或删除 sticky comments 修复结果；若报告的 boundary 无法闭合，改用
-   replacement PR。
+   如果安装了兼容的 controller，该 completed verifier run 还会触发
+   `report-completion`。不要通过编辑或删除 sticky comments 修复结果；若报告的 boundary
+   无法闭合，改用 replacement PR。
 
-sticky write failure 不会清除 findings。reconcile 不会更新或替换已有 canonical
-diagnostic；verifier CheckRun 与 summary 才是 authoritative current result。
+sticky write failure 不会清除 findings。只有独立的 completion operation 会更新或新建
+diagnostic；verifier CheckRun 与 summary 仍是 authoritative current result。编辑 comment
+不是 provider review evidence；旧 run/scope snapshot 也不代表 current state。
 
 ## Exact-head merge closure
 

@@ -57,9 +57,10 @@ repository:
 - `.github/workflows/codex-review-gate-controller.yml` is the protected
   default-branch controller. It admits exact Codex events and typed manual
   operations, creates review requests, and establishes a strictly newer full
-  verifier attempt when reconciliation is needed. The same controller can also
-  request review after a failed canonical verifier run when explicitly enabled;
-  no third workflow is installed.
+  verifier attempt when reconciliation is needed. It also records a best-effort
+  diagnostic snapshot after eligible completed verifier runs. The same
+  controller can request review after a failed canonical verifier run when
+  explicitly enabled; no third workflow is installed.
 
 Automatic requests are off by default. Set the organisation or repository
 Actions variable `CODEX_REVIEW_GATE_AUTO_REQUEST` to exactly `true` to enable
@@ -81,6 +82,38 @@ if needed. For the Joey-Tools rollout, set the organisation variable's
 selected-repository visibility first to only `codex-private-workflows` as a
 canary before expanding it; do not set a repository-level override for that
 canary.
+
+The protected `workflow_run` completion path now runs a diagnostic-only
+operation after canonical verifier completions, including successful reruns
+and completions when automatic requests are disabled. The existing automatic
+request remains unchanged: only a uniquely associated first-attempt failure
+with the exact opt-in value uses `begin-review` and requests review. Other
+eligible completions do not scan provider evidence, reconcile, rerun the
+verifier, or request review. The extra controller run uses billable runner
+minutes. Its snapshot is editable diagnostic output, never review evidence or
+gate authority; an out-of-date run/scope snapshot is ignored. The current
+native `codex/github-review-gate` CheckRun remains the required signal.
+
+For an occasional completed run with no PR association in GitHub's run
+metadata, the controller accepts only an empty association list and derives
+the PR/test-merge binding from the exact canonical verifier `display_title`.
+The `pr_number: 0` input is an internal sentinel for that case; runtime then
+rechecks the exact current PR, run, attempt and CheckRun before writing. Such an
+event shares the repository-scoped empty-suffix concurrency group rather than
+the usual PR-specific group, so final point-in-time revalidation—not global
+per-PR serialization—protects the diagnostic write. This snapshot never makes
+a PR mergeable.
+
+Roll out in order: publish an Action runtime that supports
+`report-completion`, then install the matching canonical controller workflow
+in consumers. Do not expose this operation to an older runtime such as v2.1.6;
+the public manual dispatch remains limited to `reconcile` and `begin-review`.
+This source repository is the self-hosting exception because its controller
+workflow changes with the source PR: until the compatible Action release is
+available, its optional diagnostic controller run may fail on the unknown
+operation. That does not change the required verifier CheckRun or the existing
+manual `reconcile`/`begin-review` operations. External consumers must remain
+runtime-first.
 
 Both workflows call the compatible floating major:
 
