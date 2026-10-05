@@ -20,6 +20,8 @@ export const V2_STICKY_MARKER = "codex-review-gate:v2:diagnostic";
 export const V2_STABILITY_INTERVAL_MS = 5_000;
 export const V2_STABILITY_WINDOW_MS = 60_000;
 export const V2_REACTION_FETCH_CONCURRENCY = 4;
+const V2_REACTION_BATCH_SIZE = 8;
+const V2_REACTION_PAGE_SIZE = 100;
 export const V2_OUTPUT_KEYS = Object.freeze([
   "execution_health",
   "gate_outcome",
@@ -37,7 +39,7 @@ export const V2_LIMITS_PROFILES = Object.freeze({
     reconcileBudgetMs: 60_000,
   }),
   expanded: Object.freeze({
-    maxPages: 100,
+    maxPages: 500,
     maxObjects: 10_000,
     maxAttempts: 512,
     maxSnapshotBytes: 64 * 1024 * 1024,
@@ -74,43 +76,6 @@ export const V2_RECOVERY_CODES = Object.freeze(new Set([
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
 const OFFICIAL_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]";
-const V2_BASE_EPOCH_QUERY = `query CodexReviewGateBaseEpoch(
-  $owner: String!
-  $repo: String!
-  $number: Int!
-) {
-  repository(owner: $owner, name: $repo) {
-    nameWithOwner
-    pullRequest(number: $number) {
-      number
-      timelineItems(
-        last: 1
-        itemTypes: [BASE_REF_CHANGED_EVENT, BASE_REF_FORCE_PUSHED_EVENT]
-      ) {
-        filteredCount
-        pageCount
-        nodes {
-          __typename
-          ... on BaseRefChangedEvent {
-            id
-            createdAt
-            previousRefName
-            currentRefName
-            actor { __typename login }
-          }
-          ... on BaseRefForcePushedEvent {
-            id
-            createdAt
-            beforeCommit { oid }
-            afterCommit { oid }
-            ref { name }
-            actor { __typename login }
-          }
-        }
-      }
-    }
-  }
-}`;
 const V2_DELETED_COMMENTS_PAGE_SIZE = 100;
 const V2_REVIEW_THREADS_PAGE_SIZE = 100;
 const V2_OBSERVED_HISTORY_POISON = Symbol("v2-observed-history-poison");
@@ -144,11 +109,37 @@ const V2_DELETED_COMMENTS_QUERY = `query CodexReviewGateDeletedComments(
   $commentCursor: String
   $includeDeleted: Boolean!
   $includeComments: Boolean!
+  $includeBaseEpoch: Boolean = false
 ) {
   repository(owner: $owner, name: $repo) {
     nameWithOwner
     pullRequest(number: $number) {
       number
+      baseEpochTimelineItems: timelineItems(
+        last: 1
+        itemTypes: [BASE_REF_CHANGED_EVENT, BASE_REF_FORCE_PUSHED_EVENT]
+      ) @include(if: $includeBaseEpoch) {
+        filteredCount
+        pageCount
+        nodes {
+          __typename
+          ... on BaseRefChangedEvent {
+            id
+            createdAt
+            previousRefName
+            currentRefName
+            actor { __typename login }
+          }
+          ... on BaseRefForcePushedEvent {
+            id
+            createdAt
+            beforeCommit { oid }
+            afterCommit { oid }
+            ref { name }
+            actor { __typename login }
+          }
+        }
+      }
       timelineItems(
         first: ${V2_DELETED_COMMENTS_PAGE_SIZE}
         after: $cursor
@@ -4468,20 +4459,19 @@ async function loadV2DecisionCarriers(
         );
       },
     }),
-    loadLatestV2BaseEpoch(client, config, budget, observedBaseEpoch),
     loadV2CommentHistory(
       client,
       config,
       budget,
       observedDeletedCommentEvents,
       observedIssueCommentEdits,
+      { includeBaseEpoch: true, observedBaseEpoch },
     ),
     loadV2ReviewThreads(client, config, budget),
   ]);
   const [
     issueCommentRead,
     reviewRead,
-    baseEpochRead,
     commentHistoryRead,
     reviewThreadRead,
   ] = carrierReads;
@@ -4574,8 +4564,8 @@ async function loadV2DecisionCarriers(
   }
   const issueComments = issueCommentRead.value;
   const reviews = reviewRead.value;
-  const baseEpoch = baseEpochRead.value;
-  const { deletedCommentEvents, issueCommentEdits } = commentHistoryRead.value;
+  const { baseEpoch, deletedCommentEvents, issueCommentEdits } =
+    commentHistoryRead.value;
   const reviewThreadEvidence = reviewThreadRead.value;
   const requestAuthority = await collectAuthorizedV2Requests(
     client,
@@ -4608,69 +4598,14 @@ async function loadV2DecisionCarriers(
     requests: requestAuthority.boundaries,
     authorizedRequests: requestAuthority.authorized,
   });
-  const requestReactions = new Map();
-  const seenReactionIdentities = new Map();
-  const reactionInventories = await mapV2Bounded(
+  const reactionInventories = await loadV2RequestReactionInventories(
+    client,
+    config,
+    budget,
     reactionRequests,
-    V2_REACTION_FETCH_CONCURRENCY,
-    async ({ comment }) => {
-      const id = String(comment.id);
-      const source = `reaction-rest:${id}`;
-      const reactions = await client.paginate(
-        `${config.repoPath}/issues/comments/${id}/reactions`,
-        {
-          budget,
-          label: `reactions for review request ${id}`,
-          validate: requireV2ReactionShape,
-          observe: (reaction, reactionId) => {
-            const officialIdentity =
-              reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN;
-            const previousWasOfficial = seenReactionIdentities.get(reactionId);
-            if (
-              previousWasOfficial !== undefined &&
-              (officialIdentity || previousWasOfficial)
-            ) {
-              throw poisonV2ObservedHistory(
-                observedIssueCommentEdits,
-                `review-request reactions repeated official Codex identity ${reactionId}`,
-              );
-            }
-            seenReactionIdentities.set(
-              reactionId,
-              Boolean(previousWasOfficial) || officialIdentity,
-            );
-            rememberV2ObservedCarrierFingerprint(
-              observedIssueCommentEdits,
-              "reaction-identity",
-              reactionId,
-              canonicalJson({
-                requestId: id,
-                reaction: fingerprintReaction(reaction),
-              }),
-            );
-            if (!hasV2ProviderReactionIdentitySignal(reaction)) return;
-            rememberV2ObservedCarrierFingerprint(
-              observedIssueCommentEdits,
-              source,
-              reactionId,
-              canonicalJson(fingerprintReaction(reaction)),
-            );
-          },
-        },
-      );
-      retainV2ObservedCarrierFingerprints(
-        observedIssueCommentEdits,
-        source,
-        reactions
-          .filter(hasV2ProviderReactionIdentitySignal)
-          .map((reaction) => [
-            canonicalPositiveId(reaction.id),
-            canonicalJson(fingerprintReaction(reaction)),
-          ]),
-      );
-      return [id, reactions];
-    },
+    observedIssueCommentEdits,
   );
+  const requestReactions = new Map();
   for (const [id, reactions] of reactionInventories) {
     requestReactions.set(id, reactions);
   }
@@ -4779,6 +4714,425 @@ async function loadV2DecisionCarriers(
     reviewThreadEvidence,
     decisionEvidence,
   };
+}
+
+async function loadV2RequestReactionInventories(
+  client,
+  config,
+  budget,
+  reactionRequests,
+  observedIssueCommentEdits,
+) {
+  const states = (reactionRequests ?? []).map(({ comment }) => {
+    const id = canonicalPositiveId(comment?.id);
+    if (!id || typeof comment?.node_id !== "string" || comment.node_id.trim() === "") {
+      throw new V2RuntimeFailure(
+        `Review request ${id || "<unknown>"} has no exact GraphQL node identity`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    return {
+      id,
+      nodeId: comment.node_id,
+      reactions: [],
+      reactionIds: new Set(),
+      seenCursors: new Set(),
+      expectedTotalCount: null,
+      cursor: null,
+    };
+  });
+  const reactionsByCommentId = new Map(
+    states.map((state) => [state.id, state.reactions]),
+  );
+  const seenReactionIdentities = new Map();
+  let officialActorIdentityPromise = null;
+  let pending = states.map((state) => ({ state, cursor: null }));
+
+  while (pending.length > 0) {
+    const current = pending;
+    pending = [];
+    for (let offset = 0; offset < current.length; offset += V2_REACTION_BATCH_SIZE) {
+      const batch = current.slice(offset, offset + V2_REACTION_BATCH_SIZE);
+      const { query, variables } = buildV2RequestReactionQuery(batch);
+      const { data } = await client.request(
+        "POST",
+        "/graphql",
+        { query, variables },
+        { budget, safeRead: true },
+      );
+      const label = "batched review-request reactions";
+      let pageBudgetError = null;
+      try {
+        budget.consumePage(label);
+      } catch (error) {
+        if (budget.pages <= budget.maxPages) throw error;
+        pageBudgetError = error;
+      }
+
+      const graphData = isPlainRecord(data?.data) ? data.data : null;
+      let responseError = null;
+
+      for (let index = 0; index < batch.length; index += 1) {
+        const { state, cursor } = batch[index];
+        const node = graphData?.[`comment${index}`];
+        try {
+          requireV2GraphQlReactionCommentBinding(node, state, config);
+        } catch (error) {
+          responseError ??= error;
+          continue;
+        }
+
+        const connection = node.reactions;
+        const nodes = Array.isArray(connection?.nodes)
+          ? connection.nodes
+          : null;
+        if (nodes) {
+          for (const rawReaction of nodes.slice(0, V2_REACTION_PAGE_SIZE)) {
+            let reaction;
+            try {
+              reaction = await normalizeV2GraphQlReaction(
+                rawReaction,
+                () => {
+                  officialActorIdentityPromise ??=
+                    loadV2OfficialReactionActorIdentity(client, config, budget);
+                  return officialActorIdentityPromise;
+                },
+              );
+              observeV2BatchedReaction(
+                reaction,
+                state.id,
+                seenReactionIdentities,
+                observedIssueCommentEdits,
+              );
+              const reactionId = canonicalPositiveId(reaction.id);
+              if (state.reactionIds.has(reactionId)) {
+                throw new V2RuntimeFailure(
+                  `Reactions for review request ${state.id} repeated identity ${reactionId}`,
+                  { recoveryCode: "wait_then_reconcile" },
+                );
+              }
+              state.reactionIds.add(reactionId);
+              state.reactions.push(reaction);
+            } catch (error) {
+              responseError ??= error;
+              break;
+            }
+          }
+        }
+
+        try {
+          const pagination = validateV2GraphQlReactionPage(
+            connection,
+            nodes,
+            state,
+            cursor,
+            observedIssueCommentEdits,
+          );
+          if (pagination.nextCursor !== null) {
+            pending.push({ state, cursor: pagination.nextCursor });
+          } else {
+            retainV2ObservedCarrierFingerprints(
+              observedIssueCommentEdits,
+              `reaction-rest:${state.id}`,
+              state.reactions
+                .filter(hasV2ProviderReactionIdentitySignal)
+                .map((reaction) => [
+                  canonicalPositiveId(reaction.id),
+                  canonicalJson(fingerprintReaction(reaction)),
+                ]),
+            );
+          }
+        } catch (error) {
+          responseError ??= error;
+        }
+      }
+
+      let visibleObjects = 0;
+      if (graphData) {
+        for (let index = 0; index < batch.length; index += 1) {
+          const node = graphData[`comment${index}`];
+          if (!isPlainRecord(node)) continue;
+          visibleObjects += 3;
+          if (isPlainRecord(node.reactions)) visibleObjects += 1;
+          if (Array.isArray(node.reactions?.nodes)) {
+            for (const reaction of node.reactions.nodes) {
+              visibleObjects += 1;
+              if (isPlainRecord(reaction?.user)) visibleObjects += 1;
+            }
+          }
+        }
+      }
+      let objectBudgetError = null;
+      try {
+        budget.consumeObjects(visibleObjects, label);
+      } catch (error) {
+        objectBudgetError = error;
+      }
+
+      if (pageBudgetError) throw pageBudgetError;
+      if (objectBudgetError) throw objectBudgetError;
+
+      if (
+        !isPlainRecord(data) ||
+        (data.errors !== undefined &&
+          (!Array.isArray(data.errors) || data.errors.length > 0)) ||
+        !graphData
+      ) {
+        responseError ??= new V2RuntimeFailure(
+          "GitHub GraphQL batched reaction response was incomplete or inconsistent",
+          { recoveryCode: "wait_then_reconcile" },
+        );
+      }
+      if (responseError) throw responseError;
+    }
+  }
+
+  return [...reactionsByCommentId];
+}
+
+function buildV2RequestReactionQuery(batch) {
+  const definitions = [];
+  const variables = {};
+  const selections = batch.map(({ state, cursor }, index) => {
+    definitions.push(`$nodeId${index}: ID!`);
+    definitions.push(`$reactionCursor${index}: String`);
+    variables[`nodeId${index}`] = state.nodeId;
+    variables[`reactionCursor${index}`] = cursor;
+    return `
+      comment${index}: node(id: $nodeId${index}) {
+        __typename
+        ... on IssueComment {
+          id
+          databaseId: fullDatabaseId
+          pullRequest {
+            number
+            repository { databaseId nameWithOwner }
+          }
+          reactions(first: ${V2_REACTION_PAGE_SIZE}, after: $reactionCursor${index}) {
+            totalCount
+            nodes {
+              databaseId
+              content
+              createdAt
+              user { __typename databaseId login }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    `;
+  });
+  return {
+    query: `query CodexReviewGateRequestReactions(${definitions.join(", ")}) {
+      ${selections.join("\n")}
+    }`,
+    variables,
+  };
+}
+
+function requireV2GraphQlReactionCommentBinding(node, state, config) {
+  const repository = node?.pullRequest?.repository;
+  if (
+    !isPlainRecord(node) ||
+    node.__typename !== "IssueComment" ||
+    node.id !== state.nodeId ||
+    canonicalPositiveId(node.databaseId) !== state.id ||
+    !isPlainRecord(node.pullRequest) ||
+    node.pullRequest.number !== config.prNumber ||
+    !isPlainRecord(repository) ||
+    canonicalPositiveId(repository.databaseId) !==
+      canonicalPositiveId(config.repositoryId) ||
+    !sameV2GraphQlRepositoryName(repository.nameWithOwner, config.repository)
+  ) {
+    throw new V2RuntimeFailure(
+      `GraphQL reaction node for review request ${state.id} did not match its exact issue-comment, repository, and pull-request identity`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+}
+
+async function normalizeV2GraphQlReaction(
+  value,
+  loadOfficialActorIdentity,
+) {
+  const contentByGraphQlValue = {
+    CONFUSED: "confused",
+    EYES: "eyes",
+    HEART: "heart",
+    HOORAY: "hooray",
+    LAUGH: "laugh",
+    ROCKET: "rocket",
+    THUMBS_DOWN: "-1",
+    THUMBS_UP: "+1",
+  };
+  const id = canonicalPositiveId(value?.databaseId);
+  const content = contentByGraphQlValue[value?.content];
+  const actor = value?.user;
+  if (
+    !isPlainRecord(value) ||
+    !id ||
+    !content ||
+    !isCanonicalUtcTimestamp(value.createdAt) ||
+    !isPlainRecord(actor) ||
+    typeof actor.login !== "string" ||
+    actor.login.trim() === "" ||
+    (actor.__typename !== "User" && actor.__typename !== "Bot")
+  ) {
+    throw new V2RuntimeFailure(
+      "GitHub GraphQL reaction node was incomplete or inconsistent",
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+
+  // GraphQL's `User` type can include bots, so only the independently bound
+  // official account receives Bot provenance in the REST-shaped record.
+  let actorType = "User";
+  if (actor.login === OFFICIAL_CODEX_BOT_LOGIN) {
+    const officialIdentity = await loadOfficialActorIdentity();
+    if (canonicalPositiveId(actor.databaseId) !== officialIdentity.id) {
+      throw new V2RuntimeFailure(
+        "GraphQL Codex reaction author did not match the exact REST bot account identity",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    actorType = officialIdentity.type;
+  }
+
+  return {
+    id,
+    content,
+    created_at: value.createdAt,
+    user: { login: actor.login, type: actorType },
+  };
+}
+
+async function loadV2OfficialReactionActorIdentity(client, config, budget) {
+  const { data } = await client.request(
+    "GET",
+    `/users/${encodeURIComponent(OFFICIAL_CODEX_BOT_LOGIN)}`,
+    undefined,
+    { budget, safeRead: true },
+  );
+  budget.consumeObjects(1, "official Codex reaction account identity");
+  const id = canonicalPositiveId(data?.id);
+  if (
+    !isPlainRecord(data) ||
+    !id ||
+    data.login !== OFFICIAL_CODEX_BOT_LOGIN ||
+    data.type !== "Bot"
+  ) {
+    throw new V2RuntimeFailure(
+      "REST official Codex reaction account identity was incomplete or inconsistent",
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  return { id, login: data.login, type: data.type };
+}
+
+function observeV2BatchedReaction(
+  reaction,
+  requestId,
+  seenReactionIdentities,
+  observedIssueCommentEdits,
+) {
+  const reactionId = canonicalPositiveId(reaction.id);
+  const officialIdentity = reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN;
+  const previousWasOfficial = seenReactionIdentities.get(reactionId);
+  if (
+    previousWasOfficial !== undefined &&
+    (officialIdentity || previousWasOfficial)
+  ) {
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      `review-request reactions repeated official Codex identity ${reactionId}`,
+    );
+  }
+  seenReactionIdentities.set(
+    reactionId,
+    Boolean(previousWasOfficial) || officialIdentity,
+  );
+  rememberV2ObservedCarrierFingerprint(
+    observedIssueCommentEdits,
+    "reaction-identity",
+    reactionId,
+    canonicalJson({ requestId, reaction: fingerprintReaction(reaction) }),
+  );
+  if (!hasV2ProviderReactionIdentitySignal(reaction)) return;
+  rememberV2ObservedCarrierFingerprint(
+    observedIssueCommentEdits,
+    `reaction-rest:${requestId}`,
+    reactionId,
+    canonicalJson(fingerprintReaction(reaction)),
+  );
+}
+
+function validateV2GraphQlReactionPage(
+  connection,
+  nodes,
+  state,
+  cursor,
+  observedIssueCommentEdits,
+) {
+  const pageInfo = connection?.pageInfo;
+  if (
+    !isPlainRecord(connection) ||
+    !isNonNegativeSafeInteger(connection.totalCount) ||
+    !Array.isArray(nodes) ||
+    nodes.length > V2_REACTION_PAGE_SIZE ||
+    !isPlainRecord(pageInfo) ||
+    typeof pageInfo.hasNextPage !== "boolean" ||
+    !(pageInfo.endCursor === null ||
+      (typeof pageInfo.endCursor === "string" && pageInfo.endCursor.trim() !== ""))
+  ) {
+    throw new V2RuntimeFailure(
+      `GraphQL reactions for review request ${state.id} were incomplete or inconsistent`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  if (state.expectedTotalCount === null) {
+    state.expectedTotalCount = connection.totalCount;
+  } else if (connection.totalCount !== state.expectedTotalCount) {
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      `GraphQL reaction total count changed while paging review request ${state.id}`,
+    );
+  }
+  const previousCount = state.reactions.length - nodes.length;
+  if (
+    previousCount < 0 ||
+    nodes.length > state.expectedTotalCount - previousCount
+  ) {
+    throw new V2RuntimeFailure(
+      `GraphQL reaction page exceeded the total count for review request ${state.id}`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  const needsNextPage = state.reactions.length < state.expectedTotalCount;
+  if (pageInfo.hasNextPage !== needsNextPage) {
+    throw new V2RuntimeFailure(
+      `GraphQL reaction pagination was incomplete for review request ${state.id}`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  if (!pageInfo.hasNextPage) {
+    if (state.reactions.length !== state.expectedTotalCount) {
+      throw new V2RuntimeFailure(
+        `GraphQL reaction inventory was incomplete for review request ${state.id}`,
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    return { nextCursor: null };
+  }
+  const nextCursor = pageInfo.endCursor;
+  if (nextCursor === cursor || state.seenCursors.has(nextCursor)) {
+    throw new V2RuntimeFailure(
+      `GraphQL reaction pagination repeated a cursor for review request ${state.id}`,
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
+  state.seenCursors.add(nextCursor);
+  state.cursor = nextCursor;
+  return { nextCursor };
 }
 
 function copyV2FailureWithReviewThreadStatus(error, status) {
@@ -7231,9 +7585,14 @@ async function loadV2CommentHistory(
   budget,
   observedDeletedCommentEvents = null,
   observedIssueCommentEdits = null,
+  {
+    includeBaseEpoch = false,
+    observedBaseEpoch = null,
+  } = {},
 ) {
   assertV2ObservedHistoryNotPoisoned(observedDeletedCommentEvents);
   assertV2ObservedHistoryNotPoisoned(observedIssueCommentEdits);
+  assertV2ObservedHistoryNotPoisoned(observedBaseEpoch);
   const events = [];
   const eventIds = new Set();
   const rawEventIds = new Map();
@@ -7247,10 +7606,13 @@ async function loadV2CommentHistory(
   let commentCursor = null;
   let includeDeleted = true;
   let includeComments = true;
+  let includeBaseEpochOnNextPage = includeBaseEpoch;
+  let baseEpoch = null;
   let expectedTimelineCount = null;
   let expectedDeletedCount = null;
   let expectedCommentCount = null;
   while (includeDeleted || includeComments) {
+    const includeBaseEpochOnPage = includeBaseEpochOnNextPage;
     const { data } = await client.request(
       "POST",
       "/graphql",
@@ -7264,6 +7626,7 @@ async function loadV2CommentHistory(
           commentCursor,
           includeDeleted,
           includeComments,
+          ...(includeBaseEpochOnPage ? { includeBaseEpoch: true } : {}),
         },
       },
       { budget, safeRead: true },
@@ -7286,6 +7649,13 @@ async function loadV2CommentHistory(
       observedIssueCommentEdits,
     );
     latchedPage.error ??= fingerprintError;
+    const baseEpochRead = includeBaseEpochOnPage
+      ? inspectV2BaseEpochConnection(
+          partialPullRequest?.baseEpochTimelineItems,
+          observedBaseEpoch,
+        )
+      : null;
+    const observationError = latchedPage.error ?? baseEpochRead?.error ?? null;
     if (
       !isPlainRecord(data) ||
       (data.errors !== undefined &&
@@ -7298,15 +7668,16 @@ async function loadV2CommentHistory(
     ) {
       const message =
         "GitHub GraphQL comment-history response was incomplete or inconsistent";
-      if (latchedPage.error) throw latchedPage.error;
+      if (observationError) throw observationError;
       throw new V2RuntimeFailure(message, {
         recoveryCode: "wait_then_reconcile",
       });
     }
-    if (latchedPage.error) throw latchedPage.error;
+    if (observationError) throw observationError;
     const pullRequest = data.data.repository.pullRequest;
     const { pageEvents, pageEdits } = latchedPage;
-    let pageObjects = 2;
+    let pageObjects = 2 + (baseEpochRead?.nodeCount ?? 0);
+    if (baseEpochRead) baseEpoch = baseEpochRead.value;
     if (includeDeleted) {
       const connection = pullRequest.timelineItems;
       const pageInfo = connection?.pageInfo;
@@ -7433,6 +7804,7 @@ async function loadV2CommentHistory(
       }
     }
     budget.consumeObjects(pageObjects, "pull-request comment history");
+    includeBaseEpochOnNextPage = false;
   }
   retainV2ObservedHistoryRawIdentities(
     observedDeletedCommentEvents,
@@ -7450,6 +7822,7 @@ async function loadV2CommentHistory(
     edits.map((edit) => [edit.id, canonicalJson(edit)]),
   );
   return {
+    baseEpoch,
     deletedCommentEvents: events.sort((left, right) =>
       Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
       compareV2OpaqueStringsAscending(left.id, right.id)
@@ -8333,48 +8706,8 @@ function v2DeletedCommentBoundary(event) {
   };
 }
 
-async function loadLatestV2BaseEpoch(
-  client,
-  config,
-  budget,
-  observedBaseEpoch = null,
-) {
-  assertV2ObservedHistoryNotPoisoned(observedBaseEpoch);
-  const { data } = await client.request(
-    "POST",
-    "/graphql",
-    {
-      query: V2_BASE_EPOCH_QUERY,
-      variables: {
-        owner: config.owner,
-        repo: config.repo,
-        number: config.prNumber,
-      },
-    },
-    { budget, safeRead: true },
-  );
-  budget.consumePage("latest pull-request base epoch");
-  const partialConnection = data?.data?.repository?.pullRequest?.timelineItems;
-  const latched = latchV2VisibleBaseEpoch(
-    partialConnection,
-    observedBaseEpoch,
-  );
-  if (
-    !isPlainRecord(data) ||
-    (data.errors !== undefined &&
-      (!Array.isArray(data.errors) || data.errors.length > 0)) ||
-    !isPlainRecord(data.data) ||
-    !isPlainRecord(data.data.repository) ||
-    data.data.repository.nameWithOwner !== config.repository ||
-    !isPlainRecord(data.data.repository.pullRequest) ||
-    data.data.repository.pullRequest.number !== config.prNumber
-  ) {
-    if (latched.error) throw latched.error;
-    throw new V2RuntimeFailure(
-      "GitHub GraphQL base-epoch response was incomplete or inconsistent",
-    );
-  }
-  const connection = data.data.repository.pullRequest.timelineItems;
+function inspectV2BaseEpochConnection(connection, observedBaseEpoch) {
+  const latched = latchV2VisibleBaseEpoch(connection, observedBaseEpoch);
   if (
     !isPlainRecord(connection) ||
     !isNonNegativeSafeInteger(connection.filteredCount) ||
@@ -8382,19 +8715,25 @@ async function loadLatestV2BaseEpoch(
     !Array.isArray(connection.nodes) ||
     connection.nodes.length > 1 ||
     connection.pageCount !== connection.nodes.length ||
+    connection.nodes.length > connection.filteredCount ||
     (connection.filteredCount === 0) !== (connection.nodes.length === 0)
   ) {
-    if (latched.error) throw latched.error;
-    throw new V2RuntimeFailure(
-      "GitHub GraphQL base-epoch connection was incomplete or inconsistent",
-    );
+    return {
+      value: null,
+      nodeCount: Array.isArray(connection?.nodes) ? connection.nodes.length : 0,
+      error: latched.error ?? new V2RuntimeFailure(
+        "GitHub GraphQL base-epoch connection was incomplete or inconsistent",
+        { recoveryCode: "wait_then_reconcile" },
+      ),
+    };
   }
-  if (latched.error) throw latched.error;
-  budget.consumeObjects(2 + connection.nodes.length, "latest pull-request base epoch");
-  const event = latched.event;
   return {
-    filteredCount: connection.filteredCount,
-    event,
+    value: {
+      filteredCount: connection.filteredCount,
+      event: latched.eventAvailable ? latched.event : null,
+    },
+    nodeCount: connection.nodes.length,
+    error: latched.error,
   };
 }
 

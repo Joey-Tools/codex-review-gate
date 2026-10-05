@@ -551,6 +551,35 @@ scope。它包括：
 - reviewed-commit resolution 与 native review `commit_id`；
 - collection completeness 与 exact-object refetch results。
 
+### 有界批量读取
+
+每轮 carrier pass 仍先完整读取 comments/reviews，再在本地筛选。最新 filtered base-event
+connection 并入第一份 comment-history GraphQL response，不再单独请求；后续历史页
+分别推进 deletion/comment cursors，不重复读取 latest base event。历史和 base epoch
+的既有变更记录及校验继续保留，partial response 也不能抹掉已观察到的变化。
+
+选中的 review-request reactions 按固定小批次读取：每次最多八条 comment connections，
+每条 connection 每页最多 100 reactions。comment node/database IDs、repository 和 PR
+必须绑定完整 REST inventory。每条未完成 connection 独立分页，直到 unique reaction
+数量等于稳定的 `totalCount`。缺少 node、GraphQL errors、重复 ID/cursor、count drift
+或 partial page 均 fail closed，不允许降级到不完整列表并判 success。
+
+GraphQL 将官方 Codex reaction account 返回为 `User`，所以 typename 和 `[bot]` 后缀
+都不能证明 REST `Bot` provenance。每轮 fresh carrier pass 观察到官方 reaction 时，
+独立通过 REST 读取该官方 account，验证 canonical ID/login 和 `Bot` type，再绑定
+GraphQL reaction author 的 database ID。只在本轮内共享该 account observation，
+不跨 snapshot 缓存。reaction IDs、时间、身份和历史 fingerprint 仍进入原 reducer；
+非官方 actor type 不得成为 review-request authorization 的依据。
+
+分页预算计实际获取的 pagination responses，空 response 也计入；一份 combined
+GraphQL response 计一页，而不是每个 nested connection 各计一页。但所有 nested raw
+objects 仍计入 object cap，response/aggregate byte、attempt、deadline 和 batch-size
+上限均保留，不能借批量读取隐藏无界数据。
+
+REST comment/review exact refetch 和 missing-pending-review confirmation 继续保留。
+首尾 carrier inventories 仍是来自 GitHub 的 fresh reads；success 仍依赖两份完整稳定
+snapshots。批量读取只是传输优化，不是 atomic transaction，也不是同一份缓存自我比较。
+
 thread comments/replies 不进入 diagnostic finding counts；但 thread IDs 与 resolution state
 进入 fingerprint。若接受 inline-parent closed-grammar receipt，只有其 parent review 作为普通
 provider carrier 进入 snapshot，其 child thread 是否 resolved 由上述独立 collection 判断；ruleset
@@ -637,15 +666,16 @@ profiles 是 policy，不是任意 dispatch numbers：
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
-| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| `expanded` | 500 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
 
-分页上限在每个完整 snapshot 内累计，包含首尾证据读取以及每个 reactions endpoint
-的第一页，不是单 endpoint 上限或 review 轮次限制。普通多轮审查 PR 即使评论很少，
-也可能耗尽 20 页，因此默认值提高到 100，但不裁剪历史 reactions，不改变其他默认限制。
-`expanded` 的分页上限同样是 100，因此分页超限必须报告 `raise_protected_limit`；
-其他默认容量超限仍可按对应指标报告 `use_expanded_limits`。所有容量依然有限且
-fail-closed。
+分页上限在每个完整 snapshot 内累计，包含首尾证据读取中的 pagination responses，
+包括每批 reactions 的第一页，而不是单 endpoint 上限或 review 轮次限制。原逐条
+REST reaction 读取方式下，普通多轮审查 PR 即使评论很少，也可能耗尽 20 页，因此
+默认值提高到 100。批量读取减少实际 responses，不裁剪历史 reactions，也不改变其他默认限制。
+`expanded` 的分页上限为 500。默认分页超限且 expanded 能提高有效上限时，报告
+`use_expanded_limits`；expanded 超限，或 expanded 无法改善的 protected custom cap，
+报告 `raise_protected_limit`。所有容量依然有限且 fail-closed。
 
 page size 为 100，单个 response 上限 8 MiB，clean inter-read delay 为 5 秒，
 workflow job timeout 为 14 分钟。确实存在大型 PR 的 repositories 可以通过受保护

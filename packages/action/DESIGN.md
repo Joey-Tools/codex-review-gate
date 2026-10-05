@@ -720,6 +720,44 @@ to decide the fixed PR/head scope. It includes:
 - reviewed-commit resolution and native review `commit_id`; and
 - collection completeness and exact-object refetch results.
 
+### Bounded acquisition batching
+
+Each carrier pass still acquires complete comments and reviews before local
+selection. It reads the latest filtered base-event connection alongside the
+first comment-history GraphQL page, rather than through a separate request.
+Subsequent history pages retain independent deletion/comment cursors; they do
+not repeatedly acquire the latest base event. Both history and epoch validators
+retain their observed-change latches, including on partial responses.
+
+Selected review-request reactions are acquired in bounded GraphQL batches,
+with at most eight comment connections per response and 100 reactions per
+connection page. Bind each comment's node and database IDs, repository and PR
+to the complete REST inventory. Follow each unfinished connection independently
+until its unique reaction count equals a stable `totalCount`; missing nodes,
+GraphQL errors, repeated IDs/cursors, count drift and partial pages fail closed.
+Never fall back to an incomplete REST or GraphQL inventory to produce success.
+
+GraphQL represents the official Codex reaction account as `User`, so its
+typename or `[bot]` login suffix cannot attest REST `Bot` provenance. Each fresh
+carrier pass that observes an official reaction independently reads the exact
+official account through REST, requires its canonical ID/login and `Bot` type,
+and binds the GraphQL reaction author's database ID to that account. The
+account observation is shared only inside that pass, never across snapshots.
+Reaction IDs, times, provenance and history fingerprints feed the unchanged
+reducer. Unrelated actor types cannot authorize review requests.
+
+The page budget counts fetched pagination responses, including empty ones:
+one combined GraphQL response consumes one page, not one page per nested
+connection. Every nested raw object still counts against object capacity;
+response-byte, total-byte, attempt, deadline and batch-size caps remain in
+force. This lowers network fan-out without hiding unbounded evidence.
+
+Exact REST comment/review refetches and missing-pending-review confirmation
+remain mandatory. Opening and closing carrier inventories are still fresh
+GitHub reads, and two complete snapshots still underpin stable success.
+Batching is transport optimization, not an atomic GitHub transaction or a
+comparison of a cached evidence set with itself.
+
 The fingerprint is a deterministic representation of every decision-relevant
 value in that snapshot. It is only an equality check between fresh reads, not
 a durable receipt.
@@ -774,17 +812,19 @@ The profiles are policy, not arbitrary dispatch numbers:
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
-| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| `expanded` | 500 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
 
 The page cap is aggregate within each complete snapshot, including opening and
-closing collection reads and each reaction endpoint's first page. It is not a
-per-endpoint cap or a review-round limit. Ordinary multi-round PRs can exhaust
-20 pages despite a small comment count, so the default now permits 100 pages
-without pruning historical reactions or changing other default limits. Since
-`expanded` has the same page ceiling, page exhaustion requires
-`raise_protected_limit`; default exhaustion of other capacities can still use
-`use_expanded_limits`. Every capacity remains finite and fail-closed.
+closing pagination responses and each reaction batch's first page. It is not a
+per-endpoint cap or a review-round limit. Under the original per-comment REST
+reaction acquisition, ordinary multi-round PRs could exhaust 20 pages despite
+a small comment count, so the default now permits 100 pages. Batching reduces
+actual responses without pruning historical reactions or changing other default
+limits. The expanded profile permits 500 pages. Default page exhaustion uses
+`use_expanded_limits` only when expanded raises the effective ceiling;
+expanded exhaustion, or protected custom caps that expanded cannot improve,
+requires `raise_protected_limit`. Every capacity remains finite and fail-closed.
 
 Page size is 100, one response is capped at 8 MiB, the clean inter-read delay
 is five seconds and the workflow job timeout is 14 minutes. Repositories with

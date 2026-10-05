@@ -427,6 +427,12 @@ reactions；符合条件的 Codex comments/reviews 的 identities、times、acto
 identity 和 body digests；reviewed-SHA resolution 与原生 review `commit_id`；
 以及 pagination 与 exact-refetch completeness。
 
+读取时将选中的 request reactions 按最多八条一批获取，每个 nested connection
+仍独立完整分页；最新 base event 合并到第一份 history response。每轮 fresh carrier
+pass 仍通过独立 REST account read 绑定官方 reaction author 的 ID/login/`Bot` type。
+REST carrier exact refetch、首尾 inventories 和两份 stable snapshots 都保留，
+不会用同一份缓存自我比较来替代 fresh GitHub evidence。
+
 两次读取之间，head 和 decision-relevant fingerprint 必须相同。同一 head 上新的
 request、edit、reaction 或其他 relevant evidence change 会重启 stability window。
 head/lifecycle mismatch 会使运行 stale。API、pagination 或 cap failure 是
@@ -439,14 +445,17 @@ reviewed profiles 固定如下：
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
-| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| `expanded` | 500 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
 
 每个完整 snapshot 使用独立的累计分页预算，其首尾两次证据读取共享该预算。
-第一页也计入，包括空的 reactions 列表；这不是 review 轮次上限，也不是单个 endpoint
-的页数上限。默认分页上限提高，但证据选集及其他默认限制保持不变。`expanded` 仍提高
-其他容量，不再提高分页上限；分页超限因此报告 `raise_protected_limit`，而不是建议无效的
-切换到 `expanded`。预算提高只允许按需读取更多证据，不强制额外读取或后台轮询。
+第一页也计入，包括空的 reactions 列表；每份获取到的 batched GraphQL pagination
+response 计一页，所有 nested raw objects 仍计入 object cap，batch size、完整性、
+byte、attempt 和 time caps 仍生效。这不是 review 轮次上限，也不是单个 endpoint
+的页数上限。默认分页上限提高，但证据选集及其他默认限制保持不变。`expanded` 将分页
+上限提高到 500，并继续提高其他容量。默认分页超限且 expanded 能提高有效上限时，
+报告 `use_expanded_limits`；expanded 超限或无法改善的 protected custom cap 报告
+`raise_protected_limit`。预算提高只允许按需读取更多证据，不强制额外读取或后台轮询。
 runtime 发布后，floating `@v2` 消费者获得新默认值；固定完整版本或 SHA 不会自动变化。
 
 page size 为 100，每个 response 上限为 8 MiB，inter-read delay 为 5 秒，job timeout
