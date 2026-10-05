@@ -94,6 +94,15 @@ minutes. Its snapshot is editable diagnostic output, never review evidence or
 gate authority; an out-of-date run/scope snapshot is ignored. The current
 native `codex/github-review-gate` CheckRun remains the required signal.
 
+The workflow's path filter is a cost-reduction filter, not the final identity
+boundary. [GitHub expression string comparisons and prefix/suffix functions](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions)
+ignore case, so a case-variant lookalike may still allocate a controller runner.
+The published Action validates the event path case-sensitively and, for a
+supported target, binds the fixed canonical workflow ID and actual run/attempt
+before completion-report side effects. The controller never executes PR code;
+runner admission alone cannot authorize a diagnostic write, review request,
+verifier rerun, or gate pass.
+
 For an occasional completed run with no PR association in GitHub's run
 metadata, the controller accepts only an empty association list and derives
 the PR/test-merge binding from the exact canonical verifier `display_title`.

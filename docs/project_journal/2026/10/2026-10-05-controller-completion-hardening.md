@@ -19,7 +19,13 @@ superseded_by:
   expression does not claim to validate a numeric PR number; runtime binding to
   the fixed canonical workflow ID, path, run, attempt, and PR remains the
   authority. Lookalike suffixes, non-merge pull refs, and backup paths are
-  rejected before a runner starts.
+  rejected before a runner starts, subject to GitHub's case-insensitive
+  expression comparisons. Case-variant spellings can still allocate a runner;
+  the already-published Action rejects them through its case-sensitive event
+  path validation before completion-report side effects. Runner admission is
+  a cost filter, not the final identity or write-authority boundary. This
+  clarification follows [consumer PR #128's case-sensitivity finding](https://github.com/Joey-Tools/codex-review-workflows/pull/128#discussion_r4186956142)
+  and [GitHub's expression contract](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions).
 - Preserve associated PR, issue, and manual-input concurrency groups. When a
   workflow-run association is empty, fall back to `workflow_run.id`, then
   `github.run_id`. Keep `cancel-in-progress: false`. These events serialize by

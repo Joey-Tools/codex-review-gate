@@ -53,6 +53,15 @@ set the organisation variable's selected-repository visibility first to only
 after its canary succeeds. No new
 GitHub App or ruleset is required.
 
+The completion path filter reduces unnecessary runners but is not a
+case-sensitive identity boundary: GitHub expression comparisons and
+`startsWith`/`endsWith` ignore case. A case-variant lookalike may allocate a
+controller runner. The published Action validates the event path
+case-sensitively and, for a supported target, verifies the fixed canonical
+workflow ID and actual run/attempt before completion-report side effects.
+No PR code is executed, and runner admission does not authorize writes,
+review requests, verifier reruns, or a gate pass.
+
 If GitHub omits the PR association from a completed run, the workflow accepts
 only an empty association list and the runtime derives the PR/test-merge from
 the exact canonical verifier `display_title`. The internal `pr_number: 0`
