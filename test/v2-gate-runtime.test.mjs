@@ -9622,6 +9622,31 @@ test("report-completion is an exact diagnostic-only snapshot and upserts one sti
   }
 });
 
+test("report-completion accepts the canonical verifier path qualified by a ref", async (context) => {
+  const path = `.github/workflows/codex-review-gate.yml@refs/pull/${PR}/merge`;
+  const fixture = completionRuntimeFixture({
+    currentRunOverrides: { path },
+    attemptOverrides: { path },
+    eventRunOverrides: { path },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "report-completion-qualified-verifier-path",
+    operation: "report-completion",
+    eventName: "workflow_run",
+    requestReview: "false",
+    prNumber: 0,
+    event: fixture.event,
+  });
+
+  const { result } = await runGate(environment, fixture.github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(fixture.github.stickyCreates.length, 1);
+  assert.deepEqual(fixture.github.rerunRequests, []);
+  assert.deepEqual(fixture.github.requestBodies, []);
+});
+
 test("report-completion does not infer a pass from missing or nonunique required checks", async (context) => {
   for (const [suffix, jobCount] of [["missing", 0], ["nonunique", 2]]) {
     const fixture = completionRuntimeFixture({ jobCount });
@@ -9796,6 +9821,28 @@ test("failed first-attempt workflow_run requests Codex once without rerunning th
   assert.ok(github.calls.some(({ method, path }) =>
     method === "GET" && path === `/repos/${REPOSITORY}/actions/runs/7001`
   ));
+});
+
+test("auto request accepts the canonical verifier path qualified by a ref", async (context) => {
+  const path = `.github/workflows/codex-review-gate.yml@refs/pull/${PR}/merge`;
+  const run = verifierRun({ path });
+  const github = createGitHubMock({
+    verifierRuns: [run],
+    verifierRunAttempts: [run],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-request-qualified-verifier-path",
+    eventName: "workflow_run",
+    operation: "begin-review",
+    event: workflowRunEvent(run),
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+  assert.deepEqual(github.rerunRequests, []);
 });
 
 test("auto request requires the exact lowercase true repository-variable mapping", async (context) => {

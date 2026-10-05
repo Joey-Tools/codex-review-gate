@@ -5,7 +5,7 @@ status: active
 created: 2026-10-04
 updated: 2026-10-05
 branch: codex/diagnostic-completion-update
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/101
 supersedes: []
 superseded_by:
 ---
@@ -76,8 +76,9 @@ the runtime-first deployment order above.
   remained pending at 2026-10-04 17:44:19 UTC although verifier run
   `37218963206`, attempt 2, finished successfully at 17:44:40 UTC for head
   `da0b528653055a512dca6b01ebe2fd4fd4778383`.
-- Existing source behavior creates a first diagnostic and never edits it;
-  edited diagnostic markers currently become invalid request boundaries.
+- The v2.1.6 baseline creates a first diagnostic and never edits it; its
+  edited diagnostic markers become invalid request boundaries. The changes
+  in this workstream replace both baseline behaviors as described below.
 - Local formal review is explicitly disabled for this session by Joey. PR
   review uses exact `@codex review`; delivery validation remains required.
 
@@ -92,15 +93,17 @@ the runtime-first deployment order above.
   head/run/attempt/time scope and point to PR Checks as the authority. Unread
   finding/thread counts remain typed `unknown` in the hidden payload but are
   omitted from the visible diagnostic, not converted to zero.
-- Node v24.15.0: `npm run check` passed. The final frozen runtime/action suite
+- Initial implementation, Node v24.15.0: `npm run check` passed. The frozen runtime/action suite
   passed all 273 tests, with no skipped or failed tests. Workflow/security
   contracts passed (8 and 43 tests); the bootstrap exact-canonical-workflow
   contract passed as a focused test. Source/template verifier and controller
   workflows passed actionlint v1.7.12. `git diff --check` passed.
 - A full repository test invocation reached its 600-second deadline and is
   incomplete, not passed. An earlier combined contract invocation also reached
-  its 180-second deadline. Required CI matrix results still need to be checked
-  before landing; the focused results above do not claim full-suite success.
+  its 180-second deadline. The initial PR head `0658fb5` subsequently passed
+  all 20 CI/state-machine checks; its required Codex gate failed on the P1
+  described below. Every new head still requires fresh CI and review evidence.
+  The focused local results above do not claim full-suite success.
 - Completion reporting uses bounded metadata reads, not provider reconciliation.
   A typical single-page path is estimated at about 17 GET requests and at most
   one comment write; pagination and retries can increase reads. Comment-write
@@ -108,3 +111,22 @@ the runtime-first deployment order above.
 - Runtime publication, external consumer rollout, and a real completion canary
   remain next steps under the delivery sequence above. No release manifest,
   consumer repository, or existing PR comment was changed during implementation.
+
+## PR review correction
+
+- PR #101's P1 identified a pre-run admission mismatch: GitHub workflow-run
+  payloads can qualify `path` with `@ref`, while the new controller guard
+  accepted only the bare verifier filename. That could skip both completion
+  reporting and eligible automatic requests before a runner started.
+- Accept the exact canonical path or its canonical `@` prefix, matching the
+  existing runtime validator. Synchronize the source workflow, consumer
+  template, and current bootstrap contract without changing historical
+  handoff constants. Similar filenames, directories, and other workflows
+  remain rejected. Runner, events, permissions, and concurrency are unchanged.
+- Regression tests cover bare paths, `@master`, and `@refs/pull/17/merge`,
+  rejected lookalikes, bootstrap rejection of a widened prefix, and qualified
+  paths through both completion reporting and automatic requests.
+- Node v24.15.0: syntax checks and all 326 affected runtime/action/workflow/security
+  tests passed; the exact canonical bootstrap test passed. The four
+  source/template workflows passed actionlint v1.7.12. Full-repository local
+  tests were not repeated; the PR CI matrix supplies that broader coverage.

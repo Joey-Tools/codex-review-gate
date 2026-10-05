@@ -6314,6 +6314,16 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2ControllerWorkflowContent(
         CANONICAL_CONTROLLER_WORKFLOW.replace(
+          "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+          "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml.backup')",
+        ),
+      ),
+    /job\.if must exactly match/u,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW.replace(
           "github.event.workflow_run.run_attempt == 1",
           "github.event.workflow_run.run_attempt >= 1",
         ),

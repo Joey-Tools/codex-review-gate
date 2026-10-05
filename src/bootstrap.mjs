@@ -190,7 +190,10 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
     (
       github.event_name == 'workflow_run' &&
       github.event.action == 'completed' &&
-      github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' &&
+      (
+        github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||
+        startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')
+      ) &&
       github.event.workflow_run.event == 'pull_request' &&
       !github.event.workflow_run.pull_requests[1]
     )

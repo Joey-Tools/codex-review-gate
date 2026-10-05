@@ -133,6 +133,8 @@ const publisherWorkflow = readFileSync(
 );
 
 const EXACT_BOT = "chatgpt-codex-connector[bot]";
+const CANONICAL_VERIFIER_WORKFLOW_PATH =
+  ".github/workflows/codex-review-gate.yml";
 const MARKETPLACE_ACTION = "JoeyTeng/codex-review-gate-action@v2";
 const CLOSED_JOB_IF = [
   "${{",
@@ -153,7 +155,10 @@ const CLOSED_JOB_IF = [
   "(",
   "github.event_name == 'workflow_run' &&",
   "github.event.action == 'completed' &&",
-  "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' &&",
+  "(",
+  `github.event.workflow_run.path == '${CANONICAL_VERIFIER_WORKFLOW_PATH}' ||`,
+  `startsWith(github.event.workflow_run.path, '${CANONICAL_VERIFIER_WORKFLOW_PATH}@')`,
+  ") &&",
   "github.event.workflow_run.event == 'pull_request' &&",
   "!github.event.workflow_run.pull_requests[1]",
   ")",
@@ -179,7 +184,7 @@ test("source self-installation matches canonical v2 assets after its temporary v
   for (const workflow of [templateConsumer, templateController]) {
     assert.doesNotMatch(
       workflow,
-      /\.github\/workflows\/codex-review-gate\.yml@|workflow_call|secrets:\s*inherit/u,
+      /workflow_call|secrets:\s*inherit/u,
     );
   }
 
@@ -264,6 +269,7 @@ test("automatic runner admission separates read-only PR verification from verifi
     "github.event.comment.user.type == 'Bot'",
     "github.event_name == 'workflow_run'",
     "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml'",
+    "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
     "github.event.workflow_run.event == 'pull_request'",
     "!github.event.workflow_run.pull_requests[1]",
   ]) {
@@ -273,6 +279,30 @@ test("automatic runner admission separates read-only PR verification from verifi
     jobIf,
     /CODEX_REVIEW_GATE_AUTO_REQUEST|workflow_run\.run_attempt|workflow_run\.conclusion|pull_requests\[0\]\.number/u,
   );
+
+  const pathGuard = jobIf.match(
+    /\(\s*github\.event\.workflow_run\.path == '([^']+)'\s*\|\|\s*startsWith\(github\.event\.workflow_run\.path, '([^']+)'\)\s*\)/u,
+  );
+  assert.ok(pathGuard, "job.if must use the closed bare-or-@ref verifier path guard");
+  assert.equal(pathGuard[1], CANONICAL_VERIFIER_WORKFLOW_PATH);
+  assert.equal(pathGuard[2], `${CANONICAL_VERIFIER_WORKFLOW_PATH}@`);
+  const admitsVerifierPath = (path) =>
+    path === pathGuard[1] || path.startsWith(pathGuard[2]);
+  for (const path of [
+    CANONICAL_VERIFIER_WORKFLOW_PATH,
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}@master`,
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}@refs/pull/17/merge`,
+  ]) {
+    assert.equal(admitsVerifierPath(path), true, path);
+  }
+  for (const path of [
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}.backup`,
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}/nested.yml`,
+    `prefix${CANONICAL_VERIFIER_WORKFLOW_PATH}`,
+    `.github/workflows/other.yml@${CANONICAL_VERIFIER_WORKFLOW_PATH}`,
+  ]) {
+    assert.equal(admitsVerifierPath(path), false, path);
+  }
 });
 
 test("controller forwards the raw auto-request variable for strict runtime admission", () => {
@@ -2635,6 +2665,10 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
     templateController.replace(
       "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml'",
       "github.event.workflow_run.path == '.github/workflows/other.yml'",
+    ),
+    templateController.replace(
+      "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+      "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml.backup')",
     ),
     templateController.replace(
       "github.event.workflow_run.event == 'pull_request'",
