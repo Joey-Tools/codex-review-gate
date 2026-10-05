@@ -524,6 +524,13 @@ reviews with their identities, times, actor/App identity and body digests;
 reviewed-SHA resolution and native review `commit_id`; and pagination and
 exact-refetch completeness.
 
+Acquisition batches selected request reactions in groups of at most eight,
+with complete independent pagination for every nested connection, and folds
+the latest base-event read into the first history response. Official reaction
+accounts retain an independent REST ID/login/`Bot` binding in each fresh carrier
+pass. Exact REST carrier refetches, opening/closing inventories and both stable
+snapshots remain; no cached self-comparison replaces fresh GitHub evidence.
+
 The head and decision-relevant fingerprint must match across both reads. A
 same-head request, edit, reaction or other relevant evidence change restarts
 the stability window. A head/lifecycle mismatch makes the run stale. API,
@@ -541,11 +548,15 @@ The reviewed profiles are fixed:
 
 Each complete snapshot has an aggregate page budget shared by its opening and
 closing evidence reads. First pages count, including empty reaction inventories;
+each fetched batched GraphQL pagination response counts once while all nested
+raw objects still count against object capacity. Batch size, connection
+completeness, byte, attempt and time caps remain enforced;
 the limit is not a review-round count or a per-endpoint page limit. The default
 page ceiling is raised without changing evidence selection or the other default
-limits. `expanded` increases the page ceiling to 500 as well as the other
-capacities. Default page exhaustion reports `use_expanded_limits` when that
-profile can help; expanded page exhaustion reports `raise_protected_limit`.
+limits. `expanded` raises the page ceiling to 500 as well as the other capacities.
+Default page exhaustion reports `use_expanded_limits` only when expanded raises
+the effective ceiling. Expanded exhaustion, or protected custom caps that
+expanded cannot improve, reports `raise_protected_limit`.
 Larger budgets permit more reads when needed, not mandatory
 extra reads or background polling. Existing floating `@v2` consumers receive the
 new default after runtime publication; immutable version/SHA pins do not move.

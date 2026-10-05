@@ -51,6 +51,8 @@ const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
 const HUMAN = { login: "joey", type: "User" };
 const READER = { login: "reader", type: "User" };
 const CODEX_APP = { slug: "chatgpt-codex-connector" };
+const CODEX_BOT_DATABASE_ID = 90_510;
+const HUMAN_DATABASE_ID = 90_511;
 const V2_RUNTIME_PATH = fileURLToPath(
   new URL("../packages/action/src/v2/gate-runtime.mjs", import.meta.url),
 );
@@ -1129,20 +1131,19 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
   assert.match(summary, /0 unresolved, 0 resolved, 0 historical, 0 indeterminate/u);
   assert.match(summary, new RegExp(TEST_MERGE, "u"));
   assert.equal(github.stickyCreates.length, 0);
-  const baseEpochCalls = github.calls.filter(({ path, body }) =>
-    path === "/graphql" && body?.query?.includes("CodexReviewGateBaseEpoch")
-  );
-  assert.equal(baseEpochCalls.length, 4);
-  for (const { body } of baseEpochCalls) {
-    assert.deepEqual(body.variables, { owner: OWNER, repo: REPO, number: PR });
-    assert.match(body.query, /BASE_REF_CHANGED_EVENT/u);
-    assert.match(body.query, /BASE_REF_FORCE_PUSHED_EVENT/u);
-    assert.match(body.query, /timelineItems\(\s*last: 1/su);
-  }
   const deletedCommentCalls = github.calls.filter(({ path, body }) =>
     path === "/graphql" && body?.query?.includes("CodexReviewGateDeletedComments")
   );
   assert.equal(deletedCommentCalls.length, 4);
+  const baseEpochCalls = deletedCommentCalls.filter(({ body }) =>
+    body.variables.includeBaseEpoch === true
+  );
+  assert.equal(baseEpochCalls.length, 4);
+  for (const { body } of baseEpochCalls) {
+    assert.match(body.query, /BASE_REF_CHANGED_EVENT/u);
+    assert.match(body.query, /BASE_REF_FORCE_PUSHED_EVENT/u);
+    assert.match(body.query, /timelineItems\(\s*last: 1/su);
+  }
   for (const { body } of deletedCommentCalls) {
     assert.deepEqual(body.variables, {
       owner: OWNER,
@@ -1152,6 +1153,7 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
       commentCursor: null,
       includeDeleted: true,
       includeComments: true,
+      includeBaseEpoch: true,
     });
     assert.match(body.query, /totalCount/u);
     assert.match(body.query, /databaseId:\s*fullDatabaseId/u);
@@ -1527,7 +1529,7 @@ test("latest base-ref timeline epoch invalidates older positive evidence on the 
     assert.match(result.report.reason, /strictly newer than base epoch/u, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
     assert.equal(
-      github.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
+      hasRequestReactionGraphQlCall(github, ordinary.id),
       true,
       `${suffix}: pre-epoch ordinary request reactions remain negative liveness evidence`,
     );
@@ -1591,9 +1593,7 @@ test("same-second base-epoch requests remain physical without gaining positive a
   assert.equal(historicallyClosed.report.gateOutcome, "success");
   assert.match(historicallyClosed.report.reason, /request-reaction 502/u);
   assert.equal(
-    historicallyClosedGitHub.calls.some(({ path }) =>
-      path.endsWith("/comments/101/reactions")
-    ),
+    hasRequestReactionGraphQlCall(historicallyClosedGitHub, 101),
     true,
   );
 });
@@ -1649,7 +1649,7 @@ test("a pre-epoch same-head request can veto a later direct clean with post-epoc
     assert.equal(result.report.recoveryCode, "wait_provider", suffix);
     assert.match(result.report.reason, /review is still in progress/iu, suffix);
     assert.equal(
-      github.calls.some(({ path }) => path.endsWith("/comments/101/reactions")),
+      hasRequestReactionGraphQlCall(github, 101),
       true,
       `${suffix}: pre-epoch requests retain a complete post-epoch liveness inventory`,
     );
@@ -1755,7 +1755,7 @@ test("the only canonical request at the base epoch cannot gain authority from it
   assert.equal(result.report.requiresReplacementPr, false);
   assert.match(result.report.reason, /strictly newer than base epoch/iu);
   assert.equal(
-    github.calls.some(({ path }) => path.endsWith("/comments/101/reactions")),
+    hasRequestReactionGraphQlCall(github, 101),
     true,
   );
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
@@ -1942,7 +1942,7 @@ test("same-head old-base requests remain physical after a base epoch without pos
   assert.equal(unclosed.report.recoveryCode, "request_clean_generation");
   assert.match(unclosed.report.reason, /earlier request 102.*newer request 103/iu);
   assert.equal(
-    unclosedGitHub.calls.some(({ path }) => path.endsWith("/comments/102/reactions")),
+    hasRequestReactionGraphQlCall(unclosedGitHub, 102),
     true,
     "the authorized same-head old-base request needs a complete reaction inventory",
   );
@@ -2055,7 +2055,7 @@ test("same-head stale-base requests preserve a physical gap without a base epoch
   assert.equal(result.report.recoveryCode, "request_clean_generation");
   assert.match(result.report.reason, /earlier request 102.*newer request 103/iu);
   assert.equal(
-    github.calls.some(({ path }) => path.endsWith("/comments/102/reactions")),
+    hasRequestReactionGraphQlCall(github, 102),
     true,
   );
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
@@ -2611,6 +2611,11 @@ test("deleted-comment GraphQL pagination preserves a second-page boundary", asyn
     null,
     "deleted-comment:1",
   ]);
+  assert.deepEqual(calls.map(({ body }) =>
+    body.variables.includeBaseEpoch === true
+  ), [true, false, true, false]);
+  assert.equal(calls[1].body.variables.includeBaseEpoch, undefined);
+  assert.equal(calls[3].body.variables.includeBaseEpoch, undefined);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -3204,7 +3209,261 @@ test("reaction identity tombstones prevent ordinary reactions from becoming auth
   }
 });
 
-test("an official Codex reaction with invalid actor provenance blocks success", async (context) => {
+test("batched request reactions require exact comment and parent identities", async (context) => {
+  const malformedResponses = [
+    ["missing-alias-node", (response) => { response.data.comment0 = null; }],
+    ["wrong-node-id", (response) => { response.data.comment0.id = "IC_test_999"; }],
+    ["wrong-database-id", (response) => { response.data.comment0.databaseId = "999"; }],
+    ["wrong-pull-request", (response) => {
+      response.data.comment0.pullRequest.number = PR + 1;
+    }],
+    ["wrong-repository-id", (response) => {
+      response.data.comment0.pullRequest.repository.databaseId = "999";
+    }],
+    ["wrong-repository-name", (response) => {
+      response.data.comment0.pullRequest.repository.nameWithOwner = "other/repo";
+    }],
+  ];
+
+  for (const [suffix, mutate] of malformedResponses) {
+    const request = ordinaryRequest();
+    const github = createGitHubMock({
+      issueComments: [request],
+      reactionsByCommentId: new Map([[String(request.id), [reaction({ user: HUMAN })]]]),
+      reactionGraphQlResponseMutator: (response) => {
+        mutate(response);
+        return response;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `reaction-comment-binding-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, /exact issue-comment, repository, and pull-request identity/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    assert.equal(hasRequestReactionRestRead(github, request.id), false, suffix);
+  }
+});
+
+test("batched reaction pages reject count drift and non-advancing cursors", async (context) => {
+  const cases = [
+    ["incomplete-count", 1, (response) => {
+      response.data.comment0.reactions.totalCount = 2;
+    }, /pagination was incomplete/iu],
+    ["drifting-count", 2, (response, { variables }) => {
+      if (variables.reactionCursor0 !== null) {
+        response.data.comment0.reactions.totalCount += 1;
+      }
+    }, /total count changed while paging/iu],
+    ["repeated-cursor", 3, (response, { variables }) => {
+      if (variables.reactionCursor0 !== null) {
+        response.data.comment0.reactions.pageInfo.endCursor =
+          variables.reactionCursor0;
+      }
+    }, /pagination repeated a cursor/iu],
+  ];
+
+  for (const [suffix, reactionCount, mutate, expectedReason] of cases) {
+    const request = ordinaryRequest();
+    const github = createGitHubMock({
+      issueComments: [request],
+      reactionsByCommentId: new Map([[String(request.id), Array.from(
+        { length: reactionCount },
+        (_, index) => reaction({ id: 21_000 + index, user: HUMAN }),
+      )]]),
+      reactionGraphQlPageSize: 1,
+      reactionGraphQlResponseMutator: (response, metadata) => {
+        mutate(response, metadata);
+        return response;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `reaction-pagination-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.match(result.report.reason, expectedReason, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    assert.equal(hasRequestReactionRestRead(github, request.id), false, suffix);
+  }
+});
+
+test("nested reaction and author objects still consume the snapshot object budget", async (context) => {
+  const request = ordinaryRequest();
+  const github = createGitHubMock({
+    issueComments: [request],
+    reactionsByCommentId: new Map([[String(request.id), Array.from(
+      { length: 500 },
+      (_, index) => reaction({ id: 23_000 + index, user: HUMAN }),
+    )]]),
+    reactionGraphQlPageSize: 100,
+  });
+  const environment = runtimeEnvironment(context, { suffix: "reaction-nested-object-budget" });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "use_expanded_limits");
+  assert.match(result.report.reason, /Evidence object soft limit exceeded.*2000/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("official reaction authors are bound to one fresh REST account read per carrier pass", async (context) => {
+  const request = ordinaryRequest();
+  const github = createGitHubMock({
+    issueComments: [request],
+    reactionsByCommentId: new Map([[String(request.id), [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "reaction-official-actor-binding" });
+  await runGate(environment, github);
+
+  const reactionCalls = requestReactionGraphQlCalls(github);
+  const accountReads = github.calls.filter(({ method, path }) =>
+    method === "GET" && path === `/users/${encodeURIComponent(CODEX_BOT.login)}`
+  );
+  assert.equal(reactionCalls.length, 2, "one complete inventory has opening and closing carrier passes");
+  assert.equal(accountReads.length, 2, "no official actor identity is cached across fresh carrier passes");
+});
+
+test("a nonofficial GraphQL Bot typename receives no inferred provider authority", async (context) => {
+  const request = ordinaryRequest();
+  const github = createGitHubMock({
+    issueComments: [request],
+    reactionsByCommentId: new Map([[String(request.id), [reaction({
+      user: { login: "review-request-app[bot]", type: "Bot" },
+    })]]]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "reaction-nonofficial-typename" });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(
+    github.calls.some(({ method, path }) =>
+      method === "GET" && path === `/users/${encodeURIComponent(CODEX_BOT.login)}`
+    ),
+    false,
+    "nonofficial GraphQL actors do not trigger or inherit official account attribution",
+  );
+});
+
+test("official reaction account and GraphQL actor mismatches fail closed", async (context) => {
+  const cases = [
+    ["rest-account-type", { id: CODEX_BOT_DATABASE_ID, login: CODEX_BOT.login, type: "User" }, null],
+    ["graphql-account-id", null, (response) => {
+      response.data.comment0.reactions.nodes[0].user.databaseId =
+        String(CODEX_BOT_DATABASE_ID + 1);
+    }],
+  ];
+  for (const [suffix, officialReactionAccount, mutate] of cases) {
+    const request = ordinaryRequest();
+    const github = createGitHubMock({
+      issueComments: [request],
+      reactionsByCommentId: new Map([[String(request.id), [reaction()]]]),
+      officialReactionAccount,
+      reactionGraphQlResponseMutator: mutate
+        ? (response) => { mutate(response); return response; }
+        : null,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `reaction-official-identity-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    assert.equal(
+      github.calls.filter(({ method, path }) =>
+        method === "GET" && path === `/users/${encodeURIComponent(CODEX_BOT.login)}`
+      ).length,
+      4,
+      suffix,
+    );
+  }
+});
+
+test("visible official reactions stay latched when a batched response later errors and disappears", async (context) => {
+  const request = ordinaryRequest();
+  let responses = 0;
+  const github = createGitHubMock({
+    issueComments: [request],
+    reactionSnapshotsByCommentId: new Map([[String(request.id), [
+      [
+        reaction(),
+        reaction({ id: 22_002, content: "eyes", created_at: "2026-08-25T08:02:00Z" }),
+      ],
+      [reaction()],
+      [reaction()],
+      [reaction()],
+    ]]]),
+    reactionGraphQlResponseMutator: (response) => {
+      responses += 1;
+      if (responses === 1) response.errors = [{ message: "synthetic partial reaction batch" }];
+      return response;
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "reaction-batch-partial-graphql-error" });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /reaction-rest:101.*22002.*disappeared/iu);
+  assert.ok(responses > 1, "the first partial response is followed by fresh inventories");
+  assert.equal(hasRequestReactionRestRead(github, request.id), false);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("valid reaction identities preceding an oversized GraphQL page remain latched", async (context) => {
+  const request = ordinaryRequest();
+  const oversizedPage = [
+    reaction(),
+    reaction({ id: 22_102, content: "eyes", created_at: "2026-08-25T08:02:00Z" }),
+    ...Array.from({ length: 99 }, (_, index) => reaction({
+      id: 22_200 + index,
+      content: "heart",
+      user: HUMAN,
+    })),
+  ];
+  const github = createGitHubMock({
+    issueComments: [request],
+    reactionSnapshotsByCommentId: new Map([[String(request.id), [
+      oversizedPage,
+      [reaction()],
+      [reaction()],
+      [reaction()],
+    ]]]),
+    reactionGraphQlPageSize: 101,
+  });
+  const environment = runtimeEnvironment(context, { suffix: "oversized-reaction-page-latch" });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.match(result.report.reason, /reaction-rest:101.*22102.*disappeared/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(hasRequestReactionRestRead(github, request.id), false);
+});
+
+test("GraphQL User-typed Codex reactions require and accept exact REST Bot binding", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest()],
     reactionsByCommentId: new Map([["101", [
@@ -3225,8 +3484,14 @@ test("an official Codex reaction with invalid actor provenance blocks success", 
 
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
-  assert.match(result.report.reason, /Codex eyes reaction 592 has invalid Bot provenance/iu);
-  assert.equal(result.report.counts.indeterminate > 0, true);
+  assert.match(result.report.reason, /review is still in progress/iu);
+  assert.equal(result.report.counts.indeterminate, 0);
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/users/${encodeURIComponent(CODEX_BOT.login)}`
+    ).length,
+    2,
+  );
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -4042,7 +4307,7 @@ test("base-epoch GraphQL accepts unrelated timeline items with no filtered event
           ...response.data.repository,
           pullRequest: {
             ...response.data.repository.pullRequest,
-            timelineItems: {
+            baseEpochTimelineItems: {
               totalCount: 13,
               filteredCount: 0,
               pageCount: 0,
@@ -5279,7 +5544,7 @@ test("default-any ordinary requests accept an official terminal clean receipt", 
       suffix,
     );
     assert.equal(
-      terminalGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
+      hasRequestReactionGraphQlCall(terminalGitHub, ordinary.id),
       true,
       suffix,
     );
@@ -5390,7 +5655,7 @@ test("default-any ordinary requests accept an official terminal clean receipt", 
   const { result: reactionResult } = await runGate(reactionEnvironment, reactionGitHub);
   assert.equal(reactionResult.report.gateOutcome, "pending");
   assert.equal(
-    reactionGitHub.calls.some((call) => call.path.endsWith(`/${ordinary.id}/reactions`)),
+    hasRequestReactionGraphQlCall(reactionGitHub, ordinary.id),
     true,
   );
 });
@@ -6596,7 +6861,7 @@ test("request-author write policy is opt-in and the default any policy skips col
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.executionHealth, "healthy");
   assert.equal(
-    github.calls.some((call) => call.path.endsWith(`/${request.id}/reactions`)),
+    hasRequestReactionGraphQlCall(github, request.id),
     false,
   );
 
@@ -6670,9 +6935,8 @@ test("a denied exact request remains a lineage boundary without granting clean a
   );
   assert.equal(
     ambiguousGitHub.calls.some(({ path }) =>
-      path === `/repos/${REPOSITORY}/issues/comments/${deniedU.id}` ||
-      path === `/repos/${REPOSITORY}/issues/comments/${deniedU.id}/reactions`
-    ),
+      path === `/repos/${REPOSITORY}/issues/comments/${deniedU.id}`
+    ) || hasRequestReactionGraphQlCall(ambiguousGitHub, deniedU.id),
     false,
     "the denied boundary remains read-only snapshot evidence without extra API fan-out",
   );
@@ -6909,9 +7173,8 @@ test("provider-triggerable invalid request shapes remain physical-only boundarie
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
     assert.equal(
       github.calls.some(({ path }) =>
-        path === `/repos/${REPOSITORY}/issues/comments/102` ||
-        path === `/repos/${REPOSITORY}/issues/comments/102/reactions`
-      ),
+        path === `/repos/${REPOSITORY}/issues/comments/102`
+      ) || hasRequestReactionGraphQlCall(github, 102),
       false,
       `${suffix}: physical-only boundaries must not consume exact-refetch or reaction budget`,
     );
@@ -6970,9 +7233,8 @@ test("provider-triggerable invalid request shapes remain physical-only boundarie
   assert.equal(visibleTrailerResult.report.recoveryCode, "request_clean_generation");
   assert.equal(
     visibleTrailerGitHub.calls.some(({ path }) =>
-      path === `/repos/${REPOSITORY}/issues/comments/102` ||
-      path === `/repos/${REPOSITORY}/issues/comments/102/reactions`
-    ),
+      path === `/repos/${REPOSITORY}/issues/comments/102`
+    ) || hasRequestReactionGraphQlCall(visibleTrailerGitHub, 102),
     false,
   );
 });
@@ -7028,7 +7290,7 @@ test("exact Codex provider carriers never become request generations", async (co
         true,
       );
       assert.equal(
-        github.calls.some(({ path }) => path.endsWith("/comments/201/reactions")),
+        hasRequestReactionGraphQlCall(github, 201),
         false,
       );
     } else {
@@ -7084,9 +7346,8 @@ test("edited-away trusted request comments remain unknown physical boundaries", 
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
     assert.equal(
       github.calls.some(({ path }) =>
-        path === `/repos/${REPOSITORY}/issues/comments/102` ||
-        path === `/repos/${REPOSITORY}/issues/comments/102/reactions`
-      ),
+        path === `/repos/${REPOSITORY}/issues/comments/102`
+      ) || hasRequestReactionGraphQlCall(github, 102),
       false,
       `${suffix}: unknown history stays physical-only without extra API fan-out`,
     );
@@ -7240,9 +7501,7 @@ test("opt-in write policy caches permissions and avoids exact-refetch DoS", asyn
       `denied request ${denied.id} must not be exact-refetched`,
     );
     assert.equal(
-      deniedGitHub.calls.some(({ path }) =>
-        path === `/repos/${REPOSITORY}/issues/comments/${denied.id}/reactions`
-      ),
+      hasRequestReactionGraphQlCall(deniedGitHub, denied.id),
       false,
       `denied request ${denied.id} must not consume reaction budget`,
     );
@@ -8221,9 +8480,7 @@ test("provider first-gap closure requires a quiet terminal-to-successor window",
   assert.equal(incompleteInventory.report.gateOutcome, "pending");
   assert.equal(incompleteInventory.report.recoveryCode, "request_clean_generation");
   assert.equal(
-    incompleteInventoryGitHub.calls.some(({ path }) =>
-      path.endsWith("/comments/101/reactions")
-    ),
+    hasRequestReactionGraphQlCall(incompleteInventoryGitHub, 101),
     false,
   );
 });
@@ -8627,10 +8884,7 @@ test("GraphQL lastEditedAt makes same-second request history physical-only", asy
   assert.equal(canonical.report.gateOutcome, "pending");
   assert.equal(canonical.report.requiresReplacementPr, true);
   assert.match(canonical.report.reason, /invalid binding/iu);
-  assert.equal(
-    canonicalGitHub.calls.some(({ path }) => path.endsWith("/comments/101/reactions")),
-    false,
-  );
+  assert.equal(hasRequestReactionGraphQlCall(canonicalGitHub, 101), false);
 });
 
 test("a same-second edited provider terminal has no positive or superseding authority", async (context) => {
@@ -9497,83 +9751,134 @@ test("default page budget completes snapshots with more than twenty aggregate pa
       updated_at: `2026-08-25T07:0${index}:00Z`,
       html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${1_000 + index}`,
     }));
+  const requestComments = [...historicalRequests, workflowRequest()];
+  const reactionsByCommentId = new Map(requestComments.map((comment) => [
+    String(comment.id),
+    Array.from({ length: 25 }, (_, index) => reaction({
+      id: comment.id * 100 + index,
+      user: HUMAN,
+      created_at: "2026-08-25T07:00:00Z",
+    })),
+  ]));
   const github = createGitHubMock({
     issueComments: [
       ...historicalRequests,
       workflowRequest(),
       cleanIssueComment(HEAD),
     ],
-    requestInterceptor: ({ method, path, url }) => {
-      if (method !== "GET" || !path.endsWith("/reactions")) return undefined;
-      const page = Number(url.searchParams.get("page") || "1");
-      const commentId = Number(path.match(/\/comments\/(\d+)\/reactions$/u)?.[1] || "0");
-      const headers = page < 5
-        ? { link: `<${new URL(`${url.origin}${path}?per_page=100&page=${page + 1}`).href}>; rel="next"` }
-        : {};
-      return jsonResponse([reaction({
-        id: commentId * 10 + page,
-        user: HUMAN,
-        created_at: "2026-08-25T07:00:00Z",
-      })], 200, headers);
-    },
+    reactionsByCommentId,
+    reactionGraphQlPageSize: 1,
   });
   const environment = runtimeEnvironment(context, { suffix: "default-page-budget-over-20" });
   const { result } = await runGate(environment, github);
-  const reactionPages = github.calls.filter(({ method, path }) =>
-    method === "GET" && path.endsWith("/reactions"));
+  const reactionPages = requestReactionGraphQlCalls(github);
 
   assert.equal(result.exitCode, 0, result.report.reason);
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
-  assert.ok(reactionPages.length > 20, `expected >20 aggregate pages, got ${reactionPages.length}`);
+  assert.equal(reactionPages.length, 100, "25 nested pages across four fresh carrier passes");
+  assert.ok(reactionPages.length > 20, `expected >20 physical reaction pages, got ${reactionPages.length}`);
+  for (const { body } of reactionPages) {
+    assert.ok(
+      Object.keys(body.variables).filter((key) => /^nodeId\d+$/u.test(key)).length <= 8,
+      "each reaction request remains within the fixed batch size",
+    );
+  }
+  const requestIds = new Set(requestComments.map(({ id }) => String(id)));
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && [...requestIds].some((id) =>
+        path === `/repos/${REPOSITORY}/issues/comments/${id}/reactions`
+      )
+    ).length,
+    0,
+    "selected requests no longer cause one REST reaction GET per request page",
+  );
+});
+
+test("request reaction reads batch nine exact comments into two measured GraphQL calls per carrier inventory", async (context) => {
+  const requests = Array.from({ length: 9 }, (_, index) => {
+    const id = 101 + index;
+    return ordinaryRequest({
+      id,
+      created_at: `2026-08-25T08:${String(index).padStart(2, "0")}:00Z`,
+      updated_at: `2026-08-25T08:${String(index).padStart(2, "0")}:00Z`,
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${id}`,
+    });
+  });
+  const reactionsByCommentId = new Map(requests.map(({ id }) => [String(id), [
+    reaction({
+      id: 20_000 + id,
+      user: HUMAN,
+      created_at: "2026-08-25T09:00:00Z",
+    }),
+  ]]));
+  const github = createGitHubMock({ issueComments: requests, reactionsByCommentId });
+  const environment = runtimeEnvironment(context, { suffix: "batched-nine-requests" });
+  const { result } = await runGate(environment, github);
+  const reactionCalls = requestReactionGraphQlCalls(github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(
+    reactionCalls.length,
+    4,
+    "two batched reads in each of two fresh carrier inventories",
+  );
+  const callsPerComment = new Map(requests.map(({ id }) => [String(id), 0]));
+  for (const { body } of reactionCalls) {
+    const nodeIds = Object.entries(body.variables || {})
+      .filter(([name]) => /^nodeId\d+$/u.test(name))
+      .map(([, value]) => value);
+    assert.ok(nodeIds.length > 0 && nodeIds.length <= 8);
+    for (const nodeId of nodeIds) {
+      const id = nodeId.replace(/^IC_test_/u, "");
+      callsPerComment.set(id, (callsPerComment.get(id) || 0) + 1);
+    }
+  }
+  assert.deepEqual([...callsPerComment.values()], Array(9).fill(2));
+  const requestIds = new Set(requests.map(({ id }) => String(id)));
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && [...requestIds].some((id) =>
+        path === `/repos/${REPOSITORY}/issues/comments/${id}/reactions`
+      )
+    ).length,
+    0,
+    "the former nine-by-two independent REST first-page reads are gone",
+  );
+  assert.ok(reactionCalls.length < requests.length * 2);
 });
 
 test("expanded page budget completes snapshots with more than one hundred aggregate pages", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
-    requestInterceptor: ({ method, path, url }) => {
-      if (
-        method !== "GET" ||
-        path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`
-      ) return undefined;
-      const page = Number(url.searchParams.get("page") || "1");
-      const headers = page < 60
-        ? { link: `<${new URL(`${url.origin}${path}?per_page=100&page=${page + 1}`).href}>; rel="next"` }
-        : {};
-      return jsonResponse([reaction({
-        id: 5_000 + page,
+    reactionsByCommentId: new Map([["101", Array.from({ length: 30 }, (_, index) =>
+      reaction({
+        id: 7_000 + index,
         user: HUMAN,
         created_at: "2026-08-25T07:00:00Z",
-      })], 200, headers);
-    },
+      }))]]),
+    reactionGraphQlPageSize: 1,
   });
   const environment = runtimeEnvironment(context, {
     suffix: "expanded-page-budget-over-100",
     limitsProfile: "expanded",
   });
   const { result } = await runGate(environment, github);
-  const reactionPages = github.calls.filter(({ method, path }) =>
-    method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/101/reactions`);
+  const reactionPages = requestReactionGraphQlCalls(github);
 
   assert.equal(result.exitCode, 0, result.report.reason);
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
-  assert.ok(reactionPages.length > 100, `expected >100 aggregate pages, got ${reactionPages.length}`);
+  assert.equal(reactionPages.length, 120, "30 nested pages across four fresh carrier passes");
+  assert.ok(reactionPages.length > 100, `expected >100 physical reaction pages, got ${reactionPages.length}`);
 });
 
 test("default page-budget exhaustion recommends expanded limits without writing success", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
-    requestInterceptor: ({ method, path, url }) => {
-      if (method !== "GET" || path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`) {
-        return undefined;
-      }
-      const page = Number(url.searchParams.get("page") || "1");
-      const next = new URL(url);
-      next.searchParams.set("per_page", "100");
-      next.searchParams.set("page", String(page + 1));
-      return jsonResponse([reaction({ id: 6_000 + page, user: HUMAN })], 200, {
-        link: `<${next.href}>; rel="next"`,
-      });
-    },
+    reactionsByCommentId: new Map([["101", Array.from({ length: 101 }, (_, index) =>
+      reaction({ id: 8_000 + index, user: HUMAN }))]]),
+    reactionGraphQlPageSize: 1,
   });
   const environment = runtimeEnvironment(context, { suffix: "default-page-budget-exhausted" });
   const { result } = await runGate(environment, github);
@@ -9589,18 +9894,9 @@ test("default page-budget exhaustion recommends expanded limits without writing 
 test("expanded page-budget exhaustion reports the protected limit without writing success", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
-    requestInterceptor: ({ method, path, url }) => {
-      if (method !== "GET" || path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`) {
-        return undefined;
-      }
-      const page = Number(url.searchParams.get("page") || "1");
-      const next = new URL(url);
-      next.searchParams.set("per_page", "100");
-      next.searchParams.set("page", String(page + 1));
-      return jsonResponse([reaction({ id: 7_000 + page, user: HUMAN })], 200, {
-        link: `<${next.href}>; rel="next"`,
-      });
-    },
+    reactionsByCommentId: new Map([["101", Array.from({ length: 501 }, (_, index) =>
+      reaction({ id: 9_000 + index, user: HUMAN }))]]),
+    reactionGraphQlPageSize: 1,
   });
   const environment = runtimeEnvironment(context, {
     suffix: "expanded-page-budget-exhausted",
@@ -12687,6 +12983,29 @@ async function runGate(environment, github, {
   return { result, sleeps };
 }
 
+function requestReactionGraphQlCalls(github) {
+  return github.calls.filter(({ method, path, body }) =>
+    method === "POST" &&
+    path === "/graphql" &&
+    body?.query?.includes("CodexReviewGateRequestReactions")
+  );
+}
+
+function hasRequestReactionGraphQlCall(github, commentId, nodeId = `IC_test_${commentId}`) {
+  return requestReactionGraphQlCalls(github).some(({ body }) =>
+    Object.entries(body.variables || {}).some(([name, value]) =>
+      /^nodeId\d+$/u.test(name) && value === nodeId
+    )
+  );
+}
+
+function hasRequestReactionRestRead(github, commentId) {
+  return github.calls.some(({ method, path }) =>
+    method === "GET" &&
+    path === `/repos/${REPOSITORY}/issues/comments/${commentId}/reactions`
+  );
+}
+
 function readOutputs(path) {
   return Object.fromEntries(
     readFileSync(path, "utf8")
@@ -12706,6 +13025,9 @@ function createGitHubMock({
   reviewSnapshots = null,
   reactionsByCommentId = new Map(),
   reactionSnapshotsByCommentId = new Map(),
+  reactionGraphQlPageSize = 100,
+  reactionGraphQlResponseMutator = null,
+  officialReactionAccount = null,
   pullRequestOverrides = {},
   pullRequestSequence = null,
   repositoryOverrides = {},
@@ -12739,9 +13061,9 @@ function createGitHubMock({
   verifierRerunStatus = 201,
   requestInterceptor = null,
 } = {}) {
-  const comments = issueComments.map((value) => structuredClone(value));
+  const comments = issueComments.map(testIssueCommentWithNodeId);
   const commentSnapshots = issueCommentSnapshots?.map((snapshotComments) =>
-    snapshotComments.map((value) => structuredClone(value))) || null;
+    snapshotComments.map(testIssueCommentWithNodeId)) || null;
   const reviewList = reviews.map((value) => structuredClone(value));
   const reviewSnapshotList = reviewSnapshots?.map((snapshotReviews) =>
     snapshotReviews.map((value) => structuredClone(value))) || null;
@@ -12890,6 +13212,16 @@ function createGitHubMock({
       if (intercepted !== undefined) return intercepted;
     }
 
+    if (
+      method === "GET" &&
+      path === `/users/${encodeURIComponent(CODEX_BOT.login)}`
+    ) {
+      return jsonResponse(officialReactionAccount || {
+        id: CODEX_BOT_DATABASE_ID,
+        login: CODEX_BOT.login,
+        type: "Bot",
+      });
+    }
     if (method === "GET" && path === `/repos/${REPOSITORY}`) {
       return jsonResponse(repository());
     }
@@ -13001,45 +13333,64 @@ function createGitHubMock({
     if (
       method === "POST" &&
       path === "/graphql" &&
+      body?.query?.includes("CodexReviewGateRequestReactions")
+    ) {
+      const response = requestReactionGraphQlResponse({
+        variables: body.variables || {},
+        comments: activeComments,
+        reactionsByCommentId,
+        reactionSnapshotsByCommentId,
+        reactionSnapshotIndexes,
+        pageSize: reactionGraphQlPageSize,
+      });
+      return jsonResponse(
+        typeof reactionGraphQlResponseMutator === "function"
+          ? reactionGraphQlResponseMutator(response, {
+              variables: body.variables || {},
+              calls: [...calls],
+            })
+          : response,
+      );
+    }
+    if (
+      method === "POST" &&
+      path === "/graphql" &&
       body?.query?.includes("CodexReviewGateDeletedComments")
     ) {
       const cursor = body.variables?.cursor ?? null;
       const events = currentDeletedCommentEvents();
+      const includeBaseEpoch = body.variables?.includeBaseEpoch === true;
+      const selectedBaseEpoch = includeBaseEpoch
+        ? baseEpochSequence
+          ? baseEpochSequence[Math.min(baseEpochIndex, baseEpochSequence.length - 1)]
+          : baseEpoch
+        : null;
+      if (includeBaseEpoch) baseEpochIndex += 1;
       const response = deletedCommentGraphQlResponse(events, {
         cursor,
         commentCursor: body.variables?.commentCursor ?? null,
         comments: activeComments,
         includeDeleted: body.variables?.includeDeleted !== false,
         includeComments: body.variables?.includeComments !== false,
+        includeBaseEpoch,
+        baseEpochEvent: selectedBaseEpoch,
         pageSize: deletedCommentPageSize,
       });
+      const baseEpochMutated = includeBaseEpoch &&
+          typeof baseEpochResponseMutator === "function"
+        ? baseEpochResponseMutator(response.body)
+        : response.body;
       const mutated = typeof deletedCommentResponseMutator === "function"
-        ? deletedCommentResponseMutator(response.body, {
+        ? deletedCommentResponseMutator(baseEpochMutated, {
             cursor,
             commentCursor: body.variables?.commentCursor ?? null,
             includeDeleted: body.variables?.includeDeleted !== false,
             includeComments: body.variables?.includeComments !== false,
             snapshotIndex: deletedCommentSnapshotIndex,
           })
-        : response.body;
+        : baseEpochMutated;
       if (!response.hasNext) deletedCommentSnapshotIndex += 1;
       return jsonResponse(mutated);
-    }
-    if (
-      method === "POST" &&
-      path === "/graphql" &&
-      body?.query?.includes("CodexReviewGateBaseEpoch")
-    ) {
-      const selected = baseEpochSequence
-        ? baseEpochSequence[Math.min(baseEpochIndex, baseEpochSequence.length - 1)]
-        : baseEpoch;
-      baseEpochIndex += 1;
-      const response = baseEpochGraphQlResponse(selected);
-      return jsonResponse(
-        typeof baseEpochResponseMutator === "function"
-          ? baseEpochResponseMutator(response)
-          : response,
-      );
     }
     if (method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`) {
       if (unknownPostUsed && postUnknownReread === "failure") {
@@ -13128,6 +13479,7 @@ function createGitHubMock({
     if (method === "POST" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`) {
       const created = {
         id: nextCommentId,
+        node_id: `IC_test_${nextCommentId}`,
         body: body.body,
         created_at: "2026-08-25T09:00:00Z",
         updated_at: "2026-08-25T09:00:00Z",
@@ -13144,7 +13496,7 @@ function createGitHubMock({
       if (body.body.startsWith("@codex review")) requestBodies.push(body.body);
       if (body.body.includes(`<!-- ${V2_STICKY_MARKER} -->`)) stickyCreates.push(body.body);
       if (postUnknownAfterCreate && !unknownPostUsed && body.body.startsWith("@codex review")) {
-        comments.push(...postUnknownConcurrentComments.map((comment) => structuredClone(comment)));
+        comments.push(...postUnknownConcurrentComments.map(testIssueCommentWithNodeId));
         unknownPostUsed = true;
         return jsonResponse({ message: "synthetic unknown POST" }, 500);
       }
@@ -13234,12 +13586,112 @@ function baseEpochGraphQlResponse(event = null) {
   };
 }
 
+function testIssueCommentWithNodeId(value) {
+  const comment = structuredClone(value);
+  if (!Object.hasOwn(comment, "node_id")) {
+    comment.node_id = `IC_test_${comment.id}`;
+  }
+  return comment;
+}
+
+function requestReactionGraphQlResponse({
+  variables,
+  comments,
+  reactionsByCommentId,
+  reactionSnapshotsByCommentId,
+  reactionSnapshotIndexes,
+  pageSize = 100,
+}) {
+  const data = {};
+  const indexes = Object.keys(variables)
+    .flatMap((key) => /^nodeId(\d+)$/u.exec(key)?.[1] ?? [])
+    .map(Number)
+    .sort((left, right) => left - right);
+  for (const index of indexes) {
+    const nodeId = variables[`nodeId${index}`];
+    const comment = comments.find((value) => value.node_id === nodeId);
+    if (!comment) {
+      data[`comment${index}`] = null;
+      continue;
+    }
+    const id = String(comment.id);
+    const snapshots = reactionSnapshotsByCommentId.get(id);
+    const snapshotIndex = reactionSnapshotIndexes.get(id) || 0;
+    const values = snapshots
+      ? snapshots[Math.min(snapshotIndex, snapshots.length - 1)] || []
+      : reactionsByCommentId.get(id) || [];
+    const rawCursor = variables[`reactionCursor${index}`] ?? null;
+    const cursorMatch = rawCursor === null
+      ? null
+      : new RegExp(`^reaction:${id}:(\\d+)$`, "u").exec(String(rawCursor));
+    const start = cursorMatch ? Number(cursorMatch[1]) : 0;
+    const size = Math.max(1, Number(pageSize) || 1);
+    const pageReactions = values.slice(start, start + size);
+    const nextOffset = start + pageReactions.length;
+    const hasNextPage = nextOffset < values.length;
+    data[`comment${index}`] = {
+      __typename: "IssueComment",
+      id: comment.node_id,
+      databaseId: String(comment.id),
+      pullRequest: {
+        number: PR,
+        repository: {
+          databaseId: REPO_ID,
+          nameWithOwner: REPOSITORY,
+        },
+      },
+      reactions: {
+        totalCount: values.length,
+        nodes: pageReactions.map(graphQlReactionNode),
+        pageInfo: {
+          hasNextPage,
+          endCursor: hasNextPage ? `reaction:${id}:${nextOffset}` : null,
+        },
+      },
+    };
+    if (snapshots && !hasNextPage) {
+      reactionSnapshotIndexes.set(id, snapshotIndex + 1);
+    }
+  }
+  return { data };
+}
+
+function graphQlReactionNode(value) {
+  const contentByRestValue = {
+    "+1": "THUMBS_UP",
+    "-1": "THUMBS_DOWN",
+    confused: "CONFUSED",
+    eyes: "EYES",
+    heart: "HEART",
+    hooray: "HOORAY",
+    laugh: "LAUGH",
+    rocket: "ROCKET",
+  };
+  const official = value.user?.login === CODEX_BOT.login;
+  return {
+    databaseId: String(value.id),
+    content: contentByRestValue[value.content],
+    createdAt: value.created_at,
+    user: {
+      __typename: value.user?.type === "Bot" ? "User" : value.user?.type,
+      databaseId: official
+        ? CODEX_BOT_DATABASE_ID
+        : value.user?.login === HUMAN.login
+          ? HUMAN_DATABASE_ID
+          : 90_512,
+      login: value.user?.login,
+    },
+  };
+}
+
 function deletedCommentGraphQlResponse(events, {
   cursor = null,
   commentCursor = null,
   comments = [],
   includeDeleted = true,
   includeComments = true,
+  includeBaseEpoch = false,
+  baseEpochEvent = null,
   pageSize = 100,
 } = {}) {
   const match = cursor === null
@@ -13260,6 +13712,11 @@ function deletedCommentGraphQlResponse(events, {
   const commentNextOffset = commentStart + commentNodes.length;
   const commentsHaveNext = includeComments && commentNextOffset < comments.length;
   const pullRequest = { number: PR };
+  if (includeBaseEpoch) {
+    pullRequest.baseEpochTimelineItems =
+      baseEpochGraphQlResponse(baseEpochEvent)
+        .data.repository.pullRequest.timelineItems;
+  }
   if (includeDeleted) {
     pullRequest.timelineItems = {
       totalCount: events.length,
