@@ -56,11 +56,23 @@ GitHub App or ruleset is required.
 If GitHub omits the PR association from a completed run, the workflow accepts
 only an empty association list and the runtime derives the PR/test-merge from
 the exact canonical verifier `display_title`. The internal `pr_number: 0`
-sentinel is limited to `report-completion`. This fallback uses a repository-
-scoped empty-suffix concurrency group and relies on a final point-in-time
-recheck, not complete per-PR serialization; it never makes the PR mergeable.
-Publish the compatible Action runtime before installing this controller
-revision. Do not send `report-completion` to v2.1.6 or older runtime code.
+sentinel is limited to `report-completion`. Known PR, issue, and manual inputs
+retain their existing PR-scoped concurrency group. An association-empty
+completion uses `workflow_run.id`, with `github.run_id` as a final fallback,
+so these runs have per-run groups rather than one shared empty group. This does
+not serialize completions by their runtime-derived PR. The runtime rechecks the
+exact current PR, run, attempt, and CheckRun immediately before the
+diagnostic-only metadata write; that point-in-time check is not an atomic lock
+or gate authority. The snapshot never makes the PR mergeable.
+
+The v2.1.7 Action release predates this controller-template hardening, so
+consumers installed from that release still have the prior broad qualified-path
+guard and shared empty-association group. The source bootstrap accepts only
+that exact previous controller for upgrade and writes the updated template.
+This change does not alter the published Action runtime, payload, or release
+manifest; no new Action release is needed. Runtime-first ordering still applies
+to any consumer that has not yet installed a runtime supporting
+`report-completion`.
 
 The controller's sole `pull-requests: write` permission posts its canonical
 request marker and diagnostic snapshot only on a PR. GitHub's issue-comment endpoints

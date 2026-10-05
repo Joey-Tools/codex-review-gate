@@ -177,6 +177,34 @@ const CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE = {
   ...CANONICAL_WORKFLOWS,
   legacyBridge: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
 };
+function previousCanonicalControllerWorkflow() {
+  const currentGroupLine =
+    "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id }}";
+  const previousGroupLine =
+    "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}";
+  const currentPathFilter = [
+    "            github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||",
+    "            (",
+    "              startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/') &&",
+    "              endsWith(github.event.workflow_run.path, '/merge')",
+    "            )",
+  ].join("\n");
+  const previousPathFilter = [
+    "            github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||",
+    "            startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+  ].join("\n");
+  const withPreviousGroup = CANONICAL_CONTROLLER_WORKFLOW.replace(
+    currentGroupLine,
+    previousGroupLine,
+  );
+  assert.notEqual(withPreviousGroup, CANONICAL_CONTROLLER_WORKFLOW);
+  const previousController = withPreviousGroup.replace(
+    currentPathFilter,
+    previousPathFilter,
+  );
+  assert.notEqual(previousController, withPreviousGroup);
+  return previousController;
+}
 const DEFAULT_BRANCH_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CANARY_HEAD_SHA = "0123456789abcdef0123456789abcdef01234567";
 const CANARY_REPOSITORY_ID = 1234;
@@ -2513,6 +2541,39 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
     assert.equal(repeat.status, 0, repeat.stderr);
     assert.match(repeat.stdout, /local verifier already matches the canonical v2 bytes/u);
     assert.match(repeat.stdout, /local controller already matches the canonical v2 bytes/u);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("prepare-worktree upgrades the exact previous canonical controller concurrency group", () => {
+  const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bootstrap-"));
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const controllerPath = join(
+    workflowsDirectory,
+    "codex-review-gate-controller.yml",
+  );
+  const previousCanonicalController = previousCanonicalControllerWorkflow();
+  try {
+    initializeGitRepository(targetRoot);
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(controllerPath, previousCanonicalController, "utf8");
+
+    const dryRun = runBootstrap(["--prepare-worktree", targetRoot]);
+    assert.equal(dryRun.status, 0, dryRun.stderr);
+    assert.match(
+      dryRun.stdout,
+      /Dry run: would replace the drifted controller workflow with canonical v2 bytes/u,
+    );
+    assert.equal(readFileSync(controllerPath, "utf8"), previousCanonicalController);
+
+    const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
+    assert.equal(apply.status, 0, apply.stderr);
+    assert.match(
+      apply.stdout,
+      /Applied: replace the drifted controller workflow with canonical v2 bytes/u,
+    );
+    assert.equal(readFileSync(controllerPath, "utf8"), CANONICAL_CONTROLLER_WORKFLOW);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
   }
@@ -6314,8 +6375,8 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2ControllerWorkflowContent(
         CANONICAL_CONTROLLER_WORKFLOW.replace(
-          "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
-          "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml.backup')",
+          "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/')",
+          "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@lookalike.yml@refs/pull/')",
         ),
       ),
     /job\.if must exactly match/u,
@@ -6334,8 +6395,8 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2ControllerWorkflowContent(
         CANONICAL_CONTROLLER_WORKFLOW.replace(
-          "github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number",
-          "github.event.issue.number || inputs.pr_number",
+          "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id }}",
+          "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.id }}",
         ),
       ),
     /unexpected concurrency\.group/u,
@@ -6581,6 +6642,69 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   assert.equal(
     validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOWS),
     CANONICAL_WORKFLOWS,
+  );
+
+  const previousCanonicalController = previousCanonicalControllerWorkflow();
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        previousCanonicalController,
+      ),
+    /job\.if must exactly match/u,
+    "the prior controller is accepted only as installed inventory, never as current canonical input",
+  );
+  const previousCanonicalInventory = cleanInventory.map((file) =>
+    file.path === DEFAULT_CONTROLLER_WORKFLOW_PATH
+      ? { ...file, content: previousCanonicalController }
+      : file,
+  );
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      previousCanonicalInventory,
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "the exact previously installed controller remains recognizable for upgrade",
+  );
+  const customControllerInventory = previousCanonicalInventory.map((file) =>
+    file.path === DEFAULT_CONTROLLER_WORKFLOW_PATH
+      ? {
+          ...file,
+          content: file.content.replace(
+            "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}",
+            "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.id }}",
+          ),
+        }
+      : file,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        customControllerInventory,
+        CANONICAL_WORKFLOWS,
+      ),
+    /unexpected concurrency\.group/u,
+    "an unrecognized controller concurrency group is not a migration alias",
+  );
+  const lookalikeGuardInventory = previousCanonicalInventory.map((file) =>
+    file.path === DEFAULT_CONTROLLER_WORKFLOW_PATH
+      ? {
+          ...file,
+          content: file.content.replace(
+            "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+            "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@lookalike.yml')",
+          ),
+        }
+      : file,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2WorkflowInventory(
+        lookalikeGuardInventory,
+        CANONICAL_WORKFLOWS,
+      ),
+    /job\.if must exactly match/u,
+    "the migration alias is the exact prior controller, not its widened guard",
   );
 
   const legacyInventory = [
@@ -13756,7 +13880,7 @@ syncBuiltinESMExports();
 
 assert.equal(
   test.registeredCount,
-  164,
+  165,
   "bootstrap test shard registration inventory drift",
 );
 

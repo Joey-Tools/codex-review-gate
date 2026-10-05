@@ -1387,7 +1387,8 @@ runtime SHA 相同的 fresh PR read。受保护的 top-level `run-name` 还让 G
 successful feature-head CheckRun 会在执行语义上绑定 exact current test-merge。为了避免 idle PR 消耗
 minutes，没有 cron、`pull_request_target` 或可写 review event。verifier 在 `opened`、
 `reopened`、`synchronize` 与 `ready_for_review` 上启动；controller 与 verifier 使用独立
-per-PR concurrency namespace。生效的 `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确等于 `true` 时，
+concurrency namespaces；已关联事件按 PR 分组，空关联 completion event 使用 per-run fallback
+group。生效的 `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确等于 `true` 时，
 合格的失败 canonical verifier 可通过 `workflow_run` 唤醒受保护 controller，为当前 PR scope
 创建缺失的 canonical request。自动启动只创建 request，不会立即 rerun verifier。只有该自动路径
 可识别其他 controller run 留下、repository/PR/head/base 全部精确匹配的 canonical marker；

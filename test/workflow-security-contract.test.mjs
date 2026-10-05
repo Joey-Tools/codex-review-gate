@@ -157,7 +157,10 @@ const CLOSED_JOB_IF = [
   "github.event.action == 'completed' &&",
   "(",
   `github.event.workflow_run.path == '${CANONICAL_VERIFIER_WORKFLOW_PATH}' ||`,
-  `startsWith(github.event.workflow_run.path, '${CANONICAL_VERIFIER_WORKFLOW_PATH}@')`,
+  "(",
+  `startsWith(github.event.workflow_run.path, '${CANONICAL_VERIFIER_WORKFLOW_PATH}@refs/pull/') &&`,
+  "endsWith(github.event.workflow_run.path, '/merge')",
+  ")",
   ") &&",
   "github.event.workflow_run.event == 'pull_request' &&",
   "!github.event.workflow_run.pull_requests[1]",
@@ -269,7 +272,8 @@ test("automatic runner admission separates read-only PR verification from verifi
     "github.event.comment.user.type == 'Bot'",
     "github.event_name == 'workflow_run'",
     "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml'",
-    "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+    "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/')",
+    "endsWith(github.event.workflow_run.path, '/merge')",
     "github.event.workflow_run.event == 'pull_request'",
     "!github.event.workflow_run.pull_requests[1]",
   ]) {
@@ -281,22 +285,27 @@ test("automatic runner admission separates read-only PR verification from verifi
   );
 
   const pathGuard = jobIf.match(
-    /\(\s*github\.event\.workflow_run\.path == '([^']+)'\s*\|\|\s*startsWith\(github\.event\.workflow_run\.path, '([^']+)'\)\s*\)/u,
+    /\(\s*github\.event\.workflow_run\.path == '([^']+)'\s*\|\|\s*\(\s*startsWith\(github\.event\.workflow_run\.path, '([^']+)'\)\s*&&\s*endsWith\(github\.event\.workflow_run\.path, '([^']+)'\)\s*\)\s*\)/u,
   );
-  assert.ok(pathGuard, "job.if must use the closed bare-or-@ref verifier path guard");
+  assert.ok(pathGuard, "job.if must use the closed canonical-or-pull-merge verifier path guard");
   assert.equal(pathGuard[1], CANONICAL_VERIFIER_WORKFLOW_PATH);
-  assert.equal(pathGuard[2], `${CANONICAL_VERIFIER_WORKFLOW_PATH}@`);
+  assert.equal(pathGuard[2], `${CANONICAL_VERIFIER_WORKFLOW_PATH}@refs/pull/`);
+  assert.equal(pathGuard[3], "/merge");
   const admitsVerifierPath = (path) =>
-    path === pathGuard[1] || path.startsWith(pathGuard[2]);
+    path === pathGuard[1] ||
+    (path.startsWith(pathGuard[2]) && path.endsWith(pathGuard[3]));
   for (const path of [
     CANONICAL_VERIFIER_WORKFLOW_PATH,
-    `${CANONICAL_VERIFIER_WORKFLOW_PATH}@master`,
     `${CANONICAL_VERIFIER_WORKFLOW_PATH}@refs/pull/17/merge`,
   ]) {
     assert.equal(admitsVerifierPath(path), true, path);
   }
   for (const path of [
     `${CANONICAL_VERIFIER_WORKFLOW_PATH}.backup`,
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}@lookalike.yml`,
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}@lookalike.yml@refs/pull/17/merge`,
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}@refs/pull/17/head`,
+    `${CANONICAL_VERIFIER_WORKFLOW_PATH}@refs/pull/17/merge/backup`,
     `${CANONICAL_VERIFIER_WORKFLOW_PATH}/nested.yml`,
     `prefix${CANONICAL_VERIFIER_WORKFLOW_PATH}`,
     `.github/workflows/other.yml@${CANONICAL_VERIFIER_WORKFLOW_PATH}`,
@@ -2607,7 +2616,7 @@ test("consumer routing fixes automatic reconciliation and permits only reviewed 
   }
 });
 
-test("verifier cancellation and controller serialization use separate PR concurrency namespaces", () => {
+test("verifier cancellation stays PR-scoped while empty-association controller runs serialize by run ID", () => {
   const verifier = parseVerifierWorkflow(templateConsumer);
   const controller = parseControllerWorkflow(templateController);
   assert.deepEqual(blockScalarMapping(verifier.concurrency), {
@@ -2617,7 +2626,7 @@ test("verifier cancellation and controller serialization use separate PR concurr
   });
   assert.deepEqual(blockScalarMapping(controller.concurrency), {
     group:
-      "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}",
+      "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id }}",
     "cancel-in-progress": "false",
   });
 });
@@ -2667,8 +2676,16 @@ test("security structure rejects extra jobs, steps, and execution escape keys", 
       "github.event.workflow_run.path == '.github/workflows/other.yml'",
     ),
     templateController.replace(
-      "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
-      "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml.backup')",
+      "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/')",
+      "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@lookalike.yml@refs/pull/')",
+    ),
+    templateController.replace(
+      "endsWith(github.event.workflow_run.path, '/merge')",
+      "endsWith(github.event.workflow_run.path, '/head')",
+    ),
+    templateController.replace(
+      "endsWith(github.event.workflow_run.path, '/merge')",
+      "endsWith(github.event.workflow_run.path, '/merge/backup')",
     ),
     templateController.replace(
       "github.event.workflow_run.event == 'pull_request'",

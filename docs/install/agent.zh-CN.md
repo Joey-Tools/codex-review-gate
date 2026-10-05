@@ -1105,7 +1105,8 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   `request_review`；没有 dispatch limits profile；
 - 默认 `ubuntu-slim`，只有
   `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` 选择 `ubuntu-latest`；
-- verifier/controller 使用独立 concurrency namespaces；verifier latest-wins cancel，
+- verifier/controller 使用独立 concurrency namespaces；已关联的 controller event 仍按 PR
+  分组，空关联 completion event 使用 per-run fallback group；verifier latest-wins cancel，
   controller operations 不 cancel；
 - 没有 cron、`repository_dispatch`、`pull_request_target`、可写
   `pull_request_review`、status bridge、runtime App 或 ledger。

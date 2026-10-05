@@ -98,11 +98,20 @@ For an occasional completed run with no PR association in GitHub's run
 metadata, the controller accepts only an empty association list and derives
 the PR/test-merge binding from the exact canonical verifier `display_title`.
 The `pr_number: 0` input is an internal sentinel for that case; runtime then
-rechecks the exact current PR, run, attempt and CheckRun before writing. Such an
-event shares the repository-scoped empty-suffix concurrency group rather than
-the usual PR-specific group, so final point-in-time revalidation—not global
-per-PR serialization—protects the diagnostic write. This snapshot never makes
-a PR mergeable.
+rechecks the exact current PR, run, attempt and CheckRun immediately before its
+diagnostic-only metadata write. Associated PR, issue, and manual events retain
+their existing PR-scoped group; an association-empty completion uses its
+`workflow_run.id`, with `github.run_id` as the final fallback. This isolates
+those events by run, not by the derived PR, so point-in-time revalidation is
+still not an atomic lock or global per-PR serialization. The snapshot never
+makes a PR mergeable.
+
+This controller-only hardening follows the v2.1.7 Action release. Consumers
+installed from that release retain the previous broad qualified-path check and
+shared empty-association group until their controller is upgraded. Bootstrap
+recognizes only that exact prior canonical controller as upgrade input and
+installs the updated source template; no Action runtime payload or release
+manifest changes are required.
 
 Roll out in order: publish an Action runtime that supports
 `report-completion`, then install the matching canonical controller workflow
@@ -121,9 +130,10 @@ Both workflows call the compatible floating major:
 uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
-The copied workflows own separate triggers, minimal permissions, per-PR
-concurrency namespaces, typed `workflow_dispatch`, exact pre-runner Codex-bot
-filtering and protected repository configuration. The Action remains API-only:
+The copied workflows own separate triggers, minimal permissions, PR-scoped
+concurrency groups with a per-run fallback for association-empty completion
+events, typed `workflow_dispatch`, exact pre-runner Codex-bot filtering and
+protected repository configuration. The Action remains API-only:
 it never checks out or executes pull-request code. There is no commit-status
 bridge: only the verifier's native feature-head CheckRun, execution-bound to the
 current test-merge, can satisfy the gate.

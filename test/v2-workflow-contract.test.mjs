@@ -181,12 +181,18 @@ test("canonical controller starts runners only for dispatches, Codex comments, o
     "github.event_name == 'workflow_run'",
     "github.event.action == 'completed'",
     "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml'",
-    "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+    "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/')",
+    "endsWith(github.event.workflow_run.path, '/merge')",
     "github.event.workflow_run.event == 'pull_request'",
     "!github.event.workflow_run.pull_requests[1]",
   ]) {
     assert.ok(templateController.includes(required), `missing completion filter: ${required}`);
   }
+  assert.doesNotMatch(
+    templateController,
+    /startsWith\(github\.event\.workflow_run\.path, '\.github\/workflows\/codex-review-gate\.yml@'\)/u,
+    "the controller must not admit arbitrary workflow path suffixes",
+  );
   const jobIf = templateController.match(/    if: >-[\s\S]*?    runs-on:/u)?.[0] ?? "";
   assert.doesNotMatch(
     jobIf,
@@ -284,7 +290,7 @@ test("canonical controller has only the adopted write authority and ledgerless i
   );
   assert.match(
     templateController,
-    /group: codex-review-gate-controller-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.workflow_run\.pull_requests\[0\]\.number \|\| github\.event\.issue\.number \|\| inputs\.pr_number \}\}/u,
+    /group: codex-review-gate-controller-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.workflow_run\.pull_requests\[0\]\.number \|\| github\.event\.issue\.number \|\| inputs\.pr_number \|\| github\.event\.workflow_run\.id \|\| github\.run_id \}\}/u,
   );
   assert.match(templateController, /^  cancel-in-progress: false$/mu);
   assert.match(templateController, /^    name: codex\/review-gate-controller$/mu);

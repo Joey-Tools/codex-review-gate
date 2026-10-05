@@ -1296,8 +1296,10 @@ The canonical workflows must have this contract after the merge:
   and `request_review` defaulting to `true`; no dispatch limits profile;
 - `ubuntu-slim` by default, with only
   `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` selecting `ubuntu-latest`;
-- separate verifier/controller concurrency namespaces; verifier latest-wins
-  cancellation and non-cancelling controller operations;
+- separate verifier/controller concurrency namespaces; associated controller
+  events remain PR-scoped, association-empty completion events use a per-run
+  fallback group, verifier cancellation is latest-wins, and controller
+  operations do not cancel in-progress runs;
 - no cron, `repository_dispatch`, `pull_request_target`, writable
   `pull_request_review`, status bridge, runtime App, or ledger.
 

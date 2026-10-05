@@ -192,13 +192,25 @@ const CANONICAL_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
       github.event.action == 'completed' &&
       (
         github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||
-        startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')
+        (
+          startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/') &&
+          endsWith(github.event.workflow_run.path, '/merge')
+        )
       ) &&
       github.event.workflow_run.event == 'pull_request' &&
       !github.event.workflow_run.pull_requests[1]
     )
   }}
 `);
+const PREVIOUS_CANONICAL_CONTROLLER_JOB_IF_EXPRESSION =
+  CANONICAL_CONTROLLER_JOB_IF_EXPRESSION.replace(
+    "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' || ( startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/') && endsWith(github.event.workflow_run.path, '/merge') )",
+    "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' || startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+  );
+const SUPPORTED_INSTALLED_CONTROLLER_JOB_IF_EXPRESSIONS = new Set([
+  CANONICAL_CONTROLLER_JOB_IF_EXPRESSION,
+  PREVIOUS_CANONICAL_CONTROLLER_JOB_IF_EXPRESSION,
+]);
 const FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(`
   \${{
     (
@@ -218,6 +230,25 @@ const FROZEN_HANDOFF_CONTROLLER_JOB_IF_EXPRESSION = normalizeWorkflowExpression(
   }}
 `);
 const CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES = "[created]";
+const CANONICAL_CONTROLLER_CONCURRENCY_GROUP =
+  "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id }}";
+const PREVIOUS_CANONICAL_CONTROLLER_CONCURRENCY_GROUP =
+  "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}";
+const SUPPORTED_INSTALLED_CONTROLLER_CONCURRENCY_GROUPS = new Set([
+  CANONICAL_CONTROLLER_CONCURRENCY_GROUP,
+  PREVIOUS_CANONICAL_CONTROLLER_CONCURRENCY_GROUP,
+]);
+const CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER = [
+  "            github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||",
+  "            (",
+  "              startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/') &&",
+  "              endsWith(github.event.workflow_run.path, '/merge')",
+  "            )",
+].join("\n");
+const PREVIOUS_CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER = [
+  "            github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||",
+  "            startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
+].join("\n");
 const FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES = "[created, edited]";
 const CANONICAL_REQUEST_AUTHOR_PERMISSION = "any";
 const FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION =
@@ -3844,6 +3875,16 @@ function assertExactVerifierPermissionMapping(value, expected) {
 export function validateCanonicalV2ControllerWorkflowContent(value) {
   return validateV2ControllerWorkflowContent(value, {
     jobIfExpression: CANONICAL_CONTROLLER_JOB_IF_EXPRESSION,
+    concurrencyGroups: [CANONICAL_CONTROLLER_CONCURRENCY_GROUP],
+    issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
+    workflowRun: true,
+  });
+}
+
+function validateInstalledCanonicalV2ControllerWorkflowContent(value) {
+  return validateV2ControllerWorkflowContent(value, {
+    jobIfExpression: [...SUPPORTED_INSTALLED_CONTROLLER_JOB_IF_EXPRESSIONS],
+    concurrencyGroups: [...SUPPORTED_INSTALLED_CONTROLLER_CONCURRENCY_GROUPS],
     issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
     workflowRun: true,
   });
@@ -3860,6 +3901,7 @@ function validateFrozenHandoffV2ControllerWorkflowContent(value) {
 
 function validateV2ControllerWorkflowContent(value, {
   jobIfExpression: expectedJobIfExpression,
+  concurrencyGroups = [CANONICAL_CONTROLLER_CONCURRENCY_GROUP],
   issueCommentTypes,
   requestAuthorPermission = CANONICAL_REQUEST_AUTHOR_PERMISSION,
   workflowRun,
@@ -3878,7 +3920,10 @@ function validateV2ControllerWorkflowContent(value, {
   }
 
   const jobIfExpression = extractCanonicalJobIfExpression(value);
-  if (jobIfExpression !== expectedJobIfExpression) {
+  const expectedJobIfExpressions = Array.isArray(expectedJobIfExpression)
+    ? expectedJobIfExpression
+    : [expectedJobIfExpression];
+  if (!expectedJobIfExpressions.includes(jobIfExpression)) {
     throw new Error(
       "Canonical v2 controller workflow job.if must exactly match the closed runner-admission expression.",
     );
@@ -3918,6 +3963,16 @@ function validateV2ControllerWorkflowContent(value, {
   if (!/^  cancel-in-progress: false$/m.test(value)) {
     throw new Error("Canonical v2 controller workflow must not cancel an active request.");
   }
+  if (
+    workflowRun &&
+    !concurrencyGroups.includes(
+      controllerMappings.get("concurrency.group"),
+    )
+  ) {
+    throw new Error(
+      "Canonical v2 controller workflow has an unexpected concurrency.group value.",
+    );
+  }
 
   assertControllerMappingScalar(
     controllerMappings,
@@ -3948,8 +4003,7 @@ function validateV2ControllerWorkflowContent(value, {
   }
   const routedInputs = workflowRun
     ? {
-        concurrencyGroup:
-          "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}",
+        concurrencyGroup: controllerMappings.get("concurrency.group"),
         prNumber:
           "${{ github.event_name == 'workflow_run' && (github.event.workflow_run.pull_requests[0].number || '0') || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
         expectedHeadSha:
@@ -4301,6 +4355,29 @@ export function installedWorkflowMatchesCanonical(installed, canonical) {
     typeof installed === "string" &&
     installed === canonical
   );
+}
+
+function installedControllerMatchesCanonical(installed, canonical) {
+  if (installedWorkflowMatchesCanonical(installed, canonical)) {
+    return true;
+  }
+  const currentGroupLine = `  group: ${CANONICAL_CONTROLLER_CONCURRENCY_GROUP}`;
+  if (
+    canonical.split(currentGroupLine).length !== 2 ||
+    canonical.split(CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER).length !== 2
+  ) {
+    return false;
+  }
+  const previousCanonical = canonical
+    .replace(
+      currentGroupLine,
+      `  group: ${PREVIOUS_CANONICAL_CONTROLLER_CONCURRENCY_GROUP}`,
+    )
+    .replace(
+      CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER,
+      PREVIOUS_CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER,
+    );
+  return installed === previousCanonical;
 }
 
 function assertOneCanonicalActionCall(value, role) {
@@ -4790,6 +4867,7 @@ export function validateCanonicalV2WorkflowInventory(
       legacyBridge,
       validateVerifier: validateCanonicalV2VerifierWorkflowContent,
       validateController: validateCanonicalV2ControllerWorkflowContent,
+      validateInstalledController: validateInstalledCanonicalV2ControllerWorkflowContent,
       validateLegacyBridge: validateCanonicalLegacyBridgeWorkflowContent,
     },
   );
@@ -4876,6 +4954,7 @@ function validateV2WorkflowInventory(
     legacyBridge,
     validateVerifier,
     validateController,
+    validateInstalledController = validateController,
     validateLegacyBridge,
   },
 ) {
@@ -4904,11 +4983,14 @@ function validateV2WorkflowInventory(
     if (role === "verifier") {
       validateVerifier(matches[0].content);
     } else if (role === "controller") {
-      validateController(matches[0].content);
+      validateInstalledController(matches[0].content);
     } else {
       validateLegacyBridge(matches[0].content);
     }
-    if (!installedWorkflowMatchesCanonical(matches[0].content, content)) {
+    const matchesCanonical = role === "controller"
+      ? installedControllerMatchesCanonical(matches[0].content, content)
+      : installedWorkflowMatchesCanonical(matches[0].content, content);
+    if (!matchesCanonical) {
       throw new Error(
         role === "legacy bridge"
           ? `${path} differs from the canonical temporary legacy bridge workflow bytes.`
