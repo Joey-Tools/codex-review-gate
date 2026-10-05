@@ -68,7 +68,7 @@ test("normalizers, profiles, result vocabulary, and production constants are clo
   assert.equal(normalizeV2LimitsProfile("expanded"), "expanded");
   assert.throws(() => normalizeV2LimitsProfile("custom"), /default or expanded/u);
   assert.deepEqual(V2_LIMITS_PROFILES.default, {
-    maxPages: 20,
+    maxPages: 100,
     maxObjects: 2_000,
     maxAttempts: 128,
     maxSnapshotBytes: 32 * 1024 * 1024,
@@ -9487,6 +9487,80 @@ test("fixed default and expanded profiles fail closed at aggregate snapshot caps
   const { result: expandedResult } = await runGate(expandedEnvironment, expandedGitHub);
   assert.equal(expandedResult.exitCode, 1);
   assert.equal(expandedResult.report.recoveryCode, "raise_protected_limit");
+});
+
+test("default page budget completes snapshots with more than twenty aggregate pages", async (context) => {
+  const historicalRequests = Array.from({ length: 5 }, (_, index) =>
+    ordinaryRequest({
+      id: 1_000 + index,
+      created_at: `2026-08-25T07:0${index}:00Z`,
+      updated_at: `2026-08-25T07:0${index}:00Z`,
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${1_000 + index}`,
+    }));
+  const github = createGitHubMock({
+    issueComments: [
+      ...historicalRequests,
+      workflowRequest(),
+      cleanIssueComment(HEAD),
+    ],
+    requestInterceptor: ({ method, path, url }) => {
+      if (method !== "GET" || !path.endsWith("/reactions")) return undefined;
+      const page = Number(url.searchParams.get("page") || "1");
+      const commentId = Number(path.match(/\/comments\/(\d+)\/reactions$/u)?.[1] || "0");
+      const headers = page < 5
+        ? { link: `<${new URL(`${url.origin}${path}?per_page=100&page=${page + 1}`).href}>; rel="next"` }
+        : {};
+      return jsonResponse([reaction({
+        id: commentId * 10 + page,
+        user: HUMAN,
+        created_at: "2026-08-25T07:00:00Z",
+      })], 200, headers);
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "default-page-budget-over-20" });
+  const { result } = await runGate(environment, github);
+  const reactionPages = github.calls.filter(({ method, path }) =>
+    method === "GET" && path.endsWith("/reactions"));
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.ok(reactionPages.length > 20, `expected >20 aggregate pages, got ${reactionPages.length}`);
+});
+
+test("default page-budget exhaustion beyond the protected limit is not recoverable by expanded limits", async (context) => {
+  for (const limitsProfile of ["default", "expanded"]) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+      requestInterceptor: ({ method, path, url }) => {
+        if (method !== "GET" || path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`) {
+          return undefined;
+        }
+        const page = Number(url.searchParams.get("page") || "1");
+        const next = new URL(url);
+        next.searchParams.set("per_page", "100");
+        next.searchParams.set("page", String(page + 1));
+        return jsonResponse([reaction({ id: 6_000 + page, user: HUMAN })], 200, {
+          link: `<${next.href}>; rel="next"`,
+        });
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `page-budget-exhausted-${limitsProfile}`,
+      limitsProfile,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, limitsProfile);
+    assert.equal(result.report.executionHealth, "unhealthy", limitsProfile);
+    assert.equal(result.report.gateOutcome, "pending", limitsProfile);
+    assert.equal(result.report.recoveryCode, "raise_protected_limit", limitsProfile);
+    assert.match(result.report.reason, /101.*100|100.*101/u, limitsProfile);
+    assert.equal(
+      github.statusWrites.some(({ state }) => state === "success"),
+      false,
+      limitsProfile,
+    );
+  }
 });
 
 test("unsupported scope is unhealthy/not_applicable and receives no status write", async (context) => {

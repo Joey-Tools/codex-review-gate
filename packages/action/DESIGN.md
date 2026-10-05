@@ -773,9 +773,18 @@ The profiles are policy, not arbitrary dispatch numbers:
 
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `default` | 20 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
+| `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
 | `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
+
+The page cap is aggregate within each complete snapshot, including opening and
+closing collection reads and each reaction endpoint's first page. It is not a
+per-endpoint cap or a review-round limit. Ordinary multi-round PRs can exhaust
+20 pages despite a small comment count, so the default now permits 100 pages
+without pruning historical reactions or changing other default limits. Since
+`expanded` has the same page ceiling, page exhaustion requires
+`raise_protected_limit`; default exhaustion of other capacities can still use
+`use_expanded_limits`. Every capacity remains finite and fail-closed.
 
 Page size is 100, one response is capped at 8 MiB, the clean inter-read delay
 is five seconds and the workflow job timeout is 14 minutes. Repositories with

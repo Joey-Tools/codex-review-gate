@@ -1475,9 +1475,14 @@ unhealthy execution 是恢复问题，不是 finding verdict。`healthy/pending`
 它表示本次 run 安全地无法授权 success。只有 `recovery_code=wait_provider` 是纯等待；其他
 code 都必须先执行 summary 指定的具体动作，再做后续 exact-head reconcile。
 
-超大 PR 只有在 summary 报告 `use_expanded_limits` 时，才设置受保护 repository
+大型或多轮审查 PR 只有在 summary 报告 `use_expanded_limits` 时，才设置受保护 repository
 variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`。随后重读 exact head 并运行一次
 scoped controller reconcile。manual dispatch 没有 limits-profile 或 numeric override。
+
+默认分页预算为每个完整 snapshot 累计 100 页，包含首尾读取和各 reactions endpoint
+的第一页，不是 review 轮次上限。`expanded` 也为 100 页，仅提高其他资源容量。
+因此新版的分页超限报告 `raise_protected_limit`，不能仅切换 profile 解决；需按 summary
+审查具体容量限制，绝不能忽略未读取证据后放行。
 
 最后重新读取 PR、verifier attempt 与 exact feature-head CheckRun，并同时要求：
 

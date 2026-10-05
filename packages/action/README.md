@@ -535,9 +535,19 @@ The reviewed profiles are fixed:
 
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `default` | 20 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
+| `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
 | `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
+
+Each complete snapshot has an aggregate page budget shared by its opening and
+closing evidence reads. First pages count, including empty reaction inventories;
+the limit is not a review-round count or a per-endpoint page limit. The default
+page ceiling is raised without changing evidence selection or the other default
+limits. `expanded` still increases the other capacities, but not the page ceiling;
+a page-cap hit therefore reports `raise_protected_limit`, not an ineffective
+switch to `expanded`. Larger budgets permit more reads when needed, not mandatory
+extra reads or background polling. Existing floating `@v2` consumers receive the
+new default after runtime publication; immutable version/SHA pins do not move.
 
 Page size is 100, one response is capped at 8 MiB, the inter-read delay is five
 seconds and the job timeout is 14 minutes. A repository may persistently select
