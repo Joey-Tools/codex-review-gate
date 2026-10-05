@@ -824,7 +824,8 @@ actual responses without pruning historical reactions or changing other default
 limits. The expanded profile permits 500 pages. Default page exhaustion uses
 `use_expanded_limits` only when expanded raises the effective ceiling;
 expanded exhaustion, or protected custom caps that expanded cannot improve,
-requires `raise_protected_limit`. Every capacity remains finite and fail-closed.
+requires `raise_protected_limit`. Every capacity remains finite and fail-closed;
+a higher page ceiling does not waive attempt, object, byte or time caps.
 
 Page size is 100, one response is capped at 8 MiB, the clean inter-read delay
 is five seconds and the workflow job timeout is 14 minutes. Repositories with

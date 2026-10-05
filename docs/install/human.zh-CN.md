@@ -1480,9 +1480,10 @@ variable `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`。随后重读 exact head �
 scoped controller reconcile。manual dispatch 没有 limits-profile 或 numeric override。
 
 默认分页预算为每个完整 snapshot 累计 100 页，包含首尾读取和各 reactions endpoint
-的第一页，不是 review 轮次上限。`expanded` 也为 100 页，仅提高其他资源容量。
-因此新版的分页超限报告 `raise_protected_limit`，不能仅切换 profile 解决；需按 summary
-审查具体容量限制，绝不能忽略未读取证据后放行。
+的第一页，不是 review 轮次上限。`expanded` 提高到 500 页，其他资源容量保留既有值。
+默认分页耗尽且 expanded 有帮助时报告 `use_expanded_limits`；expanded 耗尽报告
+`raise_protected_limit`。其他资源上限仍独立生效；需按 summary 审查具体容量限制，
+绝不能忽略未读取证据后放行。
 
 最后重新读取 PR、verifier attempt 与 exact feature-head CheckRun，并同时要求：
 

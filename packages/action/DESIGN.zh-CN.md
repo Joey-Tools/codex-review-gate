@@ -676,6 +676,7 @@ REST reaction 读取方式下，普通多轮审查 PR 即使评论很少，也�
 `expanded` 的分页上限为 500。默认分页超限且 expanded 能提高有效上限时，报告
 `use_expanded_limits`；expanded 超限，或 expanded 无法改善的 protected custom cap，
 报告 `raise_protected_limit`。所有容量依然有限且 fail-closed。
+更高分页上限不能豁免 attempt、object、byte 或 time caps。
 
 page size 为 100，单个 response 上限 8 MiB，clean inter-read delay 为 5 秒，
 workflow job timeout 为 14 分钟。确实存在大型 PR 的 repositories 可以通过受保护

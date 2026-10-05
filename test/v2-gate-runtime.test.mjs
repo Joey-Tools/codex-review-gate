@@ -9876,7 +9876,7 @@ test("expanded page budget completes snapshots with more than one hundred aggreg
 test("default page-budget exhaustion recommends expanded limits without writing success", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
-    reactionsByCommentId: new Map([["101", Array.from({ length: 150 }, (_, index) =>
+    reactionsByCommentId: new Map([["101", Array.from({ length: 101 }, (_, index) =>
       reaction({ id: 8_000 + index, user: HUMAN }))]]),
     reactionGraphQlPageSize: 1,
   });
@@ -9894,7 +9894,7 @@ test("default page-budget exhaustion recommends expanded limits without writing 
 test("expanded page-budget exhaustion reports the protected limit without writing success", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
-    reactionsByCommentId: new Map([["101", Array.from({ length: 550 }, (_, index) =>
+    reactionsByCommentId: new Map([["101", Array.from({ length: 501 }, (_, index) =>
       reaction({ id: 9_000 + index, user: HUMAN }))]]),
     reactionGraphQlPageSize: 1,
   });
