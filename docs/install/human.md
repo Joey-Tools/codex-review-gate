@@ -1798,7 +1798,7 @@ success yet. Only `recovery_code=wait_provider` is a pure wait; every other
 code requires the concrete action named by the summary before a later
 exact-head reconcile.
 
-For an unusually large PR, set the reviewed protected Actions variable only
+For a large or multi-round-review PR, set the reviewed protected Actions variable only
 when the summary reports `use_expanded_limits`:
 
 ```bash
@@ -1810,6 +1810,14 @@ gh variable set CODEX_REVIEW_GATE_LIMITS_PROFILE \
 Then reread the exact head and run one scoped controller reconcile. Manual
 dispatch has no limits-profile or numeric override. Only the named profiles
 are supported.
+
+The default page budget is 100 aggregate pages per complete snapshot, including
+opening/closing reads and each reaction endpoint's first page, not 100 review
+rounds. `expanded` permits 500 pages and retains its higher other resource
+capacities. Default page exhaustion reports `use_expanded_limits` when that
+profile helps; expanded exhaustion reports `raise_protected_limit`. Other
+resource caps remain independent. Review the specific capacity named in the
+summary rather than ignoring unread evidence to pass.
 
 Finally, re-read the PR, verifier attempt and exact feature-head CheckRun.
 Require

@@ -417,7 +417,9 @@ superseded_by: 20260918-organization-v2-handoff
 - Every authoritative collection is fully paginated. A cap hit leaves the gate
   pending, reports execution unhealthy, and names the exact cap, observed stop
   point, and next safe action (`expanded` or a reviewed protected-limit change).
-- Canonical profiles are fixed:
+- Initial canonical profiles were fixed as follows. The default page ceiling
+  is superseded by the [2026-10-05 capacity correction](../10/2026-10-05-default-page-budget.md);
+  the other initial limits below remain unchanged:
   - `default`: 20 pages, 2,000 raw objects, 128 API attempts, 32 MiB snapshot,
     10-second request timeout, and 60-second reconcile budget;
   - `expanded`: 100 pages, 10,000 raw objects, 512 API attempts, 64 MiB snapshot,

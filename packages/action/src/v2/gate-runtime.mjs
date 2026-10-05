@@ -29,7 +29,7 @@ export const V2_OUTPUT_KEYS = Object.freeze([
 
 export const V2_LIMITS_PROFILES = Object.freeze({
   default: Object.freeze({
-    maxPages: 20,
+    maxPages: 100,
     maxObjects: 2_000,
     maxAttempts: 128,
     maxSnapshotBytes: 32 * 1024 * 1024,
@@ -37,7 +37,7 @@ export const V2_LIMITS_PROFILES = Object.freeze({
     reconcileBudgetMs: 60_000,
   }),
   expanded: Object.freeze({
-    maxPages: 100,
+    maxPages: 500,
     maxObjects: 10_000,
     maxAttempts: 512,
     maxSnapshotBytes: 64 * 1024 * 1024,
@@ -1389,6 +1389,7 @@ class V2SnapshotBudget {
       throw this.limitFailure(
         `Aggregate GitHub pagination limit exceeded while loading ${label}: ` +
           `${this.pages} > ${this.maxPages}`,
+        { expandedCanHelp: this.maxPages < V2_LIMITS_PROFILES.expanded.maxPages },
       );
     }
   }
@@ -1407,10 +1408,12 @@ class V2SnapshotBudget {
     }
   }
 
-  limitFailure(message) {
+  limitFailure(message, { expandedCanHelp = true } = {}) {
     return new V2RuntimeFailure(message, {
       recoveryCode:
-        this.profile === "default" ? "use_expanded_limits" : "raise_protected_limit",
+        this.profile === "default" && expandedCanHelp
+          ? "use_expanded_limits"
+          : "raise_protected_limit",
     });
   }
 }
