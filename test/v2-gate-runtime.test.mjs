@@ -76,7 +76,7 @@ test("normalizers, profiles, result vocabulary, and production constants are clo
     reconcileBudgetMs: 60_000,
   });
   assert.deepEqual(V2_LIMITS_PROFILES.expanded, {
-    maxPages: 100,
+    maxPages: 500,
     maxObjects: 10_000,
     maxAttempts: 512,
     maxSnapshotBytes: 64 * 1024 * 1024,
@@ -9522,45 +9522,98 @@ test("default page budget completes snapshots with more than twenty aggregate pa
   const reactionPages = github.calls.filter(({ method, path }) =>
     method === "GET" && path.endsWith("/reactions"));
 
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
   assert.ok(reactionPages.length > 20, `expected >20 aggregate pages, got ${reactionPages.length}`);
 });
 
-test("default page-budget exhaustion beyond the protected limit is not recoverable by expanded limits", async (context) => {
-  for (const limitsProfile of ["default", "expanded"]) {
-    const github = createGitHubMock({
-      issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
-      requestInterceptor: ({ method, path, url }) => {
-        if (method !== "GET" || path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`) {
-          return undefined;
-        }
-        const page = Number(url.searchParams.get("page") || "1");
-        const next = new URL(url);
-        next.searchParams.set("per_page", "100");
-        next.searchParams.set("page", String(page + 1));
-        return jsonResponse([reaction({ id: 6_000 + page, user: HUMAN })], 200, {
-          link: `<${next.href}>; rel="next"`,
-        });
-      },
-    });
-    const environment = runtimeEnvironment(context, {
-      suffix: `page-budget-exhausted-${limitsProfile}`,
-      limitsProfile,
-    });
-    const { result } = await runGate(environment, github);
+test("expanded page budget completes snapshots with more than one hundred aggregate pages", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    requestInterceptor: ({ method, path, url }) => {
+      if (
+        method !== "GET" ||
+        path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`
+      ) return undefined;
+      const page = Number(url.searchParams.get("page") || "1");
+      const headers = page < 60
+        ? { link: `<${new URL(`${url.origin}${path}?per_page=100&page=${page + 1}`).href}>; rel="next"` }
+        : {};
+      return jsonResponse([reaction({
+        id: 5_000 + page,
+        user: HUMAN,
+        created_at: "2026-08-25T07:00:00Z",
+      })], 200, headers);
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "expanded-page-budget-over-100",
+    limitsProfile: "expanded",
+  });
+  const { result } = await runGate(environment, github);
+  const reactionPages = github.calls.filter(({ method, path }) =>
+    method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/101/reactions`);
 
-    assert.equal(result.exitCode, 1, limitsProfile);
-    assert.equal(result.report.executionHealth, "unhealthy", limitsProfile);
-    assert.equal(result.report.gateOutcome, "pending", limitsProfile);
-    assert.equal(result.report.recoveryCode, "raise_protected_limit", limitsProfile);
-    assert.match(result.report.reason, /101.*100|100.*101/u, limitsProfile);
-    assert.equal(
-      github.statusWrites.some(({ state }) => state === "success"),
-      false,
-      limitsProfile,
-    );
-  }
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.ok(reactionPages.length > 100, `expected >100 aggregate pages, got ${reactionPages.length}`);
+});
+
+test("default page-budget exhaustion recommends expanded limits without writing success", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    requestInterceptor: ({ method, path, url }) => {
+      if (method !== "GET" || path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`) {
+        return undefined;
+      }
+      const page = Number(url.searchParams.get("page") || "1");
+      const next = new URL(url);
+      next.searchParams.set("per_page", "100");
+      next.searchParams.set("page", String(page + 1));
+      return jsonResponse([reaction({ id: 6_000 + page, user: HUMAN })], 200, {
+        link: `<${next.href}>; rel="next"`,
+      });
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "default-page-budget-exhausted" });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "use_expanded_limits");
+  assert.match(result.report.reason, /101.*100|100.*101/u);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("expanded page-budget exhaustion reports the protected limit without writing success", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    requestInterceptor: ({ method, path, url }) => {
+      if (method !== "GET" || path !== `/repos/${REPOSITORY}/issues/comments/101/reactions`) {
+        return undefined;
+      }
+      const page = Number(url.searchParams.get("page") || "1");
+      const next = new URL(url);
+      next.searchParams.set("per_page", "100");
+      next.searchParams.set("page", String(page + 1));
+      return jsonResponse([reaction({ id: 7_000 + page, user: HUMAN })], 200, {
+        link: `<${next.href}>; rel="next"`,
+      });
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "expanded-page-budget-exhausted",
+    limitsProfile: "expanded",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "raise_protected_limit");
+  assert.match(result.report.reason, /501.*500|500.*501/u);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("unsupported scope is unhealthy/not_applicable and receives no status write", async (context) => {

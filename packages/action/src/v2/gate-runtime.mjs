@@ -37,7 +37,7 @@ export const V2_LIMITS_PROFILES = Object.freeze({
     reconcileBudgetMs: 60_000,
   }),
   expanded: Object.freeze({
-    maxPages: 100,
+    maxPages: 500,
     maxObjects: 10_000,
     maxAttempts: 512,
     maxSnapshotBytes: 64 * 1024 * 1024,

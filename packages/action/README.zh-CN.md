@@ -439,14 +439,15 @@ reviewed profiles 固定如下：
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
-| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| `expanded` | 500 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
 
 每个完整 snapshot 使用独立的累计分页预算，其首尾两次证据读取共享该预算。
 第一页也计入，包括空的 reactions 列表；这不是 review 轮次上限，也不是单个 endpoint
-的页数上限。默认分页上限提高，但证据选集及其他默认限制保持不变。`expanded` 仍提高
-其他容量，不再提高分页上限；分页超限因此报告 `raise_protected_limit`，而不是建议无效的
-切换到 `expanded`。预算提高只允许按需读取更多证据，不强制额外读取或后台轮询。
+的页数上限。默认分页上限提高，但证据选集及其他默认限制保持不变。`expanded` 的分页
+上限提高到 500，并继续提高其他容量。默认分页耗尽且 expanded 有帮助时报告
+`use_expanded_limits`；expanded 分页耗尽报告 `raise_protected_limit`。
+预算提高只允许按需读取更多证据，不强制额外读取或后台轮询。
 runtime 发布后，floating `@v2` 消费者获得新默认值；固定完整版本或 SHA 不会自动变化。
 
 page size 为 100，每个 response 上限为 8 MiB，inter-read delay 为 5 秒，job timeout

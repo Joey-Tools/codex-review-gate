@@ -637,15 +637,16 @@ profiles 是 policy，不是任意 dispatch numbers：
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
-| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| `expanded` | 500 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
 
 分页上限在每个完整 snapshot 内累计，包含首尾证据读取以及每个 reactions endpoint
 的第一页，不是单 endpoint 上限或 review 轮次限制。普通多轮审查 PR 即使评论很少，
 也可能耗尽 20 页，因此默认值提高到 100，但不裁剪历史 reactions，不改变其他默认限制。
-`expanded` 的分页上限同样是 100，因此分页超限必须报告 `raise_protected_limit`；
-其他默认容量超限仍可按对应指标报告 `use_expanded_limits`。所有容量依然有限且
-fail-closed。
+`expanded` 的分页上限提高到 500；默认分页耗尽且 expanded 能提高 effective ceiling 时，
+报告 `use_expanded_limits`，expanded 分页耗尽则报告 `raise_protected_limit`。
+其他资源上限保持不变；更高分页上限不能豁免 attempt、object、byte 或 time caps。
+所有容量依然有限且 fail-closed。
 
 page size 为 100，单个 response 上限 8 MiB，clean inter-read delay 为 5 秒，
 workflow job timeout 为 14 分钟。确实存在大型 PR 的 repositories 可以通过受保护

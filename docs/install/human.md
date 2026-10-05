@@ -1813,10 +1813,11 @@ are supported.
 
 The default page budget is 100 aggregate pages per complete snapshot, including
 opening/closing reads and each reaction endpoint's first page, not 100 review
-rounds. `expanded` also permits 100 pages and raises only other resource
-capacities. New-runtime page exhaustion therefore reports `raise_protected_limit`;
-switching profiles alone cannot fix it. Review the specific capacity named in
-the summary rather than ignoring unread evidence to pass.
+rounds. `expanded` permits 500 pages and retains its higher other resource
+capacities. Default page exhaustion reports `use_expanded_limits` when that
+profile helps; expanded exhaustion reports `raise_protected_limit`. Other
+resource caps remain independent. Review the specific capacity named in the
+summary rather than ignoring unread evidence to pass.
 
 Finally, re-read the PR, verifier attempt and exact feature-head CheckRun.
 Require

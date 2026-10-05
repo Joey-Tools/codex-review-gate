@@ -536,16 +536,17 @@ The reviewed profiles are fixed:
 | Profile | Pages | Raw objects | API attempts | Snapshot | Request timeout | Reconcile budget |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `default` | 100 | 2,000 | 128 | 32 MiB | 10 s | 60 s |
-| `expanded` | 100 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
+| `expanded` | 500 | 10,000 | 512 | 64 MiB | 20 s | 300 s |
 | hard ceiling | 1,000 | 20,000 | 2,048 | 64 MiB | 30 s | 720 s |
 
 Each complete snapshot has an aggregate page budget shared by its opening and
 closing evidence reads. First pages count, including empty reaction inventories;
 the limit is not a review-round count or a per-endpoint page limit. The default
 page ceiling is raised without changing evidence selection or the other default
-limits. `expanded` still increases the other capacities, but not the page ceiling;
-a page-cap hit therefore reports `raise_protected_limit`, not an ineffective
-switch to `expanded`. Larger budgets permit more reads when needed, not mandatory
+limits. `expanded` increases the page ceiling to 500 as well as the other
+capacities. Default page exhaustion reports `use_expanded_limits` when that
+profile can help; expanded page exhaustion reports `raise_protected_limit`.
+Larger budgets permit more reads when needed, not mandatory
 extra reads or background polling. Existing floating `@v2` consumers receive the
 new default after runtime publication; immutable version/SHA pins do not move.
 
