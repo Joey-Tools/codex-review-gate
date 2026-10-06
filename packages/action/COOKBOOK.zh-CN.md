@@ -109,8 +109,8 @@ current-head 顶层 issue comment（PR 的普通评论，不是 pull-request rev
 clean，或 official exact-head `COMMENTED` inline-parent 的 closed grammar（固定格式而非自由
 文本猜测）确认。后者只观察 immutable parent review，绝不读取或判断其 inline threads。
 第二条或 ambiguous request/boundary、任何 edit、terminal 不匹配，或 head/SHA binding 有歧义时，
-普通 candidate 路径保持 pending；下述 duplicate cohort 是第二条 boundary 情形的唯一
-recovery-only 例外。terminal 的 short SHA 只有被
+普通 candidate 路径保持 pending；下述新鲜 current-head recovery 和历史 duplicate cohort 是
+该普通路径之外的例外。terminal 的 short SHA 只有被
 GitHub 无歧义解析为 current PR head 才接受。同一 comment 上 official `eyes`/`+1` 的
 direct receipt 仍然受支持。这既不授予 commenter 启动或控制 Codex review 的权限，也不会
 使 Codex 启动，更不意味着任何用户都能导致 review；Codex 与 GitHub 仍决定是否接受
@@ -120,7 +120,18 @@ fail-closed pending。canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHO
 workflow 添加 strict policy。`write`/`maintain`/`admin` 仅保留给将来可以读取 collaborator
 permission 的 nonstandard verifier identity。
 
-不得故意重复发送 direct request。唯一的 recovery exception 是 duplicate cohort：恰好两条彼此
+已有 verifier 且没有观察到 base epoch 时，恢复操作更简单：发一条新鲜、exact、未编辑的
+`@codex review`，等待随后出现的未编辑 official 顶层 clean，其中 full 或无歧义 short SHA
+必须解析为 current PR head。原始 verifier run cutoff `T`、request `R` 与 clean `C` 必须满足
+`T < R < C`；不能有更新的 physical request boundary 或后续相关 provider activity。
+旧请求的归因缺口、未结清的旧 `eyes` 不再否决这个见证，也不能间接破坏稳定 snapshot 比较。
+真实 findings、未解决 review threads、provider errors 和 acquisition/history guards 仍独立生效。
+现有 provider event 通常会请求 verifier rerun；事件未送达时执行一次 scoped `reconcile`。
+不要求 empty commit；发请求不保证 Codex 启动。出现 base epoch 后，仍走现有
+exact-current-tuple canonical request/direct `+1` 路径。
+完整合同见 [README](README.zh-CN.md#review-generation-与恢复)。
+
+不要重复刷 direct request。另一个历史 recovery exception 是 duplicate cohort：恰好两条彼此
 严格顺序、未编辑、exact default-`any` 的 ordinary（不带 canonical marker）`@codex review`
 request，且来自同一 `User` login；没有 base epoch，且两条都没有 official direct `eyes`/`+1`；
 之后有一条未编辑 official 顶层 clean，且无歧义解析到 current PR head；整个 snapshot 没有
@@ -276,6 +287,10 @@ change。
 
 ## Recovery codes
 
+若 `request_clean_generation` 仅由旧请求未完成或旧归因缺口引起，优先使用上述新鲜
+current-head recovery。下表中的历史 lineage/replacement 指示仅在该见证无法成立时适用；
+恢复不会清除真实 finding、edit/deletion 歧义、provider error 或 base-epoch 要求。
+
 | Code | 安全 next action |
 | --- | --- |
 | `none` | evaluator 无需恢复；执行 exact-head merge closure。 |
@@ -329,14 +344,14 @@ finding 已 obsolete 或不适用时，按 `request_clean_generation` 的 summar
 state，也不会凭空生成 receipt；它只让 ruleset 的 “all conversations resolved” 条件可被
 满足。已经存在的合格 inline-parent receipt 仍独立按 parent review 的 fixed grammar 判定。
 
-terminal clean text 与合格 provider `+1`，只有在没有 base epoch、single-flight
+除新鲜 current-head recovery 外，terminal clean text 与合格 provider `+1`，只有在没有 base epoch、single-flight
 lineage 的第一个物理 generation 中才具有相同 clean authority。该 lineage 中唯一一条
 exact、未编辑的 default-`any` ordinary request，其匹配的未编辑 official current-head
 顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head
 `COMMENTED` inline-parent review，都可以提供建立第一个 generation 所需的最小 receipt。
-generic pull-request review clean 不可以。recovery-only duplicate cohort 是唯一额外的顶层
+generic pull-request review clean 不可以。recovery-only duplicate cohort 是另一种历史顶层
 clean 情形：它只闭合较晚 ordinary request；任何 canonical successor 仍须自身 direct `+1`。
-该例外之外，出现第二个物理
+这些例外之外，出现第二个物理
 request 后，provider terminal evidence 只能闭合第一个 gap；之后的每个 gap，以及新
 generation 的 positive/superseding authority，都必须来自直接附着于相关 request 的
 合格 `+1`。延迟、重复、不匹配、被编辑或 head binding 有歧义的 terminal 都保持 pending。
@@ -348,7 +363,7 @@ official current-head 顶层 issue-comment terminal clean，或 official exact-h
 inline-parent 的 fixed closed grammar，且仅适用于唯一、没有 base epoch、single-flight 的情况。
 出现 base epoch、第二个或 ambiguous request/boundary、任何 edit，或 terminal 的
 identity、order/head binding 有歧义时，该方式不可用。上文 duplicate cohort 是第二条 boundary
-情形的唯一 recovery-only 例外：它只使用已经存在两条 request 的顶层 clean，不能令
+情形的另一个 recovery-only 例外：它只使用已经存在两条 request 的顶层 clean，不能令
 canonical successor 使用 terminal clean。符合条件的 finding 独立阻塞，绝不
 提升 candidate。升级后 ordinary request reactions 才仅用于 liveness；ordinary `+1` 不能
 head-bind clean。same-time/later official `eyes`/progress from Codex 会阻止 candidate clean
@@ -404,7 +419,8 @@ relevant PR scope 内解析：
 - PR review 的 native `commit_id` 还必须等于 resolved current head。
 
 不要仅为了展开 prefix 而编辑 provider evidence。ambiguous 或不匹配的 terminal 不能提供
-狭窄的 default-`any` terminal-clean receipt，必须保持 pending。按 summary reason 与
+current-head terminal-clean receipt，必须保持 pending。之后新的 request 与无歧义的
+current-head clean 仍可使用上面的恢复路径。该路径之外，按 summary reason 与
 lineage 分流：已有 current canonical request 时取得其 direct `+1`；只有 lineage 可恢复且
 summary 明确要求时，才创建恰好一个 generation。不可闭合的 historical unbound gap 必须
 使用 replacement PR，不能在原 PR 增加 boundary。
