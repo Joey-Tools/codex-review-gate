@@ -1693,8 +1693,10 @@ binding input.
 
 There is deliberately no cron, `pull_request_target`, or writable review event.
 The verifier starts on `opened`, `reopened`, `synchronize`, and
-`ready_for_review`; controller and verifier have separate per-PR concurrency
-namespaces. With exact `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, an eligible
+`ready_for_review`; controller and verifier have separate concurrency
+namespaces. Associated controller events remain PR-scoped; association-empty
+completion events use a per-run fallback group. With exact
+`CODEX_REVIEW_GATE_AUTO_REQUEST=true`, an eligible
 failed canonical verifier can wake the protected controller through
 `workflow_run` to create the missing canonical request for the current PR
 scope. That auto-start is request-only: it does not immediately rerun the
