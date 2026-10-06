@@ -51,6 +51,8 @@ const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
 const HUMAN = { login: "joey", type: "User" };
 const READER = { login: "reader", type: "User" };
 const CODEX_APP = { slug: "chatgpt-codex-connector" };
+const CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER =
+  "<!-- codex-pull-request-review-summary -->";
 const CODEX_BOT_DATABASE_ID = 90_510;
 const HUMAN_DATABASE_ID = 90_511;
 const V2_RUNTIME_PATH = fileURLToPath(
@@ -1327,6 +1329,59 @@ test("issue_comment created and edited require exact sender and author before ve
   assert.match(result.report.reason, /sender\/author contract/u);
   assert.equal(result.report.recoveryCode, "unsupported_target");
   assert.equal(result.report.retrySafe, false);
+});
+
+test("recognized summary issue_comment events are no-ops before targeted refetch", async (context) => {
+  for (const action of ["created", "edited"]) {
+    for (const readback of ["missing", "changed"]) {
+      const summary = officialReviewSummaryComment({
+        id: action === "created" ? 304 : 305,
+        created_at: "2026-08-25T08:02:00Z",
+        updated_at: action === "edited"
+          ? "2026-08-25T08:03:00Z"
+          : "2026-08-25T08:02:00Z",
+      });
+      const github = createGitHubMock({
+        requestInterceptor: ({ method, path }) => {
+          if (
+            method !== "GET" ||
+            path !== `/repos/${REPOSITORY}/issues/comments/${summary.id}`
+          ) {
+            return undefined;
+          }
+          if (readback === "missing") {
+            return jsonResponse({ message: "comment was removed" }, 404);
+          }
+          return jsonResponse({
+            ...summary,
+            body: `${summary.body}\nchanged after the event payload`,
+          });
+        },
+      });
+      const environment = runtimeEnvironment(context, {
+        suffix: `summary-event-${action}-${readback}`,
+        eventName: "issue_comment",
+        expectedHeadSha: "",
+        requestReview: "false",
+        requestCommentId: String(summary.id),
+        event: issueCommentEvent(action, summary),
+      });
+      const { result } = await runGate(environment, github);
+
+      assert.equal(result.exitCode, 0, `${action}/${readback}: ${result.report.reason}`);
+      assert.equal(result.report.executionHealth, "healthy", `${action}/${readback}`);
+      assert.equal(result.report.gateOutcome, "not_applicable", `${action}/${readback}`);
+      assert.deepEqual(github.rerunRequests, [], `${action}/${readback}`);
+      assert.equal(
+        github.calls.some(({ method, path }) =>
+          method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summary.id}`
+        ),
+        false,
+        `${action}/${readback}: recognized summary was directly refetched`,
+      );
+      assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+    }
+  }
 });
 
 test("repository_dispatch is rejected before any GitHub API request", async (context) => {
@@ -3765,7 +3820,7 @@ test("an edit observed on a later failing GraphQL page remains latched", async (
   assert.equal(result.report.recoveryCode, "wait_then_reconcile");
   assert.match(
     result.report.reason,
-    /(?:edit metadata.*102.*(?:disappeared|moved backwards)|issue-comment totalCount decreased from 3 to 1)/iu,
+    /(?:edit metadata.*102.*(?:disappeared|moved backwards)|issue-comment totalCount decreased from 3 to 1|Previously observed graphql issue-comment 102 disappeared)/iu,
   );
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
@@ -9722,6 +9777,463 @@ test("snapshot closing reread catches late reviews, reactions, and provider edit
   }
 });
 
+test("official review summary comments are diagnostic-only regardless of status, table, or SHA", async (context) => {
+  const summaries = [
+    ["completed-current-head", officialReviewSummaryComment({ id: 290 })],
+    ["unknown-status-missing-sha", officialReviewSummaryComment({
+      id: 291,
+      status: "Unknown status",
+      reviewedSha: "",
+    })],
+    ["ambiguous-short-sha", officialReviewSummaryComment({
+      id: 292,
+      reviewedSha: HEAD.slice(0, 7),
+    })],
+    ["malformed-table-and-footer", officialReviewSummaryComment({
+      id: 293,
+      body: [
+        CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER,
+        "",
+        "Status: maybe-complete",
+        "| malformed table without a separator",
+        "Reviewed commit: `not-a-sha`",
+      ].join("\n"),
+    })],
+  ];
+
+  for (const [suffix, summary] of summaries) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), summary, cleanIssueComment(HEAD)],
+      reviewThreads: [reviewThread({
+        id: `PRRT_official_summary_${summary.id}`,
+        isResolved: true,
+      })],
+      commitResolution: () => ({ status: 422, message: "short SHA is ambiguous" }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `official-summary-diagnostic-only-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.recoveryCode, "none", suffix);
+    assert.equal(result.report.counts.indeterminate, 0, suffix);
+    assert.equal(result.report.reviewThreads.unresolved, 0, suffix);
+    assert.equal(result.report.reviewThreads.resolved, 1, suffix);
+    assert.equal(
+      github.calls.some(({ method, path }) =>
+        method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summary.id}`
+      ),
+      false,
+      `${suffix}: summary comment was directly refetched`,
+    );
+    assert.equal(hasRequestReactionGraphQlCall(github, summary.id), false, suffix);
+    assert.equal(
+      github.calls.some(({ path }) => path.startsWith(`/repos/${REPOSITORY}/commits/`)),
+      false,
+      `${suffix}: summary SHA was resolved as a commit`,
+    );
+  }
+});
+
+test("a completed official summary without a terminal clean remains pending", async (context) => {
+  const summary = officialReviewSummaryComment({
+    id: 294,
+    status: "Completed",
+    reviewedSha: HEAD,
+  });
+  const github = createGitHubMock({ issueComments: [workflowRequest(), summary] });
+  const environment = runtimeEnvironment(context, {
+    suffix: "official-summary-is-not-a-clean",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.notEqual(result.report.recoveryCode, "none");
+  assert.equal(result.report.counts.unresolved, 0);
+  assert.equal(result.report.counts.indeterminate, 0);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(
+    github.calls.some(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summary.id}`
+    ),
+    false,
+  );
+});
+
+test("summary creation, edits, and disappearance do not destabilize complete snapshots", async (context) => {
+  const request = workflowRequest();
+  const clean = cleanIssueComment(HEAD);
+  const summaryCreated = officialReviewSummaryComment({
+    id: 295,
+    created_at: "2026-08-25T08:01:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const summaryEdited = officialReviewSummaryComment({
+    id: summaryCreated.id,
+    status: "Unknown",
+    reviewedSha: "",
+    created_at: summaryCreated.created_at,
+    updated_at: "2026-08-25T08:03:00Z",
+  });
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [request, clean],
+      [request, clean, summaryCreated],
+      [request, clean, summaryEdited],
+      [request, clean],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "official-summary-snapshot-churn",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+    ).length,
+    4,
+    "all opening/closing inventories across the two outer stabilization rounds were read",
+  );
+  assert.equal(
+    github.calls.some(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summaryCreated.id}`
+    ),
+    false,
+    "recognized summary was not directly refetched while present",
+  );
+  assert.equal(hasRequestReactionGraphQlCall(github, summaryCreated.id), false);
+});
+
+test("trusted summary transport omissions do not change complete comment inventories", async (context) => {
+  const request = workflowRequest();
+  const clean = cleanIssueComment(HEAD);
+  const summary = officialReviewSummaryComment({
+    id: 306,
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:00:30Z",
+  });
+
+  const omittedFromHistory = createGitHubMock({
+    issueComments: [request, summary, clean],
+    deletedCommentResponseMutator: (response, { commentCursor, includeComments, snapshotIndex }) => {
+      if (!includeComments || commentCursor !== null || snapshotIndex === 0) {
+        return response;
+      }
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.comments;
+      connection.nodes = connection.nodes.filter(
+        ({ databaseId }) => String(databaseId) !== String(summary.id),
+      );
+      connection.totalCount = connection.nodes.length;
+      connection.pageInfo = { hasNextPage: false, endCursor: null };
+      return mutated;
+    },
+  });
+  const omittedEnvironment = runtimeEnvironment(context, {
+    suffix: "official-summary-graphql-omission",
+  });
+  const { result: omittedResult } = await runGate(omittedEnvironment, omittedFromHistory);
+  assert.equal(omittedResult.exitCode, 0, omittedResult.report.reason);
+  assert.equal(omittedResult.report.gateOutcome, "success");
+  assert.equal(omittedResult.report.counts.indeterminate, 0);
+  assert.equal(omittedFromHistory.statusWrites.some(({ state }) => state === "success"), false);
+
+  const historyOnly = createGitHubMock({
+    issueCommentSnapshots: [
+      [request, summary, clean],
+      [request, clean],
+      [request, clean],
+    ],
+    deletedCommentResponseMutator: (response, { commentCursor, includeComments, snapshotIndex }) => {
+      if (!includeComments || commentCursor !== null || snapshotIndex === 0) {
+        return response;
+      }
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.comments;
+      if (!connection.nodes.some(({ databaseId }) =>
+        String(databaseId) === String(summary.id)
+      )) {
+        connection.nodes.push(issueCommentEditGraphQlNode(summary));
+        connection.totalCount = connection.nodes.length;
+        connection.pageInfo = { hasNextPage: false, endCursor: null };
+      }
+      return mutated;
+    },
+  });
+  const historyOnlyEnvironment = runtimeEnvironment(context, {
+    suffix: "official-summary-known-id-history-only",
+  });
+  const { result: historyOnlyResult } = await runGate(historyOnlyEnvironment, historyOnly);
+  assert.equal(historyOnlyResult.exitCode, 0, historyOnlyResult.report.reason);
+  assert.equal(historyOnlyResult.report.executionHealth, "healthy");
+  assert.equal(historyOnlyResult.report.gateOutcome, "success");
+  assert.equal(historyOnlyResult.report.counts.indeterminate, 0);
+  assert.equal(historyOnly.statusWrites.some(({ state }) => state === "success"), false);
+
+  const unknownHistorySummary = officialReviewSummaryComment({
+    id: 308,
+    created_at: "2026-08-25T08:00:45Z",
+    updated_at: "2026-08-25T08:00:45Z",
+  });
+  const graphQlOnly = createGitHubMock({
+    issueComments: [request, clean],
+    deletedCommentResponseMutator: (response, { commentCursor, includeComments }) => {
+      if (!includeComments || commentCursor !== null) return response;
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.comments;
+      if (!connection.nodes.some(({ databaseId }) =>
+        String(databaseId) === String(unknownHistorySummary.id)
+      )) {
+        connection.nodes.push(issueCommentEditGraphQlNode(unknownHistorySummary));
+        connection.totalCount = connection.nodes.length;
+        connection.pageInfo = { hasNextPage: false, endCursor: null };
+      }
+      return mutated;
+    },
+  });
+  const graphQlOnlyEnvironment = runtimeEnvironment(context, {
+    suffix: "official-summary-new-graphql-only-id",
+  });
+  const { result: graphQlOnlyResult } = await runGate(graphQlOnlyEnvironment, graphQlOnly);
+  assert.notEqual(graphQlOnlyResult.report.gateOutcome, "success");
+  assert.equal(graphQlOnly.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("summary activity does not make canonical second-request recovery ambiguous", async (context) => {
+  const secondRequest = workflowRequest({
+    id: 301,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:11:00Z",
+    updated_at: "2026-08-25T08:11:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-301`,
+  });
+  const summary = officialReviewSummaryComment({
+    id: 296,
+    status: "Completed",
+    reviewedSha: HEAD.slice(0, 7),
+    created_at: "2026-08-25T08:11:30Z",
+    updated_at: "2026-08-25T08:11:30Z",
+  });
+
+  for (const includeSummary of [false, true]) {
+    const comments = [ordinaryRequest(), cleanIssueComment(HEAD), secondRequest];
+    if (includeSummary) comments.push(summary);
+    comments.push(recoveryClean());
+    const github = createGitHubMock({
+      issueComments: comments,
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `official-summary-canonical-recovery-${includeSummary ? "with" : "without"}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, `${includeSummary}: ${result.report.reason}`);
+    assert.equal(result.report.executionHealth, "healthy", String(includeSummary));
+    assert.equal(result.report.gateOutcome, "success", String(includeSummary));
+    assert.equal(result.report.recoveryCode, "none", String(includeSummary));
+    if (includeSummary) {
+      assert.equal(
+        github.calls.some(({ method, path }) =>
+          method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summary.id}`
+        ),
+        false,
+      );
+      assert.equal(hasRequestReactionGraphQlCall(github, summary.id), false);
+    }
+  }
+});
+
+test("summary provenance cannot hide provider errors or override unresolved threads", async (context) => {
+  const forgedSummaries = [
+    ["wrong-app", {
+      user: CODEX_BOT,
+      app: null,
+      performed_via_github_app: { slug: "untrusted-app" },
+    }],
+    ["wrong-author", {
+      user: { login: "lookalike-reviewer[bot]", type: "Bot" },
+      app: CODEX_APP,
+      performed_via_github_app: CODEX_APP,
+    }],
+  ];
+
+  for (const [suffix, identity] of forgedSummaries) {
+    const forged = officialReviewSummaryComment({
+      id: suffix === "wrong-app" ? 297 : 298,
+      ...identity,
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    });
+    const github = createGitHubMock({
+      issueComments: [
+        workflowRequest(),
+        forged,
+        cleanIssueComment(HEAD, {
+          id: 203,
+          created_at: "2026-08-25T08:05:00Z",
+          updated_at: "2026-08-25T08:05:00Z",
+        }),
+      ],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `official-summary-invalid-provenance-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(result.report.counts.indeterminate > 0, true, suffix);
+    assert.match(result.report.reason, /invalid Bot\/App provenance/iu, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+
+  const editedFinding = findingIssueComment(HEAD, {
+    id: 299,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const editedClean = cleanIssueComment(HEAD, {
+    id: 300,
+    created_at: "2026-08-25T08:03:00Z",
+    updated_at: "2026-08-25T08:04:00Z",
+  });
+  const findingSummary = officialReviewSummaryComment({
+    id: 302,
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:00:30Z",
+  });
+  const findingGitHub = createGitHubMock({
+    issueComments: [workflowRequest(), findingSummary, editedFinding, editedClean],
+  });
+  const findingEnvironment = runtimeEnvironment(context, {
+    suffix: "official-summary-edited-finding-protection",
+  });
+  const { result: findingResult } = await runGate(findingEnvironment, findingGitHub);
+  assert.notEqual(findingResult.report.gateOutcome, "success");
+  assert.equal(
+    findingResult.report.counts.unresolved > 0 ||
+      findingResult.report.counts.indeterminate > 0,
+    true,
+    findingResult.report.reason,
+  );
+  assert.equal(findingGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const threadSummary = officialReviewSummaryComment({
+    id: 303,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const threadGitHub = createGitHubMock({
+    issueComments: [workflowRequest(), cleanIssueComment(HEAD), threadSummary],
+    reviewThreads: [reviewThread({ id: "PRRT_summary_unresolved", isResolved: false })],
+  });
+  const threadEnvironment = runtimeEnvironment(context, {
+    suffix: "official-summary-unresolved-thread-protection",
+  });
+  const { result: threadResult } = await runGate(threadEnvironment, threadGitHub);
+  assert.notEqual(threadResult.report.gateOutcome, "success");
+  assert.equal(threadResult.report.reviewThreads.unresolved, 1);
+  assert.equal(threadGitHub.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a trusted summary ID cannot waive current REST provenance drift", async (context) => {
+  const trusted = officialReviewSummaryComment({
+    id: 307,
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:00:30Z",
+  });
+  const provenanceDrift = {
+    ...trusted,
+    app: null,
+    performed_via_github_app: null,
+  };
+  const request = workflowRequest();
+  const clean = cleanIssueComment(HEAD);
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [request, trusted, clean],
+      [request, provenanceDrift, clean],
+      [request, provenanceDrift, clean],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "official-summary-provenance-drift",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(
+    result.report.counts.indeterminate > 0 || result.report.gateOutcome === "failure",
+    true,
+    result.report.reason,
+  );
+  assert.match(result.report.reason, /invalid Bot\/App provenance/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("review carrier failures stay handled while REST issue-comment inventory is delayed", async (context) => {
+  const cases = [
+    {
+      suffix: "review-list",
+      rejects: ({ method, path }) =>
+        method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}/reviews`,
+    },
+    {
+      suffix: "review-threads",
+      rejects: ({ method, path, body }) =>
+        method === "POST" && path === "/graphql" &&
+        body?.query?.includes("CodexReviewGateReviewThreads"),
+    },
+  ];
+
+  for (const { suffix, rejects } of cases) {
+    const events = [];
+    let delayedInventories = 0;
+    let rejectedReads = 0;
+    const github = createGitHubMock({
+      issueComments: [workflowRequest()],
+      requestInterceptor: async (request) => {
+        if (request.method === "GET" &&
+            request.path === `/repos/${REPOSITORY}/issues/${PR}/comments` &&
+            delayedInventories++ === 0) {
+          events.push("inventory-started");
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          events.push("inventory-finished");
+          return undefined;
+        }
+        if (rejects(request)) {
+          rejectedReads += 1;
+          events.push("carrier-rejected");
+          return jsonResponse({ message: `synthetic ${suffix} failure` }, 502);
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `delayed-comments-${suffix}-rejection`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.ok(rejectedReads > 0, suffix);
+    assert.ok(events.indexOf("inventory-started") >= 0, suffix);
+    assert.ok(events.indexOf("carrier-rejected") < events.indexOf("inventory-finished"), suffix);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.executionHealth, "unhealthy", suffix);
+    assert.equal(result.report.gateOutcome, "pending", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
 test("fixed default and expanded profiles fail closed at aggregate snapshot caps", async (context) => {
   const defaultComments = Array.from({ length: 2_100 }, (_, index) =>
     genericComment(index + 1));
@@ -12468,6 +12980,37 @@ function cleanIssueComment(commitRef = HEAD, overrides = {}) {
     updated_at: "2026-08-25T08:01:00Z",
     html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-201`,
     user: CODEX_BOT,
+    performed_via_github_app: CODEX_APP,
+    ...overrides,
+  };
+}
+
+function officialReviewSummaryComment({
+  id = 290,
+  status = "Completed",
+  reviewedSha = HEAD,
+  body = [
+    CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER,
+    "## Codex Pull Request Review Summary",
+    "",
+    "| Review | Status | Reviewed commit |",
+    "| --- | --- | --- |",
+    `| 1 | ${status} | ${reviewedSha ? `\`${reviewedSha}\`` : ""} |`,
+    "",
+    `Footer: ${status}${reviewedSha ? ` for \`${reviewedSha}\`` : ""}.`,
+  ].join("\n"),
+  created_at = "2026-08-25T08:00:30Z",
+  updated_at = created_at,
+  ...overrides
+} = {}) {
+  return {
+    id,
+    body,
+    created_at,
+    updated_at,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-${id}`,
+    user: CODEX_BOT,
+    app: CODEX_APP,
     performed_via_github_app: CODEX_APP,
     ...overrides,
   };

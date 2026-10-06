@@ -307,6 +307,29 @@ server-side merge guard.
 
 ## Evidence semantics
 
+### Diagnostic Codex activity summaries
+
+An issue comment with the exact first-line marker
+`<!-- codex-pull-request-review-summary -->` and the verified official Codex
+Bot/App identity is a diagnostic activity summary, not review evidence. Its
+body, status, SHA text, edits, or absence do not authorize or block the gate.
+In particular, `Completed` is not terminal-clean evidence and cannot clear a
+finding or resolve a review thread.
+
+These identified summaries are excluded from request attribution, provider
+activity, edit-history decision inputs, decision fingerprints, and targeted
+comment rereads. They remain part of complete raw comment acquisition and its
+pagination budgets; this exception does not waive API health or inventory
+integrity. Their provider events are no-ops: they do not cause a targeted
+reread or verifier rerun. Genuine clean/finding comments retain their existing
+protections.
+GitHub deletion events do not identify the deleted comment or include its
+body, so an unknown deletion cannot safely be classified as a summary and
+retains the existing fail-closed history guard. A missing summary in an
+otherwise complete inventory is not itself a failure.
+
+### Review generations and recovery
+
 A review generation begins with an exact, unedited `@codex review` request.
 The visible first line is exact and contains no additional visible text. With
 the default `any` policy, an ordinary request is admitted to the snapshot as a
@@ -356,7 +379,9 @@ one full unambiguous SHA across `resolvedHeadSha` and `headSha`. This includes
 any otherwise unknown or unclassified, malformed, progress, or nonterminal
 official top-level `issue-comment`: with a valid activity window, it is opaque
 provider activity (a blocker rather than clean evidence) and vetoes the
-cohort. An earlier carrier may own the later clean; this explicit exception—not merely a full-head
+cohort. Identified diagnostic summaries above are excluded rather than treated
+as opaque provider activity. An earlier carrier may own the later clean; this
+explicit exception—not merely a full-head
 binding—preserves safely classified historical terminals. No additional provider
 artifact or opaque provider activity with a valid activity window may appear
 from the first request through that clean (or, if present, through its sole

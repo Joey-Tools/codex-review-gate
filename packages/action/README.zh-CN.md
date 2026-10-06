@@ -255,6 +255,23 @@ resolved”，作为 server-side merge guard。
 
 ## Evidence 语义
 
+### Codex 活动摘要只供诊断
+
+同时满足首行 exact marker `<!-- codex-pull-request-review-summary -->` 和
+verified official Codex Bot/App identity 的 issue comment 是活动摘要，不是 review
+证据。其正文、状态、SHA 文本、编辑或缺失均不提供 pass 或 blocking authority。
+尤其是 `Completed` 不等于 terminal clean，不能清除 finding 或 resolve review thread。
+
+这类已识别摘要不参与 request attribution、provider activity、edit-history 决策输入、
+decision fingerprint 或 targeted comment reread。完整 raw comment acquisition 仍读取
+它们，并计入 pagination budget；此例外不豁免 API 健康或 inventory 完整性检查。真正的
+clean/finding comment 仍受原有保护。已识别摘要的 provider event 直接跳过，不定向回读
+该 comment，也不 rerun verifier。GitHub 删除事件不含被删 comment 的 ID 或正文，
+无法安全判断未知删除是否属于摘要，因此仍保留原有 fail-closed history guard。
+在其余部分完整的 inventory 中缺少摘要，本身不是失败。
+
+### Review generation 与恢复
+
 review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
 line 必须 exact，且不得有其他 visible text。默认 `any` policy 会把 ordinary request
 author（任意 repository permission）纳入 snapshot 作为 candidate，而不是立刻视作
@@ -288,6 +305,8 @@ standard strict-policy setting。`write` threshold（`write`、`maintain` 或 `a
 read-only verifier token 无法可靠完成这个读取。workflow-authored request 还必须带
 canonical v2 hidden marker，绑定完整 head SHA、当前 base repository/ref/SHA 和 workflow
 run。符合条件的 Codex findings 不受 request-author permission 影响，始终阻塞。
+
+上文明确识别的诊断摘要不属于下述不透明 provider activity，不会否决 duplicate cohort。
 
 有一个仅用于恢复的例外，避免已经完成的重复对永久污染后续 canonical generation。这里的
 *duplicate cohort*（固定的历史两条请求对，不是应主动生成的请求模式）只在以下条件同时成立时
