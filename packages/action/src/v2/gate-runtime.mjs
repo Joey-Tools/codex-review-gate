@@ -4204,7 +4204,7 @@ async function loadCompleteV2Snapshot(client, config, {
 } = {}) {
   const budget = new V2SnapshotBudget(config, { deadlineMs, now });
   const beforeRepository = await loadV2Repository(client, config, budget);
-  const before = await loadV2PullRequest(client, config, budget);
+  let before = await loadV2PullRequest(client, config, budget);
   assertV2ExpectedSnapshotScope(before, config);
   assertV2FixedSnapshotScope(beforeRepository, before, config);
   const opening = await loadV2DecisionCarriers(
@@ -4215,7 +4215,36 @@ async function loadCompleteV2Snapshot(client, config, {
     observedDeletedCommentEvents,
     observedIssueCommentEdits,
     observedBaseEpoch,
+    null,
+    { deferIssueCommentCountMismatch: true },
   );
+  if (!opening.issueCommentCountMatched) {
+    if (opening.diagnosticSummaryCount === 0) {
+      requireMatchingV2InventoryCount(
+        before.comments,
+        opening.issueComments,
+        "issue comments",
+      );
+    }
+    const openingAuthority = await loadV2PullRequest(client, config, budget);
+    assertV2ExpectedSnapshotScope(openingAuthority, config);
+    assertV2FixedSnapshotScope(beforeRepository, openingAuthority, config);
+    if (!sameV2PullRequestScopeWithoutCommentCount(before, openingAuthority)) {
+      throw new V2RuntimeFailure(
+        "Pull-request scope changed while reconciling the opening issue-comment count",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    requireMatchingV2InventoryCount(
+      openingAuthority.comments,
+      opening.issueComments,
+      "issue comments",
+    );
+    // Rebind only after fresh metadata proves the complete raw REST inventory
+    // count. The official summaries remain diagnostic-only in the evidence
+    // reducer; no count delta is subtracted or inferred here.
+    before = openingAuthority;
+  }
   const closing = await loadV2DecisionCarriers(
     client,
     config,
@@ -4468,6 +4497,7 @@ async function loadV2DecisionCarriers(
   observedIssueCommentEdits = null,
   observedBaseEpoch = null,
   priorDiagnosticSummaryCount = null,
+  { deferIssueCommentCountMismatch = false } = {},
 ) {
   const headSha = config.expectedHeadSha;
   const baseSha = pullRequest.base.sha.toLowerCase();
@@ -4620,6 +4650,7 @@ async function loadV2DecisionCarriers(
       latchError ??= error;
     }
   }
+  let issueCommentCountMatched = true;
   if (
     issueCommentRead.status === "fulfilled" &&
     commentHistoryRead.status === "fulfilled"
@@ -4643,10 +4674,13 @@ async function loadV2DecisionCarriers(
         Number.isSafeInteger(priorDiagnosticSummaryCount)
         ? pullRequest.comments + summaryCount - priorDiagnosticSummaryCount
         : pullRequest.comments;
-      requireMatchingV2InventoryCount(
+      issueCommentCountMatched = requireMatchingV2InventoryCount(
         expectedCommentCount,
         issueCommentRead.value,
         "issue comments",
+        {
+          allowMismatch: deferIssueCommentCountMismatch && summaryCount > 0,
+        },
       );
     } catch (error) {
       latchError ??= error;
@@ -4824,6 +4858,7 @@ async function loadV2DecisionCarriers(
     issueComments,
     reviewThreadEvidence,
     decisionEvidence,
+    issueCommentCountMatched,
     diagnosticSummaryCount: issueComments.filter((comment) =>
       isV2KnownOfficialSummary(comment, diagnosticSummaryIds)
     ).length,
@@ -9593,6 +9628,22 @@ function sameV2PullRequestScope(
     !right?.merged_at;
 }
 
+function sameV2PullRequestScopeWithoutCommentCount(left, right) {
+  const leftScope = fingerprintV2PullRequestScope(left);
+  const rightScope = fingerprintV2PullRequestScope(right);
+  delete leftScope.comments;
+  delete rightScope.comments;
+  return canonicalJson(leftScope) === canonicalJson(rightScope) &&
+    left?.state === "open" &&
+    right?.state === "open" &&
+    left?.draft === false &&
+    right?.draft === false &&
+    left?.merged !== true &&
+    right?.merged !== true &&
+    !left?.merged_at &&
+    !right?.merged_at;
+}
+
 function sameV2RepositoryScope(left, right) {
   return canonicalJson(fingerprintV2RepositoryScope(left)) ===
     canonicalJson(fingerprintV2RepositoryScope(right));
@@ -9659,17 +9710,24 @@ function sameOptionalV2Count(left, right) {
   return Number.isSafeInteger(left) && left >= 0 && left === right;
 }
 
-function requireMatchingV2InventoryCount(expected, items, label) {
-  if (expected === undefined) return;
+function requireMatchingV2InventoryCount(
+  expected,
+  items,
+  label,
+  { allowMismatch = false } = {},
+) {
+  if (expected === undefined) return true;
   if (!Number.isSafeInteger(expected) || expected < 0) {
     throw new V2RuntimeFailure(`Pull-request ${label} count is invalid`);
   }
   if (items.length !== expected) {
+    if (allowMismatch) return false;
     throw new V2RuntimeFailure(
       `Pull-request ${label} inventory changed while loading: ${items.length} of ${expected}`,
       { recoveryCode: "wait_then_reconcile" },
     );
   }
+  return true;
 }
 
 function fingerprintIssueComment(comment) {

@@ -9905,6 +9905,13 @@ test("summary creation, edits, and disappearance do not destabilize complete sna
     "all opening/closing inventories across the two outer stabilization rounds were read",
   );
   assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}`
+    ).length,
+    5,
+    "stable snapshots do not add a pull-request metadata read when counts already match",
+  );
+  assert.equal(
     github.calls.some(({ method, path }) =>
       method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summaryCreated.id}`
     ),
@@ -9912,6 +9919,186 @@ test("summary creation, edits, and disappearance do not destabilize complete sna
     "recognized summary was not directly refetched while present",
   );
   assert.equal(hasRequestReactionGraphQlCall(github, summaryCreated.id), false);
+});
+
+test("an official summary arriving before the opening inventory rebinds its count authority", async (context) => {
+  const summary = officialReviewSummaryComment({
+    id: 309,
+    created_at: "2026-08-25T08:01:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const comments = [workflowRequest(), cleanIssueComment(HEAD), summary];
+  const github = createGitHubMock({
+    issueCommentSnapshots: [comments, comments],
+    // The verifier's initial PR read and the first snapshot's opening read
+    // precede the summary; the first complete REST inventory sees it.
+    pullRequestSequence: [
+      { comments: 2 },
+      { comments: 2 },
+      { comments: 3 },
+      { comments: 3 },
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "official-summary-before-opening-inventory",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+    ).length,
+    4,
+    "the count reconciliation avoids discarding and retrying the complete opening snapshot",
+  );
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}`
+    ).length,
+    6,
+    "only the mismatched opening count adds a fresh metadata read",
+  );
+});
+
+test("opening count reconciliation rejects head or base scope drift on its metadata reread", async (context) => {
+  const summary = officialReviewSummaryComment({
+    id: 312,
+    created_at: "2026-08-25T08:01:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const comments = [workflowRequest(), cleanIssueComment(HEAD), summary];
+
+  for (const [suffix, scopeChange] of [
+    ["head", { headSha: "d".repeat(40) }],
+    ["base", { baseSha: "e".repeat(40) }],
+  ]) {
+    let issueInventoryReads = 0;
+    let openingRefetchSeen = false;
+    let injectedScopeChange = false;
+    const github = createGitHubMock({
+      issueCommentSnapshots: [comments, comments],
+      pullRequestSequence: [{ comments: 2 }, { comments: 2 }, { comments: 3 }],
+      requestInterceptor: ({ method, path }) => {
+        if (
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+        ) {
+          issueInventoryReads += 1;
+        }
+        if (
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/issues/comments/201` &&
+          issueInventoryReads === 1
+        ) {
+          openingRefetchSeen = true;
+        }
+        if (
+          method === "GET" &&
+          path === `/repos/${REPOSITORY}/pulls/${PR}` &&
+          openingRefetchSeen &&
+          issueInventoryReads === 1 &&
+          !injectedScopeChange
+        ) {
+          injectedScopeChange = true;
+          return jsonResponse({
+            number: PR,
+            merge_commit_sha: TEST_MERGE,
+            state: "open",
+            draft: false,
+            merged: false,
+            merged_at: null,
+            comments: 3,
+            commits: 1,
+            user: HUMAN,
+            head: {
+              sha: scopeChange.headSha || HEAD,
+              ref: "feature",
+              repo: { id: REPO_ID, full_name: REPOSITORY },
+              user: HUMAN,
+            },
+            base: {
+              sha: scopeChange.baseSha || BASE,
+              ref: "main",
+              repo: { id: REPO_ID, full_name: REPOSITORY },
+            },
+          });
+        }
+        return undefined;
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `official-summary-opening-scope-drift-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(injectedScopeChange, true, `${suffix}: opening metadata was re-read`);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    if (suffix === "head") {
+      assert.notEqual(result.report.gateOutcome, "success", suffix);
+    } else {
+      assert.equal(result.report.gateOutcome, "success", result.report.reason);
+      assert.equal(
+        github.calls.filter(({ method, path }) =>
+          method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+        ).length,
+        5,
+        "base drift aborts the opening snapshot before its closing inventory; recovery needs two fresh stable snapshots",
+      );
+    }
+  }
+});
+
+test("opening count reconciliation rejects a non-summary arrival after its REST inventory", async (context) => {
+  const summary = officialReviewSummaryComment({
+    id: 310,
+    created_at: "2026-08-25T08:01:30Z",
+    updated_at: "2026-08-25T08:01:30Z",
+  });
+  const openingComments = [workflowRequest(), cleanIssueComment(HEAD), summary];
+  const finding = findingIssueComment(HEAD, {
+    id: 311,
+    created_at: "2026-08-25T08:05:00Z",
+    updated_at: "2026-08-25T08:05:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-311`,
+  });
+  const commentsAfterFindingArrives = [...openingComments, finding];
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      openingComments,
+      commentsAfterFindingArrives,
+      commentsAfterFindingArrives,
+      commentsAfterFindingArrives,
+    ],
+    // The fresh metadata read after the first inventory observes the real
+    // comment's arrival, so its raw count cannot be bound to that older list.
+    pullRequestSequence: [
+      { comments: 2 },
+      { comments: 2 },
+      { comments: 4 },
+      { comments: 4 },
+      { comments: 4 },
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "official-summary-count-does-not-hide-real-arrival",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "failure");
+  assert.equal(result.report.counts.unresolved, 1);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(
+    github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+    ).length,
+    3,
+    "the count disagreement retries, then evaluates the complete inventory containing the finding",
+  );
 });
 
 test("trusted summary transport omissions do not change complete comment inventories", async (context) => {

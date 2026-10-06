@@ -328,6 +328,15 @@ body, so an unknown deletion cannot safely be classified as a summary and
 retains the existing fail-closed history guard. A missing summary in an
 otherwise complete inventory is not itself a failure.
 
+If a recognized summary arrives between the initial PR metadata read and the
+opening complete comment inventory, a count mismatch may use one bounded PR
+metadata reread. The reread must retain the exact core PR scope and match the
+inventory's complete raw count; it supplies the opening count authority for
+the ordinary closing inventory and metadata checks. Every non-summary comment
+in that inventory is still evaluated. Unexplained count mismatches, subsequent
+non-summary changes, and scope changes remain fail-closed or require a fresh
+snapshot. A normal matching opening count adds no metadata request.
+
 ### Review generations and recovery
 
 A review generation begins with an exact, unedited `@codex review` request.

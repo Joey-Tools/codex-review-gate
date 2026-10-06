@@ -270,6 +270,12 @@ clean/finding comment 仍受原有保护。已识别摘要的 provider event 直
 无法安全判断未知删除是否属于摘要，因此仍保留原有 fail-closed history guard。
 在其余部分完整的 inventory 中缺少摘要，本身不是失败。
 
+如果已识别摘要出现在初始 PR metadata 与 opening 完整评论列表两次读取之间，计数不匹配
+时可额外回读一次 PR metadata。回读必须保持 exact core PR scope 不变，并与已完整读取的
+raw inventory 总数精确一致；它仅作为 opening 计数依据，后续仍执行原有 closing inventory
+和 metadata 检查。列表内的每一条非摘要评论仍参与决策。无法解释的计数不匹配、后续
+非摘要变化和 scope 变化仍 fail-closed 或要求重新 snapshot。普通计数匹配路径不增加请求。
+
 ### Review generation 与恢复
 
 review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
