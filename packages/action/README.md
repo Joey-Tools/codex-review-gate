@@ -316,6 +316,12 @@ body, status, SHA text, edits, or absence do not authorize or block the gate.
 In particular, `Completed` is not terminal-clean evidence and cannot clear a
 finding or resolve a review thread.
 
+The diagnostic exemption requires the current body to retain the exact
+first-line marker. Remembering a summary ID does not exempt a present comment
+whose marker was removed or moved: it returns to ordinary provider-evidence
+and edit-history checks, including fail-closed handling where history cannot
+be proved. A real finding cannot inherit an earlier summary's exemption.
+
 These identified summaries are excluded from request attribution, provider
 activity, edit-history decision inputs, decision fingerprints, and targeted
 comment rereads. They remain part of complete raw comment acquisition and its

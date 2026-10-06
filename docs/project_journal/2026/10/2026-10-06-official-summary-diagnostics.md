@@ -23,6 +23,14 @@ superseded_by:
   `<!-- codex-pull-request-review-summary -->` together with the existing
   exact official Bot/App provenance check. A matching marker alone does not
   grant an unrelated author authority or waive provider-provenance failures.
+- PR #106's subsequent P1 finding identified that an earlier summary ID could
+  keep exempting a present Bot/App comment after its marker was removed.
+  Require the marker on the current body, not only a remembered identity.
+  Revoke the diagnostic exemption when an observed current carrier removes
+  or moves the marker, and restore ordinary provider evidence/history checks.
+  This prevents a new finding or opaque activity from inheriting a summary's
+  earlier exemption while retaining diagnostic-only treatment for genuine
+  marked summaries and independently explained transport omissions.
 - Exclude recognized summaries from request-generation attribution, opaque
   provider activity, edit-history decision inputs, stability fingerprints,
   and exact targeted comment rereads. Do not count them as clean, findings,
@@ -68,6 +76,17 @@ superseded_by:
   appropriate for a diagnostic-only carrier.
 - Implementation starts from source master
   `d7e51cabd280187c6948ccb4231270ccf5cee54d`.
+- On [PR #106's official summary](https://github.com/Joey-Tools/codex-review-gate/pull/106#issuecomment-6016735427),
+  the same comment ID was updated across successive heads and manual requests.
+  It reported Completed for `c03a2f0` while the corresponding Codex review
+  contained [a P1 finding](https://github.com/Joey-Tools/codex-review-gate/pull/106#discussion_r4196023736).
+  Completed therefore describes activity completion, not a clean conclusion.
+- On 2026-10-06, the [official GitHub review guide](https://learn.chatgpt.com/docs/third-party/github)
+  and [changelog](https://learn.chatgpt.com/docs/changelog) did not document a
+  machine-readable summary contract, immutable request identity, or a
+  Completed-to-clean guarantee. This is a bounded documentation observation,
+  not a claim that no other provider contract exists. Keep the summary out of
+  gate decisions; optional progress display must not become pass authority.
 
 ## Delivery boundaries
 
@@ -93,6 +112,12 @@ superseded_by:
   and rejection of changed head/base scope before accepting the opening count.
 - Final `npm run check`, `git diff --check`, and project-journal validation
   passed.
+- After addressing the marker-removal P1 finding, the relevant suite passed
+  436/436 with no failures, skipped tests, or cancellations. Six focused
+  summary/provenance/transport regressions also passed. The new regressions
+  cover a remembered summary becoming a finding with the marker no longer
+  on its first line, and an unmarked GraphQL history body appearing after a
+  marked REST read; neither scenario writes a successful status.
 - The final `npm test -- --test-concurrency=2` attempt was intentionally
   interrupted with exit 130 while the unchanged bootstrap/organization
   integration harness was still running. It is incomplete, not a passing

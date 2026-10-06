@@ -262,6 +262,10 @@ verified official Codex Bot/App identity 的 issue comment 是活动摘要，不
 证据。其正文、状态、SHA 文本、编辑或缺失均不提供 pass 或 blocking authority。
 尤其是 `Completed` 不等于 terminal clean，不能清除 finding 或 resolve review thread。
 
+摘要豁免要求当前正文仍保留首行 exact marker。缓存过摘要 ID 并不豁免当前 marker 被删除或
+移到其他位置的评论：这时恢复普通 provider evidence 与 edit-history 检查，无法证明历史时
+仍 fail-closed。真正的 finding 不能继承该 ID 过去作为摘要时的豁免。
+
 这类已识别摘要不参与 request attribution、provider activity、edit-history 决策输入、
 decision fingerprint 或 targeted comment reread。完整 raw comment acquisition 仍读取
 它们，并计入 pagination budget；此例外不豁免 API 健康或 inventory 完整性检查。真正的

@@ -3526,7 +3526,7 @@ async function loadV2IssueCommentsWithEditHistory(
       validate: requireV2IssueCommentShape,
       ...(isNonNegativeSafeInteger(expectedCount) ? { expectedCount } : {}),
       observe: (comment, id) => {
-        if (isV2KnownOfficialSummary(comment, previouslyObservedSummaryIds)) return;
+        if (isV2KnownOfficialSummary(comment)) return;
         rememberV2ObservedCarrierFingerprint(
           observedIssueCommentEdits,
           "rest",
@@ -4513,7 +4513,7 @@ async function loadV2DecisionCarriers(
       label: "pull-request issue comments",
       validate: requireV2IssueCommentShape,
       observe: (comment, id) => {
-        if (isV2KnownOfficialSummary(comment, previouslyObservedSummaryIds)) return;
+        if (isV2KnownOfficialSummary(comment)) return;
         rememberV2ObservedCarrierFingerprint(
           observedIssueCommentEdits,
           "rest",
@@ -4606,7 +4606,7 @@ async function loadV2DecisionCarriers(
         observedIssueCommentEdits,
         "rest",
         issueCommentRead.value
-          .filter((comment) => !isV2KnownOfficialSummary(comment, diagnosticSummaryIds))
+          .filter((comment) => !isV2KnownOfficialSummary(comment))
           .map((comment) => [
             canonicalPositiveId(comment.id),
             canonicalJson(fingerprintIssueComment(comment)),
@@ -4667,7 +4667,7 @@ async function loadV2DecisionCarriers(
     }
     try {
       const summaryCount = issueCommentRead.value.filter((comment) =>
-        isV2KnownOfficialSummary(comment, diagnosticSummaryIds)
+        isV2KnownOfficialSummary(comment)
       ).length;
       const expectedCommentCount =
         Number.isSafeInteger(pullRequest.comments) &&
@@ -4806,7 +4806,7 @@ async function loadV2DecisionCarriers(
     baseRepositoryId: String(pullRequest.base.repo.id),
     issueComments: issueComments
       .filter((comment) =>
-        !isV2KnownOfficialSummary(comment, diagnosticSummaryIds) &&
+        !isV2KnownOfficialSummary(comment) &&
           isRelevantV2IssueComment(comment)
       )
       .sort(compareV2IssueCommentsOldestFirst)
@@ -4844,7 +4844,7 @@ async function loadV2DecisionCarriers(
     baseEpoch,
     deletedCommentEvents,
     issueCommentEdits: issueCommentEdits.filter((edit) =>
-      !diagnosticSummaryIds.has(edit.id)
+      edit.diagnosticSummary !== true
     ),
     commitResolutions: providerEvidence.commitResolutions,
     providerErrors: providerEvidence.errors,
@@ -4860,7 +4860,7 @@ async function loadV2DecisionCarriers(
     decisionEvidence,
     issueCommentCountMatched,
     diagnosticSummaryCount: issueComments.filter((comment) =>
-      isV2KnownOfficialSummary(comment, diagnosticSummaryIds)
+      isV2KnownOfficialSummary(comment)
     ).length,
   };
 }
@@ -7110,7 +7110,7 @@ async function exactRefetchV2RelevantObjects(
   for (const comment of issueComments) {
     const id = canonicalPositiveId(comment?.id);
     if (!id) continue;
-    if (isV2KnownOfficialSummary(comment, diagnosticSummaryIds)) continue;
+    if (isV2KnownOfficialSummary(comment)) continue;
     const providerCandidate = hasAnyV2ProviderIdentitySignal(comment);
     if (
       providerCandidate ||
@@ -7499,7 +7499,7 @@ async function collectV2ProviderEvidence(
   const opaqueTopLevelProviderActivities = [];
   const errors = [];
   for (const comment of issueComments) {
-    if (isV2KnownOfficialSummary(comment, diagnosticSummaryIds)) continue;
+    if (isV2KnownOfficialSummary(comment)) continue;
     if (!hasAnyV2ProviderIdentitySignal(comment)) continue;
     const revisionAt = v2IssueCommentRevisionAt(comment);
     if (!hasExactProviderIdentity(comment)) {
@@ -8570,7 +8570,8 @@ function v2IssueCommentPartialFacts(value) {
 
 function v2IssueCommentHistoryPartialFacts(value, diagnosticSummaryIds) {
   const id = canonicalPositiveId(value?.databaseId);
-  return id && diagnosticSummaryIds?.has(id)
+  return id && diagnosticSummaryIds?.has(id) &&
+      hasV2OfficialSummaryMarkerBody(value?.body)
     ? {}
     : v2IssueCommentPartialFacts(value);
 }
@@ -8824,7 +8825,11 @@ function normalizeV2IssueCommentEdit(value) {
 
 function normalizeV2IssueCommentHistoryEdit(value, diagnosticSummaryIds) {
   const id = canonicalPositiveId(value?.databaseId);
-  if (id && diagnosticSummaryIds?.has(id)) {
+  if (
+    id &&
+    diagnosticSummaryIds?.has(id) &&
+    hasV2OfficialSummaryMarkerBody(value?.body)
+  ) {
     return { id, diagnosticSummary: true };
   }
   return normalizeV2IssueCommentEdit(value);
@@ -8850,6 +8855,7 @@ function attachV2IssueCommentEditMetadata(
     );
   }
   const commentIds = new Set();
+  const commentsById = new Map();
   for (const comment of issueComments) {
     const id = canonicalPositiveId(comment?.id);
     if (!id || commentIds.has(id)) {
@@ -8859,7 +8865,8 @@ function attachV2IssueCommentEditMetadata(
       );
     }
     commentIds.add(id);
-    const diagnosticSummary = isV2KnownOfficialSummary(comment, diagnosticSummaryIds);
+    commentsById.set(id, comment);
+    const diagnosticSummary = isV2KnownOfficialSummary(comment);
     if (id && !diagnosticSummary) {
       rememberV2ObservedCarrierFingerprint(
         observedIssueCommentEdits,
@@ -8888,7 +8895,9 @@ function attachV2IssueCommentEditMetadata(
   }
   const unmatchedHistoryIds = [...editsById.keys()]
     .filter((id) => !commentIds.has(id));
-  if (unmatchedHistoryIds.some((id) => !diagnosticSummaryIds.has(id))) {
+  if (unmatchedHistoryIds.some((id) =>
+    editsById.get(id)?.diagnosticSummary !== true
+  )) {
     throw poisonV2ObservedHistory(
       observedIssueCommentEdits,
       "REST and GraphQL issue-comment inventories have different id sets",
@@ -8896,7 +8905,9 @@ function attachV2IssueCommentEditMetadata(
   }
   const unmatchedRestIds = [...commentIds]
     .filter((id) => !editsById.has(id));
-  if (unmatchedRestIds.some((id) => !diagnosticSummaryIds.has(id))) {
+  if (unmatchedRestIds.some((id) =>
+    !isV2OfficialPullRequestReviewSummary(commentsById.get(id))
+  )) {
     throw poisonV2ObservedHistory(
       observedIssueCommentEdits,
       "REST and GraphQL issue-comment inventories have different id sets",
@@ -9512,17 +9523,17 @@ function hasExactProviderIdentity(value, { allowMissingApp = false } = {}) {
     (allowMissingApp || apps.length > 0);
 }
 
-function isV2OfficialPullRequestReviewSummary(comment) {
-  if (
-    !hasExactProviderIdentity(comment) ||
-    typeof comment?.body !== "string"
-  ) {
-    return false;
-  }
+function hasV2OfficialSummaryMarkerBody(body) {
+  if (typeof body !== "string") return false;
   const marker = V2_CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER;
-  return comment.body === marker ||
-    comment.body.startsWith(`${marker}\n`) ||
-    comment.body.startsWith(`${marker}\r\n`);
+  return body === marker ||
+    body.startsWith(`${marker}\n`) ||
+    body.startsWith(`${marker}\r\n`);
+}
+
+function isV2OfficialPullRequestReviewSummary(comment) {
+  return hasExactProviderIdentity(comment) &&
+    hasV2OfficialSummaryMarkerBody(comment?.body);
 }
 
 function rememberV2OfficialSummaryIds(observed, comments) {
@@ -9554,7 +9565,7 @@ function currentV2OfficialSummaryIds(
   );
   for (const id of previouslyObservedIds ?? []) {
     const current = commentsById.get(id);
-    if (current && !hasExactProviderIdentity(current)) {
+    if (current && !isV2OfficialPullRequestReviewSummary(current)) {
       previouslyObservedIds.delete(id);
       const observedIds = observedIssueCommentEdits instanceof Map
         ? observedIssueCommentEdits.get(V2_OBSERVED_DIAGNOSTIC_SUMMARY_IDS)
@@ -9562,14 +9573,13 @@ function currentV2OfficialSummaryIds(
       if (observedIds instanceof Set) observedIds.delete(id);
       continue;
     }
-    if (!current || hasExactProviderIdentity(current)) currentIds.add(id);
+    if (!current || isV2OfficialPullRequestReviewSummary(current)) currentIds.add(id);
   }
   for (const comment of comments ?? []) {
     const id = canonicalPositiveId(comment?.id);
     if (
       id &&
-      hasExactProviderIdentity(comment) &&
-      (previouslyObservedIds?.has(id) || isV2OfficialPullRequestReviewSummary(comment))
+      isV2OfficialPullRequestReviewSummary(comment)
     ) {
       currentIds.add(id);
     }
@@ -9577,10 +9587,8 @@ function currentV2OfficialSummaryIds(
   return currentIds;
 }
 
-function isV2KnownOfficialSummary(comment, summaryIds) {
-  const id = canonicalPositiveId(comment?.id);
-  return hasExactProviderIdentity(comment) &&
-    ((id && summaryIds?.has(id)) || isV2OfficialPullRequestReviewSummary(comment));
+function isV2KnownOfficialSummary(comment) {
+  return isV2OfficialPullRequestReviewSummary(comment);
 }
 
 function hasAnyV2ProviderIdentitySignal(value) {

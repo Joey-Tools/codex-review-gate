@@ -10368,6 +10368,73 @@ test("a trusted summary ID cannot waive current REST provenance drift", async (c
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("a remembered summary ID is reclassified when its current body becomes a finding", async (context) => {
+  const summary = officialReviewSummaryComment({
+    id: 313,
+    created_at: "2026-08-25T08:02:00Z",
+    updated_at: "2026-08-25T08:02:00Z",
+  });
+  const findingBody = findingIssueComment(HEAD).body;
+  const finding = findingIssueComment(HEAD, {
+    id: summary.id,
+    body: `${findingBody}\n\nPreviously emitted marker: ${CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER}`,
+    created_at: summary.created_at,
+    updated_at: "2026-08-25T08:05:00Z",
+    html_url: summary.html_url,
+  });
+  const request = workflowRequest();
+  const clean = cleanIssueComment(HEAD);
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [request, clean, summary],
+      [request, clean, finding],
+      [request, clean, finding],
+    ],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "remembered-summary-id-becomes-finding",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success", result.report.reason);
+  assert.ok(
+    result.report.counts.unresolved > 0 || result.report.counts.indeterminate > 0,
+    result.report.reason,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("a summary ID cannot hide an unmarked GraphQL history edit", async (context) => {
+  const summary = officialReviewSummaryComment({
+    id: 314,
+    created_at: "2026-08-25T08:00:30Z",
+    updated_at: "2026-08-25T08:00:30Z",
+  });
+  const request = workflowRequest();
+  const clean = cleanIssueComment(HEAD);
+  const opaqueBody = opaqueProviderIssueComment({ id: summary.id }).body;
+  const github = createGitHubMock({
+    issueComments: [request, summary, clean],
+    deletedCommentResponseMutator: (response, { commentCursor, includeComments }) => {
+      if (!includeComments || commentCursor !== null) return response;
+      const mutated = structuredClone(response);
+      const connection = mutated.data.repository.pullRequest.comments;
+      const historyNode = connection.nodes.find(({ databaseId }) =>
+        String(databaseId) === String(summary.id)
+      );
+      if (historyNode) historyNode.body = opaqueBody;
+      return mutated;
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "summary-id-unmarked-graphql-history",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
 test("review carrier failures stay handled while REST issue-comment inventory is delayed", async (context) => {
   const cases = [
     {
