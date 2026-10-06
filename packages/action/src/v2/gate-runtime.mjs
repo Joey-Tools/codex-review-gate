@@ -76,6 +76,18 @@ export const V2_RECOVERY_CODES = Object.freeze(new Set([
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
 const OFFICIAL_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]";
+const V2_REACTION_CONTENTS = new Set([
+  "+1",
+  "-1",
+  "confused",
+  "eyes",
+  "heart",
+  "hooray",
+  "laugh",
+  "rocket",
+]);
+const V2_CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER =
+  "<!-- codex-pull-request-review-summary -->";
 const V2_DELETED_COMMENTS_PAGE_SIZE = 100;
 const V2_REVIEW_THREADS_PAGE_SIZE = 100;
 const V2_OBSERVED_HISTORY_POISON = Symbol("v2-observed-history-poison");
@@ -94,6 +106,9 @@ const V2_OBSERVED_BASE_EPOCH_LATEST = Symbol(
 );
 const V2_OBSERVED_CARRIER_FINGERPRINTS = Symbol(
   "v2-observed-carrier-fingerprints",
+);
+const V2_OBSERVED_DIAGNOSTIC_SUMMARY_IDS = Symbol(
+  "v2-observed-diagnostic-summary-ids",
 );
 const V2_PENDING_REVIEW_DELETION_CONFIRMATIONS = Symbol(
   "v2-pending-review-deletion-confirmations",
@@ -876,6 +891,7 @@ function recoveryInstruction(
   retrySafe = false,
   requiresReplacementPr = false,
   counts = {},
+  headCleanRecoveryAction = null,
 ) {
   const target = Number.isSafeInteger(Number(prNumber)) ? ` for PR #${prNumber}` : "";
   if (counts.reviewThreadPrimaryCause === true && counts.unresolvedReviewThreads > 0) {
@@ -885,6 +901,26 @@ function recoveryInstruction(
     return (
       `Resolve all ${counts.unresolvedReviewThreads} unresolved pull-request review thread(s)` +
       `${findingAction}, then dispatch reconcile${target} against the exact current head.`
+    );
+  }
+  if (
+    headCleanRecoveryAction === "request" &&
+    (code === "request_clean_generation" || code === "wait_provider")
+  ) {
+    return (
+      `Post one fresh eligible, unedited @codex review request${target}, then wait for a ` +
+      `trusted unedited top-level Codex terminal clean that resolves uniquely to the exact ` +
+      `current PR head; reconcile only after it arrives.`
+    );
+  }
+  if (
+    headCleanRecoveryAction === "wait" &&
+    (code === "request_clean_generation" || code === "wait_provider")
+  ) {
+    return (
+      `Wait for the latest eligible @codex review request${target} to finish; reconcile only ` +
+      `after a trusted unedited top-level Codex terminal clean resolves uniquely to the exact ` +
+      `current PR head.`
     );
   }
   if (code === "fix_findings") {
@@ -996,6 +1032,7 @@ function v2ReportNextAction(report, context = {}) {
           unresolvedReviewThreads: reviewThreads.unresolved,
           reviewThreadPrimaryCause: true,
         },
+        context.headCleanRecoveryAction,
       )
     : context.verifierRunId
     ? `Wait for verifier run ${context.verifierRunId} attempt ` +
@@ -1006,6 +1043,8 @@ function v2ReportNextAction(report, context = {}) {
         context.prNumber,
         report.retrySafe,
         report.requiresReplacementPr,
+        report.counts,
+        context.headCleanRecoveryAction,
       );
 
   if (reviewThreads.status === "incomplete") {
@@ -1796,6 +1835,19 @@ async function runV2ControllerAction(client, config, context, {
     expectedHeadSha: config.expectedHeadSha || String(initialPr?.head?.sha || "").toLowerCase(),
   });
   if (
+    config.triggerSource === "provider" &&
+    isV2OfficialPullRequestReviewSummary(config.event?.comment)
+  ) {
+    const report = buildV2GateReport({
+      executionHealth: "healthy",
+      gateOutcome: "not_applicable",
+      reason: "Official Codex pull-request review summary is diagnostic-only",
+      recoveryCode: "none",
+    });
+    await finalizeV2Report(client, config, context, report);
+    return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
+  }
+  if (
     (config.triggerSource === "provider" || config.triggerSource === "auto") &&
     !isOpenV2PullRequest(initialPr)
   ) {
@@ -2410,6 +2462,7 @@ function exitCodeForV2Report(report, triggerKind) {
 
 async function exactRefetchV2ControllerProviderEvent(client, config) {
   const eventComment = config.event?.comment;
+  if (isV2OfficialPullRequestReviewSummary(eventComment)) return;
   const commentId = canonicalPositiveId(eventComment?.id);
   if (!commentId) {
     throw new V2RuntimeFailure("The admitted provider comment has no canonical id", {
@@ -3360,12 +3413,17 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         createdId,
         canonicalJson(fingerprintIssueComment(refetched)),
       );
+      const diagnosticSummaryIds = rememberV2OfficialSummaryIds(
+        observedIssueCommentEdits,
+        [...comments, refetched],
+      );
       const { deletedCommentEvents, issueCommentEdits } = await loadV2CommentHistory(
         client,
         config,
         budget,
         observedDeletedCommentEvents,
         observedIssueCommentEdits,
+        { diagnosticSummaryIds },
       );
       retainV2ObservedDeletedCommentEvents(
         deletedCommentEvents,
@@ -3375,6 +3433,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         [refetched],
         issueCommentEdits.filter((edit) => edit.id === createdId),
         observedIssueCommentEdits,
+        diagnosticSummaryIds,
       );
       requireExactV2CreatedReviewRequest(
         refetched,
@@ -3489,6 +3548,10 @@ async function loadV2IssueCommentsWithEditHistory(
     observedIssueCommentEdits = null,
   },
 ) {
+  const previouslyObservedSummaryIds = rememberV2OfficialSummaryIds(
+    observedIssueCommentEdits,
+    [],
+  );
   const comments = await client.paginate(
     `${config.repoPath}/issues/${config.prNumber}/comments`,
     {
@@ -3496,17 +3559,39 @@ async function loadV2IssueCommentsWithEditHistory(
       label,
       validate: requireV2IssueCommentShape,
       ...(isNonNegativeSafeInteger(expectedCount) ? { expectedCount } : {}),
-      observe: (comment, id) => rememberV2ObservedCarrierFingerprint(
-        observedIssueCommentEdits,
-        "rest",
-        id,
-        canonicalJson(fingerprintIssueComment(comment)),
-      ),
+      observe: (comment, id) => {
+        if (isV2KnownOfficialSummary(comment)) return;
+        rememberV2ObservedCarrierFingerprint(
+          observedIssueCommentEdits,
+          "rest",
+          id,
+          canonicalJson(fingerprintIssueComment(comment)),
+        );
+      },
       poison: (message) => poisonV2ObservedHistory(
         observedIssueCommentEdits,
         message,
       ),
     },
+  );
+  retainV2ObservedCarrierFingerprints(
+    observedIssueCommentEdits,
+    "rest",
+    comments
+      .filter((comment) => !isV2KnownOfficialSummary(comment))
+      .map((comment) => [
+        canonicalPositiveId(comment.id),
+        canonicalJson(fingerprintIssueComment(comment)),
+      ]),
+  );
+  const previouslyObservedAndCurrentSummaryIds = rememberV2OfficialSummaryIds(
+    observedIssueCommentEdits,
+    comments,
+  );
+  const diagnosticSummaryIds = currentV2OfficialSummaryIds(
+    comments,
+    previouslyObservedAndCurrentSummaryIds,
+    observedIssueCommentEdits,
   );
   const { deletedCommentEvents, issueCommentEdits } = await loadV2CommentHistory(
     client,
@@ -3514,6 +3599,7 @@ async function loadV2IssueCommentsWithEditHistory(
     budget,
     observedDeletedCommentEvents,
     observedIssueCommentEdits,
+    { diagnosticSummaryIds },
   );
   retainV2ObservedDeletedCommentEvents(
     deletedCommentEvents,
@@ -3523,6 +3609,7 @@ async function loadV2IssueCommentsWithEditHistory(
     comments,
     issueCommentEdits,
     observedIssueCommentEdits,
+    diagnosticSummaryIds,
   );
   return comments;
 }
@@ -3649,6 +3736,7 @@ async function publishV2SnapshotDecision(client, config, context, snapshot) {
   context.headSha = snapshot.headSha;
   context.issueComments = snapshot.issueComments;
   const decision = snapshot.decision;
+  context.headCleanRecoveryAction = decision.headCleanRecoveryAction ?? null;
   const report = buildV2GateReport({
     executionHealth: "healthy",
     gateOutcome: decision.gateOutcome,
@@ -4161,7 +4249,7 @@ async function loadCompleteV2Snapshot(client, config, {
 } = {}) {
   const budget = new V2SnapshotBudget(config, { deadlineMs, now });
   const beforeRepository = await loadV2Repository(client, config, budget);
-  const before = await loadV2PullRequest(client, config, budget);
+  let before = await loadV2PullRequest(client, config, budget);
   assertV2ExpectedSnapshotScope(before, config);
   assertV2FixedSnapshotScope(beforeRepository, before, config);
   const opening = await loadV2DecisionCarriers(
@@ -4172,7 +4260,36 @@ async function loadCompleteV2Snapshot(client, config, {
     observedDeletedCommentEvents,
     observedIssueCommentEdits,
     observedBaseEpoch,
+    null,
+    { deferIssueCommentCountMismatch: true },
   );
+  if (!opening.issueCommentCountMatched) {
+    if (opening.diagnosticSummaryCount === 0) {
+      requireMatchingV2InventoryCount(
+        before.comments,
+        opening.issueComments,
+        "issue comments",
+      );
+    }
+    const openingAuthority = await loadV2PullRequest(client, config, budget);
+    assertV2ExpectedSnapshotScope(openingAuthority, config);
+    assertV2FixedSnapshotScope(beforeRepository, openingAuthority, config);
+    if (!sameV2PullRequestScopeWithoutCommentCount(before, openingAuthority)) {
+      throw new V2RuntimeFailure(
+        "Pull-request scope changed while reconciling the opening issue-comment count",
+        { recoveryCode: "wait_then_reconcile" },
+      );
+    }
+    requireMatchingV2InventoryCount(
+      openingAuthority.comments,
+      opening.issueComments,
+      "issue comments",
+    );
+    // Rebind only after fresh metadata proves the complete raw REST inventory
+    // count. The official summaries remain diagnostic-only in the evidence
+    // reducer; no count delta is subtracted or inferred here.
+    before = openingAuthority;
+  }
   const closing = await loadV2DecisionCarriers(
     client,
     config,
@@ -4181,6 +4298,7 @@ async function loadCompleteV2Snapshot(client, config, {
     observedDeletedCommentEvents,
     observedIssueCommentEdits,
     observedBaseEpoch,
+    opening.diagnosticSummaryCount,
   );
   const afterRepository = await loadV2Repository(client, config, budget);
   const after = await loadV2PullRequest(client, config, budget);
@@ -4189,8 +4307,18 @@ async function loadCompleteV2Snapshot(client, config, {
 
   const selfConsistent =
     sameV2RepositoryScope(beforeRepository, afterRepository) &&
-    sameV2PullRequestScope(before, after) &&
-    sameV2InventoryCounts(before, after) &&
+    sameV2PullRequestScope(
+      before,
+      after,
+      opening.diagnosticSummaryCount,
+      closing.diagnosticSummaryCount,
+    ) &&
+    sameV2InventoryCounts(
+      before,
+      after,
+      opening.diagnosticSummaryCount,
+      closing.diagnosticSummaryCount,
+    ) &&
     opening.fingerprint === closing.fingerprint;
   const fingerprintPayload = {
     verifierRun: {
@@ -4202,8 +4330,14 @@ async function loadCompleteV2Snapshot(client, config, {
       closing: fingerprintV2RepositoryScope(afterRepository),
     },
     pullRequest: {
-      opening: fingerprintV2PullRequestScope(before),
-      closing: fingerprintV2PullRequestScope(after),
+      opening: fingerprintV2PullRequestScope(
+        before,
+        opening.diagnosticSummaryCount,
+      ),
+      closing: fingerprintV2PullRequestScope(
+        after,
+        closing.diagnosticSummaryCount,
+      ),
     },
     decisionCarriers: {
       opening: opening.fingerprint,
@@ -4407,28 +4541,39 @@ async function loadV2DecisionCarriers(
   observedDeletedCommentEvents = null,
   observedIssueCommentEdits = null,
   observedBaseEpoch = null,
+  priorDiagnosticSummaryCount = null,
+  { deferIssueCommentCountMismatch = false } = {},
 ) {
   const headSha = config.expectedHeadSha;
   const baseSha = pullRequest.base.sha.toLowerCase();
   const seenReviewIds = new Set();
   const providerReviewIds = new Set();
-  const carrierReads = await Promise.allSettled([
-    client.paginate(`${config.repoPath}/issues/${config.prNumber}/comments`, {
+  const previouslyObservedSummaryIds = rememberV2OfficialSummaryIds(
+    observedIssueCommentEdits,
+    [],
+  );
+  const issueCommentPromise = client.paginate(
+    `${config.repoPath}/issues/${config.prNumber}/comments`, {
       budget,
       label: "pull-request issue comments",
       validate: requireV2IssueCommentShape,
-      observe: (comment, id) => rememberV2ObservedCarrierFingerprint(
-        observedIssueCommentEdits,
-        "rest",
-        id,
-        canonicalJson(fingerprintIssueComment(comment)),
-      ),
+      observe: (comment, id) => {
+        if (isV2KnownOfficialSummary(comment)) return;
+        rememberV2ObservedCarrierFingerprint(
+          observedIssueCommentEdits,
+          "rest",
+          id,
+          canonicalJson(fingerprintIssueComment(comment)),
+        );
+      },
       poison: (message) => poisonV2ObservedHistory(
         observedIssueCommentEdits,
         message,
       ),
-    }),
-    client.paginate(`${config.repoPath}/pulls/${config.prNumber}/reviews`, {
+    },
+  );
+  const reviewPromise = client.paginate(
+    `${config.repoPath}/pulls/${config.prNumber}/reviews`, {
       budget,
       label: "pull-request reviews",
       validate: requireV2ReviewShape,
@@ -4458,23 +4603,46 @@ async function loadV2DecisionCarriers(
           review,
         );
       },
-    }),
-    loadV2CommentHistory(
-      client,
-      config,
-      budget,
-      observedDeletedCommentEvents,
-      observedIssueCommentEdits,
-      { includeBaseEpoch: true, observedBaseEpoch },
-    ),
-    loadV2ReviewThreads(client, config, budget),
+    },
+  ).then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const reviewThreadPromise = loadV2ReviewThreads(client, config, budget).then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const issueCommentRead = await issueCommentPromise.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const previouslyObservedAndCurrentSummaryIds = rememberV2OfficialSummaryIds(
+    observedIssueCommentEdits,
+    issueCommentRead.status === "fulfilled" ? issueCommentRead.value : [],
+  );
+  const diagnosticSummaryIds = currentV2OfficialSummaryIds(
+    issueCommentRead.status === "fulfilled" ? issueCommentRead.value : [],
+    previouslyObservedAndCurrentSummaryIds,
+    observedIssueCommentEdits,
+  );
+  // Resolve trusted REST identities before GraphQL history, which has no App provenance.
+  const commentHistoryPromise = loadV2CommentHistory(
+    client,
+    config,
+    budget,
+    observedDeletedCommentEvents,
+    observedIssueCommentEdits,
+    { includeBaseEpoch: true, observedBaseEpoch, diagnosticSummaryIds },
+  ).then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const [reviewRead, commentHistoryRead, reviewThreadRead] = await Promise.all([
+    reviewPromise,
+    commentHistoryPromise,
+    reviewThreadPromise,
   ]);
-  const [
-    issueCommentRead,
-    reviewRead,
-    commentHistoryRead,
-    reviewThreadRead,
-  ] = carrierReads;
+  const carrierReads = [issueCommentRead, reviewRead, commentHistoryRead, reviewThreadRead];
   let latchError = null;
   let missingPendingReviews = [];
   if (issueCommentRead.status === "fulfilled") {
@@ -4482,10 +4650,12 @@ async function loadV2DecisionCarriers(
       retainV2ObservedCarrierFingerprints(
         observedIssueCommentEdits,
         "rest",
-        issueCommentRead.value.map((comment) => [
-          canonicalPositiveId(comment.id),
-          canonicalJson(fingerprintIssueComment(comment)),
-        ]),
+        issueCommentRead.value
+          .filter((comment) => !isV2KnownOfficialSummary(comment))
+          .map((comment) => [
+            canonicalPositiveId(comment.id),
+            canonicalJson(fingerprintIssueComment(comment)),
+          ]),
       );
     } catch (error) {
       latchError ??= error;
@@ -4525,6 +4695,7 @@ async function loadV2DecisionCarriers(
       latchError ??= error;
     }
   }
+  let issueCommentCountMatched = true;
   if (
     issueCommentRead.status === "fulfilled" &&
     commentHistoryRead.status === "fulfilled"
@@ -4534,15 +4705,27 @@ async function loadV2DecisionCarriers(
         issueCommentRead.value,
         commentHistoryRead.value.issueCommentEdits,
         observedIssueCommentEdits,
+        diagnosticSummaryIds,
       );
     } catch (error) {
       latchError ??= error;
     }
     try {
-      requireMatchingV2InventoryCount(
-        pullRequest.comments,
+      const summaryCount = issueCommentRead.value.filter((comment) =>
+        isV2KnownOfficialSummary(comment)
+      ).length;
+      const expectedCommentCount =
+        Number.isSafeInteger(pullRequest.comments) &&
+        Number.isSafeInteger(priorDiagnosticSummaryCount)
+        ? pullRequest.comments + summaryCount - priorDiagnosticSummaryCount
+        : pullRequest.comments;
+      issueCommentCountMatched = requireMatchingV2InventoryCount(
+        expectedCommentCount,
         issueCommentRead.value,
         "issue comments",
+        {
+          allowMismatch: deferIssueCommentCountMismatch && summaryCount > 0,
+        },
       );
     } catch (error) {
       latchError ??= error;
@@ -4581,6 +4764,7 @@ async function loadV2DecisionCarriers(
     reviews,
     requestAuthority.authorized,
     observedIssueCommentEdits,
+    diagnosticSummaryIds,
   );
   await exactRefetchV2MissingPendingReviews(
     client,
@@ -4588,6 +4772,40 @@ async function loadV2DecisionCarriers(
     budget,
     missingPendingReviews,
     observedIssueCommentEdits,
+  );
+  const providerEvidence = await collectV2ProviderEvidence(
+    client,
+    config,
+    budget,
+    headSha,
+    issueComments,
+    reviews,
+    diagnosticSummaryIds,
+  );
+  const physicalRequestBoundaries = [
+    ...requestAuthority.boundaries,
+    ...(deletedCommentEvents ?? []).map(v2DeletedCommentBoundary),
+  ].filter((boundary) => isV2CurrentHeadPhysicalBoundary(boundary, headSha));
+  const preliminaryHeadCleanRecovery = selectV2CurrentHeadCleanRecovery({
+    authorized: requestAuthority.authorized,
+    physicalBoundaries: physicalRequestBoundaries,
+    baseEpoch,
+    requestReactions: new Map(),
+    providerArtifacts: providerEvidence.artifacts,
+    opaqueTopLevelProviderActivities: providerEvidence.opaqueTopLevelProviderActivities,
+    providerErrors: providerEvidence.errors,
+    headSha,
+    baseSha,
+    baseRef: pullRequest.base.ref,
+    baseRepositoryId: String(pullRequest.base.repo.id),
+    repositoryId: String(config.repositoryId),
+    prNumber: config.prNumber,
+    verifierRunCreatedMs: config.verifierRunCreatedMs,
+    deferHistoryProjectionForFindings: true,
+  });
+  forgetV2AttestedPriorRequestReactionHistory(
+    observedIssueCommentEdits,
+    preliminaryHeadCleanRecovery,
   );
   const reactionRequests = selectV2ReactionInventoryRequests({
     headSha,
@@ -4604,19 +4822,14 @@ async function loadV2DecisionCarriers(
     budget,
     reactionRequests,
     observedIssueCommentEdits,
+    preliminaryHeadCleanRecovery,
   );
   const requestReactions = new Map();
   for (const [id, reactions] of reactionInventories) {
     requestReactions.set(id, reactions);
   }
-
-  const providerEvidence = await collectV2ProviderEvidence(
-    client,
-    config,
-    budget,
-    headSha,
-    issueComments,
-    reviews,
+  const requestReactionInventoryErrors = findV2GlobalReactionInventoryErrors(
+    requestReactions,
   );
   // `any` avoids a collaborator-permission lookup; it does not attest that
   // Codex accepted a user-authored request. Keep those comments in the
@@ -4625,10 +4838,7 @@ async function loadV2DecisionCarriers(
   const effectiveRequestAuthority = confirmV2DefaultAnyRequestCandidates({
     authorized: requestAuthority.authorized,
     boundaries: requestAuthority.boundaries,
-    physicalBoundaries: [
-      ...requestAuthority.boundaries,
-      ...(deletedCommentEvents ?? []).map(v2DeletedCommentBoundary),
-    ].filter((boundary) => isV2CurrentHeadPhysicalBoundary(boundary, headSha)),
+    physicalBoundaries: physicalRequestBoundaries,
     baseEpoch,
     requestReactions,
     providerArtifacts: providerEvidence.artifacts,
@@ -4651,7 +4861,11 @@ async function loadV2DecisionCarriers(
     requests: effectiveRequestAuthority.authorized,
     requestBoundaries: effectiveRequestAuthority.boundaries,
     requestErrors: requestAuthority.errors,
-    requestReactions,
+    requestReactions: projectV2HeadRecoveryReactions(
+      requestReactions,
+      effectiveRequestAuthority.headCleanRecovery,
+    ),
+    requestReactionInventoryErrors,
     artifacts: providerEvidence.artifacts,
     providerErrors: providerEvidence.errors,
     deletedCommentEvents,
@@ -4665,10 +4879,16 @@ async function loadV2DecisionCarriers(
     baseRef: pullRequest.base.ref,
     baseRepositoryId: String(pullRequest.base.repo.id),
     issueComments: issueComments
-      .filter(isRelevantV2IssueComment)
+      .filter((comment) =>
+        !isV2KnownOfficialSummary(comment) &&
+          isRelevantV2IssueComment(comment)
+      )
       .sort(compareV2IssueCommentsOldestFirst)
       .map(fingerprintIssueComment),
-    requestReactions: [...requestReactions]
+    requestReactions: [...projectV2HeadRecoveryReactions(
+      requestReactions,
+      effectiveRequestAuthority.headCleanRecovery,
+    )]
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([requestId, reactions]) => ({
         requestId,
@@ -4700,7 +4920,9 @@ async function loadV2DecisionCarriers(
     requestErrors: requestAuthority.errors,
     baseEpoch,
     deletedCommentEvents,
-    issueCommentEdits,
+    issueCommentEdits: issueCommentEdits.filter((edit) =>
+      edit.diagnosticSummary !== true
+    ),
     commitResolutions: providerEvidence.commitResolutions,
     providerErrors: providerEvidence.errors,
     reviewThreads: reviewThreadEvidence.fingerprint,
@@ -4713,6 +4935,10 @@ async function loadV2DecisionCarriers(
     issueComments,
     reviewThreadEvidence,
     decisionEvidence,
+    issueCommentCountMatched,
+    diagnosticSummaryCount: issueComments.filter((comment) =>
+      isV2KnownOfficialSummary(comment)
+    ).length,
   };
 }
 
@@ -4722,6 +4948,7 @@ async function loadV2RequestReactionInventories(
   budget,
   reactionRequests,
   observedIssueCommentEdits,
+  headCleanRecovery = null,
 ) {
   const states = (reactionRequests ?? []).map(({ comment }) => {
     const id = canonicalPositiveId(comment?.id);
@@ -4803,6 +5030,14 @@ async function loadV2RequestReactionInventories(
                 state.id,
                 seenReactionIdentities,
                 observedIssueCommentEdits,
+                {
+                  ignoreAttestedPriorRequestHistory:
+                    isV2AttestedPriorRequestReaction(
+                      state.id,
+                      reaction,
+                      headCleanRecovery,
+                    ),
+                },
               );
               const reactionId = canonicalPositiveId(reaction.id);
               if (state.reactionIds.has(reactionId)) {
@@ -4836,6 +5071,13 @@ async function loadV2RequestReactionInventories(
               `reaction-rest:${state.id}`,
               state.reactions
                 .filter(hasV2ProviderReactionIdentitySignal)
+                .filter((reaction) =>
+                  !isV2AttestedPriorRequestReaction(
+                    state.id,
+                    reaction,
+                    headCleanRecovery,
+                  )
+                )
                 .map((reaction) => [
                   canonicalPositiveId(reaction.id),
                   canonicalJson(fingerprintReaction(reaction)),
@@ -5034,6 +5276,7 @@ function observeV2BatchedReaction(
   requestId,
   seenReactionIdentities,
   observedIssueCommentEdits,
+  { ignoreAttestedPriorRequestHistory = false } = {},
 ) {
   const reactionId = canonicalPositiveId(reaction.id);
   const officialIdentity = reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN;
@@ -5051,6 +5294,7 @@ function observeV2BatchedReaction(
     reactionId,
     Boolean(previousWasOfficial) || officialIdentity,
   );
+  if (ignoreAttestedPriorRequestHistory) return;
   rememberV2ObservedCarrierFingerprint(
     observedIssueCommentEdits,
     "reaction-identity",
@@ -5169,6 +5413,7 @@ function reduceV2Evidence({
   requestBoundaries,
   requestErrors,
   requestReactions,
+  requestReactionInventoryErrors = null,
   artifacts,
   providerErrors,
   deletedCommentEvents,
@@ -5225,7 +5470,8 @@ function reduceV2Evidence({
   const allArtifacts = [...(artifacts ?? []), ...reactionEvidence.artifacts];
   const reactionErrors = [...new Set([
     ...reactionEvidence.errors,
-    ...findV2GlobalReactionInventoryErrors(requestReactions),
+    ...(requestReactionInventoryErrors ??
+      findV2GlobalReactionInventoryErrors(requestReactions)),
   ])];
   blockingErrors.push(...reactionErrors);
   indeterminate += reactionErrors.length;
@@ -5511,9 +5757,12 @@ function reduceV2Evidence({
   const latestBoundaryCannotBeContinued = latestPhysicalBoundary !== null &&
     latestPhysicalBoundary.authorized !== true &&
     latestPhysicalBoundary.physicalOnlyReason !== "post-run-unconfirmed-review-request";
-  const requiresReplacementPr =
+  const headAttestedRecoveryActive = baseEpochMs === null &&
+    generationLineage.headCleanRecovery?.kind === "current-head-attestation";
+  const requiresReplacementPr = !headAttestedRecoveryActive && (
     generationLineage.gapClosures.some((closure) => closure === null) ||
-    latestBoundaryCannotBeContinued;
+    latestBoundaryCannotBeContinued
+  );
   const waitingForPostRunClean =
     latestPhysicalBoundary?.physicalOnlyReason === "post-run-unconfirmed-review-request" &&
     generationLineage.gapClosures.every((closure) => closure !== null);
@@ -5599,6 +5848,40 @@ function reduceV2Evidence({
     };
   }
   decision.requiresReplacementPr = requiresReplacementPr;
+  // This is recovery guidance, not positive clean authority. Only known,
+  // unedited request history can use a future fresh head-attested witness;
+  // genuine provider/request errors retain their original repair path.
+  if (
+    decision.gateOutcome === "pending" &&
+    requiresReplacementPr &&
+    baseEpochMs === null &&
+    Number.isFinite(verifierRunCreatedMs) &&
+    scopedErrors.length === 0 &&
+    reactionErrors.length === 0 &&
+    !requestEpoch.error &&
+    boundaryScope.currentRequests.every((boundary) =>
+      Number.isFinite(boundary.revisionMs) &&
+      boundary.comment !== null &&
+      isCanonicalUtcTimestamp(boundary.comment?.created_at) &&
+      boundary.comment.created_at === boundary.comment.updated_at &&
+      !hasV2ObservedIssueCommentEdit(boundary.comment) &&
+      (
+        boundary.authorized === true ||
+        boundary.physicalOnlyReason === "post-run-unconfirmed-review-request"
+      )
+    )
+  ) {
+    decision.requiresReplacementPr = false;
+    const latestBoundaryHasTerminal = latestPhysicalBoundary !== null &&
+      positiveCleans.some((clean) =>
+        Date.parse(clean.createdAt) > latestPhysicalBoundary.revisionMs
+      );
+    decision.headCleanRecoveryAction =
+      latestPhysicalBoundary?.revisionMs > verifierRunCreatedMs &&
+        !latestBoundaryHasTerminal
+        ? "wait"
+        : "request";
+  }
   return { counts, reviewThreads, decision };
 }
 
@@ -5756,8 +6039,7 @@ function confirmV2DefaultAnyRequestCandidates({
     prNumber,
     verifierRunCreatedMs,
   };
-  const headCleanRecovery = selectV2PostRunHeadCleanRecovery(recoveryInputs) ??
-    selectV2CurrentHeadCleanRecovery(recoveryInputs);
+  const headCleanRecovery = selectV2CurrentHeadCleanRecovery(recoveryInputs);
   if (headCleanRecovery) confirmedIds.add(headCleanRecovery.requestId);
   const include = (request) =>
     request?.requiresProviderConfirmation !== true || confirmedIds.has(request.id);
@@ -5917,14 +6199,19 @@ function selectV2CurrentHeadCleanRecovery({
   repositoryId,
   prNumber,
   verifierRunCreatedMs,
+  deferHistoryProjectionForFindings = false,
 }) {
-  // This witness attests the current head, not which request caused the clean.
-  // It only bypasses the old ordinary-request attribution gap on a degraded
-  // no-base-epoch lineage; the normal reducer still owns findings and liveness.
+  // This witness attests the current head, not which historical request caused
+  // the clean. The latest eligible request is the only request boundary it
+  // authorizes; all earlier request lineage remains auditable but cannot veto
+  // this head-attested clean through attribution or request-reaction liveness.
   if (
     !Number.isFinite(verifierRunCreatedMs) ||
     (baseEpoch?.event !== null && baseEpoch?.event !== undefined) ||
     (providerErrors ?? []).length > 0 ||
+    (providerArtifacts ?? []).some((artifact) =>
+      artifact?.source === "issue-comment" && artifact.edited === true
+    ) ||
     (physicalBoundaries ?? []).some((boundary) =>
       !Number.isFinite(boundary?.revisionMs)
     )
@@ -5941,13 +6228,24 @@ function selectV2CurrentHeadCleanRecovery({
       left.revisionMs - right.revisionMs ||
       compareV2LineageBoundaryIdsAscending(left, right)
     );
-  const preRun = physical.filter((boundary) =>
-    boundary.revisionMs <= verifierRunCreatedMs
-  );
-  const postRun = physical.filter((boundary) =>
-    boundary.revisionMs > verifierRunCreatedMs
-  );
-  if (preRun.length === 0 || postRun.length !== 1) return null;
+  if (physical.length === 0) return null;
+  const requestBoundary = physical.at(-1);
+  if (
+    requestBoundary.revisionMs <= verifierRunCreatedMs ||
+    physical.filter((boundary) =>
+      boundary.revisionMs === requestBoundary.revisionMs
+    ).length !== 1
+  ) {
+    return null;
+  }
+  const priorBoundaries = physical.slice(0, -1);
+  if (priorBoundaries.some((boundary) =>
+    boundary.comment === null ||
+    boundary.physicalOnlyReason === "deleted-comment-unknown-history" ||
+    hasV2ObservedIssueCommentEdit(boundary.comment)
+  )) {
+    return null;
+  }
 
   const isAuthorizedOrdinaryBoundary = (boundary) => {
     const request = authorizedById.get(boundary?.id);
@@ -5965,11 +6263,8 @@ function selectV2CurrentHeadCleanRecovery({
       Date.parse(request.comment.updated_at) === boundary.revisionMs &&
       !hasV2ObservedIssueCommentEdit(request.comment);
   };
-  if (!preRun.every(isAuthorizedOrdinaryBoundary)) return null;
-
-  const requestBoundary = postRun[0];
   const request = authorizedById.get(requestBoundary.id);
-  if (!request || request.revisionMs <= verifierRunCreatedMs) return null;
+  if (!request || request.revisionMs !== requestBoundary.revisionMs) return null;
   const comment = request.comment;
   if (
     !isCanonicalUtcTimestamp(comment?.created_at) ||
@@ -5999,15 +6294,24 @@ function selectV2CurrentHeadCleanRecovery({
     return null;
   }
 
-  // An exact-head direct +1 already has the ordinary request-bound route and
-  // must retain that route's normal finding/error supersession semantics.
+  const hasCurrentHeadFinding = (providerArtifacts ?? []).some((artifact) =>
+    artifact?.kind === "finding" &&
+    String(artifact.resolvedHeadSha || artifact.headSha || "").toLowerCase() === headSha
+  );
+  if (deferHistoryProjectionForFindings && hasCurrentHeadFinding) return null;
   if (
     request.headBound === true &&
-    hasV2DirectProviderReactionAfterRequest(request, requestReactions)
+    hasCurrentHeadFinding &&
+    hasV2DirectPlusOneAfterRequest(request, requestReactions)
   ) {
+    // Preserve the ordinary +1-based supersession path when a current-head
+    // finding depends on its reaction-derived gap-closure proof.
     return null;
   }
 
+  // Keep the head-attested clean available alongside a direct reaction: the
+  // reaction retains its ordinary request-bound semantics, while this clean
+  // is excluded from superseding findings and evidence errors.
   const cleans = (providerArtifacts ?? [])
     .filter((artifact) =>
       isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(
@@ -6043,8 +6347,104 @@ function selectV2CurrentHeadCleanRecovery({
     requestId: request.id,
     cleanId: selected.artifact.id,
     verifierRunCreatedMs,
-    preRunOrdinaryRequestIds: preRun.map((boundary) => boundary.id),
+    priorRequestBoundaries: priorBoundaries.map((boundary) => ({
+      id: boundary.id,
+      revisionMs: boundary.revisionMs,
+    })),
   };
+}
+
+function isV2AttestedPriorRequestReaction(requestId, reaction, headCleanRecovery) {
+  if (
+    headCleanRecovery?.kind !== "current-head-attestation" ||
+    !Array.isArray(headCleanRecovery.priorRequestBoundaries) ||
+    !headCleanRecovery.priorRequestBoundaries.some((boundary) =>
+      String(boundary?.id) === String(requestId)
+    ) ||
+    !canonicalPositiveId(reaction?.id) ||
+    !V2_REACTION_CONTENTS.has(reaction?.content) ||
+    reaction?.user?.login !== OFFICIAL_CODEX_BOT_LOGIN ||
+    reaction?.user?.type !== "Bot" ||
+    !isCanonicalUtcTimestamp(reaction?.created_at)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function forgetV2AttestedPriorRequestReactionHistory(observed, headCleanRecovery) {
+  if (
+    !(observed instanceof Map) ||
+    headCleanRecovery?.kind !== "current-head-attestation"
+  ) {
+    return;
+  }
+  const priorIds = new Set(
+    (headCleanRecovery.priorRequestBoundaries ?? []).map((boundary) =>
+      String(boundary?.id)
+    ),
+  );
+  if (priorIds.size === 0) return;
+  const fingerprints = observed.get(V2_OBSERVED_CARRIER_FINGERPRINTS);
+  if (!(fingerprints instanceof Map)) return;
+  for (const [key, value] of fingerprints) {
+    let requestId = null;
+    let reaction = null;
+    if (key.startsWith("reaction-identity:")) {
+      try {
+        const parsed = JSON.parse(value);
+        requestId = String(parsed?.requestId ?? "");
+        reaction = parsed?.reaction;
+      } catch {
+        continue;
+      }
+    } else if (key.startsWith("reaction-rest:")) {
+      const match = /^reaction-rest:([^:]+):[1-9][0-9]*$/u.exec(key);
+      if (!match) continue;
+      requestId = match[1];
+      try {
+        reaction = JSON.parse(value);
+      } catch {
+        continue;
+      }
+    }
+    if (
+      requestId !== null &&
+      priorIds.has(requestId) &&
+      isV2TrustedOfficialReactionFingerprint(reaction)
+    ) {
+      fingerprints.delete(key);
+    }
+  }
+}
+
+function isV2TrustedOfficialReactionFingerprint(reaction) {
+  const actor = reaction?.user ?? reaction?.author;
+  const createdAt = reaction?.created_at ?? reaction?.createdAt;
+  return canonicalPositiveId(reaction?.id) !== null &&
+    V2_REACTION_CONTENTS.has(reaction?.content) &&
+    actor?.login === OFFICIAL_CODEX_BOT_LOGIN &&
+    actor?.type === "Bot" &&
+    isCanonicalUtcTimestamp(createdAt);
+}
+
+function projectV2HeadRecoveryReactions(requestReactions, headCleanRecovery) {
+  if (headCleanRecovery?.kind !== "current-head-attestation") {
+    return requestReactions;
+  }
+  const priorIds = new Set(
+    (headCleanRecovery.priorRequestBoundaries ?? []).map((boundary) =>
+      String(boundary?.id)
+    ),
+  );
+  return new Map([...(requestReactions ?? [])].map(([requestId, reactions]) => [
+    requestId,
+    priorIds.has(String(requestId))
+      ? (reactions ?? []).filter((reaction) =>
+          !isV2AttestedPriorRequestReaction(requestId, reaction, headCleanRecovery)
+        )
+      : reactions,
+  ]));
 }
 
 function selectV2DefaultAnyDuplicateCohortClosure({
@@ -6279,6 +6679,17 @@ function hasV2DirectProviderReactionAfterRequest(request, requestReactions) {
     request,
     requestReactions,
     { strictlyAfter: true },
+  );
+}
+
+function hasV2DirectPlusOneAfterRequest(request, requestReactions) {
+  return (requestReactions?.get(String(request.id)) ?? []).some((reaction) =>
+    reaction?.content === "+1" &&
+    reaction?.user?.login === OFFICIAL_CODEX_BOT_LOGIN &&
+    reaction?.user?.type === "Bot" &&
+    canonicalPositiveId(reaction?.id) &&
+    isCanonicalUtcTimestamp(reaction?.created_at) &&
+    Date.parse(reaction.created_at) > request.revisionMs
   );
 }
 
@@ -6548,9 +6959,11 @@ function isV2CurrentHeadCleanRecoveryWitness(
   ) {
     return false;
   }
-  const allowedPriorIds = new Set(recovery.preRunOrdinaryRequestIds ?? []);
+  const allowedPriorIds = new Set(
+    (recovery.priorRequestBoundaries ?? []).map((boundary) => String(boundary?.id)),
+  );
   return generations.slice(0, generationIndex).every((prior) =>
-    allowedPriorIds.has(prior.id)
+    allowedPriorIds.has(String(prior.id))
   );
 }
 
@@ -6950,6 +7363,7 @@ async function exactRefetchV2RelevantObjects(
   reviews,
   authorizedRequests,
   observedIssueCommentEdits = null,
+  diagnosticSummaryIds = new Set(),
 ) {
   const authorizedRequestIds = new Set(
     (authorizedRequests ?? []).map((request) =>
@@ -6960,6 +7374,7 @@ async function exactRefetchV2RelevantObjects(
   for (const comment of issueComments) {
     const id = canonicalPositiveId(comment?.id);
     if (!id) continue;
+    if (isV2KnownOfficialSummary(comment)) continue;
     const providerCandidate = hasAnyV2ProviderIdentitySignal(comment);
     if (
       providerCandidate ||
@@ -7130,7 +7545,10 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
   const ordinaryCandidates = [];
   const permissionByLogin = new Map();
   for (const comment of issueComments) {
-    if (hasExactProviderIdentity(comment)) continue;
+    if (
+      isV2OfficialPullRequestReviewSummary(comment) ||
+      hasExactProviderIdentity(comment)
+    ) continue;
     if (isV2CanonicalActionsSticky(comment, config)) continue;
     if (isV2StickyCommentBody(comment?.body)) {
       boundaries.push(v2PhysicalOnlyRequestBoundary(
@@ -7339,11 +7757,13 @@ async function collectV2ProviderEvidence(
   headSha,
   issueComments,
   reviews,
+  diagnosticSummaryIds = new Set(),
 ) {
   const artifacts = [];
   const opaqueTopLevelProviderActivities = [];
   const errors = [];
   for (const comment of issueComments) {
+    if (isV2KnownOfficialSummary(comment)) continue;
     if (!hasAnyV2ProviderIdentitySignal(comment)) continue;
     const revisionAt = v2IssueCommentRevisionAt(comment);
     if (!hasExactProviderIdentity(comment)) {
@@ -7588,6 +8008,7 @@ async function loadV2CommentHistory(
   {
     includeBaseEpoch = false,
     observedBaseEpoch = null,
+    diagnosticSummaryIds = new Set(),
   } = {},
 ) {
   assertV2ObservedHistoryNotPoisoned(observedDeletedCommentEvents);
@@ -7639,6 +8060,7 @@ async function loadV2CommentHistory(
       includeComments,
       observedDeletedCommentEvents,
       observedIssueCommentEdits,
+      diagnosticSummaryIds,
       deletedEventsSeen: events.length,
       rawEventIds,
       rawEditIds,
@@ -7813,13 +8235,22 @@ async function loadV2CommentHistory(
   );
   retainV2ObservedHistoryRawIdentities(
     observedIssueCommentEdits,
-    edits.map((edit) => edit.id),
+    edits
+      .filter((edit) => edit.diagnosticSummary !== true)
+      .map((edit) => edit.id),
     "issue-comment",
   );
   retainV2ObservedCarrierFingerprints(
     observedIssueCommentEdits,
     "graphql",
-    edits.map((edit) => [edit.id, canonicalJson(edit)]),
+    edits
+      .filter((edit) => edit.diagnosticSummary !== true)
+      .map((edit) => [edit.id, canonicalJson(edit)]),
+  );
+  rememberV2ObservedHistoryCount(
+    observedIssueCommentEdits,
+    expectedCommentCount - edits.filter((edit) => edit.diagnosticSummary === true).length,
+    "issue-comment",
   );
   return {
     baseEpoch,
@@ -7839,6 +8270,7 @@ function latchV2VisibleCommentHistoryNodes({
   includeComments,
   observedDeletedCommentEvents,
   observedIssueCommentEdits,
+  diagnosticSummaryIds,
   deletedEventsSeen,
   rawEventIds,
   rawEditIds,
@@ -7886,11 +8318,29 @@ function latchV2VisibleCommentHistoryNodes({
   }
   if (includeComments) {
     try {
-      rememberV2ObservedHistoryCount(
-        observedIssueCommentEdits,
-        pullRequest?.comments?.totalCount,
-        "issue-comment",
-      );
+      const totalCount = pullRequest?.comments?.totalCount;
+      const diagnosticSummaryCount = diagnosticSummaryIds instanceof Set
+        ? diagnosticSummaryIds.size
+        : 0;
+      const adjustedCount = isNonNegativeSafeInteger(totalCount) &&
+          totalCount >= diagnosticSummaryCount
+        ? totalCount - diagnosticSummaryCount
+        : null;
+      if (diagnosticSummaryCount > 0) {
+        // This adjusted page count may subtract a summary that GraphQL already
+        // omitted, so it is only a lower bound; the completed inventory below
+        // remains the exact fail-closed count check.
+        rememberV2ObservedHistoryCountLowerBound(
+          observedIssueCommentEdits,
+          adjustedCount,
+        );
+      } else {
+        rememberV2ObservedHistoryCount(
+          observedIssueCommentEdits,
+          totalCount,
+          "issue-comment",
+        );
+      }
     } catch (caught) {
       error ??= caught;
     }
@@ -7899,13 +8349,16 @@ function latchV2VisibleCommentHistoryNodes({
         Array.isArray(pullRequest?.comments?.nodes)
           ? pullRequest.comments.nodes
           : [],
-        normalizeV2IssueCommentEdit,
-        rememberV2ObservedIssueCommentEdit,
+        (node) => normalizeV2IssueCommentHistoryEdit(node, diagnosticSummaryIds),
+        (edit, observed) => {
+          if (edit.diagnosticSummary === true) return;
+          rememberV2ObservedIssueCommentEdit(edit, observed);
+        },
         observedIssueCommentEdits,
         (node) => canonicalPositiveId(node?.databaseId),
         rawEditIds,
         "issue-comment",
-        v2IssueCommentPartialFacts,
+        (node) => v2IssueCommentHistoryPartialFacts(node, diagnosticSummaryIds),
         false,
       );
       pageEdits = normalizedPage.normalized;
@@ -7920,6 +8373,7 @@ function latchV2VisibleCommentHistoryNodes({
 function rememberV2PageIssueCommentFingerprints(edits, fingerprints, observed) {
   let error = null;
   for (const edit of edits ?? []) {
+    if (edit.diagnosticSummary === true) continue;
     const fingerprint = canonicalJson(edit);
     const previous = fingerprints.get(edit.id);
     if (previous !== undefined) {
@@ -8228,6 +8682,16 @@ function rememberV2ObservedHistoryCount(
   );
 }
 
+function rememberV2ObservedHistoryCountLowerBound(observed, count) {
+  if (!(observed instanceof Map) || !isNonNegativeSafeInteger(count)) return;
+  assertV2ObservedHistoryNotPoisoned(observed);
+  const previous = observed.get(V2_OBSERVED_HISTORY_COUNT_FLOOR);
+  observed.set(
+    V2_OBSERVED_HISTORY_COUNT_FLOOR,
+    isNonNegativeSafeInteger(previous) ? Math.max(previous, count) : count,
+  );
+}
+
 function normalizeAndRememberV2HistoryNodes(
   nodes,
   normalize,
@@ -8366,6 +8830,14 @@ function v2IssueCommentPartialFacts(value) {
     facts.lastEditedAt = value.lastEditedAt;
   }
   return facts;
+}
+
+function v2IssueCommentHistoryPartialFacts(value, diagnosticSummaryIds) {
+  const id = canonicalPositiveId(value?.databaseId);
+  return id && diagnosticSummaryIds?.has(id) &&
+      hasV2OfficialSummaryMarkerBody(value?.body)
+    ? {}
+    : v2IssueCommentPartialFacts(value);
 }
 
 function v2DeletedCommentPartialFacts(value) {
@@ -8554,6 +9026,8 @@ function poisonV2ObservedHistory(observed, message) {
 }
 
 function normalizeV2DeletedCommentEvent(value) {
+  // GitHub omits the deleted comment id, body, App provenance, and marker;
+  // preserve the event as unknown rather than waiving it as a summary.
   if (
     !isPlainRecord(value) ||
     value.__typename !== "CommentDeletedEvent" ||
@@ -8613,16 +9087,28 @@ function normalizeV2IssueCommentEdit(value) {
   };
 }
 
+function normalizeV2IssueCommentHistoryEdit(value, diagnosticSummaryIds) {
+  const id = canonicalPositiveId(value?.databaseId);
+  if (
+    id &&
+    diagnosticSummaryIds?.has(id) &&
+    hasV2OfficialSummaryMarkerBody(value?.body)
+  ) {
+    return { id, diagnosticSummary: true };
+  }
+  return normalizeV2IssueCommentEdit(value);
+}
+
 function attachV2IssueCommentEditMetadata(
   issueComments,
   edits,
   observedIssueCommentEdits = null,
+  diagnosticSummaryIds = new Set(),
 ) {
-  if (!Array.isArray(issueComments) || !Array.isArray(edits) ||
-      issueComments.length !== edits.length) {
+  if (!Array.isArray(issueComments) || !Array.isArray(edits)) {
     throw poisonV2ObservedHistory(
       observedIssueCommentEdits,
-      "REST and GraphQL issue-comment inventories have different counts",
+      "REST and GraphQL issue-comment inventories were incomplete",
     );
   }
   const editsById = new Map(edits.map((edit) => [edit.id, edit]));
@@ -8633,6 +9119,7 @@ function attachV2IssueCommentEditMetadata(
     );
   }
   const commentIds = new Set();
+  const commentsById = new Map();
   for (const comment of issueComments) {
     const id = canonicalPositiveId(comment?.id);
     if (!id || commentIds.has(id)) {
@@ -8642,7 +9129,9 @@ function attachV2IssueCommentEditMetadata(
       );
     }
     commentIds.add(id);
-    if (id) {
+    commentsById.set(id, comment);
+    const diagnosticSummary = isV2KnownOfficialSummary(comment);
+    if (id && !diagnosticSummary) {
       rememberV2ObservedCarrierFingerprint(
         observedIssueCommentEdits,
         "rest",
@@ -8651,6 +9140,7 @@ function attachV2IssueCommentEditMetadata(
       );
     }
     const edit = id ? editsById.get(id) : null;
+    if (diagnosticSummary && (!edit || edit.diagnosticSummary === true)) continue;
     if (
       !edit ||
       edit.body !== comment.body ||
@@ -8667,7 +9157,21 @@ function attachV2IssueCommentEditMetadata(
     comment._v2LastEditedAt = edit.lastEditedAt;
     comment._v2GraphQlUpdatedAt = edit.updatedAt;
   }
-  if (commentIds.size !== editsById.size) {
+  const unmatchedHistoryIds = [...editsById.keys()]
+    .filter((id) => !commentIds.has(id));
+  if (unmatchedHistoryIds.some((id) =>
+    editsById.get(id)?.diagnosticSummary !== true
+  )) {
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      "REST and GraphQL issue-comment inventories have different id sets",
+    );
+  }
+  const unmatchedRestIds = [...commentIds]
+    .filter((id) => !editsById.has(id));
+  if (unmatchedRestIds.some((id) =>
+    !isV2OfficialPullRequestReviewSummary(commentsById.get(id))
+  )) {
     throw poisonV2ObservedHistory(
       observedIssueCommentEdits,
       "REST and GraphQL issue-comment inventories have different id sets",
@@ -9283,6 +9787,74 @@ function hasExactProviderIdentity(value, { allowMissingApp = false } = {}) {
     (allowMissingApp || apps.length > 0);
 }
 
+function hasV2OfficialSummaryMarkerBody(body) {
+  if (typeof body !== "string") return false;
+  const marker = V2_CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER;
+  return body === marker ||
+    body.startsWith(`${marker}\n`) ||
+    body.startsWith(`${marker}\r\n`);
+}
+
+function isV2OfficialPullRequestReviewSummary(comment) {
+  return hasExactProviderIdentity(comment) &&
+    hasV2OfficialSummaryMarkerBody(comment?.body);
+}
+
+function rememberV2OfficialSummaryIds(observed, comments) {
+  const summaryIds = observed instanceof Map
+    ? observed.get(V2_OBSERVED_DIAGNOSTIC_SUMMARY_IDS)
+    : null;
+  const knownIds = summaryIds instanceof Set ? summaryIds : new Set();
+  if (observed instanceof Map && !(summaryIds instanceof Set)) {
+    observed.set(V2_OBSERVED_DIAGNOSTIC_SUMMARY_IDS, knownIds);
+  }
+  for (const comment of comments ?? []) {
+    if (!isV2OfficialPullRequestReviewSummary(comment)) continue;
+    const id = canonicalPositiveId(comment?.id);
+    if (id) knownIds.add(id);
+  }
+  return new Set(knownIds);
+}
+
+function currentV2OfficialSummaryIds(
+  comments,
+  previouslyObservedIds,
+  observedIssueCommentEdits = null,
+) {
+  const currentIds = new Set();
+  const commentsById = new Map(
+    (comments ?? [])
+      .map((comment) => [canonicalPositiveId(comment?.id), comment])
+      .filter(([id]) => id),
+  );
+  for (const id of previouslyObservedIds ?? []) {
+    const current = commentsById.get(id);
+    if (current && !isV2OfficialPullRequestReviewSummary(current)) {
+      previouslyObservedIds.delete(id);
+      const observedIds = observedIssueCommentEdits instanceof Map
+        ? observedIssueCommentEdits.get(V2_OBSERVED_DIAGNOSTIC_SUMMARY_IDS)
+        : null;
+      if (observedIds instanceof Set) observedIds.delete(id);
+      continue;
+    }
+    if (!current || isV2OfficialPullRequestReviewSummary(current)) currentIds.add(id);
+  }
+  for (const comment of comments ?? []) {
+    const id = canonicalPositiveId(comment?.id);
+    if (
+      id &&
+      isV2OfficialPullRequestReviewSummary(comment)
+    ) {
+      currentIds.add(id);
+    }
+  }
+  return currentIds;
+}
+
+function isV2KnownOfficialSummary(comment) {
+  return isV2OfficialPullRequestReviewSummary(comment);
+}
+
 function hasAnyV2ProviderIdentitySignal(value) {
   return value?.user?.login === OFFICIAL_CODEX_BOT_LOGIN ||
     [value?.app, value?.performed_via_github_app]
@@ -9301,15 +9873,39 @@ function v2InvalidProviderReactionProvenanceError(reaction) {
 
 function isRelevantV2IssueComment(comment) {
   return Boolean(
-    hasExactV2PhysicalReviewRequestShape(comment?.body) ||
-      isV2EditedUnknownRequestBoundary(comment) ||
-      hasAnyV2ProviderIdentitySignal(comment),
+    !isV2OfficialPullRequestReviewSummary(comment) &&
+      (
+        hasExactV2PhysicalReviewRequestShape(comment?.body) ||
+        isV2EditedUnknownRequestBoundary(comment) ||
+        hasAnyV2ProviderIdentitySignal(comment)
+      ),
   );
 }
 
-function sameV2PullRequestScope(left, right) {
-  return canonicalJson(fingerprintV2PullRequestScope(left)) ===
-    canonicalJson(fingerprintV2PullRequestScope(right)) &&
+function sameV2PullRequestScope(
+  left,
+  right,
+  leftSummaryCount = 0,
+  rightSummaryCount = 0,
+) {
+  return canonicalJson(fingerprintV2PullRequestScope(left, leftSummaryCount)) ===
+    canonicalJson(fingerprintV2PullRequestScope(right, rightSummaryCount)) &&
+    left?.state === "open" &&
+    right?.state === "open" &&
+    left?.draft === false &&
+    right?.draft === false &&
+    left?.merged !== true &&
+    right?.merged !== true &&
+    !left?.merged_at &&
+    !right?.merged_at;
+}
+
+function sameV2PullRequestScopeWithoutCommentCount(left, right) {
+  const leftScope = fingerprintV2PullRequestScope(left);
+  const rightScope = fingerprintV2PullRequestScope(right);
+  delete leftScope.comments;
+  delete rightScope.comments;
+  return canonicalJson(leftScope) === canonicalJson(rightScope) &&
     left?.state === "open" &&
     right?.state === "open" &&
     left?.draft === false &&
@@ -9334,7 +9930,14 @@ function fingerprintV2RepositoryScope(repository) {
   };
 }
 
-function fingerprintV2PullRequestScope(pullRequest) {
+function fingerprintV2PullRequestScope(pullRequest, diagnosticSummaryCount = 0) {
+  const commentCount = pullRequest?.comments;
+  const projectedCommentCount =
+    Number.isSafeInteger(commentCount) && commentCount >= 0 &&
+      Number.isSafeInteger(diagnosticSummaryCount) && diagnosticSummaryCount >= 0 &&
+      diagnosticSummaryCount <= commentCount
+      ? commentCount - diagnosticSummaryCount
+      : commentCount ?? null;
   return {
     number: pullRequest?.number ?? null,
     state: pullRequest?.state ?? null,
@@ -9352,14 +9955,26 @@ function fingerprintV2PullRequestScope(pullRequest) {
     baseRef: pullRequest?.base?.ref ?? null,
     baseRepositoryId: pullRequest?.base?.repo?.id ?? null,
     baseRepositoryFullName: pullRequest?.base?.repo?.full_name ?? null,
-    comments: pullRequest?.comments ?? null,
+    // Raw counts are still checked against each other and trusted summary
+    // deltas by sameV2InventoryCounts; fingerprints track only real comments.
+    comments: projectedCommentCount,
     commits: pullRequest?.commits ?? null,
   };
 }
 
-function sameV2InventoryCounts(left, right) {
-  return sameOptionalV2Count(left?.comments, right?.comments) &&
-    sameOptionalV2Count(left?.commits, right?.commits);
+function sameV2InventoryCounts(
+  left,
+  right,
+  leftSummaryCount = null,
+  rightSummaryCount = null,
+) {
+  if (!sameOptionalV2Count(left?.commits, right?.commits)) return false;
+  if (sameOptionalV2Count(left?.comments, right?.comments)) return true;
+  return Number.isSafeInteger(left?.comments) && left.comments >= 0 &&
+    Number.isSafeInteger(right?.comments) && right.comments >= 0 &&
+    Number.isSafeInteger(leftSummaryCount) && leftSummaryCount >= 0 &&
+    Number.isSafeInteger(rightSummaryCount) && rightSummaryCount >= 0 &&
+    right.comments - left.comments === rightSummaryCount - leftSummaryCount;
 }
 
 function sameOptionalV2Count(left, right) {
@@ -9367,17 +9982,24 @@ function sameOptionalV2Count(left, right) {
   return Number.isSafeInteger(left) && left >= 0 && left === right;
 }
 
-function requireMatchingV2InventoryCount(expected, items, label) {
-  if (expected === undefined) return;
+function requireMatchingV2InventoryCount(
+  expected,
+  items,
+  label,
+  { allowMismatch = false } = {},
+) {
+  if (expected === undefined) return true;
   if (!Number.isSafeInteger(expected) || expected < 0) {
     throw new V2RuntimeFailure(`Pull-request ${label} count is invalid`);
   }
   if (items.length !== expected) {
+    if (allowMismatch) return false;
     throw new V2RuntimeFailure(
       `Pull-request ${label} inventory changed while loading: ${items.length} of ${expected}`,
       { recoveryCode: "wait_then_reconcile" },
     );
   }
+  return true;
 }
 
 function fingerprintIssueComment(comment) {

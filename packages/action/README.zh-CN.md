@@ -255,6 +255,35 @@ resolved”，作为 server-side merge guard。
 
 ## Evidence 语义
 
+### Codex 活动摘要只供诊断
+
+同时满足首行 exact marker `<!-- codex-pull-request-review-summary -->` 和
+verified official Codex Bot/App identity 的 issue comment 是活动摘要，不是 review
+证据。其正文、状态、SHA 文本、编辑或缺失均不提供 pass 或 blocking authority。
+尤其是 `Completed` 不等于 terminal clean，不能清除 finding 或 resolve review thread。
+
+摘要豁免要求当前正文仍保留首行 exact marker。缓存过摘要 ID 并不豁免当前 marker 被删除或
+移到其他位置的评论：这时恢复普通 provider evidence 与 edit-history 检查，无法证明历史时
+仍 fail-closed。真正的 finding 不能继承该 ID 过去作为摘要时的豁免。
+反过来，后加 marker 也不能清除同一次 acquisition 或 controller recovery attempt 中已观察到的
+非摘要 carrier 证据。
+
+这类已识别摘要不参与 request attribution、provider activity、edit-history 决策输入、
+decision fingerprint 或 targeted comment reread。完整 raw comment acquisition 仍读取
+它们，并计入 pagination budget；此例外不豁免 API 健康或 inventory 完整性检查。真正的
+clean/finding comment 仍受原有保护。已识别摘要的 provider event 直接跳过，不定向回读
+该 comment，也不 rerun verifier。GitHub 删除事件不含被删 comment 的 ID 或正文，
+无法安全判断未知删除是否属于摘要，因此仍保留原有 fail-closed history guard。
+在其余部分完整的 inventory 中缺少摘要，本身不是失败。
+
+如果已识别摘要出现在初始 PR metadata 与 opening 完整评论列表两次读取之间，计数不匹配
+时可额外回读一次 PR metadata。回读必须保持 exact core PR scope 不变，并与已完整读取的
+raw inventory 总数精确一致；它仅作为 opening 计数依据，后续仍执行原有 closing inventory
+和 metadata 检查。列表内的每一条非摘要评论仍参与决策。无法解释的计数不匹配、后续
+非摘要变化和 scope 变化仍 fail-closed 或要求重新 snapshot。普通计数匹配路径不增加请求。
+
+### Review generation 与恢复
+
 review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
 line 必须 exact，且不得有其他 visible text。默认 `any` policy 会把 ordinary request
 author（任意 repository permission）纳入 snapshot 作为 candidate，而不是立刻视作
@@ -272,10 +301,10 @@ generation boundary。它有两类获得 provider confirmation 的方式：
      而不是自由文本猜测）验证；它只证明 parent 没有 non-inline finding payload，不证明
      任何 child/thread 存在或已 resolved。
 
-第二类是刻意收窄的最小 receipt。额外或 ambiguous request/physical boundary、request 或
+除下述新鲜 current-head recovery 外，第二类是刻意收窄的最小 receipt。额外或 ambiguous request/physical boundary、request 或
 terminal 被编辑、terminal carrier 不匹配，或 head/SHA binding 有歧义时，普通 candidate
 路径都保持 pending；下述 duplicate cohort 与 current-head clean recovery
-（恢复早于本次 verifier run 的同 head clean 的狭窄路径）分别是严格限定的第二条
+（用新请求及其后的 current-head clean 恢复已有 verifier）分别是限定的额外
 boundary 例外。terminal 指定 reviewed SHA 时，short SHA 只有被 GitHub 无歧义解析为 current PR
 head 才接受。同一 comment 上 official `eyes`/`+1` 的直接 receipt 仍然受支持。这只决定
 gate 如何归因；不授予 commenter 调用或控制 Codex review 的权限，不会使 Codex 必然启动，
@@ -288,6 +317,8 @@ standard strict-policy setting。`write` threshold（`write`、`maintain` 或 `a
 read-only verifier token 无法可靠完成这个读取。workflow-authored request 还必须带
 canonical v2 hidden marker，绑定完整 head SHA、当前 base repository/ref/SHA 和 workflow
 run。符合条件的 Codex findings 不受 request-author permission 影响，始终阻塞。
+
+上文明确识别的诊断摘要不属于下述不透明 provider activity，不会否决 duplicate cohort。
 
 有一个仅用于恢复的例外，避免已经完成的重复对永久污染后续 canonical generation。这里的
 *duplicate cohort*（固定的历史两条请求对，不是应主动生成的请求模式）只在以下条件同时成立时
@@ -314,8 +345,8 @@ official 顶层 `issue-comment` provider artifact、finding 或其他 successor 
 要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。
 agent 不得故意创建这类请求对；它只恢复 GitHub immutable snapshot 中已经存在的历史证据。
 
-另有 *current-head clean recovery*，仅在没有 base epoch 时用于恢复已指向 current head、
-但早于本次 verifier run 的可信 clean。cutoff `T` 是原始 `pull_request` verifier run 的 GitHub-server
+另有 *current-head clean recovery*（用新请求及其后的 current-head clean 恢复已有 verifier），
+仅在没有 base epoch 时适用，不需要证明旧请求逐个完成。cutoff `T` 是原始 `pull_request` verifier run 的 GitHub-server
 `created_at`；同一 run 的 retries 固定使用该值。恢复见证由一条新鲜且符合条件、exact、未编辑的
 request `R`：可为 `User` 发出的 exact、未编辑 ordinary `@codex review`，或一条已验证且未编辑的
 canonical Actions request，其 repository、PR、完整 head/base tuple 和 workflow-run marker 与所选
@@ -324,16 +355,22 @@ PR/verifier scope 完全匹配。随后必须有一条可信、未编辑的 top-
 `T < R < C`。`R` 必须是 `C` 之前最新的 physical request boundary，且 `C` 之后不能有
 request boundary。这只是 head attestation（证明 clean 指向所选 current head，不证明 request
 与 clean 的因果关系），不证明 `R` 导致 `C`，也不证明发出 `R` 会启动
-Codex。`T` 之前的 ordinary requests 仍须接受完整 lineage audit；但只附着于这些历史 request
-的归因缺口，不会单独使此恢复见证失效。旧 request 上尚未由其自身后续 `+1` 结清的 official
-`eyes` 仍按现有 liveness 规则阻塞。
+Codex。旧 requests 仍保留在完整 inventory 中，但旧请求的数量、author 类型、canonical marker、
+归因缺口和未结清的 request reactions 不会否决该见证，也不表示这些请求被标为完成。
+short SHA 只有被 GitHub 无歧义解析为所选 current full head SHA 才接受。
 
 该保守 cutoff 不是 PR `synchronize` 的精确时间；Git commit date 和未经验证的 event timestamp
 都不能作为 fallback。此恢复不能清除 finding 或 provider error，也不豁免 edited、deleted、scope
-drift、live 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮稳定 snapshot。
+drift 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮稳定 snapshot。
+旧请求上未结清的 official `eyes` 不能压过更新的 current-head attestation，旧 request reaction
+变化本身也不能破坏这条恢复路径的稳定性。所选 clean 之后的新相关 activity 或更新的 physical
+request boundary 仍阻止 success。
 成功还要求两轮稳定 snapshot 中的所有 review thread 都已 resolved；GitHub 明确标为 resolved
 的旧 head 或人工 thread 也可接受。provider comment 或手动 `reconcile` 之后仍须 rerun
-exact-head verifier。新 verifier run ID 不继承这个 cutoff。
+exact-head verifier；现有符合条件的 provider event 通常会自动请求该 rerun。
+已有 verifier 的恢复操作就是发一条新 `@codex review`，等待随后出现的 exact-head clean，
+并解决仍未解决的 findings/threads，不要求额外 empty commit。仅发请求不等于 success，也不保证
+Codex 启动。新 verifier run ID 不继承这个 cutoff。
 
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base
@@ -380,7 +417,7 @@ exact-current-tuple canonical Actions request 上的 direct provider `+1`，top-
 
 同一个或更晚的 official `eyes`/provider activity 如果不晚于后继 boundary，会让前一个
 generation 保持 open；与后继 boundary 同时属于 timestamp-ordering ambiguity，不能
-证明 review 已经完成。最新 request 的 clean 不能跨过更早的 unclosed gap，后继
+证明 review 已经完成。除上述 current-head clean recovery 外，最新 request 的 clean 不能跨过更早的 unclosed gap，后继
 boundary 之后才到达的 evidence 也不能倒推修复该 gap。带有单一、无歧义 commit
 binding 的 progress 会直接归入对应 head。所有 unbound progress 都必须保留在 current
 inventory；邻近 request 的 timestamp 不能证明其 originating flight 或 head。edited
@@ -394,7 +431,7 @@ endpoint，不能豁免其他 carrier。provider terminal 只有在 predecessor 
 single-flight rule 下严格晚于 candidate 的匹配未编辑 official 顶层 issue-comment terminal clean，
 或 exact closed `COMMENTED` Codex inline-parent review。出现 base epoch、第二个或
 ambiguous request/boundary、任何 edit，或 terminal 的 identity、
-ordering/current-head binding 有歧义时，都不能使用该方式。上文只接受顶层 clean 的 duplicate
+ordering/current-head binding 有歧义时，都不能使用普通路径；新鲜 current-head recovery 是上述例外。上文只接受顶层 clean 的 duplicate
 cohort 是第二条 boundary 情形的另一条 recovery-only 例外：它只接受已经存在的两条 request
 snapshot，不能让 canonical successor 使用 terminal clean。direct-reaction upgrade 后，
 ordinary request reactions 才只用于 provider liveness；ordinary `+1` 本身仍不能

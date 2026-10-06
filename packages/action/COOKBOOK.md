@@ -126,8 +126,8 @@ lineage can be confirmed by an unedited official current-head top-level
 issue-comment terminal clean or exact closed `COMMENTED` Codex inline-parent
 review strictly after it. A second or ambiguous request/boundary, an edit, an
 unmatched terminal, or ambiguous head/SHA binding leaves the ordinary-candidate
-path pending. The recovery-only duplicate cohort below is the sole exception
-to the second-boundary case. A
+path pending. The fresh current-head recovery below and the legacy duplicate
+cohort are exceptions to this ordinary path. A
 short terminal SHA is accepted only when GitHub resolves it unambiguously to
 the current PR head. Direct same-comment official `eyes`/`+1` remains
 supported. This neither grants the commenter permission to start or control
@@ -141,7 +141,21 @@ pending. Canonical workflows fix
 to an ordinary consumer workflow. `write`/`maintain`/`admin` is reserved for a
 nonstandard future verifier identity that can read collaborator permissions.
 
-Do not intentionally post a duplicate direct request. The only recovery
+For an existing verifier with no observed base epoch, recovery is simpler:
+post one fresh exact, unedited `@codex review`, then wait for an unedited
+official top-level clean whose full or unambiguous short SHA resolves to the
+current PR head. The original verifier run cutoff `T`, request `R`, and clean
+`C` must satisfy `T < R < C`, with no newer physical request boundary or
+relevant later provider activity. Old request attribution gaps and unsettled
+old `eyes` do not veto this witness or its stable-snapshot comparison. Actual
+findings, unresolved review threads, provider errors and acquisition/history
+guards remain independent. The existing provider event normally requests the
+verifier rerun; if delivery fails, run one scoped `reconcile`. No empty commit
+is required. Posting the request does not guarantee Codex starts. After a base
+epoch, use the existing exact-current-tuple canonical request/direct `+1`
+path instead. See [the full recovery contract](README.md#review-generations-and-recovery).
+
+Do not spam duplicate direct requests. A separate legacy recovery
 exception is the duplicate cohort: exactly two strictly sequential, unedited
 exact default-`any` ordinary (non-canonical-marker) `@codex review` requests by
 the same `User` login, no base epoch or official direct `eyes`/`+1` on either,
@@ -321,6 +335,12 @@ provider wait or finding change named by `recovery_code`.
 
 ## Recovery codes
 
+For `request_clean_generation` caused only by old unfinished requests or
+attribution gaps, prefer the fresh current-head recovery above. The table's
+legacy lineage/replacement instructions apply only when that witness cannot
+qualify; recovery never clears an actual finding, edit/deletion ambiguity,
+provider error, or base-epoch requirement.
+
 | Code | Safe next action |
 | --- | --- |
 | `none` | No evaluator recovery is required; perform exact-head merge closure. |
@@ -338,9 +358,11 @@ provider wait or finding change named by `recovery_code`.
 | `unsupported_target` | Move to a documented supported scope or leave the gate blocked. |
 | `create_verifier_run` | If ready, convert the PR to draft and mark it ready again; if already draft, mark it ready. Verify a new `ready_for_review` verifier for the exact current head/base/test-merge scope, then reconcile. |
 
-The summary is authoritative for the concrete reason, lineage and object links
-within the code category. The recovery code alone does not authorise another
-request. In particular, an existing latest/current canonical request that only
+The summary explains the concrete reason, lineage and object links
+within the code category; its body is not pass/block evidence. Before applying
+the legacy lineage fallback below, use the fresh current-head recovery above
+when eligible. The recovery code alone does not authorise request spam.
+Outside that recovery, an existing latest/current canonical request that only
 lacks attributable clean needs its qualifying direct `+1`, except that the one
 eligible default-`any` candidate may settle through its matching terminal-clean
 receipt. An existing recovery-only duplicate cohort is reconciled, never
@@ -382,16 +404,16 @@ predecessor gap, use a replacement PR. Resolving an inline conversation does
 not enter reducer state; when an exact closed inline-parent receipt already
 exists, reconcile after the ruleset can confirm all conversations are resolved.
 
-Terminal clean text and a qualifying provider `+1` carry equal clean authority
+Apart from fresh current-head recovery, terminal clean text and a qualifying provider `+1` carry equal clean authority
 only for the first physical generation in a no-base-epoch, single-flight
 lineage. For the one unique, exact, unedited default-`any` ordinary request in
 that lineage, its matching unedited official current-head top-level
 issue-comment terminal clean or exact closed `COMMENTED` Codex inline-parent
 review can also supply the minimal receipt that establishes the first
 generation. Other pull-request review cleans cannot. The recovery-only
-duplicate cohort is the sole top-level-clean addition: it closes only the later
+duplicate cohort is a legacy top-level-clean addition: it closes only the later
 ordinary request, and any canonical successor still needs its direct `+1`.
-Outside that exception, if a
+Outside those exceptions, if a
 second physical request exists, provider terminal evidence may close only the
 first gap; every later gap and the newer generation's positive or superseding
 authority require a qualifying `+1` directly on the relevant request. A
@@ -407,7 +429,7 @@ official current-head top-level issue-comment terminal clean or exact closed
 unique no-base-epoch, single-flight case. It is unavailable after a base epoch, a
 second or ambiguous request/boundary, an edit, or an ambiguous terminal
 identity, order, or head binding. The separately defined duplicate cohort is
-the sole recovery-only exception to the second-boundary case; it does not make
+another recovery-only exception to the second-boundary case; it does not make
 this candidate path or a canonical successor terminal-clean eligible. A qualifying finding blocks independently;
 it never promotes the candidate. Afterwards, ordinary request reactions are
 liveness signals only; ordinary `+1` cannot head-bind clean. Same-time/later
@@ -469,8 +491,10 @@ to resolve it within the relevant PR scope:
   current head.
 
 Do not edit provider evidence merely to expand a prefix. An ambiguous or
-unmatched terminal cannot supply the narrow default-`any` terminal-clean
-receipt and remains pending. Follow the summary reason and lineage: complete
+unmatched terminal cannot supply a current-head terminal-clean receipt and
+remains pending. A later fresh request and qualifying unambiguous current-head
+clean can still use the recovery above. Outside that recovery, follow the
+summary reason and lineage: complete
 an existing current canonical request with its direct `+1`, or create exactly
 one generation only when the lineage remains recoverable and the summary says
 one is needed. An unclosable historical unbound gap requires a replacement PR,

@@ -3,7 +3,7 @@ id: 20260930-head-clean-review-recovery
 title: Current-Head Clean Review Recovery
 status: completed
 created: 2026-09-30
-updated: 2026-10-03
+updated: 2026-10-06
 branch:
 pr:
 supersedes: []
@@ -11,6 +11,16 @@ superseded_by:
 ---
 
 # Current-Head Clean Review Recovery
+
+## Current Policy
+
+The fresh head-attested recovery described in
+[2026-10-06-head-attested-clean-recovery.md](../10/2026-10-06-head-attested-clean-recovery.md)
+supersedes this entry's historical-request type/count restrictions and the
+unsettled old-request `eyes` veto. The earlier decisions below record the
+original implementation, not the current recovery contract. Its run cutoff,
+base-epoch boundary, finding safety, and complete review-thread requirements
+remain unchanged.
 
 ## Decision
 

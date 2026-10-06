@@ -307,6 +307,46 @@ server-side merge guard.
 
 ## Evidence semantics
 
+### Diagnostic Codex activity summaries
+
+An issue comment with the exact first-line marker
+`<!-- codex-pull-request-review-summary -->` and the verified official Codex
+Bot/App identity is a diagnostic activity summary, not review evidence. Its
+body, status, SHA text, edits, or absence do not authorize or block the gate.
+In particular, `Completed` is not terminal-clean evidence and cannot clear a
+finding or resolve a review thread.
+
+The diagnostic exemption requires the current body to retain the exact
+first-line marker. Remembering a summary ID does not exempt a present comment
+whose marker was removed or moved: it returns to ordinary provider-evidence
+and edit-history checks, including fail-closed handling where history cannot
+be proved. A real finding cannot inherit an earlier summary's exemption.
+Likewise, adding the marker later cannot erase a non-summary carrier already
+observed during the same acquisition or controller recovery attempt.
+
+These identified summaries are excluded from request attribution, provider
+activity, edit-history decision inputs, decision fingerprints, and targeted
+comment rereads. They remain part of complete raw comment acquisition and its
+pagination budgets; this exception does not waive API health or inventory
+integrity. Their provider events are no-ops: they do not cause a targeted
+reread or verifier rerun. Genuine clean/finding comments retain their existing
+protections.
+GitHub deletion events do not identify the deleted comment or include its
+body, so an unknown deletion cannot safely be classified as a summary and
+retains the existing fail-closed history guard. A missing summary in an
+otherwise complete inventory is not itself a failure.
+
+If a recognized summary arrives between the initial PR metadata read and the
+opening complete comment inventory, a count mismatch may use one bounded PR
+metadata reread. The reread must retain the exact core PR scope and match the
+inventory's complete raw count; it supplies the opening count authority for
+the ordinary closing inventory and metadata checks. Every non-summary comment
+in that inventory is still evaluated. Unexplained count mismatches, subsequent
+non-summary changes, and scope changes remain fail-closed or require a fresh
+snapshot. A normal matching opening count adds no metadata request.
+
+### Review generations and recovery
+
 A review generation begins with an exact, unedited `@codex review` request.
 The visible first line is exact and contains no additional visible text. With
 the default `any` policy, an ordinary request is admitted to the snapshot as a
@@ -321,7 +361,8 @@ boundary. It can receive provider confirmation in either of two ways:
    The admitted receipt forms are a top-level issue-comment clean and the
    exact closed `COMMENTED` Codex inline-parent review grammar.
 
-The second form is a deliberately narrow minimal receipt. An additional or
+The second form is a deliberately narrow minimal receipt outside the fresh
+current-head recovery below. An additional or
 ambiguous request or physical boundary, an edit to the request or terminal,
 an unmatched terminal carrier, or ambiguous head/SHA binding leaves the gate
 pending. Where that terminal names a reviewed SHA, a short SHA is accepted
@@ -356,7 +397,9 @@ one full unambiguous SHA across `resolvedHeadSha` and `headSha`. This includes
 any otherwise unknown or unclassified, malformed, progress, or nonterminal
 official top-level `issue-comment`: with a valid activity window, it is opaque
 provider activity (a blocker rather than clean evidence) and vetoes the
-cohort. An earlier carrier may own the later clean; this explicit exception—not merely a full-head
+cohort. Identified diagnostic summaries above are excluded rather than treated
+as opaque provider activity. An earlier carrier may own the later clean; this
+explicit exception—not merely a full-head
 binding—preserves safely classified historical terminals. No additional provider
 artifact or opaque provider activity with a valid activity window may appear
 from the first request through that clean (or, if present, through its sole
@@ -379,8 +422,9 @@ it has a full-head binding.
 Agents must never intentionally create this pair; it only recovers one that
 already exists in the immutable GitHub snapshot.
 
-A separate *current-head clean recovery* handles a trusted clean that is
-already on the current head but predates this verifier run. This recovery is
+A separate *current-head clean recovery* lets a fresh review request and a
+trusted current-head clean recover an existing verifier, without proving that
+older review requests finished. This recovery is
 available only when there is no base epoch. The cutoff `T` is the GitHub-server
 `created_at` of the original `pull_request` verifier run; retries keep that
 same cutoff. A witness consists of one eligible request `R`: either an exact,
@@ -395,22 +439,32 @@ unique full-SHA binding covers the selected head, not request-to-result
 causality); posting `R` does not prove Codex started.
 After a base epoch, this recovery does not apply: the existing rule still
 requires an exact-current-tuple canonical Actions request with a direct
-provider `+1`; a top-level terminal clean adds no authority. Older ordinary
-requests before `T` remain in the full lineage audit, but attribution gaps
-attached only to those historical requests do not invalidate this recovery
-witness.
+provider `+1`; a top-level terminal clean adds no authority. Older
+requests remain in the complete inventory, but older request count, author
+type, canonical markers, attribution gaps, and unsettled request reactions do
+not invalidate this witness. Recovery does not mark those requests completed
+or claim which request produced the clean. Short SHAs are accepted only when
+GitHub resolves them unambiguously to the selected full head SHA.
 
 The conservative cutoff is not the exact PR `synchronize` time; Git commit
 dates and unverified event timestamps are never fallbacks. This recovery does
 not clear findings or provider errors, nor does it forgive edited, deleted,
-scope-drifted, live or ambiguous evidence. It still requires complete
-inventory, exact refetches and two stable snapshots. Recovery does not waive
-unsettled provider liveness: for example, an older request's official `eyes`
-without its own later `+1` remains blocking. Recovery success also requires
+scope-drifted or ambiguous evidence. It still requires complete
+inventory, exact refetches and two stable snapshots. Historical request
+liveness alone is not a veto: an older request's unclosed official `eyes`
+cannot outweigh the later current-head attestation. Its reaction churn must
+not invalidate stability either. Relevant new activity after the selected
+clean, or a newer physical request boundary, still prevents success.
+Recovery success also requires
 every review thread to be resolved in both stable snapshots; an unresolved
 human-authored, outdated, or old-head thread still blocks. A later exact-head
 verifier rerun after the provider comment or manual `reconcile` remains
-required. The cutoff does not carry to a new verifier run ID.
+required; the existing eligible provider event normally requests that rerun
+automatically. For an existing verifier, post a fresh `@codex review`, wait for
+its subsequent exact-head clean, and resolve outstanding findings/threads.
+No empty commit is required for this recovery. Posting a request alone is not
+success and does not guarantee Codex starts. The cutoff does not carry to a
+new verifier run ID.
 
 Every snapshot also reads the latest GitHub PR timeline
 `BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
@@ -474,7 +528,8 @@ successor keeps the predecessor open; equality with the successor is
 timestamp-ordering ambiguity, not proof of completion. Provider terminal
 evidence may close the first gap only when the predecessor reaction inventory
 is complete and no current `eyes` or provider activity follows that terminal
-through the successor. A later clean cannot repair an already ambiguous gap.
+through the successor. Outside current-head clean recovery, a later clean
+cannot repair an already ambiguous gap.
 Explicitly commit-bound progress is scoped to that head. Every unbound progress
 carrier remains in the current inventory: nearby request timestamps cannot
 prove its originating flight or head. An edited terminal carrier additionally
@@ -489,7 +544,8 @@ review strictly after the candidate under the unique no-base-epoch,
 single-flight rule above. It cannot be used after a base epoch,
 after a second or ambiguous request/boundary, after an edit, or when the
 terminal's identity, ordering, or current-head binding is ambiguous, except
-for the top-level-clean-only duplicate cohort defined above. After a direct-reaction
+for the top-level-clean-only duplicate cohort and fresh current-head recovery
+defined above. After a direct-reaction
 upgrade, ordinary request reactions are provider liveness signals only;
 ordinary `+1` still cannot head-bind clean by itself. Same-time/later official
 `eyes`/progress from Codex vetoes a candidate clean because review activity has
