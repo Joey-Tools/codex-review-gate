@@ -11550,6 +11550,53 @@ test("begin-review cannot forget an edit observed before post-verification fallb
   );
 });
 
+test("begin-review cannot waive observed provider activity after an unknown POST reread adds the summary marker", async (context) => {
+  const providerActivity = findingIssueComment(HEAD, {
+    id: 315,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const summary = officialReviewSummaryComment({
+    id: providerActivity.id,
+    created_at: providerActivity.created_at,
+    updated_at: "2026-08-25T09:00:00Z",
+  });
+  const createdRequest = workflowRequest({
+    id: 10_000,
+    created_at: "2026-08-25T09:00:00Z",
+    updated_at: "2026-08-25T09:00:00Z",
+  });
+  const priorRequest = workflowRequest({
+    body: canonicalRequestBody(HEAD, { runId: "77" }),
+  });
+  const github = createGitHubMock({
+    issueCommentSnapshots: [
+      [priorRequest, providerActivity],
+      [priorRequest, summary, createdRequest],
+    ],
+    pullRequestOverrides: { comments: 2 },
+    postUnknownAfterCreate: true,
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "begin-summary-marker-cannot-waive-observed-activity",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.executionHealth, "unhealthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "retry_begin");
+  assert.equal(result.report.retrySafe, false);
+  assert.equal(github.requestBodies.length, 1);
+  assert.match(
+    result.report.reason,
+    /Previously observed rest issue-comment 315 disappeared/iu,
+  );
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
 test("begin-review cannot replace a previously observed deletion identity", async (context) => {
   const first = deletedCommentEvent({ id: "CDE_begin_E" });
   const replacement = deletedCommentEvent({

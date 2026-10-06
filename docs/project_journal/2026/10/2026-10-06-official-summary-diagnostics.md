@@ -31,6 +31,11 @@ superseded_by:
   This prevents a new finding or opaque activity from inheriting a summary's
   earlier exemption while retaining diagnostic-only treatment for genuine
   marked summaries and independently explained transport omissions.
+- Preserve previously observed non-summary REST carriers across complete
+  controller inventories, including recovery after an uncertain POST.
+  Adding the marker later must not erase an earlier real carrier's evidence
+  or edit fingerprint. Reuse the existing complete-inventory retention guard,
+  without adding a request or a new persistent state mechanism.
 - Exclude recognized summaries from request-generation attribution, opaque
   provider activity, edit-history decision inputs, stability fingerprints,
   and exact targeted comment rereads. Do not count them as clean, findings,
@@ -118,6 +123,11 @@ superseded_by:
   cover a remembered summary becoming a finding with the marker no longer
   on its first line, and an unmarked GraphQL history body appearing after a
   marked REST read; neither scenario writes a successful status.
+- After adding the controller recovery guard, the final relevant suite
+  passed 437/437 with no failures, skipped tests, or cancellations. Eight
+  focused regressions also passed. The new controller case preserves the
+  unknown-POST recovery boundary when an observed real comment later gains
+  the marker; it remains pending and cannot adopt a misleading request.
 - The final `npm test -- --test-concurrency=2` attempt was intentionally
   interrupted with exit 130 while the unchanged bootstrap/organization
   integration harness was still running. It is incomplete, not a passing

@@ -3540,6 +3540,16 @@ async function loadV2IssueCommentsWithEditHistory(
       ),
     },
   );
+  retainV2ObservedCarrierFingerprints(
+    observedIssueCommentEdits,
+    "rest",
+    comments
+      .filter((comment) => !isV2KnownOfficialSummary(comment))
+      .map((comment) => [
+        canonicalPositiveId(comment.id),
+        canonicalJson(fingerprintIssueComment(comment)),
+      ]),
+  );
   const previouslyObservedAndCurrentSummaryIds = rememberV2OfficialSummaryIds(
     observedIssueCommentEdits,
     comments,

@@ -321,6 +321,8 @@ first-line marker. Remembering a summary ID does not exempt a present comment
 whose marker was removed or moved: it returns to ordinary provider-evidence
 and edit-history checks, including fail-closed handling where history cannot
 be proved. A real finding cannot inherit an earlier summary's exemption.
+Likewise, adding the marker later cannot erase a non-summary carrier already
+observed during the same acquisition or controller recovery attempt.
 
 These identified summaries are excluded from request attribution, provider
 activity, edit-history decision inputs, decision fingerprints, and targeted

@@ -265,6 +265,8 @@ verified official Codex Bot/App identity 的 issue comment 是活动摘要，不
 摘要豁免要求当前正文仍保留首行 exact marker。缓存过摘要 ID 并不豁免当前 marker 被删除或
 移到其他位置的评论：这时恢复普通 provider evidence 与 edit-history 检查，无法证明历史时
 仍 fail-closed。真正的 finding 不能继承该 ID 过去作为摘要时的豁免。
+反过来，后加 marker 也不能清除同一次 acquisition 或 controller recovery attempt 中已观察到的
+非摘要 carrier 证据。
 
 这类已识别摘要不参与 request attribution、provider activity、edit-history 决策输入、
 decision fingerprint 或 targeted comment reread。完整 raw comment acquisition 仍读取
