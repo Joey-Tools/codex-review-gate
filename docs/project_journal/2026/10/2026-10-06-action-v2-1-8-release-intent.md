@@ -1,11 +1,11 @@
 ---
 id: 20261006-action-v218-release-intent
 title: Action v2.1.8 Release Intent
-status: active
+status: completed
 created: 2026-10-06
-updated: 2026-10-06
+updated: 2026-10-07
 branch: codex/release-v2.1.8
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/107
 supersedes: []
 superseded_by:
 ---
@@ -57,17 +57,25 @@ superseded_by:
   locally materialized candidates before opening the release intent. Local
   candidate checks do not replace the publisher's independent clean runners,
   complete source-validation matrix, or production remote-state checks.
-- The manifest change on source master automatically starts
-  `sync-action-subtree.yml`. Approve `marketplace-production` only for its
-  admitted frozen source, then confirm immutable v2.1.8, the stable `v2`
-  alias, signed provenance, and public readback before reporting completion.
-- Floating `@v2` consumers receive the runtime on fresh runs. Existing check
-  results are not automatically refreshed; no new installation PR or consumer
-  workflow change is required for this patch.
+- Source PR #107 merged by squash as
+  `02bc718cd63724b991255ab5a8b9504aca597556`.
+- Publisher run
+  [37525310070](https://github.com/Joey-Tools/codex-review-gate/actions/runs/37525310070),
+  attempt 1, completed successfully with all 16 jobs.
+- The public immutable release
+  [v2.1.8](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.8)
+  is published (release id `405151294`, not draft or prerelease) at
+  `2026-10-06T21:21:22Z`. Publication `master`, `v2.1.8`, and floating `v2`
+  peel to `299c0fde3cdd921e8d756f792edc056afb0f2ec9`. The published payload
+  tree is `6ebca340db6301b36dac6643d444d2d0052e5eb4`; its manifest SHA-256 is
+  `4fedd9246da2d16a647c0ff84c00edafe2406979363f9d2d4f8bda41a39454ed`.
+- Fresh `@v2` runs receive this release; existing check results are not
+  automatically refreshed. The separate consumer controller-completion wave
+  completed across its 11 existing consumers; its final receipts are in
+  [the v2.1.8 consumer journal](2026-10-07-v2-1-8-consumer-completion-v218.md).
 
 ## Evidence
 
+- [Published stable release](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.8).
 - [Previous stable release](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.7).
 - Intent: `release-manifest.json`; publisher contract: `docs/RELEASING.md`.
-- PR-local review, CI, candidate validation, and approval status belong to
-  the release PR and publisher run; this journal does not claim publication.
