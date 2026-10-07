@@ -1,11 +1,11 @@
 ---
 id: 20261005-action-v217-release-intent
 title: Action v2.1.7 Release Intent
-status: active
+status: completed
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-07
 branch: codex/release-v2.1.7
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/104
 supersedes: []
 superseded_by:
 ---
@@ -50,25 +50,29 @@ superseded_by:
   enabling the new completion observer in already installed repositories
   requires the separately documented controller-template update.
 
-## Next steps
+## Publication Outcome
 
-- Merge the reviewed release intent. Its `release-manifest.json` change on
-  source master automatically starts `sync-action-subtree.yml`.
-- Require the credential-free plan, two independent candidates, complete
-  source-validation matrix, assembled candidate and publication plan to pass.
-- JoeyTeng approves `marketplace-production` only for that admitted frozen
-  source. Do not mint credentials or publish from a local operator session.
-- Confirm immutable v2.1.7, the stable `v2` alias, signed provenance and public
-  readback before reporting publication complete. No consumer installation
-  or successful historical-run rerun is implied by release preparation.
+- Source release-intent PR [#104](https://github.com/Joey-Tools/codex-review-gate/pull/104)
+  merged as `5e63cd3312d3585a5b14d6fa1a7cc37d5c55a7ca`, subject
+  `chore(release): prepare action v2.1.7`. Its merge was verified as an
+  ancestor of fetched source master at
+  `02bc718cd63724b991255ab5a8b9504aca597556`.
+- Stable [v2.1.7](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.7)
+  was published at `2026-10-05T13:57:42Z` (release id `403771130`). The
+  immutable `v2.1.7` tag peels to
+  `9b05689ac64c1ef6847041544dc8aca795304534`.
+- This release is the source-manifest predecessor to v2.1.8, observed before
+  the floating alias advanced. The full `v2.1.7` tag remains at its immutable
+  commit; floating `v2` now follows v2.1.8. See the
+  [v2.1.8 release record](2026-10-06-action-v2-1-8-release-intent.md) and the
+  [current consumer controller-completion wave](2026-10-07-v2-1-8-consumer-completion-v218.md).
 
 ## Evidence
 
 - Local validation on Node v24.15.0: `npm run check`, `npm run test:v2`
   (296/296 passing), `git diff --check`, and project-journal validation passed.
-  Final committed-head publisher admission and candidate checks are required
-  before opening the intent PR; their output belongs to the PR evidence, not
-  a claim that production publication has already completed.
+- The release intent is `release-manifest.json` in source PR #104's merged
+  commit; the publisher contract is `docs/RELEASING.md`.
+- [Published stable release v2.1.7](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.7).
+- [Current stable release v2.1.8](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.8).
 - [Previous release](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.6).
-- Release intent: `release-manifest.json`.
-- Publisher contract: `docs/RELEASING.md`.

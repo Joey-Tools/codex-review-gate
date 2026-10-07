@@ -2,13 +2,17 @@
 
 ## Current State
 - The source workspace keeps the publishable GitHub Action package under `packages/action`.
-- The v2 runtime, installation, and manifest-driven publisher infrastructure
-  are released as immutable stable `v2.1.2` with the floating `v2` alias; both
-  tags peel to action commit `e767d516f55e04d314392de9c57886299764d7bc`. The
-  published payload declares Node 24. The
-  controlled organization-wide v2 handoff is complete for its fixed 10-member
-  active cohort: the old organization rule no longer requires v1, and all eight
-  affected repository-local legacy surfaces now require only `test`.
+- The latest stable Action release is `v2.1.8`: publisher run
+  [37525310070](https://github.com/Joey-Tools/codex-review-gate/actions/runs/37525310070)
+  succeeded, and the public release was published at
+  [v2.1.8](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.1.8).
+  Publication `master`, `v2.1.8`, and floating `v2` peel to
+  `299c0fde3cdd921e8d756f792edc056afb0f2ec9`. The published payload declares
+  Node 24; existing check results are not refreshed automatically. The
+  controlled organization-wide v2 handoff remains complete for its fixed
+  10-member active cohort: the old organization rule no longer requires v1,
+  and all eight affected repository-local legacy surfaces now require only
+  `test`.
 - The separate active-cohort v1 bridge-retirement phase is complete across all
   10 members: three were pre-existing canonical no-ops and seven cleanup PRs
   merged, ending with `Joey-Tools/codex-private-workflows` #206. This was
@@ -32,6 +36,8 @@
 - Per-workstream details live under `docs/project_journal/`; keep this file as a short repo-wide recovery entrypoint.
 
 ## Recovery Pointers
+- Completed v2.1.8 release proof: `docs/project_journal/2026/10/2026-10-06-action-v2-1-8-release-intent.md`
+- Completed v2.1.8 consumer controller-completion wave: `docs/project_journal/2026/10/2026-10-07-v2-1-8-consumer-completion-v218.md`
 - Action subtree layout workstream: `docs/project_journal/2026/05/2026-05-18-action-subtree-layout-4df8f16.md`
 - Completed v2 delivery plan and release evidence: `docs/project_journal/2026/08/2026-08-25-action-v2-grilling-plan-019ff4f8.md`
 - Completed v2.1.1 frozen-source release validation: `docs/project_journal/2026/09/2026-09-28-release-validation-shards.md`
