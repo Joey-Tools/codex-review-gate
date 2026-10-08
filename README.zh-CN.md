@@ -67,6 +67,14 @@ PR。它校验该 run，可能发送或采用当前 scope 的 canonical `@codex 
 variable 的 selected-repository visibility 仅设为 `codex-private-workflows` 作为
 canary，不设置 repository-level override；通过后再扩大范围。
 
+Append-only v2.2 controller contract 可选接收独立的 `review_request_token`，仅用于
+`begin-review` 请求中的认证用户身份查询与请求 comment 创建。留空保留当前
+GitHub Actions bot 行为。它不替换 `github_token`：PR/scope/evidence 读取、request refetch、sticky
+diagnostic 写入及 canonical verifier rerun 仍使用正常 workflow token。现有 consumer 必须显式在
+controller Action step 传入
+`review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}`；仅创建该 secret 不会自动启用或发现它。
+配置与凭据建议见[安装指南](docs/install/human.zh-CN.md#可选的-review-request-用户-token)。
+
 受保护的 `workflow_run` completion path 会在 canonical verifier 完成后运行仅用于诊断的
 operation，包括成功的 rerun，以及自动请求关闭时的完成事件。既有自动 request 行为保持不变：
 只有 PR association 唯一的首次失败、且 opt-in variable 精确匹配时，才使用

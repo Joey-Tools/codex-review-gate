@@ -210,6 +210,43 @@ variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派生 `limits_profile`；公开 out
 `execution_health`、`gate_outcome`、`recovery_code` 与 `retry_safe`。Finding counts
 只出现在 summary 与 sticky diagnostic，不是 outputs。
 
+### 可选的 review request 用户 token
+
+Append-only v2.2 Action contract 为 controller step 增加可选的
+`review_request_token`。留空时继续由现有 `github-actions[bot]` 发布请求。配置后，它仅用于启用
+request 的 controller `begin-review`：通过 `GET /user` 确认凭据对应的真实 GitHub identity，并创建
+`@codex review` issue comment。Verifier、`reconcile`、report-completion/diagnostic operation，以及
+`request_review=false` 的 `begin-review` 都会忽略该 input，且不调用这个凭据。Identity 与最终 comment 会
+绑定实际返回的 user ID、login、type 和 refetched comment；不硬编码特定账号。Provider eligibility、
+clean/finding evidence 与 canonical bot reaction trust 均不变。
+
+必须在 controller step 显式传入 secret；Action 不会按名称自动发现 secret：
+
+```yaml
+review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}
+```
+
+该 input 是独立 request credential，不替换 `github_token`。PR/scope/evidence 读取、request refetch、sticky
+diagnostic 写入与 canonical verifier rerun 仍使用正常 workflow token。已配置的无效、过期或未授权凭据会
+明确报错，不会静默回退到 bot。若 comment POST 结果未知，只走现有有界的只读恢复，不会重试第二次 POST。
+
+若组织允许通过 membership 使用 fine-grained PAT，优先选择它：只选一个 resource owner、将仓库访问限制到
+consumer repository，并只授予创建 PR conversation comment 所需的 Issues: write（或 Pull requests:
+write）。Outside collaborator 可能需要 classic PAT。私有仓库的 classic PAT 需要较宽的 `repo` scope，无法
+缩减为仅 comment 权限；classic PAT 没有 `issues:write` 这类细粒度 scope。仅创建此 comment 不需要
+workflow/admin scope。Organization secret 的 selected-repository 可见范围限制的是哪些 workflow 能拿到
+secret，不会缩小 token 本身的权限。GitHub Free 下，private repository 可能无法使用 organization-owned
+secret，此时使用 repository secret；同名 repository secret 会覆盖 organization secret。
+
+专用 GitHub user 可以减少继承权限，但它仍是用户凭据，并且需要独立满足 OpenAI review integration
+及可能的 credits 要求；新建账号不保证请求一定启动。不要用创建 GitHub App 作为 workaround。请参阅 GitHub
+的[个人访问 token 文档](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)、
+[issue comment API](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment)、
+[Actions secret 参考](https://docs.github.com/en/actions/reference/security/secrets)与
+[secret 使用说明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets)。
+必须先实现并发布 source capability，consumer 才能使用；设置 secret 与更新 controller 的这一行配置是
+单独、显式的 pilot change。
+
 ## 窄范围 source repository self-hosting 例外
 
 此例外只适用于 `Joey-Tools/codex-review-gate` 迁移它自己的 default branch。它不会削弱

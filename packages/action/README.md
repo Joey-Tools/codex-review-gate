@@ -248,7 +248,8 @@ decimal representation.
 
 The controller Action step uses the corresponding underscore-named inputs:
 `github_token`, `pr_number`, `expected_head_sha`, `operation`,
-`request_comment_id` and `request_review`. `github_token` and
+`request_comment_id`, `request_review` and `review_request_token`.
+`github_token` and
 `pr_number` are required. A manual run must supply the full
 `expected_head_sha`; the automatic comment path may leave it empty so the
 runtime can bind the authoritative head at startup. The automatic verifier-run
@@ -256,6 +257,16 @@ path supplies the upstream exact head, `begin-review`, and `request_review=true`
 No path may follow a later head change. Both Action steps receive `default` or
 `expanded` only from the protected repository variable
 `CODEX_REVIEW_GATE_LIMITS_PROFILE`; dispatch callers cannot override it.
+The append-only v2.2 contract adds optional `review_request_token`. Empty input
+preserves the existing bot-author request. A configured token is used only for
+`GET /user` and the request-comment `POST` in request-enabled controller
+`begin-review`; all other reads, refetches, sticky diagnostic writes and
+canonical verifier reruns continue to use `github_token`. It is ignored
+without calls outside that operation, including `reconcile` and
+`request_review=false`. Invalid, expired or unauthorised configured tokens fail
+clearly with no silent bot fallback. An uncertain POST gets only the existing
+bounded read-only recovery, not another POST. Provider identity, comment
+binding and canonical bot-reaction trust are unchanged.
 
 ## Operations
 

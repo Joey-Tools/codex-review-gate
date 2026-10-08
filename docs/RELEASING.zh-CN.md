@@ -125,6 +125,17 @@ v2.0 manifest 也不能授权 Node 24 payload。
 这里仅指 GitHub Action execution runtime policy；它本身不改变 source publisher 的
 runner toolchain，也不改变仓库现有的 dual-runtime CI coverage。
 
+v2.2 feature line 通过独立的 append-only contract
+`codex-review-gate-action-v2.2-contract-v1` 增加可选的 `review_request_token`
+Action input，选择 manifest schema
+`urn:joey-tools:codex-review-gate:release-manifest:4` 与 version-4 的 plan、
+candidate、publication-plan 和 provenance schemas。Node 24 与 v2 entrypoint
+保持不变；新的 exact input policy 要求该 input 可选且默认值为空。Frozen v2.0、
+v2.1 contract 的 input inventories 保持原样，并拒绝新增 input，不得在 historical
+verification 中默默接受新版 ABI。本次 infrastructure 修改本身不发布 v2.2.0，
+仍需独立 review 的 release intent 和现有 production Environment approval。
+稳定版 v2.2 继续推进同一个 floating `v2` alias。
+
 ## Workflow stages 与权限边界
 
 专用 publisher 在 source repository 中运行，包含以下 logical stages：

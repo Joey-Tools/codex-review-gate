@@ -1127,13 +1127,40 @@ policy 不允许使用可写的 `pull_request_target` handler。controller 只�
 Codex bot
 `issue_comment` event 或受保护的手动 exact-head `reconcile` 更新 gate。若 merge conflict
 使 verifier 无法运行，就没有可消费的 failed-verifier `workflow_run`：先解决冲突，或按文档走
-手动恢复路径。这项 opt-in 不增加第三个 workflow、新 Action input、runtime App 或 ruleset。
+手动恢复路径。`CODEX_REVIEW_GATE_AUTO_REQUEST` 这项 opt-in 本身不增加第三个 workflow、新
+Action input、runtime App 或 ruleset；v2.2 的独立 request-token input 只用于显式选择请求 comment 作者。
 
 controller Action step 的 underscore inputs 只有 `github_token`、`pr_number`、
 `expected_head_sha`、`operation`、`request_comment_id` 与 `request_review`。两份 Action
 steps 从 protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 派生
 `limits_profile=default|expanded`；public outputs 只有 `execution_health`、`gate_outcome`、
 `recovery_code` 与 `retry_safe`。Finding counts 仅是 summary/sticky diagnostics。
+
+### 可选的 review request 用户 token
+
+Append-only v2.2 Action contract 为 controller Action step 增加可选 input
+`review_request_token`。留空保留当前 bot-author request；非空时仅供启用 request 的
+`begin-review` 用于 `GET /user` 与 request comment POST。其他读取、refetch、sticky diagnostic 写入与
+canonical verifier rerun 仍用 `github_token`。不得加到 verifier 或替换 `github_token`。Verifier、
+`reconcile`、report-completion/diagnostic operation 与 `request_review=false` 均忽略该 input，且不调用
+凭据。已配置的无效、过期或未授权 token 必须明确失败，不能回退 bot；未知 POST 结果只使用现有有界只读
+恢复，不再 POST。必须绑定实际 user ID/login/type 与 refetched comment；provider evidence 和 canonical
+bot-reaction trust 不变。
+
+若要启用，需只在 controller step 显式添加以下一行，并明确创建对应 secret；不会自动发现 secret 名称：
+
+```yaml
+review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}
+```
+
+组织 membership 条件允许时优先使用 fine-grained PAT：一个 resource owner、仅选定 consumer repository，且只授予
+创建 PR conversation comment 所需的 Issues: write（或 Pull requests: write）。Outside collaborator 可能需要
+classic PAT；私有仓库 classic PAT 必须使用较宽的 `repo` 权限，且没有 comment-only classic scope。不需要
+workflow/admin scope。Organization secret 的 repository visibility 只限制凭据分发，不缩小 PAT 权限。
+GitHub Free 的 private repository 若无法使用 organization-owned secret，则创建 repository secret；同名
+repository secret 覆盖 organization secret。专用 user 可减少继承权限，但仍需 eligible OpenAI review
+integration/credits，且不保证请求会启动。不要用 GitHub App workaround。Source 实现和发布必须先于 consumer
+pilot；完整凭据文档与引用见[人类指南](human.zh-CN.md#可选的-review-request-用户-token)。
 
 Canonical workflow 直接设定
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any`：它让 verifier 接受已观察到的 exact

@@ -41,6 +41,7 @@ const CONTRACT_FIXTURES = Object.freeze({
     provenance_schema: "codex-review-gate-action-release-provenance-v2",
     toolchain: "node20",
     release_schema: 2,
+    action_inputs: Object.freeze([]),
   }),
   v2_1: Object.freeze({
     manifest_schema: "urn:joey-tools:codex-review-gate:release-manifest:3",
@@ -50,6 +51,17 @@ const CONTRACT_FIXTURES = Object.freeze({
     provenance_schema: "codex-review-gate-action-release-provenance-v3",
     toolchain: "node24",
     release_schema: 3,
+    action_inputs: Object.freeze([]),
+  }),
+  v2_2: Object.freeze({
+    manifest_schema: "urn:joey-tools:codex-review-gate:release-manifest:4",
+    schema_version: 4,
+    plan_schema: "codex-review-gate-action-release-plan-v4",
+    candidate_schema: "codex-review-gate-action-candidate-v4",
+    provenance_schema: "codex-review-gate-action-release-provenance-v4",
+    toolchain: "node24",
+    release_schema: 4,
+    action_inputs: Object.freeze(["review_request_token"]),
   }),
 });
 const RELEASE_SIGNING_PUBLIC_KEY = `-----BEGIN PGP PUBLIC KEY BLOCK-----
@@ -524,9 +536,31 @@ function contractFixture(version) {
   return fixture;
 }
 
-function actionMetadataForToolchain(toolchain) {
+const REVIEW_REQUEST_TOKEN_INPUT_PATTERN = /^  review_request_token:\n(?:    [^\n]*\n)+/mu;
+
+function actionMetadataForContract(contract) {
+  const policy = contractFixture(contract);
   assert.match(actionMetadata, /^  using: node(?:20|24)$/mu, "action metadata fixture must declare a supported Node runtime");
-  return actionMetadata.replace(/^  using: node(?:20|24)$/mu, `  using: ${toolchain}`);
+  let metadata = actionMetadata.replace(/^  using: node(?:20|24)$/mu, `  using: ${policy.toolchain}`);
+  const tokenInput = metadata.match(REVIEW_REQUEST_TOKEN_INPUT_PATTERN);
+  assert.ok(tokenInput, "current Action metadata fixture must declare review_request_token");
+  if (!policy.action_inputs.includes("review_request_token")) {
+    metadata = metadata.replace(REVIEW_REQUEST_TOKEN_INPUT_PATTERN, "");
+  }
+  return metadata;
+}
+
+function withReviewRequestTokenInput(metadata) {
+  assert.doesNotMatch(metadata, REVIEW_REQUEST_TOKEN_INPUT_PATTERN);
+  const input = actionMetadata.match(REVIEW_REQUEST_TOKEN_INPUT_PATTERN)?.[0];
+  assert.ok(input, "current Action metadata fixture must declare review_request_token");
+  return metadata.replace(/^  pr_number:/mu, `${input}  pr_number:`);
+}
+
+function replaceReviewRequestTokenInput(metadata, transform) {
+  const input = metadata.match(REVIEW_REQUEST_TOKEN_INPUT_PATTERN)?.[0];
+  assert.ok(input, "Action metadata must declare review_request_token");
+  return metadata.replace(REVIEW_REQUEST_TOKEN_INPUT_PATTERN, transform(input));
 }
 
 function releaseManifest(version, snapshot, expectedHead, previousVersion, contract = "v2_0") {
@@ -568,13 +602,9 @@ function releaseManifest(version, snapshot, expectedHead, previousVersion, contr
   };
 }
 
-function writeActionPayload(source, version, contract = "v2_0") {
-  const policy = contractFixture(contract);
+function writeActionPayload(source, version, contract = "v2_0", metadata = actionMetadataForContract(contract)) {
   const actionRoot = join(source, "packages", "action");
-  write(
-    join(actionRoot, "action.yml"),
-    actionMetadataForToolchain(policy.toolchain),
-  );
+  write(join(actionRoot, "action.yml"), metadata);
   writeJson(join(actionRoot, "package.json"), {
     name: "codex-review-gate-action",
     version,
@@ -590,8 +620,8 @@ function writeActionPayload(source, version, contract = "v2_0") {
   );
 }
 
-function writeReleaseIntent(source, version, expectedHead, previousVersion, contract = "v2_0") {
-  writeActionPayload(source, version, contract);
+function writeReleaseIntent(source, version, expectedHead, previousVersion, contract = "v2_0", metadata) {
+  writeActionPayload(source, version, contract, metadata);
   const snapshot = stagedActionSnapshot(source);
   writeJson(
     join(source, "release-manifest.json"),
@@ -658,6 +688,19 @@ function releaseArgs(state, ...args) {
     "--test-target-url",
     state.target,
   ];
+}
+
+function invokePlanForSource(state, sourceCommit, label) {
+  return invoke("bash", releaseArgs(
+    state,
+    "--plan",
+    "--source-ref",
+    sourceCommit,
+    "--control-ref",
+    sourceCommit,
+    "--output",
+    join(state.root, `plan-${label}.json`),
+  ), { cwd: state.source });
 }
 
 function buildAssembledCandidate(
@@ -4033,11 +4076,13 @@ test("schema-v2 manifest produces deterministic node20 candidates with a NUL inv
   const state = fixture(t);
   const built = buildAssembledCandidate(state);
   const manifest = JSON.parse(git(state.source, ["show", `${state.sourceCommit}:release-manifest.json`]));
+  const historicalActionMetadata = git(state.source, ["show", `${state.sourceCommit}:packages/action/action.yml`]);
   const baseline = JSON.parse(readFileSync(join(state.source, "docs", "release", "action-v2-repository-baselines.json"), "utf8"));
   const candidate = JSON.parse(readFileSync(join(built.assembled, "candidate.json"), "utf8"));
 
   assert.equal(manifest.schema_version, 2);
   assert.equal(manifest.$schema, "urn:joey-tools:codex-review-gate:release-manifest:2");
+  assert.doesNotMatch(historicalActionMetadata, /^  review_request_token:/mu);
   assert.equal(manifest.contract_versions.baseline, 3);
   assert.equal(baseline.schema_version, 3);
   assert.equal(baseline.$schema, "urn:joey-tools:codex-review-gate:action-release-baseline:3");
@@ -4047,6 +4092,7 @@ test("schema-v2 manifest produces deterministic node20 candidates with a NUL inv
     main: "src/v2/gate-runtime.mjs",
   });
   assert.equal(candidate.plan.source_tree, manifest.source.tree);
+  assert.equal(candidate.plan.release_contract, "codex-review-gate-action-v2.0-contract-v1");
   assert.deepEqual(candidate.payload.files, manifest.files);
   assert.equal(candidate.payload.inventory_sha256, inventoryDigest(candidate.payload.files));
   assert.deepEqual(readFileSync(join(built.a, "candidate.json")), readFileSync(join(built.b, "candidate.json")));
@@ -4062,10 +4108,12 @@ test("schema-v3 v2.1 release produces Node24 evidence and advances the v2 alias"
   const state = fixture(t, "2.1.0", { contract: "v2_1" });
   const built = buildAssembledCandidate(state, { label: "node24-v2-1" });
   const manifest = JSON.parse(git(state.source, ["show", `${state.sourceCommit}:release-manifest.json`]));
+  const historicalActionMetadata = git(state.source, ["show", `${state.sourceCommit}:packages/action/action.yml`]);
   const candidate = JSON.parse(readFileSync(join(built.assembled, "candidate.json"), "utf8"));
 
   assert.equal(manifest.$schema, CONTRACT_FIXTURES.v2_1.manifest_schema);
   assert.equal(manifest.schema_version, 3);
+  assert.doesNotMatch(historicalActionMetadata, /^  review_request_token:/mu);
   assert.deepEqual(manifest.entrypoint, {
     metadata_path: "action.yml",
     using: "node24",
@@ -4089,6 +4137,133 @@ test("schema-v3 v2.1 release produces Node24 evidence and advances the v2 alias"
   assert.equal(provenance.schema, CONTRACT_FIXTURES.v2_1.provenance_schema);
   assert.equal(provenance.schema_version, 3);
   assert.equal(provenance.plan.major_alias, "v2");
+});
+
+test("v2.2 adds the optional request token under schema v4 without changing the v2 alias", (t) => {
+  const state = fixture(t, "2.2.0", { contract: "v2_2" });
+  const built = buildAssembledCandidate(state, { label: "node24-v2-2" });
+  const manifest = JSON.parse(git(state.source, ["show", `${state.sourceCommit}:release-manifest.json`]));
+  const action = git(state.source, ["show", `${state.sourceCommit}:packages/action/action.yml`]);
+  const candidate = JSON.parse(readFileSync(join(built.assembled, "candidate.json"), "utf8"));
+
+  assert.equal(manifest.$schema, CONTRACT_FIXTURES.v2_2.manifest_schema);
+  assert.equal(manifest.schema_version, 4);
+  assert.deepEqual(manifest.contract_versions, {
+    toolchain: "node24",
+    release_schema: 4,
+    status: 2,
+    template: 2,
+    baseline: 3,
+  });
+  assert.deepEqual(manifest.entrypoint, {
+    metadata_path: "action.yml",
+    using: "node24",
+    main: "src/v2/gate-runtime.mjs",
+  });
+  assert.match(action, /^  review_request_token:\n    description: [^\n]+\n    required: false\n    default: ""$/mu);
+  assert.equal(candidate.schema, CONTRACT_FIXTURES.v2_2.candidate_schema);
+  assert.equal(candidate.schema_version, 4);
+  assert.equal(candidate.plan.schema, CONTRACT_FIXTURES.v2_2.plan_schema);
+  assert.equal(candidate.plan.schema_version, 4);
+  assert.equal(candidate.plan.release_contract, "codex-review-gate-action-v2.2-contract-v1");
+  assert.equal(candidate.plan.version, "2.2.0");
+  assert.equal(candidate.plan.immutable_tag, "v2.2.0");
+  assert.equal(candidate.plan.major_alias, "v2");
+
+  const output = publishCandidate(state, built);
+  assert.match(output, /reconcile_state=fresh/u);
+  const releaseCommit = git(state.target, ["rev-parse", "refs/tags/v2.2.0^{}"]);
+  assert.equal(git(state.target, ["rev-parse", "refs/tags/v2^{}"]), releaseCommit);
+  const provenance = JSON.parse(readFileSync(
+    join(state.releases, "v2.2.0", "release-provenance.json"),
+    "utf8",
+  ));
+  assert.equal(provenance.schema, CONTRACT_FIXTURES.v2_2.provenance_schema);
+  assert.equal(provenance.schema_version, 4);
+  assert.equal(provenance.plan.release_contract, "codex-review-gate-action-v2.2-contract-v1");
+  assert.equal(provenance.plan.major_alias, "v2");
+});
+
+test("historical v2.0 and v2.1 contracts reject the v2.2-only request token input", (t) => {
+  for (const release of [
+    { contract: "v2_0", version: "2.0.0", nextVersion: "2.0.1" },
+    { contract: "v2_1", version: "2.1.0", nextVersion: "2.1.1" },
+  ]) {
+    const state = fixture(t, release.version, { contract: release.contract });
+    const metadata = withReviewRequestTokenInput(actionMetadataForContract(release.contract));
+    const sourceCommit = writeReleaseIntent(
+      state.source,
+      release.nextVersion,
+      state.initialTarget,
+      "1.5.1",
+      release.contract,
+      metadata,
+    );
+    const result = invokePlanForSource(state, sourceCommit, `${release.contract}-new-input`);
+
+    assert.notEqual(result.status, 0, release.contract);
+    assert.match(
+      result.stderr,
+      /root action\.yml\.inputs keys differ from the closed Action metadata policy/u,
+      release.contract,
+    );
+  }
+});
+
+test("v2.2 Action input policy rejects extra keys, required inputs, and non-empty defaults", (t) => {
+  const state = fixture(t, "2.2.0", { contract: "v2_2" });
+  const correctMetadata = actionMetadataForContract("v2_2");
+  const cases = [
+    {
+      label: "unknown input field",
+      version: "2.2.1",
+      metadata: replaceReviewRequestTokenInput(correctMetadata, (input) =>
+        input.replace("    required: false\n", "    required: false\n    unexpected: value\n")),
+      message: /root action\.yml\.inputs\.review_request_token keys differ from the closed Action metadata policy/u,
+    },
+    {
+      label: "unknown Action input",
+      version: "2.2.2",
+      metadata: correctMetadata.replace(
+        /^  pr_number:/mu,
+        "  unexpected_input:\n    description: Unknown.\n    required: false\n  pr_number:",
+      ),
+      message: /root action\.yml\.inputs keys differ from the closed Action metadata policy/u,
+    },
+    {
+      label: "required request token",
+      version: "2.2.3",
+      metadata: replaceReviewRequestTokenInput(correctMetadata, (input) =>
+        input.replace("    required: false", "    required: true")),
+      message: /root Action input review_request_token differs from policy/u,
+    },
+    {
+      label: "non-empty request token default",
+      version: "2.2.4",
+      metadata: replaceReviewRequestTokenInput(correctMetadata, (input) =>
+        input.replace('    default: ""', "    default: injected")),
+      message: /root Action input review_request_token differs from policy/u,
+    },
+  ];
+
+  for (const invalid of cases) {
+    const sourceCommit = writeReleaseIntent(
+      state.source,
+      invalid.version,
+      state.initialTarget,
+      "1.5.1",
+      "v2_2",
+      invalid.metadata,
+    );
+    const result = invokePlanForSource(
+      state,
+      sourceCommit,
+      `v2-2-${invalid.label.replaceAll(" ", "-")}`,
+    );
+
+    assert.notEqual(result.status, 0, invalid.label);
+    assert.match(result.stderr, invalid.message, invalid.label);
+  }
 });
 
 test("candidate transport is validated before extraction and rejects symlinks", (t) => {
@@ -4271,6 +4446,14 @@ test("fresh stable publication verifies the immutable Release and replaces a leg
     "release-provenance.json",
     "release-provenance.json.asc",
   ]);
+  const provenance = JSON.parse(readFileSync(
+    join(state.releases, "v2.0.0", "release-provenance.json"),
+    "utf8",
+  ));
+  assert.equal(provenance.schema, CONTRACT_FIXTURES.v2_0.provenance_schema);
+  assert.equal(provenance.schema_version, 2);
+  assert.equal(provenance.plan.release_contract, "codex-review-gate-action-v2.0-contract-v1");
+  assert.equal(provenance.plan.major_alias, "v2");
 });
 
 test("public verification emits one closed recovery tuple for success and key failure states", (t) => {
@@ -7748,6 +7931,6 @@ test("prereleases publish only the full immutable tag", (t) => {
 
 assert.equal(
   test.registeredCount,
-  159,
+  162,
   "release pipeline shard registration inventory drift",
 );

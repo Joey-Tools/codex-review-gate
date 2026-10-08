@@ -276,6 +276,59 @@ protected repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE`. Their only pub
 counts, when available, are diagnostics in the job summary and sticky comment,
 not Action outputs.
 
+### Optional user token for review requests
+
+The append-only v2.2 Action contract adds optional `review_request_token` to
+the controller step. Leave it empty to retain the existing
+`github-actions[bot]` request author. When set, the token is used only by
+request-enabled controller `begin-review` to call `GET /user` for the
+credential's actual GitHub identity and to create the `@codex review` issue
+comment. It is ignored without calls for verifier runs, `reconcile`,
+report-completion/diagnostic operations, and `begin-review` with
+`request_review=false`. The identity and resulting comment are bound to the
+actual returned user ID, login, type and refetched comment; there is no
+hardcoded account allowlist. This does not change provider eligibility,
+clean/finding evidence, or trust in canonical bot reactions.
+
+Configure the secret explicitly on the controller step; secrets are not
+discovered by name automatically:
+
+```yaml
+review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}
+```
+
+The input is a separate request credential, not a replacement for
+`github_token`. PR/scope/evidence reads, request refetches, sticky diagnostic
+writes and canonical verifier reruns continue to use the normal workflow
+token. An invalid, expired or unauthorised configured credential reports an
+error and does not silently fall back to the bot. If the comment POST outcome
+is unknown, only the existing bounded read-only recovery is used; there is no
+second POST retry.
+
+Prefer a fine-grained personal access token where the organisation permits
+membership-based use: select one resource owner, restrict repository access to
+the consumer repository, and grant only Issues: write (or Pull requests:
+write) for creating the PR conversation comment. Outside collaborators may
+need a classic PAT instead. A classic PAT for a private repository requires
+the broad `repo` scope, which cannot be narrowed to comment-only authority;
+no `issues:write`-style classic scope exists, and workflow/admin scopes are
+not needed just to create this comment. A selected-repository allowlist on an
+organisation secret limits which workflows receive the secret, not the PAT's
+authority after use. Organisation-owned secrets may be unavailable to private
+repositories on GitHub Free; use a repository secret in that case. A
+repository secret with the same name overrides the organisation secret.
+
+A dedicated GitHub user can reduce inherited account rights, but it remains a
+user credential and must independently be eligible for the OpenAI review
+integration and any required credits; creating an account does not guarantee
+that a request will start. Do not create a GitHub App as a workaround. Consult
+GitHub's [personal access token guidance](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens),
+[issue comment API](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment),
+[Actions secret reference](https://docs.github.com/en/actions/reference/security/secrets)
+and [secret usage guidance](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets).
+Source implementation and release must precede a consumer pilot; the secret
+and one-line controller update are separate, explicit changes.
+
 ## Narrow source-repository self-hosting exception
 
 This exception applies only when `Joey-Tools/codex-review-gate` migrates its
