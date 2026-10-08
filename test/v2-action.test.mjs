@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildV2GateReport,
   buildV2StickyCommentBody,
+  writeV2GateCliReport,
 } from "../packages/action/src/v2/gate-runtime.mjs";
 
 const ACTION_YAML_URL = new URL("../packages/action/action.yml", import.meta.url);
@@ -85,6 +86,79 @@ test("controller diagnostic observations hide unread counts without inventing ze
     assert.equal(payload.findingsResolved, "unknown");
     assert.equal(payload.reviewThreads.status, "not_read");
   }
+});
+
+test("CLI diagnostics retain closed parser codes and reject unsafe extra fields", () => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "Parser rejected a provider artifact",
+    recoveryCode: "request_clean_generation",
+    carrierDiagnostics: [
+      {
+        source: "issue-comment",
+        id: "201",
+        htmlUrl: "https://github.com/JoeyTeng/codex-review-workflows/pull/215#issuecomment-201",
+        revisionAt: "2026-10-08T12:00:00Z",
+        parseDiagnostics: {
+          profile: "top-level-clean-issue-comment-v2",
+          stage: "disclosure",
+          reasonCode: "disclosure_invalid",
+          disclosureProfile: "official-codex-disclosure-v1",
+          commitRefLength: 40,
+          rawBody: "UNSAFE_PROVIDER_TEXT",
+          token: "SECRET_TOKEN",
+        },
+        requestSelection: {
+          currentGenerationCount: 1,
+          selectedRequestId: "101",
+          selected: true,
+          raw: "UNSAFE_REQUEST_DATA",
+        },
+      },
+      {
+        source: "issue-comment",
+        id: "202",
+        htmlUrl: "https://attacker.example/unsafe?token=SECRET_TOKEN",
+        revisionAt: "2026-10-08T12:01:00Z",
+        parseDiagnostics: {
+          profile: "top-level-clean-issue-comment-v2",
+          stage: "finding-signal",
+          reasonCode: "finding_signal",
+        },
+      },
+      {
+        source: "issue-comment",
+        id: "203",
+        parseDiagnostics: {
+          profile: "unknown-profile",
+          stage: "disclosure",
+          reasonCode: "disclosure_invalid",
+        },
+      },
+    ],
+  });
+  const originalError = console.error;
+  let output = "";
+  console.error = (line) => { output += `${line}\n`; };
+  try {
+    writeV2GateCliReport(report, {
+      GITHUB_TOKEN: "SECRET_TOKEN",
+      INPUT_GITHUB_TOKEN: "ANOTHER_SECRET",
+    });
+  } finally {
+    console.error = originalError;
+  }
+
+  const payload = JSON.parse(output.match(/^\[codex-review-gate\] (.*)$/mu)[1]);
+  assert.equal(payload.carrier_diagnostics.length, 2);
+  assert.equal(payload.carrier_diagnostics[0].reasonCode, "disclosure_invalid");
+  assert.equal(payload.carrier_diagnostics[0].profile, "top-level-clean-issue-comment-v2");
+  assert.equal(payload.carrier_diagnostics[0].stage, "disclosure");
+  assert.equal(payload.carrier_diagnostics[0].commitRefLength, 40);
+  assert.equal(payload.carrier_diagnostics[1].url, null);
+  assert.equal(payload.carrier_diagnostics[1].reasonCode, "finding_signal");
+  assert.doesNotMatch(output, /UNSAFE_PROVIDER_TEXT|UNSAFE_REQUEST_DATA|SECRET_TOKEN|ANOTHER_SECRET|attacker\.example|rawBody|token/u);
 });
 
 function yamlSection(text, startName, endName) {

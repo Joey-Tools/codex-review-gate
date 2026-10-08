@@ -179,6 +179,26 @@ function officialCodexDisclosure() {
   ].join("\n");
 }
 
+function pr215OfficialCodexDisclosure() {
+  return [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "",
+    "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    '- Comment "@codex review".',
+    "",
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "",
+    "",
+    "",
+    'Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".',
+    "            ",
+    "</details>",
+  ].join("\n");
+}
+
 function parseCleanIssueCommentFirstLine(firstLine, { disclosure = false } = {}) {
   const lines = [
     firstLine,
@@ -201,7 +221,10 @@ function parseCleanTagline(tagline, options) {
   );
 }
 
-function officialInlineParentReviewBody(commitRef = FULL_SHA_A.slice(0, 10)) {
+function officialInlineParentReviewBody(
+  commitRef = FULL_SHA_A.slice(0, 10),
+  disclosure = officialCodexDisclosure(),
+) {
   return [
     "### 💡 Codex Review",
     "",
@@ -210,7 +233,7 @@ function officialInlineParentReviewBody(commitRef = FULL_SHA_A.slice(0, 10)) {
     `**Reviewed commit:** \`${commitRef}\``,
     "    ",
     "",
-    officialCodexDisclosure(),
+    disclosure,
   ].join("\n");
 }
 
@@ -1301,6 +1324,12 @@ test("accepts a live-style clean Codex issue-comment artifact with a 10-characte
     url: "https://github.com/owner/repo/issues/1#issuecomment-101",
     kind: "clean",
     commitRef: "abcdef1234",
+    parseDiagnostics: {
+      profile: "top-level-clean-issue-comment-v2",
+      stage: "complete",
+      reasonCode: "accepted",
+      commitRefLength: 10,
+    },
   });
 });
 
@@ -1338,6 +1367,12 @@ test("binds both issue-comment carrier timestamps and orders the artifact by upd
     url: "https://github.com/owner/repo/issues/1#issuecomment-101",
     kind: "clean",
     commitRef: "abcdef1234",
+    parseDiagnostics: {
+      profile: "top-level-clean-issue-comment-v2",
+      stage: "complete",
+      reasonCode: "accepted",
+      commitRefLength: 10,
+    },
   });
   assert.deepEqual(
     sortCodexArtifactsNewestFirst([laterCreatedButEarlierRevision, edited])
@@ -1585,6 +1620,115 @@ test("accepts a CRLF clean issue comment with the official disclosure", () => {
   assert.equal(artifact.commitRef, "abcdef1234");
 });
 
+test("accepts the PR 215 Codex disclosure and explicit whitespace variants", () => {
+  const separator = "Codex Review: Didn't find any major issues. Delightful!";
+  const commitMarker = "**Reviewed commit:** `4acd56e77a`";
+  const variants = [
+    pr215OfficialCodexDisclosure(),
+    pr215OfficialCodexDisclosure()
+      .replace("<details> <summary>ℹ️ About Codex in GitHub</summary>", "<details>\n  <summary>About Codex in GitHub</summary>")
+      .replace("<br/>", "<br />")
+      .replace(/\n/g, "\r\n"),
+    pr215OfficialCodexDisclosure()
+      .replace("<details> <summary>ℹ️ About Codex in GitHub</summary>", "<details><summary>ℹ About Codex in GitHub</summary>")
+      .replace("<br/>", ""),
+  ];
+
+  for (const disclosure of variants) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment([
+        separator,
+        "",
+        "",
+        commitMarker,
+        "",
+        "",
+        disclosure,
+      ].join("\n")),
+      { owner: "owner", repo: "repo", allowShortCommitRefs: true },
+    );
+
+    assert.equal(artifact.kind, "clean");
+    assert.equal(artifact.commitRef, "4acd56e77a");
+    assert.deepEqual(artifact.parseDiagnostics, {
+      profile: "top-level-clean-issue-comment-v2",
+      stage: "complete",
+      reasonCode: "accepted",
+      disclosureProfile: "official-codex-disclosure-v1",
+      commitRefLength: 10,
+    });
+  }
+});
+
+test("rejects quoted, fenced, duplicated, open, or extended Codex disclosures", () => {
+  const cleanStart = [
+    "Codex Review: Didn't find any major issues. Nice work!",
+    "",
+    "**Reviewed commit:** `abcdef1234`",
+    "",
+  ];
+  const footer = pr215OfficialCodexDisclosure();
+  const malformedFooters = [
+    "> " + footer.replace(/\n/g, "\n> "),
+    ["```html", footer, "```"].join("\n"),
+    footer.replace("<details> ", '<details class="extra"> '),
+    footer.replace("</details>", ""),
+    footer.replace("</details>", "<details>\n</details>\n</details>"),
+    footer.replace("<summary>ℹ️ About Codex in GitHub</summary>", "<summary>ℹ️ About Codex in GitHub</summary>\n<summary>About Codex in GitHub</summary>"),
+    footer.replace("</details>", "</details>\nPlease fix this."),
+    footer.replace("Try commenting", "Please fix this. Try commenting"),
+  ];
+
+  for (const badFooter of malformedFooters) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment([...cleanStart, badFooter].join("\n")),
+      { owner: "owner", repo: "repo" },
+    );
+    assert.equal(artifact.kind, "malformed", badFooter.slice(0, 80));
+    assert.equal(artifact.parseDiagnostics.stage, "disclosure");
+    assert.equal(artifact.parseDiagnostics.reasonCode, "disclosure_invalid");
+  }
+
+  const findingInsideDisclosure = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment([
+      ...cleanStart,
+      footer.replace(
+        "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+        "### 💡 Codex Review\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.",
+      ),
+    ].join("\n")),
+    { owner: "owner", repo: "repo" },
+  );
+  assert.equal(findingInsideDisclosure.kind, "malformed");
+  assert.deepEqual(findingInsideDisclosure.parseDiagnostics, {
+    profile: "top-level-clean-issue-comment-v2",
+    stage: "finding-signal",
+    reasonCode: "finding_signal",
+  });
+});
+
+test("requires a unique top-level reviewed-commit marker", () => {
+  const lead = "Codex Review: Didn't find any major issues.";
+  const cases = [
+    [lead, "", "> **Reviewed commit:** `abcdef1234`"],
+    [lead, "", "```text", "**Reviewed commit:** `abcdef1234`", "```"],
+    [lead, "", "**Reviewed commit:** `abcdef1234`", "", "**Reviewed commit:** `abcdef1234`"],
+  ];
+
+  for (const lines of cases) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(lines.join("\n")),
+      { owner: "owner", repo: "repo", allowShortCommitRefs: true },
+    );
+    assert.equal(artifact.kind, "malformed");
+    assert.deepEqual(artifact.parseDiagnostics, {
+      profile: "top-level-clean-issue-comment-v2",
+      stage: "reviewed-commit",
+      reasonCode: "reviewed_commit_marker_invalid",
+    });
+  }
+});
+
 test("rejects contradictory or schema-drift content embedded in clean issue comments", () => {
   const cases = [
     [
@@ -1717,6 +1861,12 @@ test("accepts exact 7-40-character clean issue-comment commit markers", () => {
     url: "https://github.com/owner/repo/issues/1#issuecomment-101",
     kind: "clean",
     commitRef: FULL_SHA_A,
+    parseDiagnostics: {
+      profile: "top-level-clean-issue-comment-v2",
+      stage: "complete",
+      reasonCode: "accepted",
+      commitRefLength: 40,
+    },
   });
 });
 
@@ -2206,6 +2356,14 @@ test("recognizes only the closed official inline-parent review wrapper", () => {
   });
 
   assert.equal(codexInlineParentReviewBodyHasClosedGrammar(review), true);
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar({
+      ...review,
+      body: officialInlineParentReviewBody(undefined, pr215OfficialCodexDisclosure()),
+    }),
+    false,
+    "the issue-comment disclosure profile does not relax inline-parent review grammar",
+  );
   assert.equal(
     codexInlineParentReviewBodyHasClosedGrammar({
       ...review,

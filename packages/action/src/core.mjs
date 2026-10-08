@@ -18,6 +18,8 @@ const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
 const MAX_CODEX_TERMINAL_HEADING_GRAPHEMES = 64;
 const MAX_CODEX_CLEAN_TAGLINE_CODE_UNITS = 160;
 const MAX_CODEX_CLEAN_EMOJI_TAGLINE_GRAPHEMES = 8;
+const CODEX_CLEAN_ISSUE_COMMENT_PARSE_PROFILE = "top-level-clean-issue-comment-v2";
+const CODEX_CLEAN_ISSUE_COMMENT_DISCLOSURE_PROFILE = "official-codex-disclosure-v1";
 const MAX_FINDING_ID_SAMPLE_CODE_UNITS = 96;
 const EMOJI_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
@@ -425,31 +427,34 @@ export function parseCodexIssueCommentArtifact(
         ...base,
         kind: "malformed",
         reason: "clean Codex issue comment contains finding-formatted content",
+        parseDiagnostics: cleanIssueCommentParseDiagnostics("finding-signal", "finding_signal"),
       };
     }
-    const markerLabels = body.match(/\*\*Reviewed commit:\*\*/gi) || [];
-    const commitPattern = allowShortCommitRefs
-      ? /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{7,40})`[ \t]*\r?$/gm
-      : /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{10}|[0-9a-f]{40})`[ \t]*\r?$/gm;
-    const matches = [...body.matchAll(commitPattern)];
-    if (markerLabels.length !== 1 || matches.length !== 1) {
+    const parsed = parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs);
+    if (!parsed.ok) {
       return {
         ...base,
         kind: "malformed",
-        reason: "clean Codex issue comment must contain exactly one Reviewed commit marker",
-      };
-    }
-    if (!issueCommentCleanBodyHasClosedGrammar(body, matches[0][0])) {
-      return {
-        ...base,
-        kind: "malformed",
-        reason: "clean Codex issue comment does not match the closed clean-result grammar",
+        reason: parsed.reason,
+        parseDiagnostics: cleanIssueCommentParseDiagnostics(
+          parsed.stage,
+          parsed.reasonCode,
+          parsed.commitRefLength === undefined
+            ? {}
+            : { commitRefLength: parsed.commitRefLength },
+        ),
       };
     }
     return {
       ...base,
       kind: "clean",
-      commitRef: matches[0][1].toLowerCase(),
+      commitRef: parsed.commitRef,
+      parseDiagnostics: cleanIssueCommentParseDiagnostics("complete", "accepted", {
+        ...(parsed.disclosurePresent
+          ? { disclosureProfile: CODEX_CLEAN_ISSUE_COMMENT_DISCLOSURE_PROFILE }
+          : {}),
+        commitRefLength: parsed.commitRef.length,
+      }),
     };
   }
 
@@ -1491,40 +1496,207 @@ function cleanBodyContainsFindingSignals(body) {
   );
 }
 
-function issueCommentCleanBodyHasClosedGrammar(body, markerText) {
-  const normalizedBody = body.replace(/\r\n?/g, "\n");
-  const normalizedMarker = markerText.replace(/\r\n?/g, "\n");
-  const markerIndex = normalizedBody.indexOf(normalizedMarker);
-  if (markerIndex < 0) {
-    return false;
+function cleanIssueCommentParseDiagnostics(stage, reasonCode, extra = {}) {
+  return {
+    profile: CODEX_CLEAN_ISSUE_COMMENT_PARSE_PROFILE,
+    stage,
+    reasonCode,
+    ...extra,
+  };
+}
+
+function parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs) {
+  const lines = body.replace(/\r\n?/g, "\n").split("\n");
+  const conclusion = lines[0] || "";
+  if (!cleanIssueCommentConclusionHasClosedGrammar(conclusion)) {
+    return {
+      ok: false,
+      stage: "conclusion",
+      reasonCode: "conclusion_invalid",
+      reason: "clean Codex issue comment does not match the closed clean-result grammar",
+    };
   }
 
-  const prefixBlock = normalizedBody.slice(0, markerIndex);
-  if (!prefixBlock.endsWith("\n\n")) {
-    return false;
+  let markerLineIndex = skipBlankLines(lines, 1);
+  const markerLabels = body.match(/\*\*Reviewed commit:\*\*/gi) || [];
+  const commitPattern = allowShortCommitRefs
+    ? /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{7,40})`[ \t]*$/
+    : /^\*\*Reviewed commit:\*\*[ \t]*`([0-9a-f]{10}|[0-9a-f]{40})`[ \t]*$/;
+  const markerMatch = commitPattern.exec(lines[markerLineIndex] || "");
+  if (markerLabels.length !== 1 || !markerMatch) {
+    return {
+      ok: false,
+      stage: "reviewed-commit",
+      reasonCode: "reviewed_commit_marker_invalid",
+      reason: "clean Codex issue comment must contain exactly one Reviewed commit marker",
+    };
   }
-  const prefix = prefixBlock.slice(0, -2);
-  if (prefix.includes("\n") || !prefix.startsWith(CODEX_CLEAN_COMMENT_LEAD)) {
-    return false;
+  if (markerLineIndex === 1) {
+    return {
+      ok: false,
+      stage: "section-separator",
+      reasonCode: "separator_invalid",
+      reason: "clean Codex issue comment does not match the closed clean-result grammar",
+    };
   }
-  if (prefix !== CODEX_CLEAN_COMMENT_LEAD) {
-    const taglinePrefix = `${CODEX_CLEAN_COMMENT_LEAD} `;
-    if (
-      !prefix.startsWith(taglinePrefix) ||
-      !cleanTaglineHasPresentationGrammar(prefix.slice(taglinePrefix.length))
-    ) {
-      return false;
-    }
+
+  const commitRef = markerMatch[1].toLowerCase();
+  let disclosureLineIndex = skipBlankLines(lines, markerLineIndex + 1);
+  if (disclosureLineIndex === lines.length) {
+    return { ok: true, commitRef, disclosurePresent: false };
   }
-  const suffixBlock = normalizedBody.slice(markerIndex + normalizedMarker.length);
-  if (!suffixBlock) {
+  if (disclosureLineIndex === markerLineIndex + 1) {
+    return {
+      ok: false,
+      stage: "section-separator",
+      reasonCode: "separator_invalid",
+      reason: "clean Codex issue comment does not match the closed clean-result grammar",
+      commitRefLength: commitRef.length,
+    };
+  }
+
+  if (!officialIssueCommentCleanDisclosureHasClosedGrammar(lines.slice(disclosureLineIndex).join("\n"))) {
+    return {
+      ok: false,
+      stage: "disclosure",
+      reasonCode: "disclosure_invalid",
+      reason: "clean Codex issue comment does not match the closed clean-result grammar",
+      commitRefLength: commitRef.length,
+    };
+  }
+
+  return { ok: true, commitRef, disclosurePresent: true };
+}
+
+function cleanIssueCommentConclusionHasClosedGrammar(line) {
+  if (line === CODEX_CLEAN_COMMENT_LEAD) {
     return true;
   }
-
+  const taglinePrefix = `${CODEX_CLEAN_COMMENT_LEAD} `;
   return (
-    suffixBlock.startsWith("\n\n") &&
-    officialCodexDisclosureHasClosedGrammar(suffixBlock.slice(2))
+    line.startsWith(taglinePrefix) &&
+    cleanTaglineHasPresentationGrammar(line.slice(taglinePrefix.length))
   );
+}
+
+function skipBlankLines(lines, startIndex) {
+  let index = startIndex;
+  while (index < lines.length && lines[index].trim() === "") {
+    index += 1;
+  }
+  return index;
+}
+
+function officialIssueCommentCleanDisclosureHasClosedGrammar(value) {
+  const lines = value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim());
+  const first = skipBlankLines(lines, 0);
+  const last = (() => {
+    let index = lines.length - 1;
+    while (index >= first && lines[index] === "") {
+      index -= 1;
+    }
+    return index;
+  })();
+  if (first > last) {
+    return false;
+  }
+
+  const block = lines.slice(first, last + 1);
+  if (
+    block[0] !== "<details>" &&
+    !/^<details>[ \t]*<summary>.*<\/summary>(?:[ \t]*<br[ \t]*\/?>)?$/u.test(block[0])
+  ) {
+    return false;
+  }
+  if (block.at(-1) !== "</details>") {
+    return false;
+  }
+
+  const tagTokens = block.join("\n").match(/<\/?[A-Za-z][^>]*>/g) || [];
+  const allowedTags = new Set([
+    "<details>",
+    "</details>",
+    "<summary>",
+    "</summary>",
+    "<br>",
+    "<br/>",
+    "<br />",
+  ]);
+  if (
+    tagTokens.some((tag) => !allowedTags.has(tag)) ||
+    tagTokens.filter((tag) => tag === "<details>").length !== 1 ||
+    tagTokens.filter((tag) => tag === "</details>").length !== 1 ||
+    tagTokens.filter((tag) => tag === "<summary>").length !== 1 ||
+    tagTokens.filter((tag) => tag === "</summary>").length !== 1 ||
+    tagTokens.filter((tag) => tag.startsWith("<br")).length > 1
+  ) {
+    return false;
+  }
+
+  let contentStart;
+  if (block[0] === "<details>") {
+    const summaryIndex = skipBlankLines(block, 1);
+    if (!isOfficialCodexDisclosureSummaryLine(block[summaryIndex] || "")) {
+      return false;
+    }
+    contentStart = summaryIndex + 1;
+    if (!block[summaryIndex].includes("<br")) {
+      contentStart = skipBlankLines(block, contentStart);
+      if (isDisclosureBreakLine(block[contentStart] || "")) {
+        contentStart += 1;
+      }
+    }
+  } else {
+    const openingSummary = block[0].slice("<details>".length).trim();
+    if (!isOfficialCodexDisclosureSummaryLine(openingSummary)) {
+      return false;
+    }
+    contentStart = 1;
+    if (!openingSummary.includes("<br")) {
+      contentStart = skipBlankLines(block, contentStart);
+      if (isDisclosureBreakLine(block[contentStart] || "")) {
+        contentStart += 1;
+      }
+    }
+  }
+
+  const content = block
+    .slice(contentStart, -1)
+    .filter((line) => line !== "");
+  if (
+    content.some((line) => line.startsWith(">") || /^(?:`{3,}|~{3,})/.test(line)) ||
+    content.length !== 6
+  ) {
+    return false;
+  }
+
+  const setupLines = new Set([
+    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+    "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you",
+  ]);
+  const callToActionLines = new Set([
+    'When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".',
+    'Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".',
+  ]);
+  return (
+    setupLines.has(content[0]) &&
+    content[1] === "- Open a pull request for review" &&
+    content[2] === "- Mark a draft as ready" &&
+    content[3] === '- Comment "@codex review".' &&
+    content[4] === "If Codex has suggestions, it will comment; otherwise it will react with 👍." &&
+    callToActionLines.has(content[5])
+  );
+}
+
+function isOfficialCodexDisclosureSummaryLine(line) {
+  return /^<summary>[ \t]*(?:ℹ(?:️)?[ \t]*)?About Codex in GitHub[ \t]*<\/summary>(?:[ \t]*<br[ \t]*\/?>)?$/u.test(line);
+}
+
+function isDisclosureBreakLine(line) {
+  return /^<br[ \t]*\/?>$/u.test(line);
 }
 
 function cleanTaglineHasPresentationGrammar(value) {
