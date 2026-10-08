@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:3",
   "schema_version": 3,
-  "version": "2.1.8",
+  "version": "2.1.9",
   "contract_versions": {
     "toolchain": "node24",
     "release_schema": 3,
@@ -12,13 +12,13 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "6ebca340db6301b36dac6643d444d2d0052e5eb4"
+    "tree": "56db591dee48beba4ed73ba76e0e5dc52f99e7f2"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "9b05689ac64c1ef6847041544dc8aca795304534",
-    "previous_version": "2.1.7"
+    "expected_head": "299c0fde3cdd921e8d756f792edc056afb0f2ec9",
+    "previous_version": "2.1.8"
   },
   "files": [
     {
@@ -67,15 +67,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 45036,
-      "sha256": "4cced341dcac571b2aa79b14aa9b80377ce68cb35a63da8145ae62e96155f4cb"
+      "size": 46706,
+      "sha256": "d32781bf6cb7b0bb303e34a97de28ae9f58149f5142859753d42d49325edf075"
     },
     {
       "path": "README.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 44089,
-      "sha256": "853f36b0cbc0a0c542e83d1a948bb9f9718018cfa17878883f62ff48a20e47ce"
+      "size": 45446,
+      "sha256": "ac0b73ca42af02ce204107381ed5fb4b2bc3f73947965f62b29abbc5da525665"
     },
     {
       "path": "SECURITY.md",
@@ -110,7 +110,7 @@
       "type": "file",
       "mode": "100644",
       "size": 481,
-      "sha256": "5f4825cd656d3528416834e5b227cb8715ab10a69e661779cc92edb69ded5519"
+      "sha256": "1e2213edbfd52422fa677d71356daa355b77c35d10a6debc0883b8694e6a9b04"
     },
     {
       "path": "producer-receipt.schema.json",
@@ -123,8 +123,8 @@
       "path": "src/core.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 65522,
-      "sha256": "2963125336dad82e557801af30f120b63664c7fd9c724c8eeab704dca1486336"
+      "size": 71215,
+      "sha256": "baa4530e65e2e209f564515aaef763136346ca29647983ba60a7699195c34127"
     },
     {
       "path": "src/evidence-budget.mjs",
@@ -144,8 +144,8 @@
       "path": "src/v2/gate-runtime.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 350547,
-      "sha256": "a76fdbd09f49dfe1c16227b3d6dae524cd80efa98915015d27eb9f33b3877fd7"
+      "size": 357929,
+      "sha256": "8147977b886b777fa0243488c16c38bf661810d4c2e23ba26f57f499b5259c9f"
     }
   ],
   "entrypoint": {
