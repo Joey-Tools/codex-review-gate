@@ -5,7 +5,7 @@ status: active
 created: 2026-10-08
 updated: 2026-10-08
 branch: codex/review-request-token-override
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/111
 supersedes: []
 superseded_by:
 ---
@@ -65,8 +65,13 @@ superseded_by:
   combined bootstrap/security run exposed one stale public-input inventory
   assertion; after updating it, the complete security suite passed 43/43.
   Focused publication-contract coverage passed 5/5 plus the historical v2.0
-  provenance/tag check. Full release pipeline results remain to be collected;
-  these local results do not stand in for complete source PR CI or the pilot.
+  provenance/tag check. The local full release pipeline hit its 900-second
+  bound without results and is incomplete; all eight release CI cells passed
+  on source head `58fcdbfe93`. Core CI then exposed another historical
+  provenance fixture importing the new input, and a stale shard inventory.
+  After correcting only those test fixtures/counts, the complete provenance
+  and shard-contract suites passed 83/83. These results do not replace
+  exact-current-head PR CI or the production pilot.
 - Documentation describes the intended source capability and explicit pilot
   sequence. It does not claim the implementation is merged, released,
   deployed or validated in the pilot.
