@@ -205,6 +205,16 @@ function previousCanonicalControllerWorkflow() {
   assert.notEqual(previousController, withPreviousGroup);
   return previousController;
 }
+function controllerWithoutReviewRequestToken(workflow) {
+  const reviewRequestTokenLine =
+    "          review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}\n";
+  assert.equal(
+    workflow.split(reviewRequestTokenLine).length,
+    2,
+    "controller fixture must contain one approved review-request-token mapping",
+  );
+  return workflow.replace(reviewRequestTokenLine, "");
+}
 const DEFAULT_BRANCH_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CANARY_HEAD_SHA = "0123456789abcdef0123456789abcdef01234567";
 const CANARY_REPOSITORY_ID = 1234;
@@ -2553,7 +2563,9 @@ test("prepare-worktree upgrades the exact previous canonical controller concurre
     workflowsDirectory,
     "codex-review-gate-controller.yml",
   );
-  const previousCanonicalController = previousCanonicalControllerWorkflow();
+  const previousCanonicalController = controllerWithoutReviewRequestToken(
+    previousCanonicalControllerWorkflow(),
+  );
   try {
     initializeGitRepository(targetRoot);
     mkdirSync(workflowsDirectory, { recursive: true });
@@ -6349,6 +6361,53 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   );
   assert.match(
     CANONICAL_CONTROLLER_WORKFLOW,
+    /^          review_request_token: \$\{\{ secrets\.CODEX_REVIEW_GATE_REQUEST_TOKEN \}\}$/mu,
+  );
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        controllerWithoutReviewRequestToken(CANONICAL_CONTROLLER_WORKFLOW),
+      ),
+    /approved CODEX_REVIEW_GATE_REQUEST_TOKEN secret to review_request_token/u,
+    "current canonical controller bytes must contain the approved Action input mapping",
+  );
+  for (const unsafeRequestTokenValue of [
+    "${{ secrets.OTHER_TOKEN }}",
+    "${{ vars.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+    "${{ inputs.review_request_token }}",
+    "literal-token",
+    "${{ github.token }}",
+  ]) {
+    assert.throws(
+      () =>
+        validateCanonicalV2ControllerWorkflowContent(
+          CANONICAL_CONTROLLER_WORKFLOW.replace(
+            "review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+            `review_request_token: ${unsafeRequestTokenValue}`,
+          ),
+        ),
+      undefined,
+      `unsafe review_request_token value must be rejected: ${unsafeRequestTokenValue}`,
+    );
+  }
+  assert.throws(
+    () =>
+      validateCanonicalV2ControllerWorkflowContent(
+        CANONICAL_CONTROLLER_WORKFLOW
+          .replace(
+            "          review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}\n",
+            "",
+          )
+          .replace(
+            "          github_token: ${{ github.token }}",
+            "          github_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+          ),
+      ),
+    undefined,
+    "the approved PAT secret cannot replace github.token",
+  );
+  assert.match(
+    CANONICAL_CONTROLLER_WORKFLOW,
     /^  workflow_run:\n    workflows: \[Codex Review Gate Verifier\]\n    types: \[completed\]$/mu,
   );
   assert.throws(
@@ -6642,6 +6701,23 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   assert.equal(
     validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOWS),
     CANONICAL_WORKFLOWS,
+  );
+
+  const controllerWithoutRequestToken = controllerWithoutReviewRequestToken(
+    CANONICAL_CONTROLLER_WORKFLOW,
+  );
+  const legacyActionAbiInventory = cleanInventory.map((file) =>
+    file.path === DEFAULT_CONTROLLER_WORKFLOW_PATH
+      ? { ...file, content: controllerWithoutRequestToken }
+      : file,
+  );
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      legacyActionAbiInventory,
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "installed controllers predating the optional Action input remain safe upgrade targets",
   );
 
   const previousCanonicalController = previousCanonicalControllerWorkflow();

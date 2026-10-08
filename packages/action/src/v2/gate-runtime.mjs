@@ -866,6 +866,8 @@ function redactV2GateCliText(value, environment) {
   const tokens = new Set([
     String(environment?.GITHUB_TOKEN ?? "").trim(),
     String(environment?.INPUT_GITHUB_TOKEN ?? "").trim(),
+    String(environment?.REVIEW_REQUEST_TOKEN ?? "").trim(),
+    String(environment?.INPUT_REVIEW_REQUEST_TOKEN ?? "").trim(),
   ]);
   for (const token of tokens) {
     if (token) text = text.replaceAll(token, "[REDACTED]");
@@ -1849,7 +1851,7 @@ export async function runV2GateCli({
       gateOutcome: stale
         ? "not_applicable"
         : error?.gateOutcome ?? (context.headValidated ? "pending" : "unknown"),
-      reason: error?.message || String(error),
+      reason: redactV2GateCliText(error?.message || String(error), environment),
       recoveryCode: stale
         ? "refresh_head"
         : safeBeginRetry
@@ -1889,7 +1891,10 @@ export async function runV2GateCli({
       report = buildV2GateReport({
         executionHealth: "unhealthy",
         gateOutcome: preserveFindingFailure ? "failure" : "unknown",
-        reason: `Failed to persist the v2 gate report: ${reportError.message}`,
+        reason: redactV2GateCliText(
+          `Failed to persist the v2 gate report: ${reportError.message}`,
+          environment,
+        ),
         recoveryCode: preserveFindingFailure ? error.recoveryCode : "repair_permissions",
         requiresReplacementPr: error?.requiresReplacementPr === true,
         findingsUnresolved: counts.unresolved,
@@ -3463,6 +3468,13 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     return { kind: "disabled", commentId: null };
   }
 
+  const requestClient = config.reviewRequestToken
+    ? new V2GitHubClient({ ...config, token: config.reviewRequestToken }, client.fetchImpl)
+    : client;
+  const requestAuthor = config.reviewRequestToken
+    ? await loadV2ReviewRequestAuthor(requestClient, budget)
+    : null;
+
   const comments = await loadV2IssueCommentsWithEditHistory(
     client,
     config,
@@ -3482,7 +3494,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     );
   }
 
-  const matching = canonicalV2RequestComments(comments).filter(({ binding }) =>
+  const matching = controllerV2RequestComments(comments, requestAuthor).filter(({ binding }) =>
     matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
   );
   if (matching.length > 0) {
@@ -3536,7 +3548,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
   try {
     try {
       mayHaveCommitted = true;
-      const { data: created } = await client.request(
+      const { data: created } = await requestClient.request(
         "POST",
         `${config.repoPath}/issues/${config.prNumber}/comments`,
         { body: requestBody },
@@ -3589,6 +3601,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         createdId,
         requestBody,
         config.runId,
+        requestAuthor,
       );
       context.issueComments = [...comments, refetched];
 
@@ -3597,6 +3610,9 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       mayHaveCommitted = false;
       return { kind: "created", commentId: createdId };
     } catch (postError) {
+      if (postReturnedSuccessfully && postError?.exactReviewRequestBindingMismatch === true) {
+        throw postError;
+      }
       if (
         !postReturnedSuccessfully &&
         (postError?.httpStatus === 401 || postError?.httpStatus === 403)
@@ -3618,7 +3634,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
           },
         );
         context.issueComments = reread;
-        const sameRun = canonicalV2RequestComments(reread).filter(({ binding }) =>
+        const sameRun = controllerV2RequestComments(reread, requestAuthor).filter(({ binding }) =>
           matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
         );
         visible = postReturnedSuccessfully
@@ -3636,13 +3652,25 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
             visible,
             observedIssueCommentEdits,
           );
-          if (postReturnedSuccessfully && visible.length === 1) {
-            requireExactV2CreatedReviewRequest(
-              visible[0].comment,
-              createdId,
-              requestBody,
-              config.runId,
+          for (const { comment } of visible) {
+            const refetched = await refetchV2ControllerReviewRequest(
+              client,
+              config,
+              budget,
+              comment,
+              requestAuthor,
+              context,
+              initialPr,
             );
+            if (postReturnedSuccessfully) {
+              requireExactV2CreatedReviewRequest(
+                refetched,
+                createdId,
+                requestBody,
+                config.runId,
+                requestAuthor,
+              );
+            }
           }
         }
       } catch (error) {
@@ -3674,6 +3702,86 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       { recoveryCode: "retry_begin", retrySafe: false },
     );
   }
+}
+
+async function refetchV2ControllerReviewRequest(
+  client,
+  config,
+  budget,
+  listed,
+  requestAuthor,
+  context,
+  initialPr,
+) {
+  const id = canonicalPositiveId(listed?.id);
+  if (!id) throw new V2RuntimeFailure("Review request has no canonical comment id");
+  const { data } = await client.request(
+    "GET",
+    `${config.repoPath}/issues/comments/${id}`,
+    undefined,
+    { budget, safeRead: true },
+  );
+  requireV2IssueCommentShape(data, "refetched review request");
+  const binding = parseCanonicalV2ReviewRequestBody(data.body);
+  const authorMatches = requestAuthor
+    ? String(data?.user?.id ?? "") === requestAuthor.id &&
+      data?.user?.login === requestAuthor.login &&
+      data?.user?.type === requestAuthor.type
+    : data?.user?.login === GITHUB_ACTIONS_BOT_LOGIN &&
+      data?.user?.type === "Bot";
+  if (
+    String(data?.id ?? "") !== id ||
+    data?.body !== listed.body ||
+    !authorMatches ||
+    hasV2ObservedIssueCommentEdit(listed) ||
+    hasV2ObservedIssueCommentEdit(data) ||
+    !binding ||
+    !matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
+  ) {
+    throw new V2RuntimeFailure(
+      "Refetched review request failed exact author, body, or scope binding",
+    );
+  }
+  return data;
+}
+
+async function loadV2ReviewRequestAuthor(client, budget) {
+  const { data } = await client.request("GET", "/user", undefined, {
+    budget,
+    safeRead: true,
+  });
+  const id = canonicalPositiveId(data?.id);
+  const login = typeof data?.login === "string" ? data.login : "";
+  if (
+    !id ||
+    !login ||
+    login !== login.trim() ||
+    /[\u0000-\u001f\u007f]/u.test(login) ||
+    data?.type !== "User"
+  ) {
+    throw new V2RuntimeFailure(
+      "REVIEW_REQUEST_TOKEN must authenticate as a GitHub User before a review request can be posted",
+    );
+  }
+  return Object.freeze({ id, login, type: "User" });
+}
+
+function controllerV2RequestComments(comments, requestAuthor) {
+  if (!requestAuthor) return canonicalV2RequestComments(comments);
+  return (comments ?? []).flatMap((comment) => {
+    const binding = parseCanonicalV2ReviewRequestBody(comment?.body);
+    if (
+      !binding ||
+      !canonicalPositiveId(comment?.id) ||
+      String(comment?.user?.id ?? "") !== requestAuthor.id ||
+      comment?.user?.login !== requestAuthor.login ||
+      comment?.user?.type !== requestAuthor.type ||
+      hasV2ObservedIssueCommentEdit(comment)
+    ) {
+      return [];
+    }
+    return [{ comment, binding }];
+  });
 }
 
 function matchesV2BeginReviewRequestScope(binding, config, context, pullRequest) {
@@ -3763,16 +3871,34 @@ async function loadV2IssueCommentsWithEditHistory(
   return comments;
 }
 
-function requireExactV2CreatedReviewRequest(refetched, createdId, requestBody, runId) {
+function requireExactV2CreatedReviewRequest(
+  refetched,
+  createdId,
+  requestBody,
+  runId,
+  requestAuthor = null,
+) {
   requireV2IssueCommentShape(refetched, "created review request");
-  if (
+  const exactAuthor = requestAuthor
+    ? String(refetched?.user?.id ?? "") === requestAuthor.id &&
+      refetched?.user?.login === requestAuthor.login &&
+      refetched?.user?.type === requestAuthor.type
+    : refetched?.user?.login === GITHUB_ACTIONS_BOT_LOGIN &&
+      refetched?.user?.type === "Bot";
+  const bindingMismatch =
     String(refetched?.id ?? "") !== createdId ||
     refetched?.body !== requestBody ||
-    refetched?.user?.login !== GITHUB_ACTIONS_BOT_LOGIN ||
-    refetched?.user?.type !== "Bot" ||
-    hasV2ObservedIssueCommentEdit(refetched) ||
-    parseCanonicalV2ReviewRequestBody(refetched.body)?.runId !== runId
-  ) {
+    !exactAuthor ||
+    parseCanonicalV2ReviewRequestBody(refetched.body)?.runId !== runId;
+  if (bindingMismatch) {
+    const error = new V2RuntimeFailure(
+      "Created review request failed exact refetch binding",
+      { recoveryCode: "retry_begin", retrySafe: false },
+    );
+    error.exactReviewRequestBindingMismatch = true;
+    throw error;
+  }
+  if (hasV2ObservedIssueCommentEdit(refetched)) {
     throw new V2RuntimeFailure("Created review request failed exact refetch binding");
   }
 }
@@ -4060,6 +4186,11 @@ function readV2Config(environment) {
   }
   const apiUrl = stripSlashes(environment.GITHUB_API_URL || "https://api.github.com");
   const serverUrl = stripSlashes(environment.GITHUB_SERVER_URL || "https://github.com");
+  const requestReview = normalizeV2RequestReview(runtimeValue(
+    environment,
+    "REQUEST_REVIEW_INPUT",
+    "INPUT_REQUEST_REVIEW",
+  ));
   return {
     environment,
     token,
@@ -4075,11 +4206,10 @@ function readV2Config(environment) {
     outputPath: requiredValue(environment, "GITHUB_OUTPUT"),
     summaryPath: environment.GITHUB_STEP_SUMMARY || "",
     operation,
-    requestReview: normalizeV2RequestReview(runtimeValue(
-      environment,
-      "REQUEST_REVIEW_INPUT",
-      "INPUT_REQUEST_REVIEW",
-    )),
+    requestReview,
+    reviewRequestToken: operation === "begin-review" && requestReview
+      ? runtimeValue(environment, "REVIEW_REQUEST_TOKEN", "INPUT_REVIEW_REQUEST_TOKEN").trim()
+      : "",
     expectedHeadSha,
     requestCommentId,
     limitsProfile,
@@ -7743,34 +7873,45 @@ async function collectAuthorizedV2Requests(client, config, budget, issueComments
     const canonical = parseCanonicalV2ReviewRequestBody(comment?.body);
     if (canonical) {
       if (
-        comment.user?.login !== GITHUB_ACTIONS_BOT_LOGIN ||
-        comment.user?.type !== "Bot"
+        comment.user?.login === GITHUB_ACTIONS_BOT_LOGIN &&
+        comment.user?.type === "Bot"
       ) {
-        boundaries.push(v2PhysicalOnlyRequestBoundary(comment, "canonical-wrong-author"));
+        if (
+          hasV2ObservedIssueCommentEdit(comment) ||
+          canonical.repositoryId !== config.repositoryId ||
+          canonical.prNumber !== String(config.prNumber)
+        ) {
+          boundaries.push(v2PhysicalOnlyRequestBoundary(comment, "canonical-invalid-binding"));
+          errors.push({
+            message: `Workflow-authored review request ${comment.id} has an invalid binding`,
+            createdAt: v2IssueCommentRevisionAt(comment),
+          });
+          continue;
+        }
+        const request = {
+          comment,
+          binding: canonical,
+          id: String(comment.id),
+          revisionMs: Date.parse(v2IssueCommentRevisionAt(comment)),
+          headBound: true,
+          permission: "workflow",
+        };
+        authorized.push(request);
+        boundaries.push({ ...request, authorized: true });
         continue;
       }
       if (
-        hasV2ObservedIssueCommentEdit(comment) ||
-        canonical.repositoryId !== config.repositoryId ||
-        canonical.prNumber !== String(config.prNumber)
+        comment.user?.type === "User" &&
+        typeof comment.user?.login === "string" &&
+        comment.user.login.trim() !== "" &&
+        !hasV2ObservedIssueCommentEdit(comment) &&
+        hasExactV2PhysicalReviewRequestShape(comment.body)
       ) {
-        boundaries.push(v2PhysicalOnlyRequestBoundary(comment, "canonical-invalid-binding"));
-        errors.push({
-          message: `Workflow-authored review request ${comment.id} has an invalid binding`,
-          createdAt: v2IssueCommentRevisionAt(comment),
-        });
+        // A user-authored marker is an ordinary request, not a head-bound workflow request.
+        ordinaryCandidates.push(comment);
         continue;
       }
-      const request = {
-        comment,
-        binding: canonical,
-        id: String(comment.id),
-        revisionMs: Date.parse(v2IssueCommentRevisionAt(comment)),
-        headBound: true,
-        permission: "workflow",
-      };
-      authorized.push(request);
-      boundaries.push({ ...request, authorized: true });
+      boundaries.push(v2PhysicalOnlyRequestBoundary(comment, "canonical-wrong-author"));
       continue;
     }
     if (!hasExactV2PhysicalReviewRequestShape(comment?.body)) {

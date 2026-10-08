@@ -9,6 +9,10 @@ inputs:
   github_token:
     description: Token used by the verifier to read evidence and by the controller to update diagnostics and rerun the verifier.
     required: true
+  review_request_token:
+    description: Optional GitHub user token used only to identify the request author and post a Codex review request; empty retains the github_token request identity.
+    required: false
+    default: ""
   pr_number:
     description: Canonical positive pull request number to reconcile.
     required: true

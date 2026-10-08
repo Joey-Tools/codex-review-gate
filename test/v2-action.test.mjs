@@ -17,6 +17,7 @@ test("direct gate Action exposes the adopted production ABI and entrypoint", () 
   const inputs = yamlSection(action, "inputs", "outputs");
   assert.deepEqual(topLevelYamlKeys(inputs), [
     "github_token",
+    "review_request_token",
     "pr_number",
     "expected_head_sha",
     "operation",
@@ -25,6 +26,8 @@ test("direct gate Action exposes the adopted production ABI and entrypoint", () 
     "limits_profile",
   ]);
   assert.match(yamlChildBlock(inputs, "github_token"), /^    required: true$/mu);
+  assert.match(yamlChildBlock(inputs, "review_request_token"), /^    required: false$/mu);
+  assert.match(yamlChildBlock(inputs, "review_request_token"), /^    default: ""$/mu);
   assert.match(yamlChildBlock(inputs, "pr_number"), /^    required: true$/mu);
   assert.match(yamlChildBlock(inputs, "expected_head_sha"), /^    default: ""$/mu);
   assert.match(yamlChildBlock(inputs, "operation"), /^    description: .*workflow_run-only report-completion/u);

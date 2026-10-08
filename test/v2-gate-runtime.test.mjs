@@ -55,6 +55,16 @@ const CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER =
   "<!-- codex-pull-request-review-summary -->";
 const CODEX_BOT_DATABASE_ID = 90_510;
 const HUMAN_DATABASE_ID = 90_511;
+const REVIEW_REQUEST_USER = {
+  id: 90_512,
+  login: "review-request-user",
+  type: "User",
+};
+// Synthetic token fixtures from joey-private-v3: access-a and access-b.
+const REVIEW_REQUEST_TOKEN_FIXTURES = Object.freeze({
+  accessA: "codex_synth_v1_access_a",
+  accessB: "codex_synth_v1_access_b",
+});
 const V2_RUNTIME_PATH = fileURLToPath(
   new URL("../packages/action/src/v2/gate-runtime.mjs", import.meta.url),
 );
@@ -7351,7 +7361,7 @@ test("provider-triggerable invalid request shapes remain physical-only boundarie
   const invalidRequests = [
     ["canonical-wrong-author", workflowRequest({
       id: 102,
-      user: HUMAN,
+      user: { login: "review-request-app[bot]", type: "Bot" },
       created_at: "2026-08-25T08:02:00Z",
       updated_at: "2026-08-25T08:02:00Z",
     })],
@@ -11037,6 +11047,7 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
   const { result } = await runGate(environment, github);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(github.authCalls.some(({ path }) => path === "/user"), false);
   assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
   assert.deepEqual(parseCanonicalV2ReviewRequestBody(github.requestBodies[0]), {
     version: 2,
@@ -11070,7 +11081,321 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
   );
   const { result: disabled } = await runGate(disabledEnvironment, disabledGitHub);
   assert.equal(disabled.report.gateOutcome, "pending");
+  assert.equal(disabledGitHub.authCalls.some(({ path }) => path === "/user"), false);
   assert.deepEqual(disabledGitHub.requestBodies, []);
+});
+
+test("review-request token scopes User identity resolution and request posting to manual and auto controllers", async (context) => {
+  for (const eventName of ["workflow_dispatch", "workflow_run"]) {
+    const github = createGitHubMock({
+      authenticatedUser: REVIEW_REQUEST_USER,
+      createdCommentOverrides: { user: REVIEW_REQUEST_USER },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `review-request-token-${eventName}`,
+      eventName,
+      operation: "begin-review",
+    });
+    environment.REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessA;
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "pending", eventName);
+    assert.deepEqual(github.requestBodies, [canonicalRequestBody()], eventName);
+    const overrideAuthorization = `Bearer ${REVIEW_REQUEST_TOKEN_FIXTURES.accessA}`;
+    assert.deepEqual(
+      github.authCalls
+        .filter(({ authorization }) => authorization === overrideAuthorization)
+        .map(({ method, path }) => [method, path]),
+      [
+        ["GET", "/user"],
+        ["POST", `/repos/${REPOSITORY}/issues/${PR}/comments`],
+      ],
+      eventName,
+    );
+    assert.ok(
+      github.authCalls
+        .filter(({ authorization }) => authorization !== overrideAuthorization)
+        .every(({ authorization }) => authorization === "Bearer test-token"),
+      eventName,
+    );
+    assert.ok(
+      github.authCalls.some(({ method, path, authorization }) =>
+        method === "GET" &&
+        path === `/repos/${REPOSITORY}/issues/comments/10000` &&
+        authorization === "Bearer test-token"
+      ),
+      eventName,
+    );
+  }
+});
+
+test("review-request token deduplicates only its exact User marker and recovers an unknown POST without reposting", async (context) => {
+  const matching = workflowRequest({ user: REVIEW_REQUEST_USER });
+  const adoptedGitHub = createGitHubMock({
+    authenticatedUser: REVIEW_REQUEST_USER,
+    issueComments: [matching],
+  });
+  const adoptedEnvironment = runtimeEnvironment(context, {
+    suffix: "review-request-user-adopted",
+    operation: "begin-review",
+  });
+  adoptedEnvironment.INPUT_REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessB;
+  const { result: adopted } = await runGate(adoptedEnvironment, adoptedGitHub);
+  assert.equal(adopted.report.gateOutcome, "pending");
+  assert.deepEqual(adoptedGitHub.requestBodies, []);
+
+  const previousIdentity = { ...REVIEW_REQUEST_USER, id: 90_513, login: "previous-review-user" };
+  const changedIdentityGitHub = createGitHubMock({
+    authenticatedUser: REVIEW_REQUEST_USER,
+    issueComments: [workflowRequest({ user: previousIdentity })],
+    createdCommentOverrides: { user: REVIEW_REQUEST_USER },
+  });
+  const changedIdentityEnvironment = runtimeEnvironment(context, {
+    suffix: "review-request-user-changed",
+    operation: "begin-review",
+  });
+  changedIdentityEnvironment.REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessB;
+  const { result: changedIdentity } = await runGate(
+    changedIdentityEnvironment,
+    changedIdentityGitHub,
+  );
+  assert.equal(changedIdentity.report.gateOutcome, "pending");
+  assert.deepEqual(changedIdentityGitHub.requestBodies, [canonicalRequestBody()]);
+
+  const unknownGitHub = createGitHubMock({
+    authenticatedUser: REVIEW_REQUEST_USER,
+    postUnknownAfterCreate: true,
+    createdCommentOverrides: { user: REVIEW_REQUEST_USER },
+  });
+  const unknownEnvironment = runtimeEnvironment(context, {
+    suffix: "review-request-user-post-unknown",
+    operation: "begin-review",
+  });
+  unknownEnvironment.INPUT_REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessA;
+  const { result: unknown } = await runGate(unknownEnvironment, unknownGitHub);
+  assert.equal(unknown.report.gateOutcome, "pending");
+  assert.equal(unknown.report.recoveryCode, "wait_provider");
+  assert.deepEqual(unknownGitHub.requestBodies, [canonicalRequestBody()]);
+  assert.equal(
+    unknownGitHub.authCalls.filter(({ method, path, authorization }) =>
+      method === "POST" &&
+      path === `/repos/${REPOSITORY}/issues/${PR}/comments` &&
+      authorization === `Bearer ${REVIEW_REQUEST_TOKEN_FIXTURES.accessA}`
+    ).length,
+    1,
+  );
+});
+
+test("review-request token rejects invalid identities, mismatched refetch authors, and expired credentials without fallback", async (context) => {
+  for (const [suffix, authenticatedUser] of [
+    ["bot", { ...REVIEW_REQUEST_USER, type: "Bot" }],
+    ["missing-id", { ...REVIEW_REQUEST_USER, id: 0 }],
+    ["missing-login", { ...REVIEW_REQUEST_USER, login: " " }],
+  ]) {
+    const github = createGitHubMock({ authenticatedUser });
+    const environment = runtimeEnvironment(context, {
+      suffix: `review-request-invalid-user-${suffix}`,
+      operation: "begin-review",
+    });
+    environment.REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessA;
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.match(result.report.reason, /must authenticate as a GitHub User/u, suffix);
+    assert.deepEqual(github.requestBodies, [], suffix);
+    assert.equal(
+      github.authCalls.some(({ method, path, authorization }) =>
+        method === "POST" &&
+        path === `/repos/${REPOSITORY}/issues/${PR}/comments` &&
+        authorization === `Bearer ${REVIEW_REQUEST_TOKEN_FIXTURES.accessA}`
+      ),
+      false,
+      suffix,
+    );
+  }
+
+  for (const [suffix, user] of [
+    ["id", { ...REVIEW_REQUEST_USER, id: 90_514 }],
+    ["login", { ...REVIEW_REQUEST_USER, login: "different-review-user" }],
+    ["type", { ...REVIEW_REQUEST_USER, type: "Bot" }],
+  ]) {
+    const github = createGitHubMock({
+      authenticatedUser: REVIEW_REQUEST_USER,
+      createdCommentOverrides: { user: REVIEW_REQUEST_USER },
+      commentRefetchMutator: (comment) =>
+        String(comment.id) === "10000" ? { ...comment, user } : comment,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `review-request-refetch-author-${suffix}`,
+      operation: "begin-review",
+    });
+    environment.INPUT_REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessB;
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.recoveryCode, "retry_begin", suffix);
+    assert.equal(result.report.retrySafe, false, suffix);
+    assert.deepEqual(github.requestBodies, [canonicalRequestBody()], suffix);
+  }
+
+  const expiredGitHub = createGitHubMock({
+    authenticatedUser: REVIEW_REQUEST_USER,
+    requestInterceptor: ({ method, path }) =>
+      method === "GET" && path === "/user"
+        ? jsonResponse({ message: "Bad credentials" }, 401)
+        : undefined,
+  });
+  const expiredEnvironment = runtimeEnvironment(context, {
+    suffix: "review-request-expired-token",
+    operation: "begin-review",
+  });
+  expiredEnvironment.REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessB;
+  const { result: expired } = await runGate(expiredEnvironment, expiredGitHub);
+  assert.equal(expired.exitCode, 1);
+  assert.equal(expiredGitHub.requestBodies.length, 0);
+  assert.equal(
+    expiredGitHub.authCalls.some(({ method, path, authorization }) =>
+      method === "POST" &&
+      path === `/repos/${REPOSITORY}/issues/${PR}/comments` &&
+      authorization === `Bearer ${REVIEW_REQUEST_TOKEN_FIXTURES.accessB}`
+    ),
+    false,
+  );
+  assert.ok(
+    expiredGitHub.authCalls
+      .filter(({ authorization }) => authorization !== `Bearer ${REVIEW_REQUEST_TOKEN_FIXTURES.accessB}`)
+      .every(({ authorization }) => authorization === "Bearer test-token"),
+  );
+});
+
+test("unknown review-request POST is not adopted when exact refetch changes the User id", async (context) => {
+  const github = createGitHubMock({
+    authenticatedUser: REVIEW_REQUEST_USER,
+    postUnknownAfterCreate: true,
+    createdCommentOverrides: { user: REVIEW_REQUEST_USER },
+    commentRefetchMutator: (comment) =>
+      String(comment.id) === "10000"
+        ? { ...comment, user: { ...comment.user, id: 90_514 } }
+        : comment,
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-request-unknown-id-mismatch",
+    operation: "begin-review",
+  });
+  environment.INPUT_REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessA;
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.recoveryCode, "retry_begin");
+  assert.equal(result.report.retrySafe, false);
+  assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+  assert.equal(
+    github.authCalls.filter(({ method, path, authorization }) =>
+      method === "POST" &&
+      path === `/repos/${REPOSITORY}/issues/${PR}/comments` &&
+      authorization === `Bearer ${REVIEW_REQUEST_TOKEN_FIXTURES.accessA}`
+    ).length,
+    1,
+  );
+});
+
+test("stale begin-review head blocks review-request token use and POST", async (context) => {
+  const github = createGitHubMock({ pullRequestOverrides: { head: { sha: NEXT_HEAD } } });
+  const environment = runtimeEnvironment(context, {
+    suffix: "review-request-stale-head",
+    operation: "begin-review",
+  });
+  environment.REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessA;
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.equal(github.authCalls.some(({ path }) => path === "/user"), false);
+  assert.deepEqual(github.requestBodies, []);
+});
+
+test("request override is unused outside enabled begin-review and User markers stay ordinary requests", async (context) => {
+  const completion = completionRuntimeFixture();
+  const fixtures = [
+    {
+      suffix: "request-token-verifier",
+      environment: runtimeEnvironment(context, {
+        suffix: "request-token-verifier",
+        eventName: "pull_request",
+        requestReview: "false",
+      }),
+      github: createGitHubMock(),
+    },
+    {
+      suffix: "request-token-reconcile",
+      environment: runtimeEnvironment(context, {
+        suffix: "request-token-reconcile",
+        eventName: "workflow_dispatch",
+        requestReview: "false",
+      }),
+      github: createGitHubMock(),
+    },
+    {
+      suffix: "request-token-completion",
+      environment: runtimeEnvironment(context, {
+        suffix: "request-token-completion",
+        operation: "report-completion",
+        eventName: "workflow_run",
+        requestReview: "false",
+        prNumber: 0,
+        event: completion.event,
+      }),
+      github: completion.github,
+    },
+    {
+      suffix: "request-token-disabled",
+      environment: runtimeEnvironment(context, {
+        suffix: "request-token-disabled",
+        operation: "begin-review",
+        requestReview: "false",
+      }),
+      github: createGitHubMock(),
+    },
+  ];
+  for (const { suffix, environment, github } of fixtures) {
+    environment.REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessA;
+    await runGate(environment, github);
+    assert.equal(github.authCalls.some(({ path }) => path === "/user"), false, suffix);
+    assert.equal(
+      github.authCalls.some(({ authorization }) =>
+        authorization === `Bearer ${REVIEW_REQUEST_TOKEN_FIXTURES.accessA}`
+      ),
+      false,
+      suffix,
+    );
+  }
+
+  const userMarker = workflowRequest({ user: REVIEW_REQUEST_USER });
+  assert.equal(canonicalV2RequestComments([userMarker]).length, 0);
+  assert.deepEqual(
+    buildV2ReactionCleanArtifacts(
+      canonicalV2RequestComments([userMarker]),
+      new Map([[String(userMarker.id), [reaction({ content: "+1" })]]]),
+    ).artifacts,
+    [],
+  );
+  const terminal = cleanIssueComment(HEAD, {
+    id: 20_201,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+  });
+  const terminalGitHub = createGitHubMock({ issueComments: [userMarker, terminal] });
+  const terminalEnvironment = runtimeEnvironment(context, {
+    suffix: "request-token-user-terminal-clean",
+    eventName: "pull_request",
+    requestReview: "false",
+  });
+  terminalEnvironment.INPUT_REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessB;
+  const { result: terminalResult } = await runGate(terminalEnvironment, terminalGitHub);
+  assert.equal(terminalResult.exitCode, 0, terminalResult.report.reason);
+  assert.equal(terminalResult.report.gateOutcome, "success");
+  assert.equal(terminalGitHub.authCalls.some(({ path }) => path === "/user"), false);
 });
 
 test("report-completion is an exact diagnostic-only snapshot and upserts one sticky comment", async (context) => {
@@ -13506,15 +13831,25 @@ test("direct Action CLI redacts configured token and Bearer values from its repo
   for (const [tokenName, token] of [
     ["GITHUB_TOKEN", "cli-github-token-secret"],
     ["INPUT_GITHUB_TOKEN", "cli-input-token-secret"],
+    ["INPUT_REVIEW_REQUEST_TOKEN", REVIEW_REQUEST_TOKEN_FIXTURES.accessA],
+    ["REVIEW_REQUEST_TOKEN", REVIEW_REQUEST_TOKEN_FIXTURES.accessB],
   ]) {
     const environment = runtimeEnvironment(context, { suffix: tokenName });
     delete environment.GITHUB_TOKEN;
     delete environment.INPUT_GITHUB_TOKEN;
+    if (tokenName !== "GITHUB_TOKEN" && tokenName !== "INPUT_GITHUB_TOKEN") {
+      environment.GITHUB_TOKEN = "cli-default-github-token";
+    }
     environment[tokenName] = token;
     environment.GITHUB_EVENT_NAME = `invalid-token=${token} Bearer ${token}`;
     const childEnvironment = { ...process.env, ...environment };
     delete childEnvironment.GITHUB_TOKEN;
     delete childEnvironment.INPUT_GITHUB_TOKEN;
+    delete childEnvironment.REVIEW_REQUEST_TOKEN;
+    delete childEnvironment.INPUT_REVIEW_REQUEST_TOKEN;
+    if (tokenName !== "GITHUB_TOKEN" && tokenName !== "INPUT_GITHUB_TOKEN") {
+      childEnvironment.GITHUB_TOKEN = "cli-default-github-token";
+    }
     childEnvironment[tokenName] = token;
     const child = spawnSync(process.execPath, [V2_RUNTIME_PATH], {
       encoding: "utf8",
@@ -13543,6 +13878,12 @@ test("direct Action CLI redacts configured token and Bearer values from its repo
     });
     assert.equal(child.stderr.includes(token), false, child.stderr);
     assert.match(child.stderr, /\[REDACTED\]/u);
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.equal(summary.includes(token), false, summary);
+    assert.ok(
+      summary.includes("invalid-token=\\[REDACTED\\] Bearer \\[REDACTED\\]"),
+      summary,
+    );
   }
 });
 
@@ -14208,6 +14549,7 @@ function createGitHubMock({
   reactionGraphQlPageSize = 100,
   reactionGraphQlResponseMutator = null,
   officialReactionAccount = null,
+  authenticatedUser = null,
   pullRequestOverrides = {},
   pullRequestSequence = null,
   repositoryOverrides = {},
@@ -14254,6 +14596,7 @@ function createGitHubMock({
   const reviewThreadSnapshotList = reviewThreadSnapshots?.map((snapshotThreads) =>
     snapshotThreads.map((value) => structuredClone(value))) || null;
   const calls = [];
+  const authCalls = [];
   const statusWrites = [];
   const requestBodies = [];
   const stickyCreates = [];
@@ -14381,6 +14724,11 @@ function createGitHubMock({
     const method = options.method || "GET";
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ method, path, search: url.search, body });
+    authCalls.push({
+      method,
+      path,
+      authorization: options.headers?.Authorization || "",
+    });
     if (typeof requestInterceptor === "function") {
       const intercepted = await requestInterceptor({
         method,
@@ -14392,6 +14740,11 @@ function createGitHubMock({
       if (intercepted !== undefined) return intercepted;
     }
 
+    if (method === "GET" && path === "/user") {
+      return authenticatedUser
+        ? jsonResponse(authenticatedUser)
+        : jsonResponse({ message: "unexpected authenticated-user lookup" }, 401);
+    }
     if (
       method === "GET" &&
       path === `/users/${encodeURIComponent(CODEX_BOT.login)}`
@@ -14698,6 +15051,7 @@ function createGitHubMock({
   return {
     fetch,
     calls,
+    authCalls,
     statusWrites,
     requestBodies,
     stickyCreates,

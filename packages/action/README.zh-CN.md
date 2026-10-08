@@ -206,13 +206,20 @@ verdict、provider identity、required-check result、stale override、limits pr
 representation。
 
 controller Action step 使用对应的 underscore 命名 inputs：`github_token`、`pr_number`、
-`expected_head_sha`、`operation`、`request_comment_id` 与 `request_review`。
+`expected_head_sha`、`operation`、`request_comment_id`、`request_review` 与
+`review_request_token`。
 `github_token` 与 `pr_number` 必填。manual run 必须提供完整
 `expected_head_sha`；自动 comment 路径可以留空，让 runtime 在启动时绑定
 authoritative head。自动 verifier-run 路径传入 upstream exact head、`begin-review` 和
 `request_review=true`。任何路径都不能跟随之后发生的 head change。两份 Action steps 只从
 受保护 repository variable `CODEX_REVIEW_GATE_LIMITS_PROFILE` 获得 `default` 或
 `expanded`；dispatch caller 不能覆盖该值。
+Append-only v2.2 contract 新增可选的 `review_request_token`。留空保留现有 bot-author request。
+配置后，它仅在启用 request 的 controller `begin-review` 中用于 `GET /user` 和创建请求 comment 的
+`POST`；其他读取、refetch、sticky diagnostic 写入及 canonical verifier rerun 仍用
+`github_token`。除该 operation 外（包括 `reconcile` 与 `request_review=false`）会忽略此 input，且不调用
+该凭据。配置了无效、过期或未授权 token 时会明确失败，不静默回退到 bot。未知 POST 结果只使用现有有界
+只读恢复，不再次 POST。Provider identity、comment binding 与 canonical bot-reaction trust 均不变。
 
 ## Operations
 

@@ -107,6 +107,7 @@ const CONTRACT_FIXTURES = Object.freeze({
     provenance_schema: "codex-review-gate-action-release-provenance-v2",
     toolchain: "node20",
     release_schema: 2,
+    action_inputs: Object.freeze([]),
   }),
   v2_1: Object.freeze({
     manifest_schema: "urn:joey-tools:codex-review-gate:release-manifest:3",
@@ -118,6 +119,7 @@ const CONTRACT_FIXTURES = Object.freeze({
     provenance_schema: "codex-review-gate-action-release-provenance-v3",
     toolchain: "node24",
     release_schema: 3,
+    action_inputs: Object.freeze([]),
   }),
 });
 
@@ -131,6 +133,19 @@ function actionMetadataForToolchain(toolchain) {
   assert.match(ACTION_METADATA, /^  using: node(?:20|24)$/mu, "action metadata fixture must declare a supported Node runtime");
   const rewritten = ACTION_METADATA.replace(/^  using: node(?:20|24)$/mu, `  using: ${toolchain}`);
   return rewritten;
+}
+
+const REVIEW_REQUEST_TOKEN_INPUT_PATTERN = /^  review_request_token:\n(?:    [^\n]*\n)+/mu;
+
+function actionMetadataForContract(contract) {
+  const policy = contractFixture(contract);
+  let metadata = actionMetadataForToolchain(policy.toolchain);
+  const tokenInput = metadata.match(REVIEW_REQUEST_TOKEN_INPUT_PATTERN);
+  assert.ok(tokenInput, "current Action metadata fixture must declare review_request_token");
+  if (!policy.action_inputs.includes("review_request_token")) {
+    metadata = metadata.replace(REVIEW_REQUEST_TOKEN_INPUT_PATTERN, "");
+  }
+  return metadata;
 }
 
 test("publisher identity preflight creates a short-lived RS256 App JWT", () => {
@@ -1443,7 +1458,7 @@ function releaseFixture(t, { version = "2.0.0", contract = "v2_0" } = {}) {
   git(repo, ["init", "-q", "--initial-branch=master"]);
   git(repo, ["config", "user.name", "Release Fixture"]);
   git(repo, ["config", "user.email", "release-fixture@example.invalid"]);
-  write(join(repo, "packages", "action", "action.yml"), actionMetadataForToolchain(policy.toolchain));
+  write(join(repo, "packages", "action", "action.yml"), actionMetadataForContract(contract));
   writeJson(join(repo, "packages", "action", "package.json"), {
     name: "codex-review-gate-action",
     version,
@@ -2225,6 +2240,8 @@ test("historical v2.0 Node20 provenance remains verifiable after the v2.1 Node24
   const state = releaseFixture(t, { contract: "v2_0" });
   const outputDir = join(state.root, "historical-v2-0-release-assets");
   const parsedManifest = readReleaseManifest(join(state.repo, "release-manifest.json"));
+  const historicalAction = git(state.repo, ["show", `${state.sourceCommit}:packages/action/action.yml`]);
+  assert.doesNotMatch(historicalAction, /^  review_request_token:/mu);
   assert.equal(parsedManifest.$schema, CONTRACT_FIXTURES.v2_0.manifest_schema);
   assert.equal(parsedManifest.schema_version, 2);
   assert.deepEqual(parsedManifest.entrypoint, {
@@ -2270,6 +2287,8 @@ test("historical v2.0 Node20 provenance remains verifiable after the v2.1 Node24
 test("v2.1 Node24 manifest selects v3 records and binds the v2 floating alias", (t) => {
   const state = releaseFixture(t, { version: "2.1.0", contract: "v2_1" });
   const parsedManifest = readReleaseManifest(join(state.repo, "release-manifest.json"));
+  const historicalAction = git(state.repo, ["show", `${state.sourceCommit}:packages/action/action.yml`]);
+  assert.doesNotMatch(historicalAction, /^  review_request_token:/mu);
   assert.equal(parsedManifest.$schema, CONTRACT_FIXTURES.v2_1.manifest_schema);
   assert.equal(parsedManifest.schema_version, 3);
   assert.deepEqual(parsedManifest.contract_versions, {

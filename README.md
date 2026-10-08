@@ -83,6 +83,17 @@ selected-repository visibility first to only `codex-private-workflows` as a
 canary before expanding it; do not set a repository-level override for that
 canary.
 
+The append-only v2.2 controller contract can optionally receive a separate
+`review_request_token` for
+the `begin-review` request's authenticated-user identity check and comment
+creation. Empty input preserves the current GitHub Actions bot behaviour. It
+does not replace `github_token`: PR/scope/evidence reads, request refetches,
+sticky diagnostics and canonical verifier reruns continue to use the normal
+workflow token. Existing consumers must explicitly pass
+`review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}` in the
+controller Action step; merely creating that secret does not enable or
+discover it. See the [credential guidance](docs/install/human.md#optional-user-token-for-review-requests).
+
 The protected `workflow_run` completion path now runs a diagnostic-only
 operation after canonical verifier completions, including successful reruns
 and completions when automatic requests are disabled. The existing automatic

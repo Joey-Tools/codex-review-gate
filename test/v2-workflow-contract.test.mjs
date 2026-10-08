@@ -52,6 +52,7 @@ const packageReconcile = new URL(
 
 const ACTION_INPUTS = [
   "github_token",
+  "review_request_token",
   "pr_number",
   "expected_head_sha",
   "operation",
@@ -73,6 +74,8 @@ test("v2 publishes one direct JavaScript Action and no reusable-workflow ABI", (
   const inputs = yamlSection(action, "inputs", "outputs");
   assert.deepEqual(topLevelYamlKeys(inputs), ACTION_INPUTS);
   assert.match(yamlChildBlock(inputs, "github_token"), /^    required: true$/mu);
+  assert.match(yamlChildBlock(inputs, "review_request_token"), /^    required: false$/mu);
+  assert.match(yamlChildBlock(inputs, "review_request_token"), /^    default: ""$/mu);
   assert.match(yamlChildBlock(inputs, "pr_number"), /^    required: true$/mu);
   assert.match(yamlChildBlock(inputs, "operation"), /^    default: reconcile$/mu);
   assert.match(yamlChildBlock(inputs, "request_review"), /^    default: "true"$/mu);
@@ -312,6 +315,11 @@ test("canonical controller has only the adopted write authority and ledgerless i
     templateController,
     /actions\/checkout|\.\/\.github\/workflows|secrets:\s*inherit|checks: write|contents: write|issues: write|statuses:|id-token:/u,
   );
+  assert.match(
+    templateController,
+    /^          review_request_token: \$\{\{ secrets\.CODEX_REVIEW_GATE_REQUEST_TOKEN \}\}$/mu,
+  );
+  assert.doesNotMatch(templateVerifier, /review_request_token|secrets\./u);
   assert.match(
     templateController,
     /^          pr_number: \$\{\{ github\.event_name == 'workflow_run' && \(github\.event\.workflow_run\.pull_requests\[0\]\.number \|\| '0'\) \|\| github\.event_name == 'workflow_dispatch' && inputs\.pr_number \|\| github\.event\.issue\.number \}\}$/mu,

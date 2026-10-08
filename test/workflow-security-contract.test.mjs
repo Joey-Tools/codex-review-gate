@@ -2596,6 +2596,7 @@ test("consumer routing fixes automatic reconciliation and permits only reviewed 
   });
   assert.deepEqual(blockScalarMapping(controller.with), {
     github_token: "${{ github.token }}",
+    review_request_token: "${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
     pr_number:
       "${{ github.event_name == 'workflow_run' && (github.event.workflow_run.pull_requests[0].number || '0') || github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}",
     expected_head_sha:
@@ -2609,10 +2610,27 @@ test("consumer routing fixes automatic reconciliation and permits only reviewed 
     limits_profile:
       "${{ vars.CODEX_REVIEW_GATE_LIMITS_PROFILE == 'expanded' && 'expanded' || 'default' }}",
   });
+  assert.doesNotMatch(
+    templateConsumer,
+    /\$\{\{\s*secrets\./u,
+    "the verifier must remain unable to receive the review-request PAT",
+  );
+  const approvedReviewRequestTokenMapping =
+    "          review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}";
+  assert.equal(
+    templateController.split(approvedReviewRequestTokenMapping).length,
+    2,
+    "the controller may pass the one approved PAT secret to the optional Action input",
+  );
+  assert.doesNotMatch(
+    templateController.replace(approvedReviewRequestTokenMapping, ""),
+    /\$\{\{\s*secrets\./u,
+    "no other controller secret reference is permitted",
+  );
   for (const source of [templateConsumer, templateController]) {
     assert.doesNotMatch(source, /inputs\.limits_profile/u);
     assert.doesNotMatch(source, /CODEX_REVIEW_GATE_MAX_(?:PAGES|OBJECTS)/u);
-    assert.doesNotMatch(source, /\$\{\{\s*secrets\.|env\./u);
+    assert.doesNotMatch(source, /env\./u);
   }
 });
 
@@ -2792,6 +2810,48 @@ test("production controller validation rejects alternate YAML execution surfaces
       () => replaceOnce(
         "    timeout-minutes: 14\n",
         "    timeout-minutes: 14\n    secrets: ${{ github.token }}\n",
+      ),
+    ],
+    [
+      "alternate PAT secret",
+      () => replaceOnce(
+        "review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+        "review_request_token: ${{ secrets.OTHER_TOKEN }}",
+      ),
+    ],
+    [
+      "PAT secret from a variable",
+      () => replaceOnce(
+        "review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+        "review_request_token: ${{ vars.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+      ),
+    ],
+    [
+      "PAT secret from a dispatch input",
+      () => replaceOnce(
+        "review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+        "review_request_token: ${{ inputs.review_request_token }}",
+      ),
+    ],
+    [
+      "literal PAT value",
+      () => replaceOnce(
+        "review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+        "review_request_token: bearer-value",
+      ),
+    ],
+    [
+      "github token cannot be replaced by PAT secret",
+      () => replaceOnce(
+        "          github_token: ${{ github.token }}\n          review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+        "          github_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+      ),
+    ],
+    [
+      "additional secret mapping",
+      () => replaceOnce(
+        "          review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
+        "          review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}\n          extra_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
       ),
     ],
     [
@@ -3031,6 +3091,7 @@ test("the JavaScript Action exposes only the adopted public input ABI", () => {
   const inputs = section(action, "inputs", "outputs");
   assert.deepEqual(directKeys(inputs, 2), [
     "github_token",
+    "review_request_token",
     "pr_number",
     "expected_head_sha",
     "operation",
@@ -3179,6 +3240,7 @@ function parseControllerWorkflow(source) {
   );
   const actionStep = parseClosedActionStep(job, [
     "github_token",
+    "review_request_token",
     "pr_number",
     "expected_head_sha",
     "operation",

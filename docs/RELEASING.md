@@ -150,6 +150,19 @@ This is the GitHub Action execution-runtime policy only. It does not by itself
 change the source publisher's runner toolchain or the repository's dual-runtime
 CI coverage.
 
+The v2.2 feature line adds the optional `review_request_token` Action input
+through a separate append-only contract:
+`codex-review-gate-action-v2.2-contract-v1`. It selects manifest schema
+`urn:joey-tools:codex-review-gate:release-manifest:4` and version-4 plan,
+candidate, publication-plan, and provenance schemas. Node 24 and the v2
+entrypoint remain unchanged. Its exact input policy requires the new input
+to be optional with an empty default. Frozen v2.0 and v2.1 contracts retain
+their previous exact input inventories and reject that added input; historical
+verification does not silently accept a newer ABI. This infrastructure change
+does not itself publish v2.2.0: a separate reviewed release intent and the
+existing production Environment approval are still required. Stable v2.2
+releases advance the same floating `v2` alias.
+
 ## Workflow stages and privilege boundary
 
 The dedicated publisher runs in the source repository and has these logical

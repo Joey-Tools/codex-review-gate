@@ -87,9 +87,9 @@ const expectedSuites = [
   ["release 3/4", "release", "off", "3/4"],
   ["release 4/4", "release", "off", "4/4"],
 ];
-const expectedReleaseSynchronousTestCalls = 103;
-const expectedReleaseRegistrationCount = 159;
-const expectedReleaseShardDistribution = [40, 40, 40, 39];
+const expectedReleaseSynchronousTestCalls = 106;
+const expectedReleaseRegistrationCount = 162;
+const expectedReleaseShardDistribution = [41, 41, 40, 40];
 const expectedBootstrapSynchronousTestCalls = 165;
 const expectedBootstrapShardDistribution = [42, 41, 41, 41];
 

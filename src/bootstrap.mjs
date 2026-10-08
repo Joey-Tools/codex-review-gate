@@ -251,6 +251,12 @@ const PREVIOUS_CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER = [
 ].join("\n");
 const FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES = "[created, edited]";
 const CANONICAL_REQUEST_AUTHOR_PERMISSION = "any";
+const CONTROLLER_REVIEW_REQUEST_TOKEN_PATH =
+  "jobs.codex-review-gate-controller.steps.with.review_request_token";
+const CONTROLLER_REVIEW_REQUEST_TOKEN_VALUE =
+  "${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}";
+const CONTROLLER_REVIEW_REQUEST_TOKEN_LINE =
+  `          review_request_token: ${CONTROLLER_REVIEW_REQUEST_TOKEN_VALUE}\n`;
 const FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION =
   "${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}";
 const CANONICAL_VERIFIER_PERMISSION_MAPPING =
@@ -3878,6 +3884,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     concurrencyGroups: [CANONICAL_CONTROLLER_CONCURRENCY_GROUP],
     issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
     workflowRun: true,
+    reviewRequestTokenPolicy: "required",
   });
 }
 
@@ -3887,6 +3894,7 @@ function validateInstalledCanonicalV2ControllerWorkflowContent(value) {
     concurrencyGroups: [...SUPPORTED_INSTALLED_CONTROLLER_CONCURRENCY_GROUPS],
     issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
     workflowRun: true,
+    reviewRequestTokenPolicy: "optional",
   });
 }
 
@@ -3896,6 +3904,7 @@ function validateFrozenHandoffV2ControllerWorkflowContent(value) {
     issueCommentTypes: FROZEN_HANDOFF_CONTROLLER_ISSUE_COMMENT_TYPES,
     requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
     workflowRun: false,
+    reviewRequestTokenPolicy: "forbidden",
   });
 }
 
@@ -3905,6 +3914,7 @@ function validateV2ControllerWorkflowContent(value, {
   issueCommentTypes,
   requestAuthorPermission = CANONICAL_REQUEST_AUTHOR_PERMISSION,
   workflowRun,
+  reviewRequestTokenPolicy,
 }) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
@@ -3912,6 +3922,7 @@ function validateV2ControllerWorkflowContent(value, {
   assertCanonicalWorkflowLineEndings(value);
   const controllerMappings = assertCanonicalControllerWorkflowStructure(value, {
     workflowRun,
+    reviewRequestTokenPolicy,
   });
   assertOneCanonicalActionCall(value, "controller");
   assertCommonWorkflowSafety(value, "controller");
@@ -4093,6 +4104,16 @@ function validateV2ControllerWorkflowContent(value, {
   ]) {
     assertControllerMappingScalar(controllerMappings, path, expected);
   }
+  if (
+    reviewRequestTokenPolicy === "required" ||
+    controllerMappings.has(CONTROLLER_REVIEW_REQUEST_TOKEN_PATH)
+  ) {
+    assertControllerMappingScalar(
+      controllerMappings,
+      CONTROLLER_REVIEW_REQUEST_TOKEN_PATH,
+      CONTROLLER_REVIEW_REQUEST_TOKEN_VALUE,
+    );
+  }
   assertControllerOperationOptions(value);
 
   for (const fragment of [
@@ -4220,6 +4241,12 @@ const CANONICAL_CONTROLLER_MAPPING_PATHS = [
   "jobs.codex-review-gate-controller.steps.with.request_review",
   "jobs.codex-review-gate-controller.steps.with.limits_profile",
 ];
+const CANONICAL_CONTROLLER_MAPPING_PATHS_WITH_REVIEW_REQUEST_TOKEN =
+  CANONICAL_CONTROLLER_MAPPING_PATHS.flatMap((path) =>
+    path === "jobs.codex-review-gate-controller.steps.with.github_token"
+      ? [path, CONTROLLER_REVIEW_REQUEST_TOKEN_PATH]
+      : [path],
+  );
 const CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS = [
   ...CANONICAL_CONTROLLER_MAPPING_PATHS.slice(0, 4),
   "on.workflow_run",
@@ -4234,15 +4261,24 @@ const CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS = [
       : [path],
   ),
 ];
+const CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS_WITH_REVIEW_REQUEST_TOKEN =
+  CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS.flatMap((path) =>
+    path === "jobs.codex-review-gate-controller.steps.with.github_token"
+      ? [path, CONTROLLER_REVIEW_REQUEST_TOKEN_PATH]
+      : [path],
+  );
 
-function assertCanonicalControllerWorkflowStructure(value, { workflowRun }) {
+function assertCanonicalControllerWorkflowStructure(value, {
+  workflowRun,
+  reviewRequestTokenPolicy,
+}) {
   if (value.startsWith("\uFEFF") || /\uFEFF|[\u0085\u2028\u2029\t]/u.test(value)) {
     throw new Error(
       "Canonical v2 controller workflow must use plain LF YAML without BOM, tabs, or non-ASCII line separators.",
     );
   }
-  if (/\$\{\{\s*secrets\./iu.test(value)) {
-    throw new Error("Canonical v2 controller workflow must not reference secrets.");
+  if (!new Set(["required", "optional", "forbidden"]).has(reviewRequestTokenPolicy)) {
+    throw new Error("Canonical v2 controller workflow has an invalid review-request-token policy.");
   }
 
   const entries = [];
@@ -4312,9 +4348,42 @@ function assertCanonicalControllerWorkflowStructure(value, { workflowRun }) {
   }
 
   const actualPaths = entries.map((entry) => entry.path);
+  const hasReviewRequestToken = actualPaths.includes(
+    CONTROLLER_REVIEW_REQUEST_TOKEN_PATH,
+  );
+  if (reviewRequestTokenPolicy === "required" && !hasReviewRequestToken) {
+    throw new Error(
+      "Canonical v2 controller workflow must map only the approved CODEX_REVIEW_GATE_REQUEST_TOKEN secret to review_request_token.",
+    );
+  }
+  if (reviewRequestTokenPolicy === "forbidden" && hasReviewRequestToken) {
+    throw new Error(
+      "Frozen handoff controller workflow must not add the review_request_token mapping.",
+    );
+  }
+  if (hasReviewRequestToken) {
+    const requestTokenEntry = entries.find(
+      (entry) => entry.path === CONTROLLER_REVIEW_REQUEST_TOKEN_PATH,
+    );
+    if (requestTokenEntry.value !== CONTROLLER_REVIEW_REQUEST_TOKEN_VALUE) {
+      throw new Error(
+        "Canonical v2 controller workflow must map only the approved CODEX_REVIEW_GATE_REQUEST_TOKEN secret to review_request_token.",
+      );
+    }
+  }
+  const secretReferences = value.match(/\bsecrets\b/giu) ?? [];
+  if (secretReferences.length !== (hasReviewRequestToken ? 1 : 0)) {
+    throw new Error(
+      "Canonical v2 controller workflow may reference only the approved CODEX_REVIEW_GATE_REQUEST_TOKEN secret through review_request_token.",
+    );
+  }
   const expectedPaths = workflowRun
-    ? CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS
-    : CANONICAL_CONTROLLER_MAPPING_PATHS;
+    ? hasReviewRequestToken
+      ? CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS_WITH_REVIEW_REQUEST_TOKEN
+      : CANONICAL_CONTROLLER_WORKFLOW_RUN_MAPPING_PATHS
+    : hasReviewRequestToken
+      ? CANONICAL_CONTROLLER_MAPPING_PATHS_WITH_REVIEW_REQUEST_TOKEN
+      : CANONICAL_CONTROLLER_MAPPING_PATHS;
   if (
     actualPaths.length !== expectedPaths.length ||
     actualPaths.some(
@@ -4358,26 +4427,37 @@ export function installedWorkflowMatchesCanonical(installed, canonical) {
 }
 
 function installedControllerMatchesCanonical(installed, canonical) {
-  if (installedWorkflowMatchesCanonical(installed, canonical)) {
-    return true;
-  }
-  const currentGroupLine = `  group: ${CANONICAL_CONTROLLER_CONCURRENCY_GROUP}`;
-  if (
-    canonical.split(currentGroupLine).length !== 2 ||
-    canonical.split(CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER).length !== 2
-  ) {
-    return false;
-  }
-  const previousCanonical = canonical
-    .replace(
-      currentGroupLine,
-      `  group: ${PREVIOUS_CANONICAL_CONTROLLER_CONCURRENCY_GROUP}`,
-    )
-    .replace(
-      CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER,
-      PREVIOUS_CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER,
+  const supportedCanonicalVersions = [canonical];
+  if (canonical.split(CONTROLLER_REVIEW_REQUEST_TOKEN_LINE).length === 2) {
+    supportedCanonicalVersions.push(
+      canonical.replace(CONTROLLER_REVIEW_REQUEST_TOKEN_LINE, ""),
     );
-  return installed === previousCanonical;
+  }
+  for (const supportedCanonical of supportedCanonicalVersions) {
+    if (installedWorkflowMatchesCanonical(installed, supportedCanonical)) {
+      return true;
+    }
+    const currentGroupLine = `  group: ${CANONICAL_CONTROLLER_CONCURRENCY_GROUP}`;
+    if (
+      supportedCanonical.split(currentGroupLine).length !== 2 ||
+      supportedCanonical.split(CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER).length !== 2
+    ) {
+      continue;
+    }
+    const previousCanonical = supportedCanonical
+      .replace(
+        currentGroupLine,
+        `  group: ${PREVIOUS_CANONICAL_CONTROLLER_CONCURRENCY_GROUP}`,
+      )
+      .replace(
+        CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER,
+        PREVIOUS_CANONICAL_CONTROLLER_WORKFLOW_RUN_PATH_FILTER,
+      );
+    if (installed === previousCanonical) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function assertOneCanonicalActionCall(value, role) {

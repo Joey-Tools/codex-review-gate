@@ -1388,6 +1388,43 @@ are exactly `execution_health`, `gate_outcome`, `recovery_code`, and
 `retry_safe`. Treat finding counts as summary/sticky diagnostics, never as
 outputs.
 
+### Optional user token for review requests
+
+The append-only v2.2 Action contract adds optional `review_request_token` to
+the controller Action step only. Empty keeps the current bot-author request.
+A nonempty value is used only by request-enabled `begin-review` for
+`GET /user` and the request-comment POST; all reads, refetches, sticky
+diagnostic writes and canonical verifier reruns continue to use
+`github_token`. Do not add it to the verifier or replace `github_token`. The
+input is ignored without calls for verifier, `reconcile`,
+report-completion/diagnostic operations and `request_review=false`. Invalid,
+expired or unauthorised credentials fail clearly with no bot fallback; an
+unknown POST outcome gets only the existing bounded read-only recovery, not
+another POST. Actual user ID/login/type and refetched comment binding are
+required; provider evidence and canonical bot-reaction trust do not change.
+
+If activating the option, add this single input to the controller step and
+create the named secret explicitly; secret-name discovery is not automatic:
+
+```yaml
+review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}
+```
+
+Prefer a fine-grained PAT, when organisation membership permits it, scoped to
+one resource owner, the selected consumer repository, and Issues: write (or
+Pull requests: write) for the PR conversation comment. An outside collaborator
+may require a classic PAT. For a private repository, classic PAT requires
+broad `repo` access; it has no comment-only classic scope. Workflow/admin
+scopes are unnecessary. Organisation-secret repository visibility controls
+distribution, not the token's authority. If organisation secrets are
+unavailable for private repositories on GitHub Free, use a repository secret;
+a same-named repository secret overrides the organisation secret. A dedicated
+user may reduce inherited rights but still needs eligible OpenAI review
+integration/credits; it is not a guarantee the request will start. Do not use a
+GitHub App workaround. Source implementation and release must precede the
+consumer pilot; see the [human guide](human.md#optional-user-token-for-review-requests)
+for credential references and deployment caveats.
+
 ## Phase 2: stage and verify the disabled ruleset
 
 Run staging only after both canonical workflows are on `DEFAULT_BRANCH`:

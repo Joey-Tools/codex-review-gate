@@ -65,6 +65,24 @@ const V2_1_ENTRYPOINT_POLICY = Object.freeze({
   using: "node24",
   main: "src/v2/gate-runtime.mjs",
 });
+const V2_2_RELEASE_MANIFEST_SCHEMA = "urn:joey-tools:codex-review-gate:release-manifest:4";
+const V2_2_RELEASE_CONTRACT_ID = "codex-review-gate-action-v2.2-contract-v1";
+const V2_2_RELEASE_PLAN_SCHEMA = "codex-review-gate-action-release-plan-v4";
+const V2_2_RELEASE_CANDIDATE_SCHEMA = "codex-review-gate-action-candidate-v4";
+const V2_2_PUBLICATION_PLAN_SCHEMA = "codex-review-gate-action-publication-plan-v4";
+const V2_2_RELEASE_PROVENANCE_SCHEMA = "codex-review-gate-action-release-provenance-v4";
+const V2_2_CONTRACT_VERSIONS = Object.freeze({
+  toolchain: "node24",
+  release_schema: 4,
+  status: 2,
+  template: 2,
+  baseline: 3,
+});
+const V2_2_ENTRYPOINT_POLICY = Object.freeze({
+  metadata_path: "action.yml",
+  using: "node24",
+  main: "src/v2/gate-runtime.mjs",
+});
 const MAX_TRANSPORT_BYTES = 64 * 1024 * 1024;
 const MAX_TRANSPORT_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_TRANSPORT_ENTRIES = 4096;
@@ -106,6 +124,25 @@ function deepFreeze(value) {
   }
   return value;
 }
+
+const HISTORICAL_ACTION_INPUT_POLICY = deepFreeze({
+  github_token: { required: "true" },
+  pr_number: { required: "true" },
+  expected_head_sha: { required: "false", default: '\"\"' },
+  operation: { required: "false", default: "reconcile" },
+  request_comment_id: { required: "false", default: '\"\"' },
+  request_review: { required: "false", default: '\"true\"' },
+  limits_profile: { required: "false", default: "default" },
+});
+const V2_2_ACTION_INPUT_POLICY = deepFreeze({
+  ...HISTORICAL_ACTION_INPUT_POLICY,
+  review_request_token: { required: "false", default: '\"\"' },
+});
+const ACTION_INPUT_POLICIES_BY_CONTRACT = new Map([
+  [V2_0_RELEASE_CONTRACT_ID, HISTORICAL_ACTION_INPUT_POLICY],
+  [V2_1_RELEASE_CONTRACT_ID, HISTORICAL_ACTION_INPUT_POLICY],
+  [V2_2_RELEASE_CONTRACT_ID, V2_2_ACTION_INPUT_POLICY],
+]);
 
 // Published contracts are append-only. Historical verification selects one
 // from the signed provenance schema instead of applying the active publisher
@@ -186,27 +223,70 @@ const RELEASE_CONTRACT_V2_1 = deepFreeze({
     superseded: { requires_before: true },
   },
 });
+const RELEASE_CONTRACT_V2_2 = deepFreeze({
+  id: V2_2_RELEASE_CONTRACT_ID,
+  source_repository: SOURCE_REPOSITORY,
+  source_path: SOURCE_PATH,
+  target_repository: TARGET_REPOSITORY,
+  target_branch: TARGET_BRANCH,
+  action_package_repository: "git+https://github.com/JoeyTeng/codex-review-gate-action.git",
+  manifest: {
+    schema: V2_2_RELEASE_MANIFEST_SCHEMA,
+    schema_version: 4,
+    contract_versions: { ...V2_2_CONTRACT_VERSIONS },
+  },
+  plan: { schema: V2_2_RELEASE_PLAN_SCHEMA, schema_version: 4 },
+  candidate: { schema: V2_2_RELEASE_CANDIDATE_SCHEMA, schema_version: 4 },
+  publication_plan: { schema: V2_2_PUBLICATION_PLAN_SCHEMA, schema_version: 4 },
+  provenance: { schema: V2_2_RELEASE_PROVENANCE_SCHEMA, schema_version: 4 },
+  entrypoint: { ...V2_2_ENTRYPOINT_POLICY },
+  signer: { ...V2_0_SIGNER_POLICY },
+  runtime_paths: [...V2_0_RUNTIME_MODULE_PATHS],
+  control_paths: [...V2_0_CONTROL_PATH_LIST],
+  executable_control_paths: [
+    "scripts/generate-action-release-provenance.mjs",
+    "scripts/release-action-subtree.sh",
+  ],
+  archive_encoder: "canonical-ustar-gzip-store-v1",
+  semver_policy: "canonical-semver-v2-plus-v1",
+  push_admission: {
+    schema: V2_0_PUSH_ADMISSION_SCHEMA,
+    schema_version: 1,
+    event: "push",
+  },
+  floating_alias_modes: {
+    create: { requires_before: false },
+    "force-with-lease": { requires_before: true },
+    "already-current": { requires_before: true },
+    superseded: { requires_before: true },
+  },
+});
 const HISTORICAL_MANIFEST_CONTRACTS = new Map([
   [`${V2_0_RELEASE_MANIFEST_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
   [`${V2_1_RELEASE_MANIFEST_SCHEMA}:3`, RELEASE_CONTRACT_V2_1],
+  [`${V2_2_RELEASE_MANIFEST_SCHEMA}:4`, RELEASE_CONTRACT_V2_2],
 ]);
 const HISTORICAL_RELEASE_CONTRACTS = new Map([
   [`${V2_0_RELEASE_PROVENANCE_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
   [`${V2_1_RELEASE_PROVENANCE_SCHEMA}:3`, RELEASE_CONTRACT_V2_1],
+  [`${V2_2_RELEASE_PROVENANCE_SCHEMA}:4`, RELEASE_CONTRACT_V2_2],
 ]);
 const HISTORICAL_PLAN_CONTRACTS = new Map([
   [`${V2_0_RELEASE_PLAN_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
   [`${V2_1_RELEASE_PLAN_SCHEMA}:3`, RELEASE_CONTRACT_V2_1],
+  [`${V2_2_RELEASE_PLAN_SCHEMA}:4`, RELEASE_CONTRACT_V2_2],
 ]);
 const HISTORICAL_CANDIDATE_CONTRACTS = new Map([
   [`${V2_0_RELEASE_CANDIDATE_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
   [`${V2_1_RELEASE_CANDIDATE_SCHEMA}:3`, RELEASE_CONTRACT_V2_1],
+  [`${V2_2_RELEASE_CANDIDATE_SCHEMA}:4`, RELEASE_CONTRACT_V2_2],
 ]);
 const HISTORICAL_PUBLICATION_PLAN_CONTRACTS = new Map([
   [`${V2_0_PUBLICATION_PLAN_SCHEMA}:2`, RELEASE_CONTRACT_V2_0],
   [`${V2_1_PUBLICATION_PLAN_SCHEMA}:3`, RELEASE_CONTRACT_V2_1],
+  [`${V2_2_PUBLICATION_PLAN_SCHEMA}:4`, RELEASE_CONTRACT_V2_2],
 ]);
-const CURRENT_RELEASE_CONTRACT = RELEASE_CONTRACT_V2_1;
+const CURRENT_RELEASE_CONTRACT = RELEASE_CONTRACT_V2_2;
 
 function releaseContractFor(record, registry, label) {
   const contract = registry.get(`${record?.schema}:${record?.schema_version}`);
@@ -1345,15 +1425,10 @@ function validateActionMetadataForContract(bytes, contract) {
     fail("root Action branding differs from policy");
   }
 
-  const inputPolicy = Object.freeze({
-    github_token: { required: "true" },
-    pr_number: { required: "true" },
-    expected_head_sha: { required: "false", default: '\"\"' },
-    operation: { required: "false", default: "reconcile" },
-    request_comment_id: { required: "false", default: '\"\"' },
-    request_review: { required: "false", default: '\"true\"' },
-    limits_profile: { required: "false", default: "default" },
-  });
+  const inputPolicy = ACTION_INPUT_POLICIES_BY_CONTRACT.get(contract.id);
+  if (inputPolicy === undefined) {
+    fail(`release contract ${contract.id} has no frozen Action input policy`);
+  }
   requireMetadataKeys(metadata.inputs, Object.keys(inputPolicy), "root action.yml.inputs");
   for (const [name, policy] of Object.entries(inputPolicy)) {
     const input = metadata.inputs[name];
@@ -1396,9 +1471,14 @@ function validateActionMetadataV2_1(bytes) {
   return validateActionMetadataForContract(bytes, RELEASE_CONTRACT_V2_1);
 }
 
+function validateActionMetadataV2_2(bytes) {
+  return validateActionMetadataForContract(bytes, RELEASE_CONTRACT_V2_2);
+}
+
 export function validateActionMetadata(bytes, contract = CURRENT_RELEASE_CONTRACT) {
   if (contract.id === RELEASE_CONTRACT_V2_0.id) return validateActionMetadataV2_0(bytes);
   if (contract.id === RELEASE_CONTRACT_V2_1.id) return validateActionMetadataV2_1(bytes);
+  if (contract.id === RELEASE_CONTRACT_V2_2.id) return validateActionMetadataV2_2(bytes);
   fail(`release contract ${contract.id} has no frozen Action metadata validator`);
 }
 
