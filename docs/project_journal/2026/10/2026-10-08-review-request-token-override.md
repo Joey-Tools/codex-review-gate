@@ -61,10 +61,12 @@ superseded_by:
   specific diagnostics and bounded read-only recovery; neither path reposts.
 - Local validation passed: `npm run check`, journal validation, and 455/455
   core/Action/runtime/workflow-contract tests. Focused installer/security
-  coverage passed 6/6; focused publication-contract coverage passed 5/5 plus
-  the historical v2.0 provenance/tag check. Full installer/security and release
-  pipeline regression results remain to be collected; these focused results
-  do not stand in for the complete source PR CI or production pilot.
+  coverage passed 6/6 and the complete bootstrap suite passed 165/165. The
+  combined bootstrap/security run exposed one stale public-input inventory
+  assertion; after updating it, the complete security suite passed 43/43.
+  Focused publication-contract coverage passed 5/5 plus the historical v2.0
+  provenance/tag check. Full release pipeline results remain to be collected;
+  these local results do not stand in for complete source PR CI or the pilot.
 - Documentation describes the intended source capability and explicit pilot
   sequence. It does not claim the implementation is merged, released,
   deployed or validated in the pilot.

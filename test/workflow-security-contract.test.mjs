@@ -3091,6 +3091,7 @@ test("the JavaScript Action exposes only the adopted public input ABI", () => {
   const inputs = section(action, "inputs", "outputs");
   assert.deepEqual(directKeys(inputs, 2), [
     "github_token",
+    "review_request_token",
     "pr_number",
     "expected_head_sha",
     "operation",
