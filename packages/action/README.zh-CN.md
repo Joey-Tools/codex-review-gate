@@ -255,6 +255,24 @@ resolved”，作为 server-side merge guard。
 
 ## Evidence 语义
 
+### 分段解析 terminal clean 评论
+
+官方顶层 clean issue comment 分为结论、唯一的 `**Reviewed commit:**` 标记，以及
+可选官方说明段。结论仍使用既有、有界的展示后缀文法；任意赞美或额外自然语言不能
+证明 clean。引用或代码块中的 commit 标记不能提供 head 归属。7–40 位短 SHA 仍须
+无歧义地解析到当前完整 head，并满足原有请求和 snapshot 条件。
+
+可选说明段只能是尾部一个闭合的 `<details>`，包含一个 `About Codex in GitHub`
+summary。启用介绍、触发方式、reaction 和其他功能介绍分别识别，因此支持的旧、新
+介绍文案、链接形式及无害空白变化不再要求整段逐字匹配。未知正文、嵌套或未闭合
+结构、重复 summary、额外尾文仍不能放行。finding 格式信号扫描原始正文，包括说明段。
+此文法只用于顶层 clean issue comment，不放宽共享的 inline-parent review receipt 文法。
+
+Verifier 的有界 CLI 日志和 Actions Summary 会标明相关 carrier、解析阶段与原因代码，
+以及可获得的 head 解析和请求选择上下文。不输出原始评论正文或 token；诊断信息也不
+提供 pass 权威。未知 provider 格式与真实 unresolved finding 分开报告，两者在各自
+恢复条件满足前均不会 success。
+
 ### Codex 活动摘要只供诊断
 
 同时满足首行 exact marker `<!-- codex-pull-request-review-summary -->` 和

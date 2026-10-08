@@ -543,6 +543,7 @@ export function buildV2GateReport({
   findingsHistorical = 0,
   findingsIndeterminate = 0,
   reviewThreads = null,
+  carrierDiagnostics = [],
 } = {}) {
   if (executionHealth !== "healthy" && executionHealth !== "unhealthy") {
     throw new Error("executionHealth must be healthy or unhealthy");
@@ -587,6 +588,7 @@ export function buildV2GateReport({
     requiresReplacementPr,
     counts: Object.freeze(counts),
     reviewThreads: normalizedReviewThreads,
+    carrierDiagnostics: Object.freeze(normalizeV2CarrierDiagnostics(carrierDiagnostics)),
   });
 }
 
@@ -621,6 +623,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
         `- Findings: ${formatV2FindingCounts(report.counts)}`,
         `- Review threads: ${formatV2ReviewThreadCounts(report.reviewThreads)}`,
         `- Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}`,
+        ...formatV2CarrierDiagnostics(report.carrierDiagnostics),
         ...formatV2ReviewThreadDiagnostics(report.reviewThreads.diagnostics),
       ];
   const body = [
@@ -870,7 +873,7 @@ function redactV2GateCliText(value, environment) {
   return text.replace(/\bBearer\s+\S+/giu, "Bearer [REDACTED]");
 }
 
-function writeV2GateCliReport(report, environment) {
+export function writeV2GateCliReport(report, environment) {
   const reason = redactV2GateCliText(
     oneLine(report.reason, "No reason was reported"),
     environment,
@@ -882,7 +885,153 @@ function writeV2GateCliReport(report, environment) {
     retry_safe: report.retrySafe,
     findings: report.counts,
     reason,
+    carrier_diagnostics: report.carrierDiagnostics,
   })}`);
+}
+
+const V2_PARSE_REASON_LABELS = Object.freeze({
+  accepted: "recognized clean result",
+  finding_signal: "finding content is present",
+  conclusion_invalid: "clean conclusion does not match the closed grammar",
+  reviewed_commit_marker_invalid: "reviewed-commit marker or reference is invalid",
+  separator_invalid: "required section separator is missing",
+  disclosure_invalid: "official disclosure footer is malformed or unsupported",
+});
+const V2_PARSE_STAGES = new Set([
+  "complete",
+  "finding-signal",
+  "conclusion",
+  "reviewed-commit",
+  "section-separator",
+  "disclosure",
+]);
+const V2_PARSE_PROFILES = new Set(["top-level-clean-issue-comment-v2"]);
+const V2_DISCLOSURE_PROFILES = new Set(["official-codex-disclosure-v1"]);
+
+function normalizeV2CarrierDiagnostics(values) {
+  if (!Array.isArray(values)) return [];
+  return values.slice(0, 8).flatMap((value) => {
+    if (!isPlainRecord(value) || value.source !== "issue-comment") return [];
+    const id = boundedV2DiagnosticId(value.id);
+    const parsed = value.parseDiagnostics;
+    if (!id || !isPlainRecord(parsed)) return [];
+    const { profile, stage, reasonCode } = parsed;
+    if (
+      !V2_PARSE_PROFILES.has(profile) ||
+      !V2_PARSE_STAGES.has(stage) ||
+      !Object.hasOwn(V2_PARSE_REASON_LABELS, reasonCode)
+    ) return [];
+    const disclosureProfile = V2_DISCLOSURE_PROFILES.has(parsed.disclosureProfile)
+      ? parsed.disclosureProfile
+      : null;
+    const commitRefLength = isSafeIntegerBetween(parsed.commitRefLength, 7, 40)
+      ? parsed.commitRefLength
+      : null;
+    const nativeHead = FULL_SHA.test(String(value.resolvedHeadSha || value.headSha || ""))
+      ? String(value.resolvedHeadSha || value.headSha).toLowerCase()
+      : null;
+    const currentHeadSha = FULL_SHA.test(String(value.currentHeadSha || ""))
+      ? String(value.currentHeadSha).toLowerCase()
+      : null;
+    const requestSelection = isPlainRecord(value.requestSelection)
+      ? {
+          currentGenerationCount: isNonNegativeSafeInteger(value.requestSelection.currentGenerationCount) &&
+              value.requestSelection.currentGenerationCount <= V2_HARD_LIMITS.maxObjects
+            ? value.requestSelection.currentGenerationCount
+            : null,
+          selectedRequestId: boundedV2DiagnosticId(value.requestSelection.selectedRequestId),
+          selected: value.requestSelection.selected === true,
+      }
+      : null;
+    const completeSnapshotCount = isSafeIntegerBetween(value.completeSnapshotCount, 1, 2)
+      ? value.completeSnapshotCount
+      : null;
+    const sourceUrl = safeV2IssueCommentUrl(value.htmlUrl, id);
+    return [Object.freeze({
+      source: "issue-comment",
+      id,
+      url: sourceUrl,
+      revisionAt: isCanonicalUtcTimestamp(value.revisionAt) ? value.revisionAt : null,
+      profile,
+      stage,
+      reasonCode,
+      disclosureProfile,
+      commitRefLength,
+      resolvedHeadSha: nativeHead,
+      currentHeadSha,
+      headResolution: nativeHead
+        ? "resolved"
+        : value.resolutionError === true
+          ? "failed"
+          : "not_evaluated",
+      headMatch: nativeHead && currentHeadSha
+        ? (nativeHead === currentHeadSha ? "exact" : "different")
+        : "not_evaluated",
+      requestSelection,
+      paginationComplete: value.paginationComplete === true,
+      snapshotConsistent: value.snapshotConsistent === true,
+      completeSnapshotCount,
+    })];
+  });
+}
+
+function safeV2IssueCommentUrl(raw, id) {
+  if (typeof raw !== "string" || raw.length > 500) return null;
+  try {
+    const url = new URL(raw);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "github.com" ||
+      url.username || url.password || url.search ||
+      !/^\/[^/]+\/[^/]+\/pull\/[1-9][0-9]*$/u.test(url.pathname) ||
+      url.hash !== `#issuecomment-${id}`
+    ) return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function isSafeIntegerBetween(value, minimum, maximum) {
+  return Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+}
+
+function boundedV2DiagnosticId(value) {
+  const id = canonicalPositiveId(value);
+  return id && id.length <= 20 ? id : null;
+}
+
+function formatV2CarrierDiagnostics(diagnostics) {
+  return diagnostics.map((item) => {
+    const carrier = item.url
+      ? `[issue comment #${item.id}](${item.url})`
+      : `issue comment #${item.id}`;
+    const revision = item.revisionAt ? `, revision ${item.revisionAt}` : "";
+    const ref = item.commitRefLength === null
+      ? ""
+      : `, commit-ref length ${item.commitRefLength}`;
+    const disclosure = item.disclosureProfile
+      ? `, disclosure ${item.disclosureProfile}`
+      : "";
+    const resolvedHead = item.resolvedHeadSha
+      ? `, resolved SHA \`${item.resolvedHeadSha}\``
+      : "";
+    const currentHead = item.currentHeadSha
+      ? `, current SHA \`${item.currentHeadSha}\``
+      : "";
+    const head = `; head resolution ${item.headResolution}${resolvedHead}${currentHead}, exact-head match ${item.headMatch}`;
+    const request = item.requestSelection
+      ? `; current request generation: ${item.requestSelection.currentGenerationCount ?? "unknown"}, ` +
+        `selected request #${item.requestSelection.selectedRequestId || "unknown"} ` +
+        `(${item.requestSelection.selected ? "selected" : "not selected"})`
+      : "";
+    const snapshot = `; pagination ${item.paginationComplete ? "complete" : "unknown"}, ` +
+      `snapshot ${item.snapshotConsistent ? "self-consistent" : "unknown"}, ` +
+      `complete snapshots evaluated ${item.completeSnapshotCount ?? "unknown"}`;
+    // Snapshot evidence is descriptive only and never participates in gate selection.
+    return `- Carrier diagnostic: ${carrier}${revision}; ${item.profile}/${item.stage}/${item.reasonCode} ` +
+      `(${V2_PARSE_REASON_LABELS[item.reasonCode]}${ref}${disclosure})${head}${request}${snapshot}`;
+  });
 }
 
 function recoveryInstruction(
@@ -3698,14 +3847,14 @@ async function runV2Reconcile(client, config, context, {
     if (current?.selfConsistent === true) {
       latestComplete = current;
       if (current.decision.gateOutcome !== "success") {
-        return publishV2SnapshotDecision(client, config, context, current);
+        return publishV2SnapshotDecision(client, config, context, current, 1);
       }
       if (
         previousClean &&
         previousClean.headSha === current.headSha &&
         previousClean.fingerprint === current.fingerprint
       ) {
-        return publishV2SnapshotDecision(client, config, context, current);
+        return publishV2SnapshotDecision(client, config, context, current, 2);
       }
       if (previousClean) {
         instabilityDetail = "Complete clean evidence changed between adjacent snapshots";
@@ -3732,7 +3881,7 @@ async function runV2Reconcile(client, config, context, {
   );
 }
 
-async function publishV2SnapshotDecision(client, config, context, snapshot) {
+async function publishV2SnapshotDecision(client, config, context, snapshot, completeSnapshotCount) {
   context.headSha = snapshot.headSha;
   context.issueComments = snapshot.issueComments;
   const decision = snapshot.decision;
@@ -3748,6 +3897,12 @@ async function publishV2SnapshotDecision(client, config, context, snapshot) {
     findingsHistorical: snapshot.counts.historical,
     findingsIndeterminate: snapshot.counts.indeterminate,
     reviewThreads: snapshot.reviewThreads,
+    carrierDiagnostics: (snapshot.carrierDiagnostics ?? []).map((diagnostic) => ({
+      ...diagnostic,
+      paginationComplete: true,
+      snapshotConsistent: snapshot.selfConsistent === true,
+      completeSnapshotCount,
+    })),
   });
   await finalizeV2Report(client, config, context, report);
   return { report, exitCode: exitCodeForV2Report(report, config.triggerKind) };
@@ -4354,6 +4509,7 @@ async function loadCompleteV2Snapshot(client, config, {
     reviewThreads: closing.decisionEvidence.reviewThreads,
     counts: closing.decisionEvidence.counts,
     decision: closing.decisionEvidence.decision,
+    carrierDiagnostics: closing.decisionEvidence.carrierDiagnostics,
   };
 }
 
@@ -5882,7 +6038,29 @@ function reduceV2Evidence({
         ? "wait"
         : "request";
   }
-  return { counts, reviewThreads, decision };
+  const currentGeneration = requestEpoch.selected ?? null;
+  const carrierDiagnostics = (artifacts ?? [])
+    .filter((artifact) =>
+      artifact?.source === "issue-comment" &&
+      artifact.kind === "malformed" &&
+      isPlainRecord(artifact.parseDiagnostics)
+    )
+    .map((artifact) => ({
+      source: artifact.source,
+      id: artifact.id,
+      htmlUrl: artifact.htmlUrl,
+      revisionAt: artifact.revisionAt || artifact.createdAt,
+      parseDiagnostics: artifact.parseDiagnostics,
+      resolvedHeadSha: artifact.resolvedHeadSha || artifact.headSha || null,
+      resolutionError: Boolean(artifact.resolutionError),
+      currentHeadSha: headSha,
+      requestSelection: {
+        currentGenerationCount: generationRequests.length,
+        selectedRequestId: currentGeneration?.id || null,
+        selected: Boolean(currentGeneration),
+      },
+    }));
+  return { counts, reviewThreads, decision, carrierDiagnostics };
 }
 
 function selectCurrentV2RequestGenerations({
@@ -7792,6 +7970,7 @@ async function collectV2ProviderEvidence(
       allowShortCommitRefs: true,
     });
     if (artifact) {
+      artifact.htmlUrl = comment.html_url;
       if (observedEdit) {
         artifact.edited = true;
         artifact.carrierUpdatedAt = revisionAt;

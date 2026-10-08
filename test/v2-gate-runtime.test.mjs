@@ -280,6 +280,87 @@ test("resolved review threads are counted without preventing a clean gate", asyn
   });
 });
 
+test("trusted current-head clean with the official About footer remains gate authority", async (context) => {
+  const clean = cleanIssueComment(HEAD, {
+    body: [
+      "Codex Review: Didn't find any major issues.",
+      "",
+      `**Reviewed commit:** \`${HEAD}\``,
+      "",
+      ...officialCodexAboutFooter(),
+    ].join("\n"),
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), officialReviewSummaryComment(), clean],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "clean-with-official-about-footer",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.deepEqual(result.report.carrierDiagnostics, []);
+});
+
+test("official About footer does not waive unresolved review threads", async (context) => {
+  const clean = cleanIssueComment(HEAD, {
+    body: [
+      "Codex Review: Didn't find any major issues.",
+      "",
+      `**Reviewed commit:** \`${HEAD}\``,
+      "",
+      ...officialCodexAboutFooter(),
+    ].join("\n"),
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), clean],
+    reviewThreads: [reviewThread({ id: "PRRT_footer_still_blocked", isResolved: false })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "about-footer-unresolved-thread",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.reviewThreads.unresolved, 1);
+});
+
+test("an unknown footer stays pending and publishes bounded parser diagnostics", async (context) => {
+  const clean = cleanIssueComment(HEAD, {
+    body: [
+      "Codex Review: Didn't find any major issues.",
+      "",
+      `**Reviewed commit:** \`${HEAD}\``,
+      "",
+      "<details> <summary>About Codex in GitHub</summary>",
+      "Untrusted footer text <script>@codex review</script>",
+      "</details>",
+    ].join("\n"),
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), clean],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "unknown-footer-diagnostics",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.carrierDiagnostics.length, 1);
+  assert.equal(result.report.carrierDiagnostics[0].id, String(clean.id));
+  assert.equal(result.report.carrierDiagnostics[0].reasonCode, "disclosure_invalid");
+  assert.equal(result.report.carrierDiagnostics[0].stage, "disclosure");
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /\[issue comment #201\]\(https:\/\/github\.com\/owner\/repo\/pull\/17#issuecomment-201\)/u);
+  assert.match(summary, /disclosure_invalid \(official disclosure footer is malformed or unsupported, commit-ref length 40\)/u);
+  assert.match(summary, /current SHA `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`, exact-head match not_evaluated/u);
+  assert.match(summary, /current request generation: 1, selected request #101 \(selected\)/u);
+  assert.match(summary, /pagination complete, snapshot self-consistent, complete snapshots evaluated 1/u);
+  assert.doesNotMatch(summary, /Untrusted footer text|<script>|@codex review/u);
+});
+
 test("an empty review-thread connection is complete and reports zero inventory", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
@@ -13458,6 +13539,7 @@ test("direct Action CLI redacts configured token and Bearer values from its repo
         indeterminate: "unknown",
       },
       reason: "Unsupported v2 runtime event: invalid-token=[REDACTED] Bearer [REDACTED]",
+      carrier_diagnostics: [],
     });
     assert.equal(child.stderr.includes(token), false, child.stderr);
     assert.match(child.stderr, /\[REDACTED\]/u);
@@ -13524,6 +13606,20 @@ function cleanIssueComment(commitRef = HEAD, overrides = {}) {
     performed_via_github_app: CODEX_APP,
     ...overrides,
   };
+}
+
+function officialCodexAboutFooter() {
+  return [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    '- Comment "@codex review".',
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    'Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".',
+    "</details>",
+  ];
 }
 
 function officialReviewSummaryComment({

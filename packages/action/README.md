@@ -307,6 +307,34 @@ server-side merge guard.
 
 ## Evidence semantics
 
+### Structured terminal clean comments
+
+The top-level official clean issue-comment parser treats the conclusion,
+the unique `**Reviewed commit:**` marker, and the optional official disclosure
+as separate sections. The conclusion and existing bounded presentation
+tagline grammar remain required; arbitrary praise or free-form trailing text
+does not establish clean. Commit markers in quotes or code fences do not
+provide head attestation. An unambiguous 7–40-character marker still has to
+resolve to the exact current head under the ordinary request and snapshot
+rules.
+
+The optional trailing disclosure has one closed `<details>` block and one
+`About Codex in GitHub` summary. Its supported setup, trigger, reaction, and
+call-to-action blocks are parsed separately, so supported old/new introduction
+and link forms and harmless whitespace changes do not require a whole-footer
+byte match. Unknown prose, nested or unclosed blocks, duplicate summaries,
+or extra trailing payload remain inconclusive. Finding-formatted content is
+checked across the original body, including the disclosure. This profile is
+specific to top-level clean issue comments; it does not broaden the shared
+inline-parent review receipt grammar.
+
+The verifier's bounded CLI diagnostics and Actions Summary identify the
+relevant carrier and parser stage/reason code, with available head-resolution
+and request-selection context. They do not print raw comment bodies or tokens,
+and diagnostic metadata never supplies pass authority. Unsupported provider
+formatting is distinct from an actual unresolved finding; both remain
+non-success outcomes until their respective recovery conditions are met.
+
 ### Diagnostic Codex activity summaries
 
 An issue comment with the exact first-line marker
