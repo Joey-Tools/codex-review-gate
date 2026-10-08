@@ -79,13 +79,18 @@ superseded_by:
 
 ## Next Steps
 
-- Implement and validate the Action input, controller-only credential use and
-  fail-closed request recovery in the source repository.
-- Complete source review and release through the existing protected release
-  process.
-- Only after release, make the one-line controller update and secret setup in
-  the `codex-private-workflows` pilot; verify author, comment binding, clean/
-  finding evidence and gate behavior before any expansion.
+- Source PR #111 is merged. Complete the separate v2.2.0 release-intent PR with
+  the append-only schema-4 contract and frozen target baseline recorded in the
+  [release-intent journal](2026-10-08-action-v2-2-0-release-intent.md).
+- Publish through the existing protected staged process only after human
+  approval of the `marketplace-production` Environment; verify v2.2.0 and the
+  floating v2 alias before changing a consumer.
+- After publication, make the one-line controller update for the
+  `Joey-Tools/codex-private-workflows` pilot and verify request author, comment
+  binding, clean/finding evidence, and gate behavior. Joey confirmed the
+  `CODEX_REVIEW_GATE_REQUEST_TOKEN` organization secret is configured in both
+  Joey-Tools and Joey-Project; do not read its value or expand the rollout to
+  Joey-Project.
 
 ## Evidence
 
