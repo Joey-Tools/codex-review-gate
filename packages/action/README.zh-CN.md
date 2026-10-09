@@ -380,8 +380,17 @@ PR/verifier scope 完全匹配。随后必须有一条可信、未编辑的 top-
 `T < R < C`。`R` 必须是 `C` 之前最新的 physical request boundary，且 `C` 之后不能有
 request boundary。这只是 head attestation（证明 clean 指向所选 current head，不证明 request
 与 clean 的因果关系），不证明 `R` 导致 `C`，也不证明发出 `R` 会启动
-Codex。旧 requests 仍保留在完整 inventory 中，但旧请求的数量、author 类型、canonical marker、
+Codex。在当前配置的 `any` request-author policy 下，token 生成的 `User` request 可能携带
+canonical hidden marker（workflow 添加、用于绑定 request scope 的 comment marker）。它仍是普通
+user request，不是 workflow-authored request，也不具备 workflow authority。只有 marker 中的
+`repositoryId`、`prNumber`、`headSha`、`baseSha`、`baseRef` 和 `baseRepositoryId` 全部与所选 PR
+及 verifier scope 精确一致，并满足现有 exact-request 与 authorized User 条件时，ordinary recovery
+路径才接受这个带 marker 的 request。Marker 不会授予 workflow provenance 或 head-bound authority；
+后续 clean 仍须独立、无歧义地解析为 exact current full head SHA。
+旧 requests 仍保留在完整 inventory 中，但旧请求的数量、author 类型、canonical marker、
 归因缺口和未结清的 request reactions 不会否决该见证，也不表示这些请求被标为完成。
+特别是，更早、针对不同 head 的 request 单独留下的归因缺口，不会否决随后唯一绑定
+current head 的 clean。
 short SHA 只有被 GitHub 无歧义解析为所选 current full head SHA 才接受。
 
 该保守 cutoff 不是 PR `synchronize` 的精确时间；Git commit date 和未经验证的 event timestamp
@@ -583,14 +592,27 @@ direct status projection 与 `status_projection` 已删除。finding counts 仍�
 
 Review-thread diagnostics 独立于 findings。`report.reviewThreads.status` 为 `not_read`、`complete` 或
 `incomplete`；只有 `complete` 时 resolved/unresolved/total 才是可信数字，否则均为 `unknown`，不能
-当作已验证的 zero。Thread diagnostics 是补充信息，必须保留主要 recovery instruction（包括 finding、
-permission、budget、replacement-PR 或 begin-delivery 指引）；只有完整读取确认存在未解决 thread 时，
-才提示在 GitHub 解决 open conversations 并对同一 exact head 运行受保护的手动 `reconcile`。
-该修复不需要重新请求 provider review。
+当作已验证的 zero。完整读取确认存在未解决 thread 时，指引优先要求在 GitHub 解决 open conversations，
+并对同一 exact head 运行受保护的手动 `reconcile`，同时保留其他必要的 finding、permission、budget、
+replacement-PR 或 begin-delivery 操作。如果已有合格的 exact-head clean 且 head 未变，单纯解决 threads
+不需要重新请求 provider review；缺少合格 clean 时，仍须执行报告给出的 review 恢复操作。
 
 API 读取、pagination 不完整、cap hit 或不稳定 thread state 会使受影响 counts 为 `unknown`，
 绝不能写成 `0`。Finding counts 只覆盖 normalized non-inline findings；thread counts 来自
-GraphQL review-thread state。两者都不能替代 branch-protection 对 conversation resolution 的独立要求。
+GraphQL review-thread state。CLI diagnostic JSON 也会通过独立的 `review_threads` 字段暴露这些计数；
+它不是 Action output。两者都不能替代 branch-protection 对 conversation resolution 的独立要求。
+
+对于 blocking verifier result，Actions Summary 最后一行是专用的
+`Steps to unblock: ...`；CLI JSON diagnostic 行之后也会输出同一条最终指引。更详细的 bounded
+evidence 留在前面的 summary 内容和 logs 中；最终这行是最重要、最可操作的用户输出，不是新的
+result 或 authority signal。完整 thread inventory 中只要有 unresolved thread，指引就优先处理
+thread：在不改变 head 的情况下解决 PR `#X` 的全部 `N` 条 unresolved review thread，然后针对
+exact current head dispatch `reconcile`。如果修复 finding 会改变 head，应先为新 head 请求一次
+review，再运行 `reconcile`。其他当前 evidence blocker 和 recovery action 仍然有效；解决 threads
+不保证 pass。Thread inventory 不完整时，counts 保持 `unknown`，指引保留已有的 primary recovery action，
+并要求先处理其中指出的权限、limit 或读取问题，再针对 exact current head rerun safe verifier action
+（例如受保护的 `reconcile`）。只有两轮完整稳定 snapshots 后 counts 才可信。Job 不会自动执行这些
+修复或 reconcile 操作。
 
 authority 和 consistency 模型见 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)，恢复操作见
 [COOKBOOK.zh-CN.md](COOKBOOK.zh-CN.md)。

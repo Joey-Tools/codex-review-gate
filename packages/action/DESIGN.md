@@ -519,15 +519,28 @@ request boundary follows `C`. This is current-head attestation (the clean's
 unique full-SHA binding covers the selected head, not request-to-result
 causality); posting `R` does not prove Codex started.
 
+Under the configured `any` request-author policy, a token-generated `User`
+request may carry a canonical hidden marker (a workflow-added comment marker
+that binds the request scope). It remains an ordinary user request, not a
+workflow-authored request or workflow authority. The ordinary witness path
+may accept that marked request only when its `repositoryId`, `prNumber`,
+`headSha`, `baseSha`, `baseRef`, and `baseRepositoryId` all match the selected
+PR and verifier scope exactly, in addition to the existing exact-request and
+authorized User checks. The marker does not set workflow provenance or
+head-bound authority. The later clean must independently satisfy the same
+trusted, unedited, exact-current-head receipt requirements above.
+
 Historical ordinary requests before `T` remain in the complete lineage audit.
-Only attribution gaps attached to those historical requests may be ignored by
-this witness; the history is neither deleted nor relabeled as resolved. An
-older request's unresolved official `eyes` without its own later `+1` remains
-blocking under existing liveness rules. The recovery does not clear findings
-or provider errors and does not waive unknown, edited, deleted, forged,
-scope-drifted, live or ambiguous boundaries. It requires complete inventory,
-exact refetches and two stable snapshots. A new verifier run ID has a new
-cutoff and cannot inherit the witness.
+An eligible witness may ignore their request-attribution gaps, including a gap
+left by an older request for a different head, and does not require each older
+request to acquire its own closing `+1`. This does not delete the history or
+label those requests completed. Valid nonterminal provider activity before
+`C` does not prove that an older flight must finish first; relevant activity at
+or after `C`, or a newer request boundary, remains blocking. The recovery does
+not clear findings or provider errors and does not waive unknown, edited,
+deleted, forged, scope-drifted or ambiguous evidence. It requires complete
+inventory, exact refetches and two stable snapshots. A new verifier run ID has
+a new cutoff and cannot inherit the witness.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
@@ -693,19 +706,31 @@ Summary and sticky diagnostics expose `report.reviewThreads` separately from
 numeric only for a complete collection; for `not_read` or `incomplete`, all
 three are `unknown`. `not_read` means this run did not collect thread evidence,
 not that the PR has zero threads. An incomplete collection remains fail-closed
-where a thread decision is required.
+where a thread decision is required. The CLI diagnostic JSON exposes the
+same collection in a separate `review_threads` field; neither diagnostic
+representation adds a public Action output.
 They list the three thread counts separately from the four non-inline finding
 counts and provide at most five unresolved-thread paths plus the first comment
 URL when available. A partial read sets all three thread counts to `unknown`,
 never verified zero. The configured `default`/`expanded` resource profile and
 existing hard ceilings also bound thread pagination.
 
-Thread diagnostics are additive and preserve the report's existing recovery
-priority. In particular, `not_read` must not replace a more actionable finding,
-authorization, budget, replacement-PR, or begin-delivery recovery instruction
-with a thread-resolution hint. The resolve-threads-and-reconcile instruction
-applies when a complete collection reports unresolved threads; thread status
-does not mask findings, errors, or the report's primary recovery code.
+Thread diagnostics do not rewrite `recovery_code` or finding counts. A `not_read`
+or `incomplete` collection preserves the existing primary safety action and
+states that a complete thread inventory from two stable snapshots is needed
+before relying on counts.
+A complete nonzero thread inventory independently blocks success and leads the
+final `Steps to unblock` instruction: resolve all reported unresolved PR
+threads without changing the head, then reconcile against the exact current
+head. If a finding fix changes the head, request one review for the new head
+before reconciling. An incomplete inventory keeps counts `unknown`; the final
+instruction preserves the existing primary recovery action and directs the
+user to resolve its named permission, limit, or read condition and rerun the
+safe verifier action (such as protected `reconcile` for the exact current
+head). Counts are trustworthy only after two complete stable snapshots. This
+ordered presentation does not erase any remaining finding, error,
+authorization, budget, replacement-PR, or begin-delivery action and does not
+promise that the next evaluation will pass.
 
 A “snapshot” is one independent, fully paginated set of GitHub API reads used
 to decide the fixed PR/head scope. It includes:
@@ -890,6 +915,23 @@ Summary and sticky contain a bounded reason, recovery code and concrete next
 action. They expose object identities, digests, bounded escaped excerpts and
 links when useful, but never tokens, headers, raw payload dumps or untrusted
 workflow commands.
+
+For a blocking verifier result, the Actions Summary ends with a dedicated
+`Steps to unblock: ...` line, and the CLI prints the same final line after its
+JSON diagnostics. Detailed bounded evidence stays in the preceding summary
+and logs; the final line is the most actionable user-facing output, not a new
+result or authority signal. A complete thread inventory with unresolved PR
+review threads independently blocks success and leads that line: resolve all
+`N` threads on PR `#X` without changing the head, then dispatch `reconcile`
+against the exact current head. If fixing a finding changes the head, request
+one review for the new head before reconciling. Thread counts remain separate
+from non-inline finding counts. An incomplete inventory keeps counts `unknown`
+and preserves the primary safety action, directing the user to resolve the
+reported permission, limit, or read issue and rerun the safe exact-head action
+to collect a complete stable inventory. Counts remain untrusted until two
+stable snapshots complete. Resolving threads or following
+the displayed steps does not promise a pass; the gate re-evaluates all
+remaining evidence and blockers.
 
 At-least-once recovery may create small duplicate requests, verifier attempts
 or diagnostic comments after an unknown write result. `report-completion`
