@@ -4885,6 +4885,10 @@ test("PR 34 User canonical request recovers only for its exact target and comple
     created_at: "2026-10-09T15:51:34Z",
     updated_at: "2026-10-09T15:51:34Z",
   });
+  const oldHeadWrapper = pr215InlineParentReview(OLD_HEAD, {
+    id: 6084300001,
+    submitted_at: "2026-10-09T15:49:30Z",
+  });
   const oldEyes = new Map(oldRequests.map((request, index) => [
     String(request.id),
     [reaction({
@@ -4898,7 +4902,12 @@ test("PR 34 User canonical request recovers only for its exact target and comple
       ][index],
     })],
   ]));
-  const makeGitHub = ({ reviewThreads = [], includeUnknownProvider = false, request = currentRequest } = {}) =>
+  const makeGitHub = ({
+    reviewThreads = [],
+    includeUnknownProvider = false,
+    request = currentRequest,
+    includeCurrentClean = true,
+  } = {}) =>
     createGitHubMock({
       issueComments: [
         ...oldRequests,
@@ -4911,8 +4920,9 @@ test("PR 34 User canonical request recovers only for its exact target and comple
               performed_via_github_app: { slug: "unknown-provider-app" },
             })]
           : []),
-        clean,
+        ...(includeCurrentClean ? [clean] : []),
       ],
+      reviews: [oldHeadWrapper],
       reactionsByCommentId: oldEyes,
       reviewThreads,
       selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
@@ -4974,6 +4984,21 @@ test("PR 34 User canonical request recovers only for its exact target and comple
     ["complete", 0, 1, 1],
   );
   assert.equal(resolved.result.report.requiresReplacementPr, false);
+
+  const noCurrentCleanGitHub = makeGitHub({
+    reviewThreads: [reviewThread({ id: "PRRT_pr34_resolved_without_clean", isResolved: true })],
+    includeCurrentClean: false,
+  });
+  const noCurrentClean = await runGate(
+    environmentFor("old-wrapper-without-current-clean"),
+    noCurrentCleanGitHub,
+  );
+  assert.notEqual(noCurrentClean.result.report.gateOutcome, "success");
+  assert.equal(
+    noCurrentCleanGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+    "an old-head inline-parent wrapper cannot replace the current-head top-level clean",
+  );
 
   const uncertainGitHub = makeGitHub({ includeUnknownProvider: true });
   const uncertain = await runGate(environmentFor("unknown-provider"), uncertainGitHub);
@@ -14264,6 +14289,22 @@ function inlineParentReview(commitRef = HEAD, overrides = {}) {
     app: CODEX_APP,
     performed_via_github_app: CODEX_APP,
     ...overrides,
+  };
+}
+
+function pr215InlineParentReview(commitRef = HEAD, overrides = {}) {
+  const review = inlineParentReview(commitRef, overrides);
+  return {
+    ...review,
+    body: review.body
+      .replace(
+        "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+        "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you",
+      )
+      .replace(
+        'When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".',
+        'Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".',
+      ),
   };
 }
 

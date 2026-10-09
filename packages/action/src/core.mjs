@@ -629,7 +629,9 @@ export function codexInlineParentReviewBodyHasClosedGrammar(
     return false;
   }
 
-  return officialCodexDisclosureHasClosedGrammar(lines.slice(3).join("\n"));
+  return officialIssueCommentCleanDisclosureHasClosedGrammar(
+    lines.slice(3).join("\n"),
+  );
 }
 
 export function sortCodexArtifactsNewestFirst(artifacts) {
@@ -1740,26 +1742,6 @@ function cleanTaglineHasPresentationGrammar(value) {
     previousWasSpace = false;
   }
   return emojiCount > 0 && !previousWasSpace;
-}
-
-function officialCodexDisclosureHasClosedGrammar(value) {
-  const normalized = value
-    .replace(/\r\n?/g, "\n")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .join("\n");
-  return normalized === [
-    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
-    "<br/>",
-    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
-    "- Open a pull request for review",
-    "- Mark a draft as ready",
-    '- Comment "@codex review".',
-    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
-    "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
-    "</details>",
-  ].join("\n");
 }
 
 function approvedReviewBodyCommitReferencesAgree(
