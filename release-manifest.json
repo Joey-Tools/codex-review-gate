@@ -12,7 +12,7 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "5bc8e96f45d0fa709a53f1035e09e350b52c74cf"
+    "tree": "f574490db68b7db0af15c64d5b2fbae45fb16b47"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
@@ -39,15 +39,15 @@
       "path": "DESIGN.md",
       "type": "file",
       "mode": "100644",
-      "size": 59634,
-      "sha256": "94b1752c8f5587dcd61bf351be3d9ea61c54f2ad88824d763b631609f9b4ea3a"
+      "size": 60134,
+      "sha256": "fbaf568575d5237475357f55b932367df9f834fd07cdefd5b1673293613b827b"
     },
     {
       "path": "DESIGN.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 59167,
-      "sha256": "00b17ec5d098aeeeb439c801ee1a59f6e6eeae19646c33815a63167379ba8844"
+      "size": 59624,
+      "sha256": "3e3caceed1c457cea22ef318e5a191dae7e26d5fc21a411100ac93b135f51c5e"
     },
     {
       "path": "EULA.md",
@@ -123,8 +123,8 @@
       "path": "src/core.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 71215,
-      "sha256": "baa4530e65e2e209f564515aaef763136346ca29647983ba60a7699195c34127"
+      "size": 70423,
+      "sha256": "71a68c2df73c3d7def476f5c51ce407a5d894e0e65d90accdfc63dd57532ce80"
     },
     {
       "path": "src/evidence-budget.mjs",
