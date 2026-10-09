@@ -1,16 +1,21 @@
 ---
 id: 20261009-action-v221-release-intent
 title: Action v2.2.1 Release Intent
-status: active
+status: completed
 created: 2026-10-09
 updated: 2026-10-09
 branch: codex/release-v2.2.1
 pr:
 supersedes: []
-superseded_by:
+superseded_by: 20261009-action-v221-combined-release-intent
 ---
 
 # Action v2.2.1 Release Intent
+
+This original single-PR selection is retained as history and is superseded by
+the [combined v2.2.1 release intent](2026-10-09-action-v2-2-1-combined-release-intent.md).
+The `completed` status closes this intent only; it does not mean that v2.2.1
+was published.
 
 ## Decision and Scope
 
@@ -66,18 +71,30 @@ superseded_by:
   v2 alias remain unverified until the protected publisher runs after
   Environment approval.
 
+## Supersession and Publisher Boundary
+
+- The earlier frozen source from PR #114 at `56a6769` excludes PR #115 and is
+  not the payload selected by the combined intent. Publisher run
+  `37981458822` must not publish or be reused for that old source.
+- Before cancellation, the `Publish signed release` job was `waiting` with
+  `steps=[]`. The provider also returned a `started_at` value for that
+  waiting job; that field alone does not show that a privileged step ran. The
+  cancellation API returned success, and the later run GET reported
+  `completed/cancelled`.
+
 ## Next Steps
 
-- After this intent lands on protected source `master`, use the existing staged
-  publisher for v2.2.1 after a human approves the `marketplace-production`
-  Environment; verify the target head, immutable release tag, provenance, and
-  floating v2 alias.
-- After publication, existing `@v2` consumers receive the new runtime on their
-  next run; no consumer workflow rollout is part of this release intent.
+- Use the linked combined intent for any remaining v2.2.1 publication work;
+  do not approve, redispatch, or reuse the superseded PR #114 publisher source.
+- Production publication remains a separate step through the existing staged
+  publisher after a human approves `marketplace-production`. No manual
+  Marketplace patch or consumer workflow rollout is part of this intent.
 
 ## Evidence
 
 - [Source implementation PR #113](https://github.com/Joey-Tools/codex-review-gate/pull/113).
 - [Published v2.2.0 predecessor](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.2.0).
 - Release contract and protected publication flow: `docs/RELEASING.md`.
-- Release intent and frozen payload: `release-manifest.json`.
+- The old manifest snapshot recorded above describes the superseded
+  #113-only payload; the current selection is documented in the linked
+  combined intent and `release-manifest.json`.
