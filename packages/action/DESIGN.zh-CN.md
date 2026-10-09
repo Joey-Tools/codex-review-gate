@@ -332,6 +332,11 @@ reducer 只消费符合条件的 Codex top-level issue comments 和 PR review bo
 唯一的窄例外是：符合 fixed closed grammar（枚举式固定格式，而非自由文本猜测）的官方
 exact-head `COMMENTED` inline-parent review 可作为 non-inline terminal-clean receipt；
 runtime 仍只观察 immutable parent review，不从它的 child/thread 推导 receipt authority。
+parent 的 informational disclosure 复用 clean issue comment 的同一份 closed structural
+grammar，包括已观察到的 team-settings setup link 和较短 call to action。展示空白与这些
+已知文案变体不会把历史 inline-parent wrapper 误判为 malformed finding。未知正文、额外
+finding 或链接、commit reference 不匹配、provider provenance 无效仍然阻塞；历史 parent
+不能提供 current-head clean authority。
 另外，每个完整 snapshot 都通过 GraphQL 读取所有 PR review threads，并要求每个
 `isResolved` 均为 true。任何未解决 thread 都会阻塞，不论作者、outdated 状态或 reviewed
 head；parent receipt 不会改变该要求。installed ruleset 仍提供独立的 server-side

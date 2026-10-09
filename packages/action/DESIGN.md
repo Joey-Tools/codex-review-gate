@@ -392,7 +392,14 @@ sticky does not make the boundary harmless.
 The reducer consumes qualifying Codex top-level issue comments and pull-request
 review bodies. A closed official `COMMENTED` inline-parent review may be a
 terminal receipt only when its fixed grammar and native commit binding verify;
-it is treated as a clean non-inline parent payload. Independently, each
+it is treated as a clean non-inline parent payload. The parent's informational
+disclosure uses the same closed structural grammar as
+clean issue comments, including the observed team-settings setup link and
+shorter call to action. Presentation whitespace and these known wording
+variants do not turn historical inline-parent wrappers into malformed findings.
+Unknown prose, extra findings or links, mismatched commit references, and
+invalid provider provenance remain blocking evidence; a historical parent
+never supplies current-head clean authority. Independently, each
 complete snapshot reads every pull-request review thread via GraphQL and
 requires every thread's `isResolved` value to be true. An unresolved thread
 blocks regardless of author, outdated status, or reviewed head; parent review

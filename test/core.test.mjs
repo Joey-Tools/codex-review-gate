@@ -2361,23 +2361,71 @@ test("recognizes only the closed official inline-parent review wrapper", () => {
       ...review,
       body: officialInlineParentReviewBody(undefined, pr215OfficialCodexDisclosure()),
     }),
-    false,
-    "the issue-comment disclosure profile does not relax inline-parent review grammar",
+    true,
+    "the inline-parent wrapper accepts the already-closed PR 215 disclosure variant",
   );
-  assert.equal(
-    codexInlineParentReviewBodyHasClosedGrammar({
+
+  const pr215Disclosure = pr215OfficialCodexDisclosure();
+  const malformedWrappers = [
+    [
+      "extra finding text inside disclosure",
+      officialInlineParentReviewBody(undefined, pr215Disclosure.replace(
+        "</details>",
+        "Please fix the parser.\n</details>",
+      )),
+    ],
+    [
+      "URL inside disclosure",
+      officialInlineParentReviewBody(undefined, pr215Disclosure.replace(
+        "</details>",
+        "See https://example.com/finding.\n</details>",
+      )),
+    ],
+    [
+      "extra finding text outside disclosure",
+      `${officialInlineParentReviewBody(undefined, pr215Disclosure)}\nPlease fix the parser.`,
+    ],
+    [
+      "URL outside disclosure",
+      `${officialInlineParentReviewBody(undefined, pr215Disclosure)}\nhttps://example.com/finding`,
+    ],
+    [
+      "nested disclosure",
+      officialInlineParentReviewBody(undefined, pr215Disclosure.replace(
+        "</details>",
+        "<details>\n</details>\n</details>",
+      )),
+    ],
+    [
+      "unknown disclosure content",
+      officialInlineParentReviewBody(undefined, pr215Disclosure.replace(
+        "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+        "Codex found a potential issue in this pull request.",
+      )),
+    ],
+  ];
+  for (const [name, body] of malformedWrappers) {
+    assert.equal(
+      codexInlineParentReviewBodyHasClosedGrammar({ ...review, body }),
+      false,
+      name,
+    );
+  }
+
+  for (const [name, candidate] of [
+    ["short reviewed commit mismatch", {
       ...review,
       body: officialInlineParentReviewBody(FULL_SHA_B.slice(0, 10)),
-    }),
-    false,
-  );
-  assert.equal(
-    codexInlineParentReviewBodyHasClosedGrammar({
+    }],
+    ["full reviewed commit mismatch", {
       ...review,
-      body: `${review.body}\nUnexpected terminal content`,
-    }),
-    false,
-  );
+      body: officialInlineParentReviewBody(FULL_SHA_B),
+    }],
+    ["wrong state", { ...review, state: "APPROVED" }],
+  ]) {
+    assert.equal(codexInlineParentReviewBodyHasClosedGrammar(candidate), false, name);
+  }
+
   assert.equal(
     codexInlineParentReviewBodyHasClosedGrammar({
       ...review,
