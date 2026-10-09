@@ -644,7 +644,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
         ]
       : []),
     "",
-    `Next action: ${nextAction}`,
+    `Steps to unblock: ${nextAction}`,
     "",
   ].join("\n");
   appendFileSync(summaryPath, body, "utf8");
@@ -875,7 +875,7 @@ function redactV2GateCliText(value, environment) {
   return text.replace(/\bBearer\s+\S+/giu, "Bearer [REDACTED]");
 }
 
-export function writeV2GateCliReport(report, environment) {
+export function writeV2GateCliReport(report, environment, nextActionOverride = null) {
   const reason = redactV2GateCliText(
     oneLine(report.reason, "No reason was reported"),
     environment,
@@ -886,9 +886,21 @@ export function writeV2GateCliReport(report, environment) {
     recovery_code: report.recoveryCode,
     retry_safe: report.retrySafe,
     findings: report.counts,
+    review_threads: report.reviewThreads,
     reason,
     carrier_diagnostics: report.carrierDiagnostics,
   })}`);
+  const prNumber = environment?.PR_NUMBER || environment?.INPUT_PR_NUMBER;
+  const nextAction = redactV2GateCliText(
+    oneLine(
+      typeof nextActionOverride === "string"
+        ? nextActionOverride
+        : v2ReportNextAction(report, { prNumber }),
+      "Inspect the workflow run and retry safely.",
+    ),
+    environment,
+  ).slice(0, 1_000);
+  console.error(`[codex-review-gate] Steps to unblock: ${nextAction}`);
 }
 
 const V2_PARSE_REASON_LABELS = Object.freeze({
@@ -1041,19 +1053,11 @@ function recoveryInstruction(
   prNumber,
   retrySafe = false,
   requiresReplacementPr = false,
-  counts = {},
   headCleanRecoveryAction = null,
 ) {
-  const target = Number.isSafeInteger(Number(prNumber)) ? ` for PR #${prNumber}` : "";
-  if (counts.reviewThreadPrimaryCause === true && counts.unresolvedReviewThreads > 0) {
-    const findingAction = counts.unresolved > 0
-      ? ` and address ${counts.unresolved} reported Codex finding(s)`
-      : "";
-    return (
-      `Resolve all ${counts.unresolvedReviewThreads} unresolved pull-request review thread(s)` +
-      `${findingAction}, then dispatch reconcile${target} against the exact current head.`
-    );
-  }
+  const target = Number.isSafeInteger(Number(prNumber)) && Number(prNumber) > 0
+    ? ` for PR #${prNumber}`
+    : "";
   if (
     headCleanRecoveryAction === "request" &&
     (code === "request_clean_generation" || code === "wait_provider")
@@ -1165,27 +1169,7 @@ function v2ReportNextAction(report, context = {}) {
     return "This verifier observation is a diagnostic snapshot, not the current gating result; PR Checks and the verifier summary are authoritative.";
   }
   const reviewThreads = report.reviewThreads;
-  const unresolvedThreadCause =
-    reviewThreads.status === "complete" &&
-    reviewThreads.unresolved > 0 &&
-    report.recoveryCode === "wait_then_reconcile" &&
-    /^GitHub reports [0-9]+ unresolved pull-request review thread\(s\)/u.test(
-      report.reason,
-    );
-  const primaryAction = unresolvedThreadCause
-    ? recoveryInstruction(
-        report.recoveryCode,
-        context.prNumber,
-        report.retrySafe,
-        report.requiresReplacementPr,
-        {
-          ...report.counts,
-          unresolvedReviewThreads: reviewThreads.unresolved,
-          reviewThreadPrimaryCause: true,
-        },
-        context.headCleanRecoveryAction,
-      )
-    : context.verifierRunId
+  const primaryAction = context.verifierRunId
     ? `Wait for verifier run ${context.verifierRunId} attempt ` +
       `${context.verifierRunAttempt} to complete, then require its exact ` +
       `${V2_REQUIRED_CHECK_NAME} result to be healthy/success before merge.`
@@ -1194,22 +1178,26 @@ function v2ReportNextAction(report, context = {}) {
         context.prNumber,
         report.retrySafe,
         report.requiresReplacementPr,
-        report.counts,
         context.headCleanRecoveryAction,
       );
 
-  if (reviewThreads.status === "incomplete") {
-    return `${primaryAction} Review-thread inventory is incomplete; once the primary action is complete, rerun reconcile and wait for two stable snapshots before relying on thread counts.`;
-  }
-  if (
-    reviewThreads.status === "complete" &&
-    reviewThreads.unresolved > 0 &&
-    !unresolvedThreadCause
-  ) {
-    const target = Number.isSafeInteger(Number(context.prNumber))
+  if (reviewThreads.status === "complete" && reviewThreads.unresolved > 0) {
+    const target = Number.isSafeInteger(Number(context.prNumber)) &&
+      Number(context.prNumber) > 0
       ? ` on PR #${context.prNumber}`
       : "";
-    return `${primaryAction} Also resolve all ${reviewThreads.unresolved} unresolved pull-request review thread(s)${target}, then reconcile the exact current head.`;
+    const followUp = report.recoveryCode === "wait_then_reconcile" &&
+      /^GitHub reports [0-9]+ unresolved pull-request review thread/u.test(report.reason)
+      ? `dispatch reconcile against the exact current head${target}`
+      : primaryAction;
+    return (
+      `First resolve all ${reviewThreads.unresolved} unresolved pull-request review ` +
+      `thread(s)${target}; then ${followUp}`
+    );
+  }
+
+  if (reviewThreads.status === "incomplete") {
+    return `${primaryAction} Thread inventory is incomplete and counts remain unknown. Resolve the reported read, permission, or limit condition, then rerun the safe exact-head reconcile to reacquire a complete stable inventory; rely on thread counts only after the runtime obtains two stable snapshots.`;
   }
   return primaryAction;
 }
@@ -1817,6 +1805,10 @@ export async function runV2GateCli({
     completionSnapshotValidated: false,
     diagnosticObservation: false,
   };
+  const withNextAction = (result) => ({
+    ...result,
+    nextAction: v2ReportNextAction(result.report, context),
+  });
   try {
     config = readV2Config(environment);
     Object.assign(config, validateV2Trigger(config));
@@ -1824,19 +1816,19 @@ export async function runV2GateCli({
     context.triggerKind = config.triggerKind;
     client = new V2GitHubClient(config, fetchImpl);
     if (config.triggerKind === "verifier") {
-      return await runV2Verifier(client, config, context, {
+      return withNextAction(await runV2Verifier(client, config, context, {
         sleep,
         now,
         stabilityIntervalMs,
         stabilityWindowMs: stabilityWindowMs ?? config.limits.reconcileBudgetMs,
-      });
+      }));
     }
-    return await runV2ControllerAction(client, config, context, {
+    return withNextAction(await runV2ControllerAction(client, config, context, {
       sleep,
       now,
       pollIntervalMs: stabilityIntervalMs,
       pollWindowMs: stabilityWindowMs ?? config.limits.reconcileBudgetMs,
-    });
+    }));
   } catch (error) {
     const counts = normalizeV2FailureCounts(error?.counts);
     const stale = error instanceof V2StaleFailure;
@@ -1917,6 +1909,7 @@ export async function runV2GateCli({
     return {
       report,
       exitCode: exitCodeForV2Report(report, config?.triggerKind),
+      nextAction: v2ReportNextAction(report, context),
     };
   }
 }
@@ -6557,19 +6550,31 @@ function selectV2CurrentHeadCleanRecovery({
 
   const isAuthorizedOrdinaryBoundary = (boundary) => {
     const request = authorizedById.get(boundary?.id);
+    const comment = request?.comment;
+    const canonical = parseCanonicalV2ReviewRequestBody(comment?.body);
+    const exactCurrentTargetMarker = canonical !== null &&
+      canonical.repositoryId === String(repositoryId) &&
+      canonical.prNumber === String(prNumber) &&
+      canonical.headSha === headSha &&
+      canonical.baseSha === baseSha &&
+      canonical.baseRef === baseRef &&
+      canonical.baseRepositoryId === baseRepositoryId;
     return request !== undefined &&
       request.headBound !== true &&
       request.binding === null &&
-      request.comment?.id !== undefined &&
-      isExactV2OrdinaryReviewRequestBody(request.comment.body) &&
-      request.comment.user?.type === "User" &&
-      typeof request.comment.user?.login === "string" &&
-      request.comment.user.login.trim() !== "" &&
-      isCanonicalUtcTimestamp(request.comment.created_at) &&
-      isCanonicalUtcTimestamp(request.comment.updated_at) &&
-      Date.parse(request.comment.created_at) === boundary.revisionMs &&
-      Date.parse(request.comment.updated_at) === boundary.revisionMs &&
-      !hasV2ObservedIssueCommentEdit(request.comment);
+      comment?.id !== undefined &&
+      (
+        isExactV2OrdinaryReviewRequestBody(comment.body) ||
+        exactCurrentTargetMarker
+      ) &&
+      comment.user?.type === "User" &&
+      typeof comment.user?.login === "string" &&
+      comment.user.login.trim() !== "" &&
+      isCanonicalUtcTimestamp(comment.created_at) &&
+      isCanonicalUtcTimestamp(comment.updated_at) &&
+      Date.parse(comment.created_at) === boundary.revisionMs &&
+      Date.parse(comment.updated_at) === boundary.revisionMs &&
+      !hasV2ObservedIssueCommentEdit(comment);
   };
   const request = authorizedById.get(requestBoundary.id);
   if (!request || request.revisionMs !== requestBoundary.revisionMs) return null;
@@ -10529,6 +10534,6 @@ if (
   pathToFileURL(process.argv[1]).href === import.meta.url
 ) {
   const result = await runV2GateCli();
-  writeV2GateCliReport(result.report, process.env);
+  writeV2GateCliReport(result.report, process.env, result.nextAction);
   process.exitCode = result.exitCode;
 }

@@ -476,14 +476,27 @@ uniquely to the current full head SHA. The receipt order is strict:
 and no request boundary may follow `C`. This is head attestation (the clean's
 unique full-SHA binding covers the selected head, not request-to-result
 causality); posting `R` does not prove Codex started.
+
+Under the configured `any` request-author policy, a token-generated `User`
+request may carry a canonical hidden marker (a workflow-added comment marker
+that binds the request scope). It remains an ordinary user request, not a
+workflow-authored request or workflow authority. The ordinary recovery path
+accepts it only when the marker's `repositoryId`, `prNumber`, `headSha`,
+`baseSha`, `baseRef`, and `baseRepositoryId` all exactly match the selected
+PR and verifier scope, alongside the existing exact-request and
+authorized User checks. The marker does not grant workflow provenance or head-bound
+authority; the later clean still must independently and unambiguously resolve
+to the exact current full head SHA.
 After a base epoch, this recovery does not apply: the existing rule still
 requires an exact-current-tuple canonical Actions request with a direct
 provider `+1`; a top-level terminal clean adds no authority. Older
 requests remain in the complete inventory, but older request count, author
 type, canonical markers, attribution gaps, and unsettled request reactions do
 not invalidate this witness. Recovery does not mark those requests completed
-or claim which request produced the clean. Short SHAs are accepted only when
-GitHub resolves them unambiguously to the selected full head SHA.
+or claim which request produced the clean. In particular, an attribution gap
+left solely by an older request for a different head does not invalidate the
+later, uniquely head-attested clean. Short SHAs are accepted only when GitHub
+resolves them unambiguously to the selected full head SHA.
 
 The conservative cutoff is not the exact PR `synchronize` time; Git commit
 dates and unverified event timestamps are never fallbacks. This recovery does
@@ -725,17 +738,37 @@ and Actions summary report:
 Review-thread diagnostics are reported separately from findings. The
 `report.reviewThreads.status` is `not_read`, `complete`, or `incomplete`; only
 `complete` has trusted numeric resolved/unresolved/total counts. Otherwise
-counts are `unknown`, not verified zero. Thread diagnostics are additive and
-must preserve the primary recovery instruction (including finding, permission,
-budget, replacement-PR, or begin-delivery guidance); only a complete read that
-finds unresolved threads calls for resolving them and running protected
-exact-head manual `reconcile`. A new provider review request is not required
-for that repair.
+counts are `unknown`, not verified zero. A complete read that finds unresolved
+threads leads with resolving them and running protected exact-head manual
+`reconcile`, while retaining any other required finding, permission, budget,
+replacement-PR, or begin-delivery action. If an eligible exact-head clean
+already exists and the head stays unchanged, resolving threads alone does not
+require another provider review request. A missing eligible clean still
+requires the indicated review recovery.
 
 Incomplete API reads, pagination or cap hits make affected counts `unknown`,
 never `0`. Finding counts cover only normalised non-inline findings; thread
-counts cover GraphQL review-thread state. Neither summary replaces the
-independent branch-protection conversation-resolution requirement.
+counts cover GraphQL review-thread state. The CLI diagnostic JSON also exposes
+them in a separate `review_threads` field; it is not an Action output. Neither
+summary replaces the independent branch-protection conversation-resolution
+requirement.
+
+For a blocking verifier result, the Actions Summary ends with a dedicated
+`Steps to unblock: ...` line. CLI output prints the same final line after its
+JSON diagnostic record. Detailed bounded evidence remains in the preceding
+summary and logs; this final line is the most actionable user-facing output,
+not a new result or authority signal. A complete nonzero thread inventory
+leads with the thread repair: resolve all `N` unresolved PR review threads on
+PR `#X` without changing the head, then dispatch `reconcile` against the exact
+current head. If fixing a finding changes the head, first request one review
+for the new head, then reconcile. Any other current evidence or recovery action
+remains required; resolving threads does not promise a pass. With an incomplete
+thread inventory, the line keeps counts `unknown`, preserves the primary
+recovery action, and directs the user to resolve its named permission, limit,
+or read issue and rerun the safe verifier action (such as protected
+`reconcile` for the exact current head). Counts are trusted only after two
+complete stable snapshots. The job does not perform the suggested repair or
+reconciliation automatically.
 
 See [DESIGN.md](DESIGN.md) for the authority and consistency model and
 [COOKBOOK.md](COOKBOOK.md) for recovery procedures.

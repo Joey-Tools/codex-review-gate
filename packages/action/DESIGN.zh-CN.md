@@ -431,12 +431,21 @@ attestation（证明 clean 指向所选 current head，不证明 request 与 cle
 因果匹配：timestamps 与 head binding 不证明 `R` 导致 `C`，也不证明发出
 `R` 会启动 Codex。
 
-`T` 之前的 ordinary requests 仍完整保留在 lineage audit 中。恢复见证只忽略附着于这些历史
-request 的归因缺口，不删除或改写其历史状态。旧 request 上尚未由该 request 自身后续 `+1`
-结清的 official `eyes` 仍按既有 liveness 规则阻塞。恢复不清除 findings 或 provider errors，
-也不豁免 unknown、edited、deleted、forged、scope-drifted、live 或 ambiguous boundaries。仍须
-完成 inventory、exact refetch 和两轮稳定 snapshot。新的 verifier run ID 使用自己的 cutoff，不
-继承旧 witness。
+在当前配置的 `any` request-author policy 下，token 生成的 `User` request 可能携带 canonical hidden
+marker（workflow 添加、用于绑定 request scope 的 comment marker）。它仍然是普通 user request，
+不是 workflow-authored request，也不具备 workflow authority。只有当 marker 中的
+`repositoryId`、`prNumber`、`headSha`、`baseSha`、`baseRef` 和 `baseRepositoryId` 全部与所选 PR
+及 verifier scope 精确一致，并且满足现有 exact-request 与 authorized User 条件时，ordinary
+witness 路径才接受这个带 marker 的 request。Marker 不会设置 workflow provenance 或 head-bound
+authority；后续 clean 仍须独立满足上文的 trusted、未编辑、精确绑定 current head 的 receipt 条件。
+
+`T` 之前的 ordinary requests 仍完整保留在 lineage audit 中。合格的恢复见证可以忽略这些历史
+request 的归因缺口，包括由更早、针对不同 head 的 request 留下的缺口；也不要求每个旧 request
+必须由自己的后续 `+1` 结清。历史不会被删除或标为已完成。`C` 之前有效的非终态 provider
+activity 并不能证明旧 flight 必须先完成；`C` 当时或之后的相关 activity，以及更新的 physical
+request boundary，仍会阻塞。恢复不清除 findings 或 provider errors，也不豁免 unknown、edited、
+deleted、forged、scope-drifted 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮
+稳定 snapshot。新的 verifier run ID 使用自己的 cutoff，不继承旧 witness。
 
 permission threshold 保护 generation reset，不保护 negative evidence。符合条件的
 provider findings 不受 request-author permission 影响，始终阻塞。finding 绝不充当最小
@@ -606,17 +615,26 @@ snapshots 因此至少执行四次 thread pass，每次需要 `ceil(totalThreads
 也至少读取一页），thread check 不额外增加 sweep。
 
 摘要和 sticky diagnostic 通过独立 `reviewThreads` 节点报告 `status`、`unresolved`、`resolved`、
-`total` 和 `diagnostics`，不混入四项 `findings` counts。`status` 为 `not_read`、`complete` 或
-`incomplete`；只有完整 collection 的 counts 才是可信数字，`not_read` 或 `incomplete` 时三项均为
+`total` 和 `diagnostics`，不混入四项 `findings` counts。CLI diagnostic JSON 也通过独立的
+`review_threads` 字段报告同一 collection；这两种 diagnostics 都不增加 public Action output。
+`status` 为 `not_read`、`complete` 或 `incomplete`；只有完整 collection 的 counts 才是可信数字，
+`not_read` 或 `incomplete` 时三项均为
 `unknown`。`not_read` 表示本次没有读取 thread evidence，不代表 PR 没有 thread；需要据此作出 thread
 决策时，不完整 collection 仍 fail closed。最多提供五条未解决 thread 的 path 与首条 comment URL
 （若可用）以便处理，outdated 标记仅供诊断。扫描使用既有 `default`/`expanded` limits profile 和
 hard ceilings。
 
-Thread diagnostics 只作补充，并保留 report 既有 recovery 优先级。特别是 `not_read` 不得用解决 thread
-提示覆盖更具行动性的 finding、授权、预算、replacement-PR 或 begin-delivery recovery instruction。
-只有完整 collection 确认存在未解决 thread 时，才给出“解决 thread 后 reconcile”的操作提示；thread
-状态不得掩盖 findings、errors 或 report 的主要 recovery code。
+Thread diagnostics 不会改写 `recovery_code` 或 finding counts。`not_read` 或 `incomplete`
+collection 保留已有 primary safety action，并明确说明必须先取得基于两轮稳定 snapshots 的完整
+thread inventory 才能依赖计数。
+完整且非零的 thread inventory 会独立阻止 success，并优先进入最终 `Steps to unblock` 指引：在不改变
+head 的情况下解决全部已报告的 unresolved PR threads，然后针对 exact current head reconcile。如果修复
+finding 改变了 head，应先为新 head 请求一次 review，再 reconcile。此顺序不会删除剩余的 finding、
+error、授权、budget、replacement-PR 或 begin-delivery action，也不承诺下一次 evaluation 会 pass。
+Thread inventory 不完整时，counts 保持 `unknown`；最终指引保留已有的 primary recovery action，并要求
+先处理它指出的权限、limit 或读取问题，再针对 exact current head rerun safe verifier action（例如受保护的
+`reconcile`），以重新采集完整稳定的 inventory。只有两轮完整稳定 snapshots 后 counts 才可信；指引不是
+要求用户自行实现 API 读取。
 
 fingerprint 是 snapshot 中每个 decision-relevant value 的 deterministic
 representation。它只是两次 fresh reads 之间的 equality check，不是 durable
@@ -736,6 +754,19 @@ counts 不是 public Action outputs。
 summary 和 sticky 包含 bounded reason、recovery code 与具体 next action。必要时会
 暴露 object identities、digests、bounded escaped excerpts 和 links，但绝不暴露
 tokens、headers、raw payload dumps 或 untrusted workflow commands。
+
+对 blocking verifier result，Actions Summary 以独立的 `Steps to unblock: ...` 行收尾；CLI
+JSON diagnostics 之后也输出同一条最终指引。更详细的 bounded evidence 留在此前的 summary
+内容和 logs 中。该行是最重要、最可操作的用户输出，不是新的 result 或 authority signal。
+完整 thread inventory 中只要仍有 unresolved PR review threads，就会独立阻止 success，并优先
+给出操作顺序：在不改变 head 的情况下解决 PR `#X` 的全部 `N` 条 thread，然后针对 exact current
+head dispatch `reconcile`。如果修复 finding 会改变 head，应先为新 head 请求一次 review，再
+运行 `reconcile`。Thread counts 与 non-inline finding counts 分开显示。Thread inventory 不完整时，
+counts 保持 `unknown`；指引会保留已有的 primary safety action，要求先处理报告的权限、limit 或读取问题，
+再针对 exact current head rerun safe verifier action（例如受保护的 `reconcile`），以重新采集完整稳定的
+inventory。只有两轮完整稳定 snapshots 后 counts 才可信；指引不是要求用户自行实现 API 读取。解决 threads
+或照做指引都不保证 pass；gate 仍会重新评估剩余 evidence 与
+blockers。
 
 at-least-once recovery 在 write result unknown 后可能生成少量 duplicate requests、
 verifier attempts 或 diagnostic comments。`report-completion` 在 update/create 前 fresh-read，

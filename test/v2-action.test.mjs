@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   buildV2GateReport,
   buildV2StickyCommentBody,
+  appendV2GateSummary,
   writeV2GateCliReport,
 } from "../packages/action/src/v2/gate-runtime.mjs";
 
@@ -162,7 +165,119 @@ test("CLI diagnostics retain closed parser codes and reject unsafe extra fields"
   assert.equal(payload.carrier_diagnostics[1].url, null);
   assert.equal(payload.carrier_diagnostics[1].reasonCode, "finding_signal");
   assert.doesNotMatch(output, /UNSAFE_PROVIDER_TEXT|UNSAFE_REQUEST_DATA|SECRET_TOKEN|ANOTHER_SECRET|attacker\.example|rawBody|token/u);
+  assert.match(output.trim().split("\n").at(-1), /^\[codex-review-gate\] Steps to unblock: /u);
 });
+
+test("unblock guidance leads with complete unresolved threads and retains review recovery", () => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    recoveryCode: "request_clean_generation",
+    reason: "A historical request attribution gap remains",
+    findingsUnresolved: 0,
+    findingsResolved: 0,
+    findingsHistorical: 0,
+    findingsIndeterminate: 4,
+    reviewThreads: { status: "complete", unresolved: 1, resolved: 11, total: 12 },
+  });
+  const lines = captureCliReport(report, { INPUT_PR_NUMBER: "34" });
+  const payload = JSON.parse(lines[0].slice("[codex-review-gate] ".length));
+  assert.equal(payload.recovery_code, "request_clean_generation");
+  assert.equal(payload.findings.unresolved, 0);
+  assert.equal(payload.review_threads.unresolved, 1);
+  assert.equal(payload.review_threads.resolved, 11);
+  assert.equal(payload.review_threads.total, 12);
+  assert.match(lines.at(-1), /Steps to unblock: First resolve all 1 unresolved pull-request review thread\(s\) on PR #34; then /u);
+  assert.match(lines.at(-1), /request lineage|review generation/u);
+});
+
+test("complete thread blockers retain independent finding and permission repairs", () => {
+  for (const [code, action] of [
+    ["fix_findings", /Fix the unresolved Codex findings/u],
+    ["repair_permissions", /Repair the canonical workflow permissions/u],
+  ]) {
+    const report = buildV2GateReport({
+      executionHealth: code === "repair_permissions" ? "unhealthy" : "healthy",
+      gateOutcome: code === "fix_findings" ? "failure" : "pending",
+      recoveryCode: code,
+      reason: "An independent blocker remains",
+      findingsUnresolved: code === "fix_findings" ? 2 : 0,
+      reviewThreads: { status: "complete", unresolved: 1, resolved: 0, total: 1 },
+    });
+    const tail = captureCliReport(report, { INPUT_PR_NUMBER: "34" }).at(-1);
+    assert.match(tail, /Steps to unblock: First resolve all 1 unresolved/u);
+    assert.match(tail, action);
+    assert.doesNotMatch(tail, /do not request another review while the head is unchanged/u);
+  }
+});
+
+test("incomplete thread inventory keeps counts unknown and ends with safe recovery", () => {
+  const report = buildV2GateReport({
+    executionHealth: "unhealthy",
+    gateOutcome: "pending",
+    recoveryCode: "use_expanded_limits",
+    reason: "Thread pagination exceeded the configured limit",
+    reviewThreads: { status: "incomplete" },
+  });
+  const lines = captureCliReport(report, { INPUT_PR_NUMBER: "34" });
+  const payload = JSON.parse(lines[0].slice("[codex-review-gate] ".length));
+  assert.equal(payload.review_threads.unresolved, "unknown");
+  assert.equal(payload.review_threads.resolved, "unknown");
+  assert.equal(payload.review_threads.total, "unknown");
+  assert.match(lines.at(-1), /Steps to unblock: Rerun reconcile for PR #34 with limits_profile=expanded/u);
+  assert.match(lines.at(-1), /counts remain unknown/u);
+  assert.match(lines.at(-1), /exact-head reconcile/u);
+});
+
+test("thread-only summary ends with reconcile instructions without requesting another review", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gate-unblock-summary-"));
+  const summary = join(directory, "summary.md");
+  try {
+    const report = buildV2GateReport({
+      executionHealth: "healthy",
+      gateOutcome: "pending",
+      recoveryCode: "wait_then_reconcile",
+      reason: "GitHub reports 1 unresolved pull-request review thread(s)",
+      reviewThreads: { status: "complete", unresolved: 1, resolved: 11, total: 12 },
+    });
+    appendV2GateSummary(summary, report, { prNumber: 34 });
+    const tail = readFileSync(summary, "utf8").trim().split("\n").at(-1);
+    assert.match(tail, /^Steps to unblock: First resolve all 1 unresolved/u);
+    assert.ok(tail.includes("dispatch reconcile against the exact current head on PR \\#34"));
+    assert.doesNotMatch(tail, /@codex|&#64;codex|canonical generation|request a new review/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI uses the actual contextual recovery instruction and redacts its final line", () => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    recoveryCode: "request_clean_generation",
+    reason: "The latest request is still awaiting a clean receipt",
+  });
+  const nextAction = "Wait for the latest eligible @codex review request for PR #34 to finish; reconcile only after its exact-head clean arrives.";
+  const lines = captureCliReport(report, { INPUT_PR_NUMBER: "34" }, nextAction);
+  assert.equal(lines.at(-1), `[codex-review-gate] Steps to unblock: ${nextAction}`);
+  assert.doesNotMatch(lines.at(-1), /create exactly one canonical generation/u);
+  const redacted = captureCliReport(report, { INPUT_GITHUB_TOKEN: "SECRET_TOKEN" },
+    "Repair permissions without exposing SECRET_TOKEN\n::error:: untrusted text");
+  assert.equal(redacted.length, 2);
+  assert.doesNotMatch(redacted.at(-1), /SECRET_TOKEN|\n/u);
+});
+
+function captureCliReport(report, environment, nextAction) {
+  const originalError = console.error;
+  const lines = [];
+  console.error = (line) => { lines.push(line); };
+  try {
+    writeV2GateCliReport(report, environment, nextAction);
+  } finally {
+    console.error = originalError;
+  }
+  return lines;
+}
 
 function yamlSection(text, startName, endName) {
   const start = text.indexOf(`${startName}:\n`);

@@ -648,7 +648,7 @@ test("review-thread permission failure keeps permission repair as the primary ac
   assert.equal(result.report.recoveryCode, "repair_permissions");
   assert.match(
     readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Next action: Repair the canonical workflow permissions or installation/u,
+    /Steps to unblock: Repair the canonical workflow permissions or installation/u,
   );
   assert.ok(github.calls.some(({ method, path, body }) =>
     method === "POST" && path === "/graphql" &&
@@ -682,7 +682,7 @@ test("review-thread inventory budget exhaustion keeps expanded limits as the pri
   assert.match(result.report.reason, /soft limit exceeded.*pull-request review threads/iu);
   assert.match(
     readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Next action: Rerun reconcile.*limits\\_profile=expanded.*Review-thread inventory is incomplete/isu,
+    /Steps to unblock: Rerun reconcile.*limits\\_profile=expanded.*Thread inventory is incomplete/isu,
   );
 
   const protectedBudgetGithub = createGitHubMock({
@@ -702,7 +702,7 @@ test("review-thread inventory budget exhaustion keeps expanded limits as the pri
   assert.equal(protectedBudget.result.report.recoveryCode, "raise_protected_limit");
   assert.match(
     readFileSync(protectedBudgetEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Next action: Review the evidence volume and raise the protected runtime limit before reconciling.*Review-thread inventory is incomplete/isu,
+    /Steps to unblock: Review the evidence volume and raise the protected runtime limit before reconciling.*Thread inventory is incomplete/isu,
   );
 });
 
@@ -4859,6 +4859,143 @@ test("a pre-run request's unclosed eyes activity does not block current-head cle
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("PR 34 User canonical request recovers only for its exact target and complete evidence", async (context) => {
+  const cutoff = "2026-10-09T15:45:43Z";
+  const oldRequests = [
+    [6081765588, OLD_HEAD, "2026-10-09T13:23:00Z", "2026-10-09T13:24:00Z"],
+    [6081984535, NEXT_HEAD, "2026-10-09T13:34:27Z", "2026-10-09T13:35:00Z"],
+    [6083244766, TEST_MERGE, "2026-10-09T14:46:18Z", "2026-10-09T14:47:00Z"],
+    [6083952919, "f".repeat(40), "2026-10-09T15:27:14Z", "2026-10-09T15:28:00Z"],
+  ].map(([id, headSha, created_at]) => ordinaryRequest({
+    id,
+    body: canonicalRequestBody(headSha, { runId: "37954193317" }),
+    created_at,
+    updated_at: created_at,
+    user: { login: "JoeyTeng-Codex", type: "User" },
+  }));
+  const currentRequest = ordinaryRequest({
+    id: 6084271279,
+    body: canonicalRequestBody(HEAD, { runId: "37954193317" }),
+    created_at: "2026-10-09T15:46:24Z",
+    updated_at: "2026-10-09T15:46:24Z",
+    user: { login: "JoeyTeng-Codex", type: "User" },
+  });
+  const clean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 6084355624,
+    created_at: "2026-10-09T15:51:34Z",
+    updated_at: "2026-10-09T15:51:34Z",
+  });
+  const oldEyes = new Map(oldRequests.map((request, index) => [
+    String(request.id),
+    [reaction({
+      id: 701 + index,
+      content: "eyes",
+      created_at: [
+        "2026-10-09T13:24:00Z",
+        "2026-10-09T13:35:00Z",
+        "2026-10-09T14:47:00Z",
+        "2026-10-09T15:28:00Z",
+      ][index],
+    })],
+  ]));
+  const makeGitHub = ({ reviewThreads = [], includeUnknownProvider = false, request = currentRequest } = {}) =>
+    createGitHubMock({
+      issueComments: [
+        ...oldRequests,
+        request,
+        ...(includeUnknownProvider
+          ? [opaqueProviderIssueComment({
+              id: 6084300000,
+              created_at: "2026-10-09T15:49:00Z",
+              updated_at: "2026-10-09T15:49:00Z",
+              performed_via_github_app: { slug: "unknown-provider-app" },
+            })]
+          : []),
+        clean,
+      ],
+      reactionsByCommentId: oldEyes,
+      reviewThreads,
+      selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
+    });
+  const environmentFor = (suffix) => runtimeEnvironment(context, {
+    suffix: `pr34-user-canonical-${suffix}`,
+  });
+
+  const blockedGitHub = makeGitHub({
+    reviewThreads: [reviewThread({ id: "PRRT_pr34_unresolved", isResolved: false })],
+  });
+  const blockedEnvironment = environmentFor("unresolved-thread");
+  const blocked = await runGate(blockedEnvironment, blockedGitHub);
+  assert.equal(blocked.result.report.executionHealth, "healthy");
+  assert.equal(blocked.result.report.gateOutcome, "pending");
+  assert.equal(blocked.result.report.recoveryCode, "wait_then_reconcile");
+  assert.deepEqual(blocked.result.report.counts, {
+    unresolved: 0,
+    resolved: 0,
+    historical: 0,
+    indeterminate: 0,
+  });
+  assert.deepEqual(
+    [
+      blocked.result.report.reviewThreads.status,
+      blocked.result.report.reviewThreads.unresolved,
+      blocked.result.report.reviewThreads.resolved,
+      blocked.result.report.reviewThreads.total,
+    ],
+    ["complete", 1, 0, 1],
+  );
+  assert.match(
+    blocked.result.nextAction,
+    /^First resolve all 1 unresolved pull-request review thread.*then dispatch reconcile against the exact current head/u,
+  );
+  const blockedSummary = readFileSync(blockedEnvironment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(
+    blockedSummary,
+    /Steps to unblock: First resolve all 1 unresolved pull-request review thread.*then dispatch reconcile against the exact current head/u,
+  );
+  assert.equal(blockedSummary.trimEnd().split("\n").at(-1).startsWith("Steps to unblock: "), true);
+
+  const resolvedGitHub = makeGitHub({
+    reviewThreads: [reviewThread({ id: "PRRT_pr34_resolved", isResolved: true })],
+  });
+  const resolvedEnvironment = environmentFor("resolved-thread");
+  const resolved = await runGate(resolvedEnvironment, resolvedGitHub);
+  assert.equal(resolved.result.exitCode, 0, resolved.result.report.reason);
+  assert.equal(resolved.result.report.gateOutcome, "success", resolved.result.report.reason);
+  assert.equal(resolved.result.report.recoveryCode, "none");
+  assert.equal(resolved.result.nextAction, "No recovery action is required.");
+  assert.deepEqual(
+    [
+      resolved.result.report.reviewThreads.status,
+      resolved.result.report.reviewThreads.unresolved,
+      resolved.result.report.reviewThreads.resolved,
+      resolved.result.report.reviewThreads.total,
+    ],
+    ["complete", 0, 1, 1],
+  );
+  assert.equal(resolved.result.report.requiresReplacementPr, false);
+
+  const uncertainGitHub = makeGitHub({ includeUnknownProvider: true });
+  const uncertain = await runGate(environmentFor("unknown-provider"), uncertainGitHub);
+  assert.notEqual(uncertain.result.report.gateOutcome, "success");
+  assert.equal(uncertain.result.report.recoveryCode, "request_clean_generation");
+  assert.match(uncertain.result.report.reason, /invalid or incomplete/u);
+  assert.match(uncertain.result.nextAction, /observed historical lineage cannot be closed safely/u);
+
+  const wrongBaseRequest = ordinaryRequest({
+    ...currentRequest,
+    body: canonicalRequestBody(HEAD, {
+      runId: "37954193317",
+      baseSha: OLD_HEAD,
+    }),
+  });
+  const wrongBinding = await runGate(
+    environmentFor("wrong-base-binding"),
+    makeGitHub({ request: wrongBaseRequest }),
+  );
+  assert.notEqual(wrongBinding.result.report.gateOutcome, "success");
+});
+
 test("old official request reactions may churn between stable snapshots after head attestation", async (context) => {
   const oldRequest = ordinaryRequest({
     id: 512,
@@ -5453,8 +5590,10 @@ test("unresolved threads stay additive unless Codex evidence otherwise qualifies
     assert.equal(result.report.recoveryCode, scenario.expectedRecovery, scenario.suffix);
     assert.match(result.report.reason, scenario.expectedReason, scenario.suffix);
     const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
-    assert.match(summary, /Also resolve all 1 unresolved pull-request review thread/u);
-    assert.match(summary, /then reconcile the exact current head/u);
+    assert.match(
+      summary,
+      /Steps to unblock: First resolve all 1 unresolved pull-request review thread.*; then /u,
+    );
   }
 
   const qualifyingGitHub = createGitHubMock({
@@ -5471,7 +5610,7 @@ test("unresolved threads stay additive unless Codex evidence otherwise qualifies
   assert.match(qualifying.report.reason, /GitHub reports 1 unresolved pull-request review thread/u);
   assert.match(
     readFileSync(qualifyingEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Resolve all 1 unresolved pull-request review thread.*dispatch reconcile/u,
+    /Steps to unblock: First resolve all 1 unresolved pull-request review thread.*then dispatch reconcile against the exact current head/u,
   );
 });
 
@@ -13859,8 +13998,12 @@ test("direct Action CLI redacts configured token and Bearer values from its repo
     assert.equal(child.status, 1, child.stderr);
     const reports = child.stderr
       .split("\n")
-      .filter((line) => line.startsWith("[codex-review-gate] "));
+      .filter((line) => line.startsWith("[codex-review-gate] {"));
     assert.equal(reports.length, 1, child.stderr);
+    const steps = child.stderr
+      .split("\n")
+      .find((line) => line.startsWith("[codex-review-gate] Steps to unblock: "));
+    assert.equal(steps, "[codex-review-gate] Steps to unblock: Move the PR to a supported v2 target shape before retrying.");
     const report = JSON.parse(reports[0].slice("[codex-review-gate] ".length));
     assert.deepEqual(report, {
       execution_health: "unhealthy",
@@ -13872,6 +14015,13 @@ test("direct Action CLI redacts configured token and Bearer values from its repo
         resolved: "unknown",
         historical: "unknown",
         indeterminate: "unknown",
+      },
+      review_threads: {
+        unresolved: "unknown",
+        resolved: "unknown",
+        total: "unknown",
+        status: "not_read",
+        diagnostics: [],
       },
       reason: "Unsupported v2 runtime event: invalid-token=[REDACTED] Bearer [REDACTED]",
       carrier_diagnostics: [],
