@@ -346,6 +346,21 @@ provider carriers 必须绑定 exact bot identity。相似 name、复制的文�
 claim 都没有 authority。finding severity label 不影响 blocking：任何符合条件的
 finding 都会阻塞。
 
+已观察到的官方 service-failure issue comment（provider 执行失败的普通 PR 评论）是单独的
+non-clean carrier，不是 finding，也不是 positive review result。其 closed grammar 只接受
+固定的 `Something went wrong` retry heading、一段 fenced `Unknown error` detail，以及
+必须携带符合既有规则的 official disclosure。仍需正常的 Bot/App identity、canonical
+server-time、未编辑 carrier、exact refetch 与稳定 snapshot。额外正文、finding content、未知
+链接或失败格式、edited carrier，以及不正确的 provenance 都继续 fail closed。
+
+只有当已知 service failure 严格早于符合条件的 current-head request `R`，且之后存在可信的
+current-head clean `C`，并满足下文同一套 current-head witness 规则时，该 failure 才不再阻塞。
+顺序必须是 `failure < R < C`；failure 本身绝不能提供 clean authority 或结清 request。
+没有这样的后续 witness，或 failure 出现在所选 clean 当时或之后，均不能 pass。这一窄例外的
+原因是：更早的 provider 执行失败不应在后续审查成功后变成永久的 malformed-finding lock。
+它不忽略未知 malformed evidence、provider findings 或 unresolved threads，也不增加自动
+review request 或恢复 write。
+
 GitHub REST 对 `PENDING` pull-request review 可能完全省略 `submitted_at`。这种 shape
 仍会进入 identity、exact-refetch 和 snapshot-stability observation，但它是尚未提交的
 draft，其 body 不会被 reducer 变成 provider finding 或 clean evidence。但它的存在本身是
@@ -448,7 +463,8 @@ authority；后续 clean 仍须独立满足上文的 trusted、未编辑、精�
 request 的归因缺口，包括由更早、针对不同 head 的 request 留下的缺口；也不要求每个旧 request
 必须由自己的后续 `+1` 结清。历史不会被删除或标为已完成。`C` 之前有效的非终态 provider
 activity 并不能证明旧 flight 必须先完成；`C` 当时或之后的相关 activity，以及更新的 physical
-request boundary，仍会阻塞。恢复不清除 findings 或 provider errors，也不豁免 unknown、edited、
+request boundary，仍会阻塞。恢复不清除 findings 或未知 provider errors；只有上文明确识别且更早的
+service-failure carrier 允许被后续 witness 取代。仍不豁免 unknown、edited、
 deleted、forged、scope-drifted 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮
 稳定 snapshot。新的 verifier run ID 使用自己的 cutoff，不继承旧 witness。
 

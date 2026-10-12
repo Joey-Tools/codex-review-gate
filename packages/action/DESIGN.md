@@ -410,6 +410,25 @@ Provider carriers must bind exact bot identity. Similar names, copied text or
 user-authored claims have no authority. A finding's severity label does not
 affect blocking: any qualifying finding blocks.
 
+An observed official service-failure issue comment is a separate non-clean
+carrier, not a finding or a positive review result. Its closed grammar is the
+exact `Something went wrong` retry heading, one fenced `Unknown error` detail,
+and the required, already-admitted official disclosure. It retains the
+normal Bot/App identity, canonical server-time, unedited-carrier, exact-refetch
+and stability requirements. Extra prose, finding content, unknown links or
+failure formats, edited carriers and invalid provenance remain fail-closed.
+
+A known service failure ceases blocking only when it is strictly older than
+an eligible current-head request `R` followed by a trusted current-head clean
+`C`, using the same current-head witness rules below. The order is
+`failure < R < C`; the failure itself never supplies clean authority or closes
+a request. Without that later qualifying witness, or when the failure occurs
+at or after the selected clean, it remains non-passing. This narrow exception
+exists because an earlier provider execution failure must not become a
+permanent malformed-finding lock after a later review succeeds. It does not
+suppress unknown malformed evidence, provider findings or unresolved threads,
+and it does not add automatic review requests or recovery mutations.
+
 GitHub REST may omit `submitted_at` entirely for a `PENDING` pull-request
 review. It remains in identity, exact-refetch, and snapshot-stability
 observation, but it is an unsubmitted draft and its body is not reduced into
@@ -544,7 +563,8 @@ request to acquire its own closing `+1`. This does not delete the history or
 label those requests completed. Valid nonterminal provider activity before
 `C` does not prove that an older flight must finish first; relevant activity at
 or after `C`, or a newer request boundary, remains blocking. The recovery does
-not clear findings or provider errors and does not waive unknown, edited,
+not clear findings or unknown provider errors. Only the explicitly recognised
+older service-failure carrier above may be superseded; this does not waive unknown, edited,
 deleted, forged, scope-drifted or ambiguous evidence. It requires complete
 inventory, exact refetches and two stable snapshots. A new verifier run ID has
 a new cutoff and cannot inherit the witness.

@@ -4834,6 +4834,174 @@ test("a new-head top-level clean recovers across multiple pre-run boundaries and
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
+test("a known prior service failure is cleared only by the latest current-head recovery witness", async (context) => {
+  const failureBody = [
+    "Codex Review: Something went wrong. Try again later by commenting “@codex review”.",
+    "",
+    "```",
+    "Unknown error",
+    "```",
+    "",
+    ...officialCodexAboutFooter(),
+  ].join("\n");
+  const failure = (overrides = {}) => ({
+    id: 6123667182,
+    body: failureBody,
+    created_at: "2026-10-12T11:49:22Z",
+    updated_at: "2026-10-12T11:49:22Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-6123667182`,
+    user: CODEX_BOT,
+    performed_via_github_app: CODEX_APP,
+    ...overrides,
+  });
+  const canonicalUserRequest = workflowRequest({
+    id: 6124541735,
+    body: canonicalRequestBody(HEAD, { runId: "123" }),
+    created_at: "2026-10-12T12:46:17Z",
+    updated_at: "2026-10-12T12:46:17Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-6124541735`,
+    user: HUMAN,
+  });
+  const canonicalClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 6124608925,
+    created_at: "2026-10-12T12:50:25Z",
+    updated_at: "2026-10-12T12:50:25Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-6124608925`,
+  });
+  const laterPlainRequest = ordinaryRequest({
+    id: 6124754828,
+    created_at: "2026-10-12T12:59:17Z",
+    updated_at: "2026-10-12T12:59:17Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-6124754828`,
+  });
+  const latestClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 6124820433,
+    created_at: "2026-10-12T13:03:15Z",
+    updated_at: "2026-10-12T13:03:15Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-6124820433`,
+  });
+  const recoveryComments = [
+    ordinaryRequest(),
+    cleanIssueComment(HEAD),
+    failure(),
+    canonicalUserRequest,
+    canonicalClean,
+    laterPlainRequest,
+    latestClean,
+  ];
+  const github = createGitHubMock({
+    issueComments: recoveryComments,
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-10-12T12:45:30Z" }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "provider-failure-observed-pr100-recovery",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(result.report.counts.indeterminate, 0);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+
+  const unresolvedThreadGitHub = createGitHubMock({
+    issueComments: recoveryComments,
+    reviewThreads: [reviewThread({
+      id: "PRRT_known_failure_unresolved_old_thread",
+      isResolved: false,
+      isOutdated: true,
+    })],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-10-12T12:45:30Z" }),
+  });
+  const threadEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-failure-recovery-preserves-unresolved-threads",
+  });
+  const { result: threadBlocked } = await runGate(threadEnvironment, unresolvedThreadGitHub);
+  assert.equal(threadBlocked.report.gateOutcome, "pending");
+  assert.equal(threadBlocked.report.reviewThreads.unresolved, 1);
+  assert.equal(threadBlocked.report.counts.indeterminate, 0);
+  assert.match(threadBlocked.report.reason, /unresolved pull-request review thread/u);
+  assert.deepEqual(unresolvedThreadGitHub.statusWrites, []);
+
+  const unresolvedFindingGitHub = createGitHubMock({
+    issueComments: recoveryComments.concat(findingIssueComment(HEAD, {
+      id: 6124700000,
+      created_at: "2026-10-12T12:55:00Z",
+      updated_at: "2026-10-12T12:55:00Z",
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-6124700000`,
+    })),
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-10-12T12:45:30Z" }),
+  });
+  const findingEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-failure-recovery-preserves-unresolved-finding",
+  });
+  const { result: findingBlocked } = await runGate(findingEnvironment, unresolvedFindingGitHub);
+  assert.equal(findingBlocked.report.gateOutcome, "failure");
+  assert.equal(findingBlocked.report.recoveryCode, "fix_findings");
+  assert.equal(findingBlocked.report.counts.unresolved, 1);
+  assert.equal(findingBlocked.report.counts.indeterminate, 0);
+  assert.deepEqual(unresolvedFindingGitHub.statusWrites, []);
+
+  const noRecovery = createGitHubMock({
+    issueComments: [
+      ordinaryRequest(),
+      cleanIssueComment(HEAD),
+      failure({ created_at: "2026-10-12T12:44:00Z", updated_at: "2026-10-12T12:44:00Z" }),
+    ],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-10-12T12:45:30Z" }),
+  });
+  const noRecoveryEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-failure-needs-new-generation",
+  });
+  const { result: blocked } = await runGate(noRecoveryEnvironment, noRecovery);
+  assert.equal(blocked.report.gateOutcome, "pending");
+  assert.equal(blocked.report.recoveryCode, "request_clean_generation");
+  assert.equal(blocked.report.counts.indeterminate, 1);
+  assert.match(blocked.report.reason, /service failure/iu);
+  assert.match(
+    readFileSync(noRecoveryEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
+    /Post one fresh eligible, unedited.*trusted unedited top-level Codex terminal clean.*exact current PR head; reconcile only after it arrives/u,
+  );
+
+  const nonRecoveringCases = [
+    ["failure-after-latest-clean", recoveryComments.concat(failure({
+      id: 6124900000,
+      created_at: "2026-10-12T13:04:00Z",
+      updated_at: "2026-10-12T13:04:00Z",
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-6124900000`,
+    }))],
+    ["edited-failure", recoveryComments.map((comment) =>
+      String(comment.id) === "6123667182"
+        ? failure({ updated_at: "2026-10-12T11:50:00Z" })
+        : comment
+    )],
+    ["unknown-error-prose", recoveryComments.map((comment) =>
+      String(comment.id) === "6123667182"
+        ? failure({ body: failureBody.replace("Unknown error", "Unknown error: 503") })
+        : comment
+    )],
+    ["wrong-app", recoveryComments.map((comment) =>
+      String(comment.id) === "6123667182"
+        ? failure({ performed_via_github_app: { slug: "wrong-app" } })
+        : comment
+    )],
+  ];
+  for (const [suffix, issueComments] of nonRecoveringCases) {
+    const githubCase = createGitHubMock({
+      issueComments,
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-10-12T12:45:30Z" }),
+    });
+    const environmentCase = runtimeEnvironment(context, {
+      suffix: `provider-failure-${suffix}`,
+    });
+    const { result: blockedCase } = await runGate(environmentCase, githubCase);
+    assert.notEqual(blockedCase.report.gateOutcome, "success", suffix);
+    assert.equal(blockedCase.report.counts.indeterminate > 0, true, suffix);
+    assert.equal(githubCase.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
 test("a pre-run request's unclosed eyes activity does not block current-head clean recovery", async (context) => {
   const oldRequest = ordinaryRequest({
     id: 511,
