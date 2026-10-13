@@ -2714,6 +2714,10 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   assert.match(workflow, /RELEASE_TARGET_ASKPASS: \$\{\{ runner\.temp \}\}\/release-target-askpass/u);
   assert.doesNotMatch(workflow, /gh api installation\s*>/u);
   const publishJob = workflowJobBlock(workflow, "publish");
+  const certificateValidationStep = workflowStepBlock(
+    publishJob,
+    "Validate live release signing certificate before minting credentials",
+  );
   const workflowTransitionStep = workflowStepBlock(
     publishJob,
     "Determine frozen target workflow-transition permission",
@@ -2745,6 +2749,33 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   const reconcileStep = workflowStepBlock(publishJob, "Reconcile release publication");
   const cleanupStep = workflowStepBlock(publishJob, "Remove ephemeral local credentials");
   const recoveryStep = workflowStepBlock(publishJob, "Explain publication recovery");
+
+  assert.match(workflow, /^permissions:\n  actions: read\n  contents: read$/mu);
+  assert.match(
+    certificateValidationStep,
+    /^      - name: Validate live release signing certificate before minting credentials\n        env:\n          GITHUB_TOKEN: \$\{\{ github\.token \}\}\n        run: \|$/mu,
+  );
+  assert.match(certificateValidationStep, /--header "Authorization: Bearer \$GITHUB_TOKEN"/u);
+  assert.match(
+    certificateValidationStep,
+    /'https:\/\/api\.github\.com\/users\/JoeyTeng-Codex\/gpg_keys'/u,
+  );
+  assert.match(
+    certificateValidationStep,
+    /--proto '=https'[\s\S]*--tlsv1\.2[\s\S]*--retry 3[\s\S]*--retry-all-errors/u,
+  );
+  assert.doesNotMatch(
+    certificateValidationStep,
+    /--location\b|(?:^|\s)-L(?:\s|$)|\b(?:PUBLISHER_TOKEN|INVENTORY_INSTALLATION_TOKEN|SCOPED_INSTALLATION_TOKEN|RELEASE_PUBLISHER_APP_PRIVATE_KEY)\b/u,
+  );
+  assert.match(
+    certificateValidationStep,
+    /verify-github-signing-key[\s\S]*--input "\$github_keys"[\s\S]*--output-public-key "\$current_public_key"/u,
+  );
+  assert.ok(
+    workflow.indexOf("Validate live release signing certificate before minting credentials") <
+      workflow.indexOf("Create inventory-only Publisher App token"),
+  );
 
   assert.match(workflowTransitionStep, /id: publisher-workflow-transition/u);
   assert.match(workflowTransitionStep, /candidate_json="\$RUNNER_TEMP\/release-candidate\/candidate\.json"/u);
@@ -2883,6 +2914,7 @@ test("workflow and publisher expose the adopted staged ABI and scoped credential
   // The secret-bearing steps do not reference workflow output, environment, or
   // summary sinks at all. This catches both direct and local-variable writes.
   const secretBearingPublisherSteps = [
+    certificateValidationStep,
     inventoryTokenStep,
     identityStep,
     scopedTokenStep,

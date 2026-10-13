@@ -64,16 +64,48 @@ superseded_by:
   optional-token coverage). `git diff --check` and project-journal validation
   passed. Exact committed-head planning/candidate comparison is a later
   validation gate and is not self-asserted by this journal commit.
-- This release intent does not assert that v2.2.2 has been published or
-  installed. The protected publisher has not run for this intent, and native
-  consumer verification remains pending.
+- The release intent landed in source PR
+  [#118](https://github.com/Joey-Tools/codex-review-gate/pull/118) as
+  `45c5b37c66c99d1e6058df0b3f3648302f98937b`. The original protected master-push
+  publisher run `38404550587`, attempt 1, completed all 14 unprivileged jobs,
+  then failed after human approval at the live signing-certificate read.
+- That fixed public API request was anonymous and returned HTTP 403 through
+  all four curl attempts. The log did not retain response headers or body, so
+  the exact rejection cause is unproved; rate limiting must not be reported
+  as established fact. App token minting, signing-key import, and publication
+  were skipped. Target master remained
+  `1c15f87ace478865d965a1864743e5f0625e1a9b`; no v2.2.2 matching tag or Release
+  existed in the subsequent authenticated reads.
+- A separate publisher-control repair authenticates only that fixed public
+  certificate GET with the existing read-only job token. The user-GPG endpoint
+  supports App installation tokens without additional permissions. The
+  expected signing identity, certificate validation, token-minting order,
+  approval boundary, release manifest, and complete action payload remain
+  unchanged. This repairs transport, not an observed App-key or GPG-signature
+  failure.
+- Neither source merging nor the control repair asserts that v2.2.2 is
+  published or installed; production publication and native consumer
+  verification remain pending.
+- For the controls-only transport repair, Node `v24.15.0` `npm run check`,
+  the focused staged-workflow regression, the pinned-certificate regression,
+  all 43 workflow-security-contract tests, extracted-step `bash -n` and
+  `shellcheck`, journal validation, and `git diff --check` passed. The new
+  workflow assertion failed without step-local authentication before passing
+  with it. An independent authenticated public-inventory read also passed
+  the unchanged cryptographic certificate validator. No runtime private key
+  was imported and none of these local results asserts production success.
 
 ## Next Steps
 
-- Carry this exact release intent through the reviewed source-master path.
-- After the committed intent is admitted by the staged publisher, complete its
-  human-approved publish stage and verify the immutable v2.2.2 tag, Release,
-  assets, provenance, and floating `v2` alias.
+- Recover this original intent with `source_sha=45c5b37c66c99d1e6058df0b3f3648302f98937b`,
+  `admission_run_id=38404550587`, and `admission_run_attempt=1`, after the
+  independent publisher-control repair reaches protected source master.
+  Authenticate the original persisted admission artifact; execute current
+  master controls and rematerialize the publication plan and candidates.
+  Do not rewrite the manifest baseline, mint a new release intent, rerun stale
+  executable controls, or supply an existing-draft selector without a draft.
+- Complete the recovery attempt's fresh human Environment approval and verify
+  the immutable v2.2.2 tag, Release, assets, provenance, and floating `v2` alias.
 - Reconcile BBDown-rust #100 on its then-current frozen scope and inspect the
   native verifier result; do not infer a consumer pass from local tests,
   controller success, or publisher success alone.
@@ -84,3 +116,5 @@ superseded_by:
   contains the reviewed and landed provider-failure recovery change.
 - [Known provider-failure recovery workstream](2026-10-12-known-provider-failure-recovery.md).
 - [Release contract and protected publication flow](../../../RELEASING.md).
+- [Original v2.2.2 publisher run](https://github.com/Joey-Tools/codex-review-gate/actions/runs/38404550587).
+- [GitHub user GPG-key endpoint](https://docs.github.com/en/rest/users/gpg-keys#list-gpg-keys-for-a-user).

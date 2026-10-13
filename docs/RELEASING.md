@@ -350,6 +350,29 @@ publication fence. A persistent GitHub verification result on an existing
 commit or tag proves that object's signature state; it does not substitute for
 proof that the pinned signer is still present in the current account inventory.
 
+Before any Publisher App token is minted, the publish workflow reads the live
+certificate from the fixed public-user endpoint
+[`GET /users/{username}/gpg_keys`](https://docs.github.com/en/rest/users/gpg-keys?apiVersion=2022-11-28#list-gpg-keys-for-a-user)
+using the workflow's existing read-only `github.token`. That token is exposed
+as `GITHUB_TOKEN` only in this certificate-validation step; workflow
+permissions remain `actions: read` and `contents: read`, with no write
+permission. GitHub's endpoint accepts installation access tokens and requires
+no additional permission. This is not the Publisher App inventory or
+target-scoped token. The fixed HTTPS request retains TLS 1.2, no redirect
+following, and bounded retries, then validates the returned certificate
+against the pinned primary and signing-subkey fingerprints before App-token
+minting, signing-key import, or any target write.
+
+Publisher run `38404550587` (2026-10-13) exhausted four attempts on the prior
+anonymous request and received HTTP 403. The run retained neither response
+headers nor body, so the exact 403 cause is unknown; it failed before App-token
+minting, signing-key import, or target writes. Treat this as a certificate-read
+transport failure, not proof that the pinned signer changed or that publication
+partially occurred. Keep certificate validation before privileged credentials
+and use the existing admission and reconcile gates when retrying the exact
+release intent; do not relax the signer pin, expand App permissions, or move
+the check past the write boundary.
+
 The explicit `--test-enforce-live-signer-policy` seam is test-only and doubly
 environment-gated: both
 `CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY=1` and `NODE_ENV=test` must be
