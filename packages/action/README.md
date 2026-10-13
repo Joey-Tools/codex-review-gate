@@ -753,6 +753,18 @@ them in a separate `review_threads` field; it is not an Action output. Neither
 summary replaces the independent branch-protection conversation-resolution
 requirement.
 
+When the review-thread inventory is complete and has unresolved threads, the
+Actions Summary adds an `Unresolved review threads` section with verified unresolved and total
+counts plus at most the already-collected first five path, first-comment, and
+outdated hints; shown and omitted hint counts make the cap explicit. These
+bounded hints are not the full thread inventory. For healthy `failure` or
+`pending` results, the displayed reason foregrounds the unresolved-thread count
+and includes any known unresolved non-inline finding count, while an
+`Evaluator reason` line preserves the evaluator's original explanation.
+Unknown/incomplete inventories and diagnostic-only observations do not render
+their thread hints as current verified blockers. This is presentation only and
+uses already-collected evidence without another GitHub API read.
+
 For a blocking verifier result, the Actions Summary ends with a dedicated
 `Steps to unblock: ...` line. CLI output prints the same final line after its
 JSON diagnostic record. Detailed bounded evidence remains in the preceding
@@ -769,6 +781,17 @@ or read issue and rerun the safe verifier action (such as protected
 `reconcile` for the exact current head). Counts are trusted only after two
 complete stable snapshots. The job does not perform the suggested repair or
 reconciliation automatically.
+
+The Summary links to the current Actions run and provides a jump to `Steps to
+unblock`. When the canonical native `codex/github-review-gate` verifier
+already exits nonzero, it also emits one fixed GitHub Actions error
+annotation linking to that run and directing the operator to its Summary. The
+annotation contains no finding or provider prose. These links use the existing
+repository, run ID, and server URL; invalid or mismatched navigation metadata
+suppresses navigation without changing the verdict. This does not modify the
+GitHub-managed PR check row or its Details URL, grant `checks: write`, or add
+API reads. Success, controller or diagnostic-only results, and local CLI
+invocations do not emit the annotation.
 
 See [DESIGN.md](DESIGN.md) for the authority and consistency model and
 [COOKBOOK.md](COOKBOOK.md) for recovery procedures.

@@ -28,6 +28,7 @@ import {
   buildV2ReactionCleanArtifacts,
   buildV2StickyCommentBody,
   canonicalV2RequestComments,
+  emitV2VerifierNavigationAnnotation,
   normalizeV2LimitsProfile,
   normalizeV2Operation,
   normalizeV2RequestReview,
@@ -264,6 +265,11 @@ test("unresolved outdated and human-authored review threads remain blocking", as
   assert.equal(result.report.executionHealth, "healthy");
   assert.notEqual(result.report.gateOutcome, "success");
   assert.equal(result.report.reviewThreads.unresolved, 2);
+  const reviewThreadReads = github.calls.filter(({ method, path, body }) =>
+    method === "POST" && path === "/graphql" &&
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  );
+  assert.equal(reviewThreadReads.length, 2, "summary formatting must not add GraphQL reads");
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -13930,6 +13936,403 @@ test("review-thread paths use code-span delimiters beyond embedded backticks", (
       );
     }
   }
+});
+
+test("summary foregrounds known unresolved threads over an unrelated healthy pending reason", (context) => {
+  const evaluatorReason = "Codex evidence lineage is incomplete; one finding is indeterminate.";
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: evaluatorReason,
+    recoveryCode: "request_clean_generation",
+    findingsIndeterminate: 1,
+    reviewThreads: {
+      status: "complete",
+      unresolved: 3,
+      resolved: 1,
+      total: 4,
+      diagnostics: [
+        { path: "src/one.mjs", isOutdated: false, url: null },
+        { path: "src/two.mjs", isOutdated: true, url: null },
+        { path: "src/three.mjs", isOutdated: false, url: null },
+      ],
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-unresolved-primary" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(summary, /- Reason: 3 unresolved pull-request review threads remain\./u);
+  assert.match(
+    summary,
+    /- Evaluator reason: Codex evidence lineage is incomplete; one finding is indeterminate\./u,
+  );
+  assert.match(summary, /### Unresolved review threads/u);
+  assert.match(summary, /Verified inventory: \*\*3 unresolved, 4 total\*\*/u);
+  assert.match(summary, /Thread details: showing \*\*3 of 3\*\*; \*\*0 omitted\*\*/u);
+  assert.match(summary, /- Findings: 0 unresolved, 0 resolved, 0 historical, 1 indeterminate/u);
+  assert.equal(report.reason, evaluatorReason, "the presentation must not mutate report.reason");
+  assert.equal(summary.trimEnd().split("\n").at(-1).startsWith("Steps to unblock: "), true);
+});
+
+test("summary uses singular wording for one unresolved review thread", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "Codex evidence lineage is incomplete.",
+    recoveryCode: "request_clean_generation",
+    reviewThreads: {
+      status: "complete",
+      unresolved: 1,
+      resolved: 0,
+      total: 1,
+      diagnostics: [{ path: "src/one.mjs", isOutdated: false, url: null }],
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-single-unresolved-thread" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(summary, /- Reason: 1 unresolved pull-request review thread remains\./u);
+});
+
+test("summary foregrounds known findings with unresolved threads and preserves the evaluator reason", (context) => {
+  const evaluatorReason = "The evaluator found an unresolved non-inline finding.";
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "failure",
+    reason: evaluatorReason,
+    recoveryCode: "fix_findings",
+    findingsUnresolved: 2,
+    reviewThreads: {
+      status: "complete",
+      unresolved: 3,
+      resolved: 0,
+      total: 3,
+      diagnostics: [
+        { path: "src/finding-thread-1.mjs", isOutdated: false, url: null },
+        { path: "src/finding-thread-2.mjs", isOutdated: false, url: null },
+        { path: "src/finding-thread-3.mjs", isOutdated: false, url: null },
+      ],
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-finding-and-thread-counts" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(
+    summary,
+    /- Reason: 2 unresolved non-inline findings and 3 unresolved pull-request review threads remain\./u,
+  );
+  assert.match(summary, /- Evaluator reason: The evaluator found an unresolved non-inline finding\./u);
+  assert.match(summary, /Thread details: showing \*\*3 of 3\*\*; \*\*0 omitted\*\*/u);
+});
+
+test("unhealthy summary keeps an infrastructure reason primary despite complete thread evidence", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "unhealthy",
+    gateOutcome: "pending",
+    reason: "GitHub review evidence did not stabilize across two snapshots.",
+    recoveryCode: "wait_then_reconcile",
+    reviewThreads: {
+      status: "complete",
+      unresolved: 3,
+      resolved: 0,
+      total: 3,
+      diagnostics: [],
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-unhealthy-thread-reason" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(
+    summary,
+    /- Reason: GitHub review evidence did not stabilize across two snapshots\./u,
+  );
+  assert.doesNotMatch(summary, /- Reason: 3 unresolved|Evaluator reason:/u);
+});
+
+test("summary labels the unresolved thread section and reports capped Markdown-safe hints", (context) => {
+  const path = "src/`[active](https://attacker.example)<script>.mjs";
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "Review threads remain unresolved.",
+    recoveryCode: "wait_then_reconcile",
+    reviewThreads: {
+      status: "complete",
+      unresolved: 7,
+      resolved: 2,
+      total: 9,
+      diagnostics: Array.from({ length: 7 }, (_, index) => ({
+        path: index === 0 ? path : `src/thread-${index + 1}.mjs`,
+        isOutdated: index === 0,
+        url: index === 0
+          ? `https://github.com/${REPOSITORY}/pull/${PR}#discussion_first`
+          : null,
+      })),
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-thread-hint-cap" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(summary, /### Unresolved review threads/u);
+  assert.match(summary, /Verified inventory: \*\*7 unresolved, 9 total\*\*/u);
+  assert.match(summary, /Thread details: showing \*\*5 of 7\*\*; \*\*2 omitted\*\*/u);
+  assert.match(summary, /\(outdated\) \(\[first comment\]\(<https:\/\/github\.com\/owner\/repo\/pull\/17#discussion_first>\)\)/u);
+  const longestRun = Math.max(0, ...[...path.matchAll(/`+/gu)].map(([run]) => run.length));
+  const delimiter = "`".repeat(longestRun + 1);
+  assert.ok(summary.includes(`${delimiter} ${path} ${delimiter}`));
+  assert.equal(summary.includes("src/thread-6.mjs"), false, "hints stay capped at five");
+  assert.equal(summary.trimEnd().split("\n").at(-1).startsWith("Steps to unblock: "), true);
+});
+
+test("summary omits thread blockers and stale details for a complete all-resolved inventory", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "success",
+    reason: "No findings or unresolved review threads.",
+    recoveryCode: "none",
+    reviewThreads: {
+      status: "complete",
+      unresolved: 0,
+      resolved: 2,
+      total: 2,
+      diagnostics: [{ path: "stale/old.md", isOutdated: true, url: null }],
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-all-threads-resolved" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(summary, /Review threads: 0 unresolved, 2 resolved, 2 total/u);
+  assert.doesNotMatch(summary, /### Unresolved review threads|stale\/old\.md/u);
+});
+
+test("summary omits stale thread hints whenever the inventory is unknown or incomplete", (context) => {
+  for (const status of ["not_read", "incomplete"]) {
+    const report = buildV2GateReport({
+      executionHealth: "healthy",
+      gateOutcome: "pending",
+      reason: "Review-thread inventory is unavailable.",
+      recoveryCode: "wait_then_reconcile",
+      reviewThreads: {
+        status,
+        unresolved: status === "incomplete" ? 1 : "unknown",
+        resolved: status === "incomplete" ? 0 : "unknown",
+        total: status === "incomplete" ? 1 : "unknown",
+        diagnostics: [{
+          path: `stale/${status}.md`,
+          isOutdated: false,
+          url: `https://github.com/${REPOSITORY}/pull/${PR}#stale_${status}`,
+        }],
+      },
+    });
+    const environment = runtimeEnvironment(context, { suffix: `summary-${status}-threads` });
+    appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+      prNumber: PR,
+      headSha: HEAD,
+    });
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+    assert.match(summary, /Review threads: unknown unresolved, unknown resolved, unknown total/u);
+    assert.doesNotMatch(summary, /### Unresolved review threads|stale\//u);
+  }
+});
+
+test("diagnostic-only summary does not promote observed unresolved threads to current blockers", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "Diagnostic observation from an earlier verifier run.",
+    recoveryCode: "wait_provider",
+    reviewThreads: {
+      status: "complete",
+      unresolved: 3,
+      resolved: 0,
+      total: 3,
+      diagnostics: [{ path: "stale/current-looking.md", isOutdated: false, url: null }],
+    },
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-diagnostic-only-threads" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+    diagnosticObservation: true,
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(summary, /diagnostic-only snapshot, not the current gating result/u);
+  assert.doesNotMatch(summary, /Reason: 3 unresolved|Evaluator reason:|Review threads:|### Unresolved review threads|stale\/current-looking\.md/u);
+  assert.match(summary, /Steps to unblock: This verifier observation is a diagnostic snapshot/u);
+});
+
+test("summary links navigate to the current run and Steps to unblock section", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "A current-head review clean is required.",
+    recoveryCode: "request_clean_generation",
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-current-run-navigation" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+    runUrl: `https://github.com/${REPOSITORY}/actions/runs/123`,
+    serverUrl: "https://github.com",
+    repository: REPOSITORY,
+    runId: "123",
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(
+    summary,
+    /^## Codex GitHub Review Gate\n\n- Current run: \[Open Actions Summary\]\(<https:\/\/github\.com\/owner\/repo\/actions\/runs\/123>\)\n- \[Jump to Steps to unblock\]\(#steps-to-unblock\)/u,
+  );
+  assert.match(summary, /### Steps to unblock\n\nSteps to unblock: /u);
+  assert.equal(summary.trimEnd().split("\n").at(-1).startsWith("Steps to unblock: "), true);
+});
+
+test("summary navigation refuses URLs with controls, query, fragment, or mismatched run identity", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "A current-head review clean is required.",
+    recoveryCode: "request_clean_generation",
+  });
+  const invalidUrls = [
+    `https://github.com/${REPOSITORY}/actions/runs/123?next=https://attacker.example`,
+    `https://github.com/${REPOSITORY}/actions/runs/123#steps-to-unblock\n::error title=Injected`,
+    `https://github.com/${REPOSITORY}/actions/runs/124`,
+    `https://github.com/other/repo/actions/runs/123`,
+  ];
+
+  for (const [index, runUrl] of invalidUrls.entries()) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `summary-invalid-navigation-${index}`,
+    });
+    appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+      prNumber: PR,
+      headSha: HEAD,
+      runUrl,
+      serverUrl: "https://github.com",
+      repository: REPOSITORY,
+      runId: "123",
+    });
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.doesNotMatch(summary, /Open Actions Summary|attacker\.example|Injected/u);
+  }
+});
+
+test("navigation annotation writer is limited to blocked native verifier results", () => {
+  const config = { summaryPath: "/tmp/summary" };
+  const blocked = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "An untrusted provider reason must not enter the workflow command.",
+    recoveryCode: "request_clean_generation",
+  });
+  const nativeContext = {
+    triggerKind: "verifier",
+    githubActions: true,
+    diagnosticObservation: false,
+    repository: REPOSITORY,
+    runId: "123",
+    runUrl: `https://github.com/${REPOSITORY}/actions/runs/123`,
+    serverUrl: "https://github.com",
+  };
+  const annotations = [];
+  assert.equal(
+    emitV2VerifierNavigationAnnotation(config, blocked, nativeContext, (value) => {
+      annotations.push(value);
+    }),
+    true,
+  );
+  assert.deepEqual(annotations, [
+    `::error title=Codex Review Gate%3A Steps to unblock::Open this run's Summary and follow Steps to unblock: https://github.com/${REPOSITORY}/actions/runs/123\n`,
+  ]);
+  assert.doesNotMatch(annotations[0], /untrusted|provider reason|finding|@codex|\r/u);
+
+  const success = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "success",
+    reason: "All required evidence is current.",
+    recoveryCode: "none",
+  });
+  const suppressed = [
+    [config, success, nativeContext],
+    [config, blocked, { ...nativeContext, triggerKind: "controller" }],
+    [config, blocked, { ...nativeContext, diagnosticObservation: true }],
+    [config, blocked, { ...nativeContext, githubActions: false }],
+    [{ summaryPath: "" }, blocked, nativeContext],
+    [config, blocked, { ...nativeContext, runUrl: `${nativeContext.runUrl}?next=x` }],
+    [config, blocked, { ...nativeContext, runUrl: `${nativeContext.runUrl}#fragment` }],
+    [config, blocked, {
+      ...nativeContext,
+      runUrl: `${nativeContext.runUrl}\r\n::error title=Injected`,
+    }],
+    [config, blocked, { ...nativeContext, runId: "124" }],
+    [config, blocked, { ...nativeContext, repository: "other/repo" }],
+    [config, blocked, { ...nativeContext, repository: `${REPOSITORY}/` }],
+    [config, blocked, { ...nativeContext, repository: `${REPOSITORY}/extra` }],
+  ];
+  for (const [candidateConfig, report, candidateContext] of suppressed) {
+    assert.equal(
+      emitV2VerifierNavigationAnnotation(candidateConfig, report, candidateContext, (value) => {
+        annotations.push(value);
+      }),
+      false,
+    );
+  }
+  assert.equal(annotations.length, 1, "suppressed cases do not write workflow commands");
+});
+
+test("verifier Summary navigation reuses run identity without additional API reads", async (context) => {
+  const nativeEnvironment = runtimeEnvironment(context, {
+    suffix: "native-blocked-summary-navigation",
+  });
+  const nativeGitHub = createGitHubMock({ issueComments: [workflowRequest()] });
+  const native = await runGate(nativeEnvironment, nativeGitHub);
+
+  assert.equal(native.result.exitCode, 1);
+  assert.equal(native.result.report.executionHealth, "healthy");
+  assert.equal(native.result.report.gateOutcome, "pending");
+  const summary = readFileSync(nativeEnvironment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /\[Open Actions Summary\]\(<https:\/\/github\.com\/owner\/repo\/actions\/runs\/123>\)/u);
+  assert.match(summary, /\[Jump to Steps to unblock\]\(#steps-to-unblock\)/u);
+  assert.match(summary, /### Steps to unblock\n\nSteps to unblock: /u);
+
+  const localEnvironment = runtimeEnvironment(context, {
+    suffix: "local-blocked-summary-navigation",
+  });
+  const localGitHub = createGitHubMock({ issueComments: [workflowRequest()] });
+  const local = await runGate(localEnvironment, localGitHub);
+  assert.equal(local.result.exitCode, 1);
+  assert.deepEqual(
+    nativeGitHub.calls.map(({ method, path }) => [method, path]),
+    localGitHub.calls.map(({ method, path }) => [method, path]),
+    "navigation is rendered from existing run identity and adds no API reads",
+  );
 });
 
 test("recovery diagnostics route request-clean and finding fixes by proven lineage", async (context) => {

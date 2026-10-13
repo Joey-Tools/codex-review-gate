@@ -75,6 +75,7 @@ export const V2_RECOVERY_CODES = Object.freeze(new Set([
 
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
+const SAFE_REPOSITORY_PATH_SEGMENT = /^[A-Za-z0-9._-]+$/u;
 const OFFICIAL_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]";
 const V2_REACTION_CONTENTS = new Set([
   "+1",
@@ -601,12 +602,14 @@ export function writeV2GateOutputs(outputPath, report) {
 
 export function appendV2GateSummary(summaryPath, report, context = {}) {
   if (!summaryPath) return;
+  const currentRunUrl = validatedV2CurrentRunUrl(context);
   const pr = context.prNumber ? `#${context.prNumber}` : "unknown";
   const head = context.headSha ? `\`${context.headSha}\`` : "unknown";
   const testMerge = FULL_SHA.test(String(context.testMergeSha || ""))
     ? `\`${context.testMergeSha}\``
     : "unknown";
   const reason = formatV2DiagnosticText(report.reason, "No reason was reported");
+  const reasonLines = formatV2SummaryReason(report, reason, context);
   const nextAction = formatV2DiagnosticText(
     v2ReportNextAction(report, context),
     "Inspect the workflow run and retry safely.",
@@ -624,17 +627,23 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
         `- Review threads: ${formatV2ReviewThreadCounts(report.reviewThreads)}`,
         `- Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}`,
         ...formatV2CarrierDiagnostics(report.carrierDiagnostics),
-        ...formatV2ReviewThreadDiagnostics(report.reviewThreads.diagnostics),
       ];
   const body = [
     "## Codex GitHub Review Gate",
     "",
+    ...(currentRunUrl
+      ? [
+          `- Current run: [Open Actions Summary](<${currentRunUrl}>)`,
+          "- [Jump to Steps to unblock](#steps-to-unblock)",
+          "",
+        ]
+      : []),
     `- Execution health: **${report.executionHealth}**`,
     `- Gate outcome: **${report.gateOutcome}**`,
     `- Pull request: **${pr}**`,
     `- Exact head: ${head}`,
     `- Test-merge commit: ${testMerge}`,
-    `- Reason: ${reason}`,
+    ...reasonLines,
     `- Recovery code: \`${report.recoveryCode}\``,
     ...diagnosticMetadata,
     ...(context.verifierRunId
@@ -643,6 +652,11 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
           `- Verifier attempt: **${context.verifierRunAttempt}**`,
         ]
       : []),
+    ...(!context.diagnosticObservation
+      ? formatV2UnresolvedReviewThreadSummary(report.reviewThreads)
+      : []),
+    "",
+    "### Steps to unblock",
     "",
     `Steps to unblock: ${nextAction}`,
     "",
@@ -1162,6 +1176,49 @@ function formatV2ReviewThreadStatus(status) {
   if (status === "complete") return "complete";
   if (status === "incomplete") return "incomplete";
   return "not read";
+}
+
+function formatV2SummaryReason(report, reason, context = {}) {
+  const reviewThreads = report.reviewThreads;
+  if (
+    context.diagnosticObservation ||
+    report.executionHealth !== "healthy" ||
+    !["failure", "pending"].includes(report.gateOutcome) ||
+    reviewThreads.status !== "complete" ||
+    reviewThreads.unresolved === 0
+  ) {
+    return [`- Reason: ${reason}`];
+  }
+
+  const blockers = [];
+  const unresolvedFindings = report.counts.unresolved;
+  if (Number.isSafeInteger(unresolvedFindings) && unresolvedFindings > 0) {
+    blockers.push(
+      `${unresolvedFindings} unresolved non-inline ${unresolvedFindings === 1 ? "finding" : "findings"}`,
+    );
+  }
+  blockers.push(
+    `${reviewThreads.unresolved} unresolved pull-request review ${reviewThreads.unresolved === 1 ? "thread" : "threads"}`,
+  );
+  const verb = blockers.length > 1 || reviewThreads.unresolved > 1 ? "remain" : "remains";
+  return [
+    `- Reason: ${blockers.join(" and ")} ${verb}.`,
+    `- Evaluator reason: ${reason}`,
+  ];
+}
+
+function formatV2UnresolvedReviewThreadSummary(reviewThreads) {
+  if (reviewThreads.status !== "complete" || reviewThreads.unresolved === 0) return [];
+  const details = reviewThreads.diagnostics.slice(0, 5);
+  const omitted = Math.max(0, reviewThreads.unresolved - details.length);
+  return [
+    "",
+    "### Unresolved review threads",
+    "",
+    `- Verified inventory: **${reviewThreads.unresolved} unresolved, ${reviewThreads.total} total** review threads.`,
+    `- Thread details: showing **${details.length} of ${reviewThreads.unresolved}**; **${omitted} omitted** (display capped at five).`,
+    ...formatV2ReviewThreadDiagnostics(details),
+  ];
 }
 
 function v2ReportNextAction(report, context = {}) {
@@ -1814,6 +1871,12 @@ export async function runV2GateCli({
     Object.assign(config, validateV2Trigger(config));
     context.prNumber = config.prNumber;
     context.triggerKind = config.triggerKind;
+    context.repository = config.repository;
+    context.runId = config.runId;
+    context.runUrl = config.runUrl;
+    context.serverUrl = config.serverUrl;
+    context.summaryPath = config.summaryPath;
+    context.githubActions = environment.GITHUB_ACTIONS === "true";
     client = new V2GitHubClient(config, fetchImpl);
     if (config.triggerKind === "verifier") {
       return withNextAction(await runV2Verifier(client, config, context, {
@@ -4096,6 +4159,109 @@ function persistV2ReportFiles(config, report, context, {
   }
   if (failures.length > 0) {
     throw v2ReportPersistenceFailure(failures, report);
+  }
+  emitV2VerifierNavigationAnnotation(config, report, context);
+}
+
+function validatedV2CurrentRunUrl(context = {}) {
+  const repository = typeof context.repository === "string" ? context.repository : "";
+  const repositoryParts = repository.split("/");
+  const [owner, repo] = repositoryParts;
+  const runId = canonicalPositiveId(context.runId);
+  const serverUrlValue = typeof context.serverUrl === "string" ? context.serverUrl : "";
+  const runUrlValue = typeof context.runUrl === "string" ? context.runUrl : "";
+  if (
+    repositoryParts.length !== 2 ||
+    !owner ||
+    !repo ||
+    owner === "." ||
+    owner === ".." ||
+    repo === "." ||
+    repo === ".." ||
+    !SAFE_REPOSITORY_PATH_SEGMENT.test(owner) ||
+    !SAFE_REPOSITORY_PATH_SEGMENT.test(repo) ||
+    !runId ||
+    !serverUrlValue ||
+    !runUrlValue ||
+    /[\u0000-\u0020\u007f]/u.test(serverUrlValue) ||
+    /[\u0000-\u0020\u007f]/u.test(runUrlValue)
+  ) {
+    return null;
+  }
+
+  let serverUrl;
+  let runUrl;
+  try {
+    serverUrl = new URL(serverUrlValue);
+    runUrl = new URL(runUrlValue);
+  } catch {
+    return null;
+  }
+  const allowedProtocols = new Set(["http:", "https:"]);
+  if (
+    !allowedProtocols.has(serverUrl.protocol) ||
+    !allowedProtocols.has(runUrl.protocol) ||
+    serverUrl.username ||
+    serverUrl.password ||
+    runUrl.username ||
+    runUrl.password ||
+    serverUrl.pathname !== "/" ||
+    serverUrl.search ||
+    serverUrl.hash ||
+    runUrl.search ||
+    runUrl.hash
+  ) {
+    return null;
+  }
+
+  const expectedPath = `/${owner}/${repo}/actions/runs/${runId}`;
+  if (runUrl.origin !== serverUrl.origin || runUrl.pathname !== expectedPath) return null;
+  return runUrl.href;
+}
+
+function escapeV2WorkflowCommandData(value) {
+  return String(value)
+    .replace(/%/gu, "%25")
+    .replace(/\r/gu, "%0D")
+    .replace(/\n/gu, "%0A");
+}
+
+function escapeV2WorkflowCommandProperty(value) {
+  return String(value)
+    .replace(/%/gu, "%25")
+    .replace(/\r/gu, "%0D")
+    .replace(/\n/gu, "%0A")
+    .replace(/:/gu, "%3A")
+    .replace(/,/gu, "%2C");
+}
+
+export function emitV2VerifierNavigationAnnotation(
+  config,
+  report,
+  context = {},
+  write = (command) => process.stdout.write(command),
+) {
+  if (
+    context.triggerKind !== "verifier" ||
+    context.diagnosticObservation === true ||
+    context.githubActions !== true ||
+    !config?.summaryPath ||
+    exitCodeForV2Report(report, "verifier") === 0
+  ) {
+    return false;
+  }
+  const runUrl = validatedV2CurrentRunUrl(context);
+  if (!runUrl) return false;
+  const message = escapeV2WorkflowCommandData(
+    `Open this run's Summary and follow Steps to unblock: ${runUrl}`,
+  );
+  const title = escapeV2WorkflowCommandProperty("Codex Review Gate: Steps to unblock");
+  try {
+    write(`::error title=${title}::${message}\n`);
+    return true;
+  } catch {
+    // Annotation output is supplemental and must not change the gate result.
+    return false;
   }
 }
 
