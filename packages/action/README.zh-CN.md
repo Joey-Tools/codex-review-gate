@@ -602,6 +602,14 @@ API 读取、pagination 不完整、cap hit 或不稳定 thread state 会使受�
 GraphQL review-thread state。CLI diagnostic JSON 也会通过独立的 `review_threads` 字段暴露这些计数；
 它不是 Action output。两者都不能替代 branch-protection 对 conversation resolution 的独立要求。
 
+当完整 inventory 中有 unresolved thread 时，Actions Summary 会使用单独的
+`Unresolved review threads` 区块，列出可信的 unresolved/total counts，并最多展示已收集的前五条
+path、first-comment link 和 outdated 标记；显示数与省略数会明确说明这一上限。这些有数量限制的
+诊断提示不是完整 thread inventory。对于 healthy 的 `failure` 或 `pending` 结果，显示的 Reason 会优先
+列出 unresolved thread 数量，以及已知的 unresolved non-inline finding 数量；`Evaluator reason` 会保留
+evaluator 原始说明。Unknown/incomplete inventory 和 diagnostic-only observation 不会把 thread 提示显示为
+当前且已验证的 blocker。这只是展示层变化，使用已有 evidence，不会额外读取 GitHub API。
+
 对于 blocking verifier result，Actions Summary 最后一行是专用的
 `Steps to unblock: ...`；CLI JSON diagnostic 行之后也会输出同一条最终指引。更详细的 bounded
 evidence 留在前面的 summary 内容和 logs 中；最终这行是最重要、最可操作的用户输出，不是新的

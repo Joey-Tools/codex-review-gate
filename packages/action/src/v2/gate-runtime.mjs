@@ -607,6 +607,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     ? `\`${context.testMergeSha}\``
     : "unknown";
   const reason = formatV2DiagnosticText(report.reason, "No reason was reported");
+  const reasonLines = formatV2SummaryReason(report, reason, context);
   const nextAction = formatV2DiagnosticText(
     v2ReportNextAction(report, context),
     "Inspect the workflow run and retry safely.",
@@ -624,7 +625,6 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
         `- Review threads: ${formatV2ReviewThreadCounts(report.reviewThreads)}`,
         `- Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}`,
         ...formatV2CarrierDiagnostics(report.carrierDiagnostics),
-        ...formatV2ReviewThreadDiagnostics(report.reviewThreads.diagnostics),
       ];
   const body = [
     "## Codex GitHub Review Gate",
@@ -634,7 +634,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     `- Pull request: **${pr}**`,
     `- Exact head: ${head}`,
     `- Test-merge commit: ${testMerge}`,
-    `- Reason: ${reason}`,
+    ...reasonLines,
     `- Recovery code: \`${report.recoveryCode}\``,
     ...diagnosticMetadata,
     ...(context.verifierRunId
@@ -642,6 +642,9 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
           `- Verifier run: ${formatV2DiagnosticText(context.verifierRunUrl || context.verifierRunId, "unknown", 500)}`,
           `- Verifier attempt: **${context.verifierRunAttempt}**`,
         ]
+      : []),
+    ...(!context.diagnosticObservation
+      ? formatV2UnresolvedReviewThreadSummary(report.reviewThreads)
       : []),
     "",
     `Steps to unblock: ${nextAction}`,
@@ -1162,6 +1165,49 @@ function formatV2ReviewThreadStatus(status) {
   if (status === "complete") return "complete";
   if (status === "incomplete") return "incomplete";
   return "not read";
+}
+
+function formatV2SummaryReason(report, reason, context = {}) {
+  const reviewThreads = report.reviewThreads;
+  if (
+    context.diagnosticObservation ||
+    report.executionHealth !== "healthy" ||
+    !["failure", "pending"].includes(report.gateOutcome) ||
+    reviewThreads.status !== "complete" ||
+    reviewThreads.unresolved === 0
+  ) {
+    return [`- Reason: ${reason}`];
+  }
+
+  const blockers = [];
+  const unresolvedFindings = report.counts.unresolved;
+  if (Number.isSafeInteger(unresolvedFindings) && unresolvedFindings > 0) {
+    blockers.push(
+      `${unresolvedFindings} unresolved non-inline ${unresolvedFindings === 1 ? "finding" : "findings"}`,
+    );
+  }
+  blockers.push(
+    `${reviewThreads.unresolved} unresolved pull-request review ${reviewThreads.unresolved === 1 ? "thread" : "threads"}`,
+  );
+  const verb = blockers.length > 1 || reviewThreads.unresolved > 1 ? "remain" : "remains";
+  return [
+    `- Reason: ${blockers.join(" and ")} ${verb}.`,
+    `- Evaluator reason: ${reason}`,
+  ];
+}
+
+function formatV2UnresolvedReviewThreadSummary(reviewThreads) {
+  if (reviewThreads.status !== "complete" || reviewThreads.unresolved === 0) return [];
+  const details = reviewThreads.diagnostics.slice(0, 5);
+  const omitted = Math.max(0, reviewThreads.unresolved - details.length);
+  return [
+    "",
+    "### Unresolved review threads",
+    "",
+    `- Verified inventory: **${reviewThreads.unresolved} unresolved, ${reviewThreads.total} total** review threads.`,
+    `- Thread details: showing **${details.length} of ${reviewThreads.unresolved}**; **${omitted} omitted** (display capped at five).`,
+    ...formatV2ReviewThreadDiagnostics(details),
+  ];
 }
 
 function v2ReportNextAction(report, context = {}) {
