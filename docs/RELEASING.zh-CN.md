@@ -292,6 +292,23 @@ mutation fence 都必须重新读取并验证这组 live primary/subkey/certific
 persistent verification result 只能证明该 object 的 signature state；它不能
 替代 pinned signer 仍存在于 current account inventory 的证明。
 
+在 mint 任何 Publisher App token 之前，publish workflow 会通过固定的公开用户端点
+[`GET /users/{username}/gpg_keys`](https://docs.github.com/en/rest/users/gpg-keys?apiVersion=2022-11-28#list-gpg-keys-for-a-user)
+读取 live certificate，并且只使用 workflow 已有的只读 `github.token`。该 token
+仅在此证书校验 step 中作为 `GITHUB_TOKEN` 暴露；workflow permissions 仍为
+`actions: read` 和 `contents: read`，没有写权限。GitHub 文档说明该端点接受
+installation access token，且不需要额外 permission。这不是 Publisher App inventory
+token 或 target-scoped token。固定 HTTPS 请求保留 TLS 1.2、不跟随重定向及有界重试，
+随后按 pinned primary 与 signing-subkey fingerprints 校验返回证书，再 mint App token、
+导入签名密钥或执行任何 target 写入。
+
+Publisher run `38404550587`（2026-10-13）在此前的匿名请求上四次尝试均得到 HTTP 403。
+该 run 未保留响应 headers 或 body，因此无法确定 403 的确切原因；失败发生在 App-token
+mint、签名密钥导入及 target 写入之前。应将其视为证书读取传输失败，而不是 pinned signer
+已变化或发布已部分发生的证据。证书校验应继续位于 privileged credentials 之前；按既有
+admission 和 reconcile gates 重试同一 release intent。不要放宽 signer pin、扩大 App
+permissions，或把检查移到写入边界之后。
+
 显式的 `--test-enforce-live-signer-policy` seam 只供测试，并受双重
 environment gate 约束：必须同时存在
 `CODEX_REVIEW_GATE_RELEASE_PROVENANCE_TEST_ONLY=1` 与 `NODE_ENV=test`。它还只能与

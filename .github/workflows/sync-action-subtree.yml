@@ -634,6 +634,8 @@ jobs:
             --candidate "$RUNNER_TEMP/release-candidate" \
             --publication-plan-file "$RUNNER_TEMP/publication-plan.json"
       - name: Validate live release signing certificate before minting credentials
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           github_keys="$RUNNER_TEMP/github-signing-keys.json"
@@ -646,6 +648,7 @@ jobs:
             --retry-all-errors \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
             --output "$github_keys" \
             'https://api.github.com/users/JoeyTeng-Codex/gpg_keys'
           node scripts/generate-action-release-provenance.mjs verify-github-signing-key \
