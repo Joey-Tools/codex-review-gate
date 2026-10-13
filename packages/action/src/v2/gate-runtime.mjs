@@ -5759,6 +5759,7 @@ function reduceV2Evidence({
   const currentHeadTerminalArtifacts = [];
   const historicalArtifacts = [];
   const progressArtifacts = [];
+  const knownProviderFailures = [];
   const unboundProviderActivities = (deletedCommentEvents ?? []).map((event) => ({
     source: "comment-deleted-event",
     id: event.id,
@@ -5778,6 +5779,7 @@ function reduceV2Evidence({
       artifact.source !== "request-reaction" &&
       (
         artifact.kind === "malformed" ||
+        artifact.kind === "provider-failure" ||
         Boolean(artifact.orderingError) ||
         Boolean(artifact.resolutionError) ||
         (
@@ -5796,7 +5798,9 @@ function reduceV2Evidence({
         id: artifact.id,
         carrierCreatedAt: artifact.carrierCreatedAt || artifact.createdAt,
         revisionAt: artifact.revisionAt || artifact.createdAt,
-        activityKind: "unbound-provider-carrier",
+        activityKind: artifact.kind === "provider-failure"
+          ? "known-provider-service-failure"
+          : "unbound-provider-carrier",
       });
     }
     if (
@@ -5820,6 +5824,25 @@ function reduceV2Evidence({
         createdAt: artifact.createdAt,
       }));
       indeterminate += 1;
+      continue;
+    }
+    if (artifact.kind === "provider-failure") {
+      if (artifact.edited === true || artifact.orderingError || artifact.resolutionError) {
+        const detail = artifact.orderingError || artifact.resolutionError ||
+          "the comment was edited and its prior body is unobservable";
+        blockingErrors.push(
+          `Codex provider service failure issue-comment ${artifact.id} ${detail}; ` +
+            "it cannot be used as a recovery witness",
+        );
+        indeterminate += 1;
+      } else {
+        knownProviderFailures.push(normalizeV2EvidenceError({
+          message:
+            `Recognized Codex provider service failure issue-comment ${artifact.id} ` +
+            "requires a later eligible current-head request and trusted current-head clean",
+          createdAt: artifact.createdAt,
+        }));
+      }
       continue;
     }
     if (artifact.orderingError) {
@@ -5992,6 +6015,21 @@ function reduceV2Evidence({
       blockingErrors.push(error.message);
     }
   }
+  let hasUnrecoveredKnownProviderFailure = false;
+  for (const failure of knownProviderFailures) {
+    if (!findV2SupersedingGenerationClean({
+      evidenceMs: failure.createdMs,
+      currentRequests: generationRequests,
+      currentCleans: positiveCleans,
+      requestReactions,
+      generationLineage,
+      allowHeadCleanRecovery: true,
+    })) {
+      blockingErrors.push(failure.message);
+      indeterminate += 1;
+      hasUnrecoveredKnownProviderFailure = true;
+    }
+  }
   const unresolvedFindings = [];
   const resolvedFindings = [];
   for (const finding of providerFindings) {
@@ -6160,6 +6198,14 @@ function reduceV2Evidence({
         !latestBoundaryHasTerminal
         ? "wait"
         : "request";
+  }
+  if (
+    decision.gateOutcome === "pending" &&
+    decision.recoveryCode === "request_clean_generation" &&
+    hasUnrecoveredKnownProviderFailure
+  ) {
+    decision.requiresReplacementPr = false;
+    decision.headCleanRecoveryAction = "request";
   }
   const currentGeneration = requestEpoch.selected ?? null;
   const carrierDiagnostics = (artifacts ?? [])
@@ -7094,6 +7140,7 @@ function findV2SupersedingGenerationClean({
   currentCleans,
   requestReactions,
   generationLineage,
+  allowHeadCleanRecovery = false,
 }) {
   if (!Number.isFinite(evidenceMs)) return null;
   const generations = currentRequests
@@ -7101,10 +7148,14 @@ function findV2SupersedingGenerationClean({
     .sort(compareV2RequestEpochNewestFirst);
   for (const generation of generations) {
     const clean = currentCleans.find((candidate) =>
-      !(
+      (!(
         candidate.source === "issue-comment" &&
         candidate.id === generationLineage.headCleanRecovery?.cleanId
-      ) &&
+      ) || (
+        allowHeadCleanRecovery === true &&
+        generationLineage.headCleanRecovery?.kind === "current-head-attestation" &&
+        generationLineage.headCleanRecovery.requestId === generation.id
+      )) &&
       (!evidenceHeadSha || candidate.headSha === evidenceHeadSha) &&
       Date.parse(candidate.createdAt) > generation.revisionMs &&
       isV2QualifyingCleanForGeneration(
@@ -8114,6 +8165,7 @@ async function collectV2ProviderEvidence(
       repo: config.repo,
       botLogins: EXACT_CODEX_LOGINS,
       allowShortCommitRefs: true,
+      allowKnownServiceFailure: true,
     });
     if (artifact) {
       artifact.htmlUrl = comment.html_url;
@@ -8123,6 +8175,14 @@ async function collectV2ProviderEvidence(
         artifact.revisionAt = revisionAt;
       }
       artifacts.push(artifact);
+      if (artifact.kind === "provider-failure") {
+        opaqueTopLevelProviderActivities.push({
+          source: "issue-comment",
+          id: String(comment.id),
+          carrierCreatedAt: artifact.carrierCreatedAt,
+          revisionAt: artifact.revisionAt,
+        });
+      }
     } else if (observedEdit || hasExactV2PhysicalReviewRequestShape(comment?.body)) {
       artifacts.push({
         source: "issue-comment",

@@ -1333,6 +1333,74 @@ test("accepts a live-style clean Codex issue-comment artifact with a 10-characte
   });
 });
 
+test("recognizes only the opt-in closed Codex provider service-failure grammar", () => {
+  const body = [
+    "Codex Review: Something went wrong. Try again later by commenting “@codex review”.",
+    "",
+    "```",
+    "Unknown error",
+    "```",
+    "",
+    officialCodexDisclosure(),
+  ].join("\n");
+  const comment = liveCodexIssueComment(body);
+
+  assert.equal(parseCodexIssueCommentArtifact(comment).kind, "malformed");
+
+  const artifact = parseCodexIssueCommentArtifact(comment, {
+    owner: "owner",
+    repo: "repo",
+    allowKnownServiceFailure: true,
+  });
+  assert.deepEqual(artifact, {
+    source: "issue-comment",
+    id: "101",
+    createdAt: "2026-07-23T08:00:00Z",
+    carrierCreatedAt: "2026-07-23T08:00:00Z",
+    carrierUpdatedAt: "2026-07-23T08:00:00Z",
+    revisionAt: "2026-07-23T08:00:00Z",
+    edited: false,
+    url: "https://github.com/owner/repo/issues/1#issuecomment-101",
+    kind: "provider-failure",
+    reason: "recognized Codex provider service failure",
+  });
+
+  const rejected = [
+    ["missing disclosure", body.slice(0, body.indexOf("\n\n<details>"))],
+    ["unknown error prose", body.replace("Unknown error", "Unknown error: 503")],
+    ["finding-shaped content", body.replace("Unknown error", "Unknown error\n- [P1] fix this")],
+    ["extra link", body.replace("Unknown error", "Unknown error\nhttps://example.invalid/finding")],
+    ["extra prose", body.replace("```\n\n<details>", "```\n\nUnexpected detail\n\n<details>")],
+    ["changed disclosure", body.replace("If Codex has suggestions", "Codex found a concern")],
+  ];
+  for (const [name, rejectedBody] of rejected) {
+    assert.notEqual(parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(rejectedBody),
+      { allowKnownServiceFailure: true },
+    )?.kind, "provider-failure", name);
+  }
+
+  assert.notEqual(parseCodexIssueCommentArtifact(
+    comment,
+    { allowKnownServiceFailure: true, botLogins: new Set(["other[bot]"]) },
+  )?.kind, "provider-failure", "wrong Bot login");
+  assert.notEqual(parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(body, {
+      user: { login: "other[bot]", type: "Bot" },
+    }),
+    {
+      allowKnownServiceFailure: true,
+      botLogins: new Set(["other[bot]"]),
+    },
+  )?.kind, "provider-failure", "non-official configured Bot login");
+  assert.notEqual(parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(body, {
+      performed_via_github_app: { slug: "other-app" },
+    }),
+    { allowKnownServiceFailure: true },
+  )?.kind, "provider-failure", "wrong GitHub App");
+});
+
 test("binds both issue-comment carrier timestamps and orders the artifact by updated_at", () => {
   const body = [
     "Codex Review: Didn't find any major issues.",

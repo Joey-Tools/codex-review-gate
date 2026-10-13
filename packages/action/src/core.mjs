@@ -14,6 +14,8 @@ export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
 export const V2_OFFICIAL_CODEX_BOT_LOGIN =
   "chatgpt-codex-connector[bot]";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
+const CODEX_PROVIDER_SERVICE_FAILURE_LEAD =
+  "Codex Review: Something went wrong. Try again later by commenting “@codex review”.";
 const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
 const MAX_CODEX_TERMINAL_HEADING_GRAPHEMES = 64;
 const MAX_CODEX_CLEAN_TAGLINE_CODE_UNITS = 160;
@@ -373,6 +375,7 @@ export function parseCodexIssueCommentArtifact(
     repo = "",
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
     allowShortCommitRefs = false,
+    allowKnownServiceFailure = false,
   } = {},
 ) {
   const body = normalizeCodexCommentBody(comment?.body);
@@ -473,6 +476,21 @@ export function parseCodexIssueCommentArtifact(
       headSha: parsed.headSha,
       samples: parsed.samples,
       findingCount: parsed.findingCount,
+    };
+  }
+
+  if (
+    allowKnownServiceFailure === true &&
+    isExactV2CodexProviderIdentity(
+      comment.user,
+      comment.performed_via_github_app,
+    ) &&
+    codexProviderServiceFailureBodyHasClosedGrammar(body)
+  ) {
+    return {
+      ...base,
+      kind: "provider-failure",
+      reason: "recognized Codex provider service failure",
     };
   }
 
@@ -1505,6 +1523,26 @@ function cleanIssueCommentParseDiagnostics(stage, reasonCode, extra = {}) {
     reasonCode,
     ...extra,
   };
+}
+
+function codexProviderServiceFailureBodyHasClosedGrammar(body) {
+  const lines = body.replace(/\r\n?/g, "\n").split("\n");
+  if (lines[0] !== CODEX_PROVIDER_SERVICE_FAILURE_LEAD) return false;
+
+  const fenceStart = skipBlankLines(lines, 1);
+  if (
+    lines[fenceStart] !== "```" ||
+    lines[fenceStart + 1] !== "Unknown error" ||
+    lines[fenceStart + 2] !== "```"
+  ) {
+    return false;
+  }
+
+  const disclosureStart = skipBlankLines(lines, fenceStart + 3);
+  return disclosureStart < lines.length &&
+    officialIssueCommentCleanDisclosureHasClosedGrammar(
+      lines.slice(disclosureStart).join("\n"),
+    );
 }
 
 function parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs) {
