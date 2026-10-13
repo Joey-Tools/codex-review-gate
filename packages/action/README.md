@@ -782,6 +782,17 @@ or read issue and rerun the safe verifier action (such as protected
 complete stable snapshots. The job does not perform the suggested repair or
 reconciliation automatically.
 
+The Summary links to the current Actions run and provides a jump to `Steps to
+unblock`. When the canonical native `codex/github-review-gate` verifier
+already exits nonzero, it also emits one fixed GitHub Actions error
+annotation linking to that run and directing the operator to its Summary. The
+annotation contains no finding or provider prose. These links use the existing
+repository, run ID, and server URL; invalid or mismatched navigation metadata
+suppresses navigation without changing the verdict. This does not modify the
+GitHub-managed PR check row or its Details URL, grant `checks: write`, or add
+API reads. Success, controller or diagnostic-only results, and local CLI
+invocations do not emit the annotation.
+
 See [DESIGN.md](DESIGN.md) for the authority and consistency model and
 [COOKBOOK.md](COOKBOOK.md) for recovery procedures.
 

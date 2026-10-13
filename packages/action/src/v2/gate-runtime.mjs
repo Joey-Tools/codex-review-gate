@@ -75,6 +75,7 @@ export const V2_RECOVERY_CODES = Object.freeze(new Set([
 
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
+const SAFE_REPOSITORY_PATH_SEGMENT = /^[A-Za-z0-9._-]+$/u;
 const OFFICIAL_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]";
 const V2_REACTION_CONTENTS = new Set([
   "+1",
@@ -601,6 +602,7 @@ export function writeV2GateOutputs(outputPath, report) {
 
 export function appendV2GateSummary(summaryPath, report, context = {}) {
   if (!summaryPath) return;
+  const currentRunUrl = validatedV2CurrentRunUrl(context);
   const pr = context.prNumber ? `#${context.prNumber}` : "unknown";
   const head = context.headSha ? `\`${context.headSha}\`` : "unknown";
   const testMerge = FULL_SHA.test(String(context.testMergeSha || ""))
@@ -629,6 +631,13 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
   const body = [
     "## Codex GitHub Review Gate",
     "",
+    ...(currentRunUrl
+      ? [
+          `- Current run: [Open Actions Summary](<${currentRunUrl}>)`,
+          "- [Jump to Steps to unblock](#steps-to-unblock)",
+          "",
+        ]
+      : []),
     `- Execution health: **${report.executionHealth}**`,
     `- Gate outcome: **${report.gateOutcome}**`,
     `- Pull request: **${pr}**`,
@@ -646,6 +655,8 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     ...(!context.diagnosticObservation
       ? formatV2UnresolvedReviewThreadSummary(report.reviewThreads)
       : []),
+    "",
+    "### Steps to unblock",
     "",
     `Steps to unblock: ${nextAction}`,
     "",
@@ -1860,6 +1871,12 @@ export async function runV2GateCli({
     Object.assign(config, validateV2Trigger(config));
     context.prNumber = config.prNumber;
     context.triggerKind = config.triggerKind;
+    context.repository = config.repository;
+    context.runId = config.runId;
+    context.runUrl = config.runUrl;
+    context.serverUrl = config.serverUrl;
+    context.summaryPath = config.summaryPath;
+    context.githubActions = environment.GITHUB_ACTIONS === "true";
     client = new V2GitHubClient(config, fetchImpl);
     if (config.triggerKind === "verifier") {
       return withNextAction(await runV2Verifier(client, config, context, {
@@ -4142,6 +4159,109 @@ function persistV2ReportFiles(config, report, context, {
   }
   if (failures.length > 0) {
     throw v2ReportPersistenceFailure(failures, report);
+  }
+  emitV2VerifierNavigationAnnotation(config, report, context);
+}
+
+function validatedV2CurrentRunUrl(context = {}) {
+  const repository = typeof context.repository === "string" ? context.repository : "";
+  const repositoryParts = repository.split("/");
+  const [owner, repo] = repositoryParts;
+  const runId = canonicalPositiveId(context.runId);
+  const serverUrlValue = typeof context.serverUrl === "string" ? context.serverUrl : "";
+  const runUrlValue = typeof context.runUrl === "string" ? context.runUrl : "";
+  if (
+    repositoryParts.length !== 2 ||
+    !owner ||
+    !repo ||
+    owner === "." ||
+    owner === ".." ||
+    repo === "." ||
+    repo === ".." ||
+    !SAFE_REPOSITORY_PATH_SEGMENT.test(owner) ||
+    !SAFE_REPOSITORY_PATH_SEGMENT.test(repo) ||
+    !runId ||
+    !serverUrlValue ||
+    !runUrlValue ||
+    /[\u0000-\u0020\u007f]/u.test(serverUrlValue) ||
+    /[\u0000-\u0020\u007f]/u.test(runUrlValue)
+  ) {
+    return null;
+  }
+
+  let serverUrl;
+  let runUrl;
+  try {
+    serverUrl = new URL(serverUrlValue);
+    runUrl = new URL(runUrlValue);
+  } catch {
+    return null;
+  }
+  const allowedProtocols = new Set(["http:", "https:"]);
+  if (
+    !allowedProtocols.has(serverUrl.protocol) ||
+    !allowedProtocols.has(runUrl.protocol) ||
+    serverUrl.username ||
+    serverUrl.password ||
+    runUrl.username ||
+    runUrl.password ||
+    serverUrl.pathname !== "/" ||
+    serverUrl.search ||
+    serverUrl.hash ||
+    runUrl.search ||
+    runUrl.hash
+  ) {
+    return null;
+  }
+
+  const expectedPath = `/${owner}/${repo}/actions/runs/${runId}`;
+  if (runUrl.origin !== serverUrl.origin || runUrl.pathname !== expectedPath) return null;
+  return runUrl.href;
+}
+
+function escapeV2WorkflowCommandData(value) {
+  return String(value)
+    .replace(/%/gu, "%25")
+    .replace(/\r/gu, "%0D")
+    .replace(/\n/gu, "%0A");
+}
+
+function escapeV2WorkflowCommandProperty(value) {
+  return String(value)
+    .replace(/%/gu, "%25")
+    .replace(/\r/gu, "%0D")
+    .replace(/\n/gu, "%0A")
+    .replace(/:/gu, "%3A")
+    .replace(/,/gu, "%2C");
+}
+
+export function emitV2VerifierNavigationAnnotation(
+  config,
+  report,
+  context = {},
+  write = (command) => process.stdout.write(command),
+) {
+  if (
+    context.triggerKind !== "verifier" ||
+    context.diagnosticObservation === true ||
+    context.githubActions !== true ||
+    !config?.summaryPath ||
+    exitCodeForV2Report(report, "verifier") === 0
+  ) {
+    return false;
+  }
+  const runUrl = validatedV2CurrentRunUrl(context);
+  if (!runUrl) return false;
+  const message = escapeV2WorkflowCommandData(
+    `Open this run's Summary and follow Steps to unblock: ${runUrl}`,
+  );
+  const title = escapeV2WorkflowCommandProperty("Codex Review Gate: Steps to unblock");
+  try {
+    write(`::error title=${title}::${message}\n`);
+    return true;
+  } catch {
+    // Annotation output is supplemental and must not change the gate result.
+    return false;
   }
 }
 

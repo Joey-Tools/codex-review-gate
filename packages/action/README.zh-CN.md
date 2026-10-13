@@ -622,6 +622,13 @@ review，再运行 `reconcile`。其他当前 evidence blocker 和 recovery acti
 （例如受保护的 `reconcile`）。只有两轮完整稳定 snapshots 后 counts 才可信。Job 不会自动执行这些
 修复或 reconcile 操作。
 
+Summary 会链接到当前 Actions run，并提供跳转到 `Steps to unblock` 的目录链接。Canonical native
+`codex/github-review-gate` verifier 已经以非零状态退出时，还会输出一条固定的 GitHub Actions error
+annotation，链接到该 run 并提示查看 Summary；annotation 不包含 finding 或 provider 原文。这些链接只使用
+已有的 repository、run ID 和 server URL。导航 metadata 无效或与 run identity 不匹配时，只抑制导航，
+不改变 verdict。此改动不会修改 GitHub 管理的 PR check 行或其 Details URL，不会增加 `checks: write`
+权限或 API 读取。Success、controller/diagnostic-only 结果和本地 CLI 调用都不会输出该 annotation。
+
 authority 和 consistency 模型见 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)，恢复操作见
 [COOKBOOK.zh-CN.md](COOKBOOK.zh-CN.md)。
 

@@ -28,6 +28,7 @@ import {
   buildV2ReactionCleanArtifacts,
   buildV2StickyCommentBody,
   canonicalV2RequestComments,
+  emitV2VerifierNavigationAnnotation,
   normalizeV2LimitsProfile,
   normalizeV2Operation,
   normalizeV2RequestReview,
@@ -14184,6 +14185,154 @@ test("diagnostic-only summary does not promote observed unresolved threads to cu
   assert.match(summary, /diagnostic-only snapshot, not the current gating result/u);
   assert.doesNotMatch(summary, /Reason: 3 unresolved|Evaluator reason:|Review threads:|### Unresolved review threads|stale\/current-looking\.md/u);
   assert.match(summary, /Steps to unblock: This verifier observation is a diagnostic snapshot/u);
+});
+
+test("summary links navigate to the current run and Steps to unblock section", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "A current-head review clean is required.",
+    recoveryCode: "request_clean_generation",
+  });
+  const environment = runtimeEnvironment(context, { suffix: "summary-current-run-navigation" });
+  appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+    prNumber: PR,
+    headSha: HEAD,
+    runUrl: `https://github.com/${REPOSITORY}/actions/runs/123`,
+    serverUrl: "https://github.com",
+    repository: REPOSITORY,
+    runId: "123",
+  });
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+
+  assert.match(
+    summary,
+    /^## Codex GitHub Review Gate\n\n- Current run: \[Open Actions Summary\]\(<https:\/\/github\.com\/owner\/repo\/actions\/runs\/123>\)\n- \[Jump to Steps to unblock\]\(#steps-to-unblock\)/u,
+  );
+  assert.match(summary, /### Steps to unblock\n\nSteps to unblock: /u);
+  assert.equal(summary.trimEnd().split("\n").at(-1).startsWith("Steps to unblock: "), true);
+});
+
+test("summary navigation refuses URLs with controls, query, fragment, or mismatched run identity", (context) => {
+  const report = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "A current-head review clean is required.",
+    recoveryCode: "request_clean_generation",
+  });
+  const invalidUrls = [
+    `https://github.com/${REPOSITORY}/actions/runs/123?next=https://attacker.example`,
+    `https://github.com/${REPOSITORY}/actions/runs/123#steps-to-unblock\n::error title=Injected`,
+    `https://github.com/${REPOSITORY}/actions/runs/124`,
+    `https://github.com/other/repo/actions/runs/123`,
+  ];
+
+  for (const [index, runUrl] of invalidUrls.entries()) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `summary-invalid-navigation-${index}`,
+    });
+    appendV2GateSummary(environment.GITHUB_STEP_SUMMARY, report, {
+      prNumber: PR,
+      headSha: HEAD,
+      runUrl,
+      serverUrl: "https://github.com",
+      repository: REPOSITORY,
+      runId: "123",
+    });
+    const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+    assert.doesNotMatch(summary, /Open Actions Summary|attacker\.example|Injected/u);
+  }
+});
+
+test("navigation annotation writer is limited to blocked native verifier results", () => {
+  const config = { summaryPath: "/tmp/summary" };
+  const blocked = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "pending",
+    reason: "An untrusted provider reason must not enter the workflow command.",
+    recoveryCode: "request_clean_generation",
+  });
+  const nativeContext = {
+    triggerKind: "verifier",
+    githubActions: true,
+    diagnosticObservation: false,
+    repository: REPOSITORY,
+    runId: "123",
+    runUrl: `https://github.com/${REPOSITORY}/actions/runs/123`,
+    serverUrl: "https://github.com",
+  };
+  const annotations = [];
+  assert.equal(
+    emitV2VerifierNavigationAnnotation(config, blocked, nativeContext, (value) => {
+      annotations.push(value);
+    }),
+    true,
+  );
+  assert.deepEqual(annotations, [
+    `::error title=Codex Review Gate%3A Steps to unblock::Open this run's Summary and follow Steps to unblock: https://github.com/${REPOSITORY}/actions/runs/123\n`,
+  ]);
+  assert.doesNotMatch(annotations[0], /untrusted|provider reason|finding|@codex|\r/u);
+
+  const success = buildV2GateReport({
+    executionHealth: "healthy",
+    gateOutcome: "success",
+    reason: "All required evidence is current.",
+    recoveryCode: "none",
+  });
+  const suppressed = [
+    [config, success, nativeContext],
+    [config, blocked, { ...nativeContext, triggerKind: "controller" }],
+    [config, blocked, { ...nativeContext, diagnosticObservation: true }],
+    [config, blocked, { ...nativeContext, githubActions: false }],
+    [{ summaryPath: "" }, blocked, nativeContext],
+    [config, blocked, { ...nativeContext, runUrl: `${nativeContext.runUrl}?next=x` }],
+    [config, blocked, { ...nativeContext, runUrl: `${nativeContext.runUrl}#fragment` }],
+    [config, blocked, {
+      ...nativeContext,
+      runUrl: `${nativeContext.runUrl}\r\n::error title=Injected`,
+    }],
+    [config, blocked, { ...nativeContext, runId: "124" }],
+    [config, blocked, { ...nativeContext, repository: "other/repo" }],
+    [config, blocked, { ...nativeContext, repository: `${REPOSITORY}/` }],
+    [config, blocked, { ...nativeContext, repository: `${REPOSITORY}/extra` }],
+  ];
+  for (const [candidateConfig, report, candidateContext] of suppressed) {
+    assert.equal(
+      emitV2VerifierNavigationAnnotation(candidateConfig, report, candidateContext, (value) => {
+        annotations.push(value);
+      }),
+      false,
+    );
+  }
+  assert.equal(annotations.length, 1, "suppressed cases do not write workflow commands");
+});
+
+test("verifier Summary navigation reuses run identity without additional API reads", async (context) => {
+  const nativeEnvironment = runtimeEnvironment(context, {
+    suffix: "native-blocked-summary-navigation",
+  });
+  const nativeGitHub = createGitHubMock({ issueComments: [workflowRequest()] });
+  const native = await runGate(nativeEnvironment, nativeGitHub);
+
+  assert.equal(native.result.exitCode, 1);
+  assert.equal(native.result.report.executionHealth, "healthy");
+  assert.equal(native.result.report.gateOutcome, "pending");
+  const summary = readFileSync(nativeEnvironment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /\[Open Actions Summary\]\(<https:\/\/github\.com\/owner\/repo\/actions\/runs\/123>\)/u);
+  assert.match(summary, /\[Jump to Steps to unblock\]\(#steps-to-unblock\)/u);
+  assert.match(summary, /### Steps to unblock\n\nSteps to unblock: /u);
+
+  const localEnvironment = runtimeEnvironment(context, {
+    suffix: "local-blocked-summary-navigation",
+  });
+  const localGitHub = createGitHubMock({ issueComments: [workflowRequest()] });
+  const local = await runGate(localEnvironment, localGitHub);
+  assert.equal(local.result.exitCode, 1);
+  assert.deepEqual(
+    nativeGitHub.calls.map(({ method, path }) => [method, path]),
+    localGitHub.calls.map(({ method, path }) => [method, path]),
+    "navigation is rendered from existing run identity and adds no API reads",
+  );
 });
 
 test("recovery diagnostics route request-clean and finding fixes by proven lineage", async (context) => {

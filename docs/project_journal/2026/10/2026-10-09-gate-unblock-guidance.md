@@ -35,6 +35,14 @@ superseded_by:
   diagnostic-only observation remains labelled as a snapshot, not a new gate
   verdict. The reducer, raw report reason, recovery codes, machine outputs,
   fingerprints, snapshot guards, and final unblock instruction are unchanged.
+- The native required CheckRun keeps its GitHub-managed name and Details URL.
+  A blocking native verifier can emit a runner annotation directing readers to
+  the current run's Summary and its labelled `Steps to unblock` section. The
+  Summary exposes navigation using existing run metadata; no Checks write
+  permission, legacy status projection, or extra GitHub read is introduced.
+  Missing or invalid navigation metadata is omitted rather than changing the
+  gate result, and diagnostic controller observations do not claim to be the
+  primary verifier. Navigation does not turn a repair hint into pass authority.
 - The motivating verifier for [macos-edr-virtual-display-fixture PR #22](https://github.com/Joey-Project/macos-edr-virtual-display-fixture/pull/22)
   reported healthy execution but pending evidence attribution on v2.2.1,
   alongside a complete 27-thread inventory with 3 unresolved and 24 resolved.
@@ -69,3 +77,9 @@ superseded_by:
 - Twelve focused presentation and collection tests passed, including the pending-lineage case with unresolved threads, known non-inline findings plus threads, the unchanged unhealthy reason, single-thread wording, explicit hint truncation, Markdown-safe paths, all-resolved and incomplete inventories, and diagnostic-only observations.
 - The representative unresolved-thread integration case still performs exactly two existing review-thread GraphQL reads; the query and snapshot acquisition code are unchanged.
 - `git diff --check` and the project-journal validator passed. No version, release intent, production deployment, PR rerun, or state transition is part of this presentation-only change.
+
+### Recovery Navigation Follow-up
+
+- Node `v24.15.0`: `npm run check` passed; the complete affected v2 Action/runtime/workflow-contract and workflow-security suites passed with 388 tests, no failures or skips.
+- Four focused navigation regressions and all eight direct Action tests passed. Coverage includes current-run identity matching, malformed URL omission, the final actionable Steps line, suppression outside blocking native verifiers, safely encoded annotations, and a captured writer that cannot create mock CI annotations.
+- The navigation integration test compares native-shaped and local mock request sequences and confirms no additional API calls. Gating, exit codes, recovery fields, and the four public outputs remain unchanged; only human-facing Summary and supplemental annotation output are extended.
