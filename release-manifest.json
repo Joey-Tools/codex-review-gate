@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:4",
   "schema_version": 4,
-  "version": "2.2.2",
+  "version": "2.2.3",
   "contract_versions": {
     "toolchain": "node24",
     "release_schema": 4,
@@ -12,13 +12,13 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "037f73e7f8fcfd6fefbfeaa8b4e6c4fc632f5a22"
+    "tree": "284a8247a46d47a09bc4fc82f6e8087b6c69cb53"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "1c15f87ace478865d965a1864743e5f0625e1a9b",
-    "previous_version": "2.2.1"
+    "expected_head": "a9678053b213bd33454c495ee40a9fb801a2d2a4",
+    "previous_version": "2.2.2"
   },
   "files": [
     {
@@ -67,15 +67,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 49694,
-      "sha256": "2b69ea1f77859473ff0d7e3125eb4421162f15de559264420e5bc7a37f570c63"
+      "size": 51259,
+      "sha256": "5c8dddc0b5a0aa4c67b7c863d79eaa447c27fb567818b13ef0b94ca06cbee860"
     },
     {
       "path": "README.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 48391,
-      "sha256": "e795c4c696a051e9f4b55dd217c3b410e192dd32502df9421f608f884d669337"
+      "size": 49919,
+      "sha256": "5079dc8a5f5c0068a7da6c7d61ddad60e4027af63251a391be9d32c0ce9ae1df"
     },
     {
       "path": "SECURITY.md",
@@ -110,7 +110,7 @@
       "type": "file",
       "mode": "100644",
       "size": 481,
-      "sha256": "e0184a537df3807e5da965f9662fd55e4421bc73ad5c725f208772d1018a2524"
+      "sha256": "80d40fecfb640ee2c769608c2d7e78343c3e3d9f8e74d5679c62cb9a0a67c89a"
     },
     {
       "path": "producer-receipt.schema.json",
@@ -144,8 +144,8 @@
       "path": "src/v2/gate-runtime.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 365392,
-      "sha256": "785bc8307eb4cd86f130683c8fec49ce1820341a8aacfc4b92c6de7fb1db528f"
+      "size": 370711,
+      "sha256": "0c28762aa0df0211f41ab1dc2c7c5ce3ede6b6dd5a896b3e1996124d15b71b1b"
     }
   ],
   "entrypoint": {
