@@ -54,6 +54,7 @@ const READER = { login: "reader", type: "User" };
 const CODEX_APP = { slug: "chatgpt-codex-connector" };
 const CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER =
   "<!-- codex-pull-request-review-summary -->";
+const CODEX_REVIEW_RECEIPT_ENVELOPE_V1 = "<!-- codex-review-receipt:v1 -->";
 const CODEX_BOT_DATABASE_ID = 90_510;
 const HUMAN_DATABASE_ID = 90_511;
 const REVIEW_REQUEST_USER = {
@@ -317,6 +318,113 @@ test("trusted current-head clean with the official About footer remains gate aut
   assert.equal(result.report.executionHealth, "healthy");
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
   assert.deepEqual(result.report.carrierDiagnostics, []);
+});
+
+test("v2 opts into one exact receipt envelope across stable current-head snapshots", async (context) => {
+  const cleanBody = [
+    "Codex Review: Didn't find any major issues.",
+    "",
+    `**Reviewed commit:** \`${HEAD}\``,
+  ].join("\n");
+  const wrappedCleanBody = `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${cleanBody}`;
+  const clean = cleanIssueComment(HEAD, { body: wrappedCleanBody });
+  const summary = officialReviewSummaryComment({
+    body: `${CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER}\n${JSON.stringify({
+      state: "completed",
+      outcome: "success",
+      reviewed_head_sha: HEAD,
+    })}`,
+  });
+  const comments = [workflowRequest(), summary, clean];
+  const github = createGitHubMock({
+    issueCommentSnapshots: [comments, comments, comments, comments],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "receipt-envelope-current-head-clean",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.deepEqual(result.report.carrierDiagnostics, []);
+  assert.equal(clean.body, wrappedCleanBody, "the raw issue-comment body remains unchanged");
+  const commentInventoryReads = github.calls.filter(({ method, path }) =>
+    method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`
+  );
+  assert.ok(commentInventoryReads.length >= 2, "the result follows repeated complete snapshots");
+});
+
+test("receipt-envelope summary state JSON remains diagnostic-only", async (context) => {
+  const summary = officialReviewSummaryComment({
+    body: `${CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER}\n${JSON.stringify({
+      state: "completed",
+      outcome: "success",
+      reviewed_head_sha: HEAD,
+    })}`,
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), summary],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "receipt-envelope-summary-not-authority",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("receipt envelope does not bypass exact provider identity or edit guards", async (context) => {
+  const cleanBody = cleanIssueComment(HEAD).body;
+  const wrappedBody = `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${cleanBody}`;
+  const cases = [
+    ["wrong-app", {
+      performed_via_github_app: { slug: "other-app" },
+    }],
+    ["wrong-author", {
+      user: { login: "lookalike-reviewer[bot]", type: "Bot" },
+    }],
+    ["edited", {
+      updated_at: "2026-08-25T08:02:00Z",
+    }],
+  ];
+
+  for (const [suffix, overrides] of cases) {
+    const wrappedClean = cleanIssueComment(HEAD, {
+      body: wrappedBody,
+      ...overrides,
+    });
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), wrappedClean],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `receipt-envelope-${suffix}-guard`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("receipt-wrapped clean does not waive an unresolved inline review thread", async (context) => {
+  const clean = cleanIssueComment(HEAD, {
+    body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${cleanIssueComment(HEAD).body}`,
+  });
+  const github = createGitHubMock({
+    issueComments: [workflowRequest(), clean],
+    reviewThreads: [reviewThread({ id: "PRRT_receipt_unresolved", isResolved: false })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "receipt-envelope-unresolved-inline-thread",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.reviewThreads.unresolved, 1);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("official About footer does not waive unresolved review threads", async (context) => {
@@ -1526,6 +1634,30 @@ test("stale provider event is healthy/not_applicable and writes no status", asyn
     event: issueCommentEvent("created", terminal),
   });
   const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "not_applicable");
+  assert.equal(result.report.recoveryCode, "refresh_head");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("stale receipt-wrapped provider event remains bound to its original head", async (context) => {
+  const terminal = cleanIssueComment(HEAD);
+  terminal.body = `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${terminal.body}`;
+  const github = createGitHubMock({
+    issueComments: [terminal],
+    pullRequestOverrides: { head: { sha: NEXT_HEAD } },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "stale-receipt-wrapped-provider",
+    eventName: "issue_comment",
+    expectedHeadSha: "",
+    requestReview: "false",
+    requestCommentId: String(terminal.id),
+    event: issueCommentEvent("created", terminal),
+  });
+  const { result } = await runGate(environment, github);
+
   assert.equal(result.exitCode, 0);
   assert.equal(result.report.executionHealth, "healthy");
   assert.equal(result.report.gateOutcome, "not_applicable");

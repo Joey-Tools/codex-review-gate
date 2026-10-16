@@ -73,6 +73,7 @@ const FULL_SHA_A = "a".repeat(40);
 const FULL_SHA_B = "b".repeat(40);
 const LARGE_REVIEW_COMMENT_ID = 3634927460;
 const LARGE_REVIEW_COMMENT_NODE_ID = "PRRC_kwDOReviewGate3634927460";
+const CODEX_REVIEW_RECEIPT_ENVELOPE_V1 = "<!-- codex-review-receipt:v1 -->";
 
 function reviewCommentNodeId(numericId) {
   return `PRRC_kwDOReviewGate${numericId}`;
@@ -101,6 +102,10 @@ function liveCodexIssueComment(body, overrides = {}) {
     },
     ...overrides,
   };
+}
+
+function codexReviewReceiptEnvelope(body) {
+  return `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${body}`;
 }
 
 function liveCodexReview(overrides = {}) {
@@ -1331,6 +1336,176 @@ test("accepts a live-style clean Codex issue-comment artifact with a 10-characte
       commitRefLength: 10,
     },
   });
+});
+
+test("opts into the exact v1 Codex receipt envelope without changing legacy defaults", () => {
+  const shortShaBody = [
+    "Codex Review: Didn't find any major issues. Nice work!",
+    "",
+    "**Reviewed commit:** `abcdef1234`",
+  ].join("\n");
+  const fullShaBody = [
+    "Codex Review: Didn't find any major issues.",
+    "",
+    `**Reviewed commit:** \`${FULL_SHA_A}\``,
+    "",
+    officialCodexDisclosure(),
+  ].join("\n");
+
+  for (const [name, body, expectedCommitRef] of [
+    ["short SHA", shortShaBody, "abcdef1234"],
+    ["full SHA and official disclosure", fullShaBody, FULL_SHA_A],
+  ]) {
+    const rawBody = codexReviewReceiptEnvelope(body);
+    const comment = liveCodexIssueComment(rawBody, {
+      id: 102,
+      created_at: "2026-07-23T08:00:00Z",
+      updated_at: "2026-07-23T08:00:00Z",
+    });
+    assert.equal(parseCodexIssueCommentArtifact(comment), null, `${name}: legacy default`);
+    assert.equal(parseCodexIssueCommentArtifact(comment, {
+      allowKnownReceiptEnvelope: false,
+    }), null, `${name}: explicit legacy default`);
+
+    const artifact = parseCodexIssueCommentArtifact(comment, {
+      owner: "owner",
+      repo: "repo",
+      allowKnownReceiptEnvelope: true,
+    });
+    assert.equal(artifact.kind, "clean", name);
+    assert.equal(artifact.commitRef, expectedCommitRef, name);
+    assert.equal(artifact.id, "102", name);
+    assert.equal(artifact.createdAt, "2026-07-23T08:00:00Z", name);
+    assert.equal(artifact.revisionAt, "2026-07-23T08:00:00Z", name);
+    assert.equal(comment.body, rawBody, `${name}: preserve the raw carrier body`);
+  }
+
+  const crlfBody = codexReviewReceiptEnvelope(shortShaBody)
+    .replace(/\n/g, "\r\n");
+  const crlfArtifact = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(crlfBody),
+    { allowKnownReceiptEnvelope: true },
+  );
+  assert.equal(crlfArtifact.kind, "clean");
+  assert.equal(crlfArtifact.commitRef, "abcdef1234");
+
+  const malformedBodies = [
+    ["unknown version", `<!-- codex-review-receipt:v2 -->\n\n${shortShaBody}`],
+    ["malformed marker", `<!-- codex-review-receipt:v1-->\n\n${shortShaBody}`],
+    ["missing blank-line boundary", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n${shortShaBody}`],
+    [
+      "duplicate envelope",
+      `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${shortShaBody}`,
+    ],
+    ["marker only", CODEX_REVIEW_RECEIPT_ENVELOPE_V1],
+    [
+      "misplaced envelope",
+      [
+        "Codex Review: Didn't find any major issues.",
+        "",
+        CODEX_REVIEW_RECEIPT_ENVELOPE_V1,
+        "",
+        "**Reviewed commit:** `abcdef1234`",
+      ].join("\n"),
+    ],
+  ];
+  for (const [name, body] of malformedBodies) {
+    const artifact = parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body),
+      { allowKnownReceiptEnvelope: true },
+    );
+    assert.notEqual(artifact?.kind, "clean", name);
+  }
+});
+
+test("receipt envelopes preserve wrapped finding, failure, and provenance semantics", () => {
+  const finding = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(codexReviewReceiptEnvelope([
+      "### 💡 Codex Review",
+      "",
+      `https://github.com/owner/repo/blob/${FULL_SHA_A}/src/lib.mjs#L12-L14`,
+    ].join("\n"))),
+    {
+      owner: "owner",
+      repo: "repo",
+      allowKnownReceiptEnvelope: true,
+    },
+  );
+  assert.equal(finding.kind, "finding");
+  assert.equal(finding.headSha, FULL_SHA_A);
+  assert.equal(finding.findingCount, 1);
+
+  const serviceFailureBody = [
+    "Codex Review: Something went wrong. Try again later by commenting “@codex review”.",
+    "",
+    "```",
+    "Unknown error",
+    "```",
+    "",
+    officialCodexDisclosure(),
+  ].join("\n");
+  const serviceFailure = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(codexReviewReceiptEnvelope(serviceFailureBody)),
+    {
+      allowKnownReceiptEnvelope: true,
+      allowKnownServiceFailure: true,
+    },
+  );
+  assert.equal(serviceFailure.kind, "provider-failure");
+
+  const cleanWithFinding = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(codexReviewReceiptEnvelope([
+      "Codex Review: Didn't find any major issues.",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+      "",
+      "- [P1] this is still a finding",
+    ].join("\n"))),
+    { allowKnownReceiptEnvelope: true },
+  );
+  assert.equal(cleanWithFinding.kind, "malformed");
+  assert.equal(cleanWithFinding.parseDiagnostics.reasonCode, "finding_signal");
+
+  const wrongApp = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(codexReviewReceiptEnvelope([
+      "Codex Review: Didn't find any major issues.",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+    ].join("\n")), {
+      performed_via_github_app: { slug: "other-app" },
+    }),
+    { allowKnownReceiptEnvelope: true },
+  );
+  assert.equal(wrongApp.kind, "malformed");
+  assert.match(wrongApp.reason, /not bound to chatgpt-codex-connector/u);
+
+  const wrongAuthor = parseCodexIssueCommentArtifact(
+    liveCodexIssueComment(codexReviewReceiptEnvelope([
+      "Codex Review: Didn't find any major issues.",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+    ].join("\n")), {
+      user: { login: "joey", type: "User" },
+    }),
+    { allowKnownReceiptEnvelope: true },
+  );
+  assert.equal(wrongAuthor, null);
+
+  const editedBody = codexReviewReceiptEnvelope([
+    "Codex Review: Didn't find any major issues.",
+    "",
+    "**Reviewed commit:** `abcdef1234`",
+  ].join("\n"));
+  const editedComment = liveCodexIssueComment(editedBody, {
+    updated_at: "2026-07-23T08:02:00Z",
+  });
+  const edited = parseCodexIssueCommentArtifact(editedComment, {
+    allowKnownReceiptEnvelope: true,
+  });
+  assert.equal(edited.kind, "clean");
+  assert.equal(edited.edited, true);
+  assert.equal(edited.revisionAt, "2026-07-23T08:02:00Z");
+  assert.equal(editedComment.body, editedBody);
 });
 
 test("recognizes only the opt-in closed Codex provider service-failure grammar", () => {

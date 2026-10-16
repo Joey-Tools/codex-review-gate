@@ -14,6 +14,7 @@ export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
 export const V2_OFFICIAL_CODEX_BOT_LOGIN =
   "chatgpt-codex-connector[bot]";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
+const CODEX_REVIEW_RECEIPT_ENVELOPE_V1 = "<!-- codex-review-receipt:v1 -->";
 const CODEX_PROVIDER_SERVICE_FAILURE_LEAD =
   "Codex Review: Something went wrong. Try again later by commenting “@codex review”.";
 const MAX_CODEX_TERMINAL_HEADING_CODE_UNITS = 512;
@@ -318,6 +319,17 @@ function normalizeCodexCommentBody(body) {
     .replace(/\r\n?|[\u000B\u000C\u0085\u2028\u2029]/g, "\n");
 }
 
+function unwrapKnownCodexReviewReceiptEnvelope(body) {
+  const boundary = `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n`;
+  if (
+    !body.startsWith(boundary) ||
+    body.split(CODEX_REVIEW_RECEIPT_ENVELOPE_V1).length !== 2
+  ) {
+    return body;
+  }
+  return body.slice(boundary.length);
+}
+
 function stripLeadingEmojiGraphemes(value) {
   let cursor = 0;
   let graphemeCount = 0;
@@ -376,9 +388,13 @@ export function parseCodexIssueCommentArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
     allowShortCommitRefs = false,
     allowKnownServiceFailure = false,
+    allowKnownReceiptEnvelope = false,
   } = {},
 ) {
-  const body = normalizeCodexCommentBody(comment?.body);
+  const normalizedBody = normalizeCodexCommentBody(comment?.body);
+  const body = allowKnownReceiptEnvelope === true
+    ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
+    : normalizedBody;
   const terminalHeading = parseCodexIssueCommentTerminalHeading(body);
   if (!terminalHeading.terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
     return null;

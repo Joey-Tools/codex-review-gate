@@ -410,6 +410,20 @@ Provider carriers must bind exact bot identity. Similar names, copied text or
 user-authored claims have no authority. A finding's severity label does not
 affect blocking: any qualifying finding blocks.
 
+The v2 issue-comment parser also accepts one observed presentation envelope:
+the exact standalone leading `<!-- codex-review-receipt:v1 -->` line followed
+by a blank line. Existing line-ending normalization applies before this narrow
+unwrap. The shared parser opts into this compatibility explicitly; legacy
+callers retain their default behavior. The envelope alone is never evidence:
+the inner body must still pass the existing terminal grammar, Bot/App
+provenance, commit and request binding, and complete-snapshot finding guards.
+Wrapped findings and known service failures keep their non-clean semantics.
+Unknown, malformed, duplicate, misplaced or marker-only envelopes cannot supply
+clean authority; arbitrary HTML is not removed. Original carrier bodies and
+server metadata remain unchanged for identity, edit and fingerprint checks.
+The separate official PR-level summary and its embedded state remain
+non-authoritative and cannot substitute for a qualifying terminal carrier.
+
 An observed official service-failure issue comment is a separate non-clean
 carrier, not a finding or a positive review result. Its closed grammar is the
 exact `Something went wrong` retry heading, one fenced `Unknown error` detail,
