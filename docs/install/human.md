@@ -1278,18 +1278,36 @@ After owner review, append
 `--reviewed-status-writer .github/workflows/transport.yml@<printed-sha256>`
 to each bootstrap command.
 
-First have the control-plane owner review the exact workflow, its invoked code
-and the contexts it writes. Then add the declaration to local preview and
+Before hashing, isolate the writers into explicit job-level `statuses: write`
+jobs on literal `runs-on: ubuntu-slim`. Keep workflow-level permissions
+read-only. The privileged jobs must be self-contained inline Bash publishers,
+without actions, checkout, artifacts, repository scripts, containers, services,
+runner overrides or inherited executable defaults. Jobs that exercise PR code
+may keep their dependencies but must not inherit status-write authority.
+Each privileged job has exactly one literal `run: |` step with `shell: bash`.
+Its step `env` must clear `BASH_ENV` and `ENV` and set
+`GH_TOKEN: ${{ github.token }}`; metadata also belongs in step `env`, not a
+job-level environment. Literal `needs`, `if`, job outputs and one step ID are
+supported for trusted metadata handoff.
+The control-plane owner reviews the exact inline scripts and data flow:
+trusted metadata supplies the target SHA/context, and GitHub job results
+supply the terminal outcome. Do not execute PR-produced text or downloaded
+mutable/unprotected code, or trust a test artifact's claimed outcome.
+
+Then add the declaration to local preview and
 apply, remote staging and activation, and later full-profile cleanup commands.
 Repeat the option for each file (at most 32). Keep the same reviewed paths and
 digests; do not regenerate a digest after a change without reviewing it again.
 Every inventory read requires the exact UTF-8 content hash. Missing or changed
 files, duplicate/canonical paths, read-only no-op declarations, additional
 gate callers, the reserved gate job name, and any other relevant write
-permission are still rejected. The declaration is explicit owner-reviewed
-trust, not a static guarantee about arbitrary script behavior or status
-contexts; it does not replace CODEOWNERS or independent exact-head approval.
-Without declarations the original deny policy is unchanged. Historical
+permission are still rejected. The helper checks the isolated writer
+structure; script behavior and non-gate contexts still require explicit owner
+review. A workflow-only digest does not protect later changes to scripts it
+invokes. This does not replace CODEOWNERS or independent exact-head approval.
+Without declarations the original deny policy is unchanged. Do not combine
+the option with `--legacy-bridge`; initial admission rejects that combination
+because the later bridge cleanup has a frozen policy. Historical
 organization handoff/bridge-removal and source-only proofs do not accept this
 exception. Full inventory fingerprints and cleanup-plan digests already bind
 the retained workflows, so this does not add a stored receipt or runtime input.

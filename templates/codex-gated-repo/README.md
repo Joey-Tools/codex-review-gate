@@ -124,9 +124,20 @@ It has no bypass actors. Keep it disabled until the live canary succeeds.
 Repositories with an unrelated commit-status producer may explicitly retain
 its `statuses: write` permission using the bootstrap helper's repeatable
 `--reviewed-status-writer .github/workflows/FILE.yml@SHA256` option. The
-control-plane owner must review the exact file, its called code, and its
-non-gate status contexts before the digest is supplied. This is an explicit
-trust decision, not static proof of a script's behavior. Each declared file
+workflow must first isolate status writers in literal `ubuntu-slim` jobs with
+explicit job-level `statuses: write` and self-contained inline Bash steps.
+Workflow-level permissions stay read-only. Privileged jobs cannot use actions,
+checkouts, artifacts, repository scripts, containers, services, runner overrides
+or inherited executable defaults. PR-executing test jobs keep read-only tokens.
+Each privileged job contains one literal Bash `run: |` step, `shell: bash`,
+and step-level `env` clearing `BASH_ENV`/`ENV` and passing
+`GH_TOKEN: ${{ github.token }}`. Use step env for metadata; literal `needs`,
+`if`, job outputs and one step ID support the metadata handoff.
+The control-plane owner reviews every publisher's inline code and non-gate
+context: use trusted metadata and GitHub job results, never execute PR-produced
+text or downloaded mutable/unprotected code. Structural admission is not a
+static proof of arbitrary shell behavior; a workflow digest cannot bind future
+changes to an unprotected dependency. Each declared file
 must match that SHA-256 of its UTF-8 bytes at every inventory read and must
 have exactly `statuses: write` among the policy's relevant write permissions.
 Gate callers, the reserved native job name, and additional `actions`, `checks`,
@@ -135,7 +146,9 @@ changed, duplicate, canonical-path, or no-longer-status-writing declarations
 fail closed. Repeat the same declarations through local preview/apply,
 remote staging/activation, and full-profile cleanup verification; no
 declaration is learned or persisted automatically. Existing canonical
-CODEOWNERS coverage and independent owner review still apply. Historical
+CODEOWNERS coverage and independent owner review still apply. Initial admission
+rejects `--legacy-bridge` together with this option because later bridge
+removal keeps a frozen policy. Historical
 organization handoff/bridge-removal and source-only proofs do not accept
 this exception.
 

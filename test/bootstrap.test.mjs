@@ -173,6 +173,28 @@ const CANONICAL_WORKFLOWS = {
   verifier: CANONICAL_WORKFLOW,
   controller: CANONICAL_CONTROLLER_WORKFLOW,
 };
+const REVIEWED_INLINE_STATUS_WRITER = [
+  "name: Reviewed transport publisher",
+  "on: push",
+  "permissions:",
+  "  contents: read",
+  "jobs:",
+  "  publish:",
+  "    runs-on: ubuntu-slim",
+  "    permissions:",
+  "      statuses: write",
+  "    steps:",
+  "      - name: Publish",
+  "        env:",
+  '          BASH_ENV: ""',
+  '          ENV: ""',
+  "          GH_TOKEN: ${{ github.token }}",
+  "        shell: bash",
+  "        run: |",
+  "          set -euo pipefail",
+  "          printf 'Reviewed inline publisher\\n'",
+  "",
+].join("\n");
 const CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE = {
   ...CANONICAL_WORKFLOWS,
   legacyBridge: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
@@ -2559,8 +2581,8 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
 test("reviewed status writers survive local preparation only with explicit frozen declarations", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-reviewed-writers-"));
   const writers = [
-    { path: ".github/workflows/transport.yml", content: "name: Transport\npermissions:\n  statuses: write\njobs: {}\n" },
-    { path: ".github/workflows/evidence.yaml", content: "name: Evidence\npermissions:\n  contents: read\njobs:\n  evidence:\n    permissions:\n      statuses: write\n    runs-on: ubuntu-slim\n    steps: []\n" },
+    { path: ".github/workflows/transport.yml", content: REVIEWED_INLINE_STATUS_WRITER },
+    { path: ".github/workflows/evidence.yaml", content: REVIEWED_INLINE_STATUS_WRITER.replace("publish:", "evidence:") },
   ];
   const declarations = writers.flatMap(({ path, content }) => [
     "--reviewed-status-writer", `${path}@${createHash("sha256").update(content).digest("hex")}`,
@@ -2580,6 +2602,15 @@ test("reviewed status writers survive local preparation only with explicit froze
       for (const { path, content } of writers) assert.equal(readFileSync(join(targetRoot, path), "utf8"), content);
     }
     assert.equal(readFileSync(join(targetRoot, DEFAULT_WORKFLOW_PATH), "utf8"), CANONICAL_WORKFLOW);
+    const unsafeWriter = writers[0].content.replace("runs-on: ubuntu-slim", "runs-on: self-hosted");
+    writeFileSync(join(targetRoot, writers[0].path), unsafeWriter);
+    const unsafe = runBootstrap([
+      "--prepare-worktree", targetRoot,
+      "--reviewed-status-writer", `${writers[0].path}@${createHash("sha256").update(unsafeWriter).digest("hex")}`,
+      ...declarations.slice(2), "--apply",
+    ]);
+    assert.equal(unsafe.status, 1);
+    assert.match(unsafe.stderr, /reviewed status writer/iu);
     writeFileSync(join(targetRoot, writers[0].path), `${writers[0].content}# changed\n`);
     const drifted = runBootstrap(["--prepare-worktree", targetRoot, ...declarations, "--apply"]);
     assert.equal(drifted.status, 1);
@@ -2597,6 +2628,19 @@ test("reviewed status writers survive local preparation only with explicit froze
 
 test("reviewed status writer CLI rejects malformed, duplicate, canonical and frozen-mode declarations", () => {
   const declaration = `.github/workflows/transport.yml@${"a".repeat(64)}`;
+  const legacyBridgeConflict = runBootstrap([
+    "--prepare-worktree",
+    "/definitely-not-a-worktree",
+    "--reviewed-status-writer",
+    declaration,
+    "--legacy-bridge",
+  ]);
+  assert.equal(legacyBridgeConflict.status, 1);
+  assert.match(
+    legacyBridgeConflict.stderr,
+    /--reviewed-status-writer cannot be combined with --legacy-bridge.*--remove-legacy-bridge/u,
+  );
+
   for (const args of [
     ["--reviewed-status-writer", ".github/workflows/transport.yml@short"],
     ["--reviewed-status-writer", `../transport.yml@${"a".repeat(64)}`],
@@ -2617,7 +2661,7 @@ test("reviewed status writers remain admitted across remote staging and activati
   const stateDir = join(fixtureRoot, "state");
   const callLog = join(fixtureRoot, "calls.log");
   const repoSlug = "Joey-Tools/consumer";
-  const content = "name: Transport\npermissions:\n  statuses: write\njobs: {}\n";
+  const content = REVIEWED_INLINE_STATUS_WRITER;
   const declaration = `.github/workflows/transport.yml@${createHash("sha256").update(content).digest("hex")}`;
   try {
     createFakeGhExecutable(fakeBin);
@@ -2644,7 +2688,7 @@ test("reviewed status writer drift stops remote staging before the ruleset write
   const stateDir = join(fixtureRoot, "state");
   const callLog = join(fixtureRoot, "calls.log");
   const repoSlug = "Joey-Tools/consumer";
-  const content = "name: Transport\npermissions:\n  statuses: write\njobs: {}\n";
+  const content = REVIEWED_INLINE_STATUS_WRITER;
   const declaration = `.github/workflows/transport.yml@${createHash("sha256").update(content).digest("hex")}`;
   try {
     createFakeGhExecutable(fakeBin);

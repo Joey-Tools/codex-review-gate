@@ -818,6 +818,11 @@ function readCliOptions() {
   const reviewedStatusWriters = parseReviewedStatusWriterArguments(
     values["reviewed-status-writer"] ?? [],
   );
+  if (reviewedStatusWriters.length > 0 && values["legacy-bridge"]) {
+    throw new Error(
+      "--reviewed-status-writer cannot be combined with --legacy-bridge because the later --remove-legacy-bridge cleanup phase retains a frozen declaration policy.",
+    );
+  }
   if (
     reviewedStatusWriters.length > 0 &&
     (rulesetProfile !== DEFAULT_RULESET_PROFILE ||
@@ -1251,7 +1256,7 @@ Options:
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
   --legacy-bridge         Explicitly require/install the exact temporary v1 producer at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. Keep this flag through legacy cleanup verification.
-  --reviewed-status-writer PATH@SHA256  Repeat for explicitly reviewed status-only writers; exact raw UTF-8 bytes are required on every local and remote read. This is owner-reviewed trust, not proof of a script's status context. Repeat the declarations through staging, activation and cleanup. Other write permissions, gate callers and reserved job names remain forbidden.
+  --reviewed-status-writer PATH@SHA256  Repeat for owner-reviewed isolated inline status publishers: read-only workflow permissions, explicit job-level statuses:write and literal ubuntu-slim. No action, checkout, repository script or executable dependency in privileged jobs. Exact raw UTF-8 bytes are required on every read; inline behavior/context still requires owner review. Use only without --legacy-bridge; frozen proof modes do not accept declarations. Other writes, gate callers and reserved job names remain forbidden.
   --remove-legacy-bridge  Freeze-bound, local-only post-cutover removal of an exact canonical bridge. By default it uses no GitHub API reads.
   --live-revalidate-final-closure
                           Explicitly repeat the expensive live organization/canary closure audit for one diagnostic cleanup. Do not use for batch consumer cleanup during a freeze.

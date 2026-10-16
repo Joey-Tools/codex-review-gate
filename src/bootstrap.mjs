@@ -4551,9 +4551,14 @@ export function workflowSingleProducerPolicyViolations(
   return violations;
 }
 
-// The digest pins the exact UTF-8 bytes approved through Code Review; it does
-// not prove that a workflow is benign. This explicit exception may suppress
-// only the statuses: write finding and never changes the default policy.
+// The digest pins exact UTF-8 bytes approved through Code Review; it does not
+// prove that the inline shell program is benign. The structural profile below
+// only excludes implicit permissions and YAML-provided executable inputs such
+// as actions, reusable workflows, containers, and self-hosted runners. Review
+// of the frozen inline bytes remains responsible for script semantics and for
+// ensuring that PR-controlled data is never treated as executable input.
+// This explicit exception may suppress only the statuses: write finding and
+// never changes the default policy.
 export function validateReviewedStatusWriters(
   workflowFiles,
   reviewedStatusWriters = [],
@@ -4646,6 +4651,7 @@ export function validateReviewedStatusWriters(
           `${path} must have exactly the statuses: write violation and no other single-producer policy violation; found ${violations.join(", ") || "none"}.`,
         );
       }
+      validateReviewedStatusWriterIsolationProfile(matches[0].content);
       reviewedPaths.add(path);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -4657,6 +4663,546 @@ export function validateReviewedStatusWriters(
   }
 
   return reviewedPaths;
+}
+
+const REVIEWED_STATUS_WRITER_JOB_FIELDS = new Set([
+  "if",
+  "name",
+  "needs",
+  "outputs",
+  "permissions",
+  "runs-on",
+  "steps",
+  "timeout-minutes",
+]);
+const REVIEWED_STATUS_WRITER_STEP_FIELDS = new Set([
+  "env",
+  "id",
+  "name",
+  "run",
+  "shell",
+]);
+
+function validateReviewedStatusWriterIsolationProfile(value) {
+  const tokens = tokenizeReviewedStatusWriterWorkflow(value);
+  const rootEntries = tokens
+    .filter((token) => token.indent === 0)
+    .map((token) => ({ token, mapping: parseReviewedStatusWriterMapping(token) }));
+  if (rootEntries.some(({ mapping }) => mapping === null)) {
+    throw new Error("workflow root contains an unsupported structural form.");
+  }
+  const rootFields = new Map();
+  for (const { token, mapping } of rootEntries) {
+    if (rootFields.has(mapping.key)) {
+      throw new Error(`workflow repeats its root ${mapping.key} field.`);
+    }
+    rootFields.set(mapping.key, { token, mapping });
+  }
+
+  const permissionsEntry = rootFields.get("permissions");
+  if (permissionsEntry === undefined) {
+    throw new Error("workflow must declare explicit read-only root permissions.");
+  }
+  const workflowPermissions = parseReviewedStatusWriterPermissions(
+    tokens,
+    permissionsEntry.token,
+    "workflow",
+  );
+  if ([...workflowPermissions.values()].some((access) => access === "write")) {
+    throw new Error("workflow-level permissions must be explicitly read-only.");
+  }
+
+  if (rootFields.has("defaults")) {
+    throw new Error("workflow-level defaults are not allowed for a status writer.");
+  }
+  const workflowEnv = rootFields.get("env");
+  if (workflowEnv !== undefined) {
+    validateReviewedStatusWriterEnvironment(
+      parseReviewedStatusWriterFlatMapping(tokens, workflowEnv.token, "workflow env"),
+      { scope: "workflow", requireToken: false },
+    );
+  }
+
+  const jobsEntry = rootFields.get("jobs");
+  if (jobsEntry === undefined || jobsEntry.mapping.value !== "") {
+    throw new Error("workflow must use an explicit block-style jobs mapping.");
+  }
+  const jobTokens = reviewedStatusWriterSubtree(tokens, jobsEntry.token);
+  const jobHeaders = jobTokens.filter((token) => token.indent === 2);
+  const jobIds = new Set();
+  const jobs = [];
+  for (const header of jobHeaders) {
+    const mapping = parseReviewedStatusWriterMapping(header);
+    if (mapping === null || mapping.sequence || mapping.value !== "") {
+      // A read-only job may use an opaque mapping form. Permission inventory
+      // rejects opaque permission declarations; it is otherwise left alone.
+      continue;
+    }
+    if (jobIds.has(mapping.key)) {
+      throw new Error(`workflow repeats job identifier ${mapping.key}.`);
+    }
+    jobIds.add(mapping.key);
+    const body = reviewedStatusWriterSubtree(jobTokens, header);
+    const properties = body.filter((token) => token.indent === 4);
+    const permissionHeaders = properties
+      .map((token) => ({ token, mapping: parseReviewedStatusWriterMapping(token) }))
+      .filter(({ mapping }) => mapping?.key === "permissions");
+    if (permissionHeaders.length > 1) {
+      throw new Error(`job ${mapping.key} repeats its permissions field.`);
+    }
+    const jobPermissions = permissionHeaders.length === 0
+      ? new Map()
+      : parseReviewedStatusWriterPermissions(
+          tokens,
+          permissionHeaders[0].token,
+          `job ${mapping.key}`,
+        );
+    if (jobPermissions.get("statuses") === "write") {
+      jobs.push({
+        id: mapping.key,
+        header,
+        body,
+        properties,
+        permissionHeader: permissionHeaders[0].token,
+        permissions: jobPermissions,
+      });
+    }
+  }
+
+  const attributableStatusWrites = new Set();
+  for (const job of jobs) {
+    const statusPermission = reviewedStatusWriterSubtree(
+      tokens,
+      job.permissionHeader,
+    ).find((token) => {
+      if (token.indent !== job.permissionHeader.indent + 2) {
+        return false;
+      }
+      const mapping = parseReviewedStatusWriterMapping(token);
+      return mapping?.key === "statuses" &&
+        readReviewedStatusWriterScalar(mapping.value, "statuses permission") === "write";
+    });
+    if (statusPermission === undefined) {
+      throw new Error(`job ${job.id} statuses: write permission is not structurally attributable.`);
+    }
+    attributableStatusWrites.add(statusPermission.index);
+  }
+  for (const token of tokens) {
+    const mapping = parseReviewedStatusWriterMapping(token);
+    if (mapping?.key !== "statuses") {
+      continue;
+    }
+    if (
+      readReviewedStatusWriterScalar(mapping.value, "statuses permission") === "write" &&
+      !attributableStatusWrites.has(token.index)
+    ) {
+      throw new Error("statuses: write must appear only in an explicit job-level permissions mapping.");
+    }
+  }
+
+  if (jobs.length === 0) {
+    throw new Error("workflow has no isolated job-level statuses: write publisher.");
+  }
+  for (const job of jobs) {
+    validateReviewedStatusWriterJob(tokens, job, jobIds);
+  }
+}
+
+function tokenizeReviewedStatusWriterWorkflow(value) {
+  if (typeof value !== "string") {
+    throw new Error("workflow content must be text.");
+  }
+  assertCanonicalWorkflowLineEndings(value);
+  const normalized = value.startsWith("\uFEFF") ? value.slice(1) : value;
+  const lines = normalized.split(/\r?\n/u);
+  const tokens = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index];
+    const rawIndent = rawLine.match(/^ */u)[0].length;
+    if (/^\s*\t/u.test(rawLine)) {
+      throw new Error("workflow uses tab-indented YAML structure.");
+    }
+    const uncommented = stripYamlComment(rawLine.slice(rawIndent)).trimEnd();
+    if (uncommented.trim() === "") {
+      continue;
+    }
+    const token = {
+      index,
+      indent: rawIndent,
+      text: uncommented,
+      blockStyle: null,
+      blockContent: [],
+    };
+    const mapping = parseReviewedStatusWriterMapping(token);
+    if (mapping !== null && /^[|>][+-]?[1-9]?$|^[|>][1-9]?[+-]?$/u.test(mapping.value)) {
+      token.blockStyle = mapping.value;
+      for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+        const contentLine = lines[cursor];
+        const contentIndent = contentLine.match(/^ */u)[0].length;
+        if (contentLine.trim() !== "" && contentIndent <= rawIndent) {
+          break;
+        }
+        token.blockContent.push(contentLine);
+        index = cursor;
+      }
+    }
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+function parseReviewedStatusWriterMapping(token) {
+  if (token === undefined || token === null) {
+    return null;
+  }
+  let text = token.text;
+  let sequence = false;
+  if (text.startsWith("- ")) {
+    sequence = true;
+    text = text.slice(2);
+  }
+  const match = text.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/u);
+  return match === null
+    ? null
+    : { key: match[1], value: match[2], sequence };
+}
+
+function reviewedStatusWriterSubtree(tokens, header) {
+  const headerPosition = tokens.indexOf(header);
+  if (headerPosition === -1) {
+    throw new Error("workflow contains a detached structural token.");
+  }
+  const descendants = [];
+  for (let index = headerPosition + 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token.indent <= header.indent) {
+      break;
+    }
+    descendants.push(token);
+  }
+  return descendants;
+}
+
+function parseReviewedStatusWriterFlatMapping(tokens, header, description) {
+  const mapping = parseReviewedStatusWriterMapping(header);
+  if (mapping === null || mapping.value !== "") {
+    throw new Error(`${description} must be a block-style mapping.`);
+  }
+  const children = reviewedStatusWriterSubtree(tokens, header);
+  const entries = new Map();
+  for (const child of children) {
+    if (child.indent !== header.indent + 2) {
+      throw new Error(`${description} contains a nested or ambiguous mapping.`);
+    }
+    const childMapping = parseReviewedStatusWriterMapping(child);
+    if (childMapping === null || childMapping.sequence) {
+      throw new Error(`${description} contains an unsupported entry.`);
+    }
+    if (entries.has(childMapping.key)) {
+      throw new Error(`${description} repeats key ${childMapping.key}.`);
+    }
+    if (child.blockStyle !== null) {
+      throw new Error(`${description} values must be single-line scalars.`);
+    }
+    entries.set(
+      childMapping.key,
+      readReviewedStatusWriterScalar(childMapping.value, `${description} ${childMapping.key}`, { allowEmpty: true }),
+    );
+  }
+  return entries;
+}
+
+function parseReviewedStatusWriterPermissions(tokens, header, description) {
+  const mapping = parseReviewedStatusWriterMapping(header);
+  if (mapping === null) {
+    throw new Error(`${description} permissions use an unsupported mapping form.`);
+  }
+  if (mapping.value === "read-all" || mapping.value === "{}") {
+    return new Map();
+  }
+  if (mapping.value !== "") {
+    throw new Error(`${description} permissions must use an explicit block mapping.`);
+  }
+  const entries = parseReviewedStatusWriterFlatMapping(
+    tokens,
+    header,
+    `${description} permissions`,
+  );
+  if (entries.size === 0) {
+    throw new Error(`${description} permissions mapping must not be empty.`);
+  }
+  for (const [permission, access] of entries) {
+    if (
+      permission !== permission.toLowerCase() ||
+      !/^[a-z][a-z-]*$/u.test(permission) ||
+      !["read", "write", "none"].includes(access)
+    ) {
+      throw new Error(`${description} has an ambiguous permission entry ${permission}.`);
+    }
+  }
+  return entries;
+}
+
+function readReviewedStatusWriterScalar(value, description, { allowEmpty = false } = {}) {
+  const trimmed = value.trim();
+  if (trimmed === "" && allowEmpty) {
+    return "";
+  }
+  if (trimmed === "" || /^[|>]/u.test(trimmed)) {
+    throw new Error(`${description} must be a supported single-line scalar.`);
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replaceAll("''", "'");
+  }
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    const inner = trimmed.slice(1, -1);
+    if (/\\/u.test(inner)) {
+      throw new Error(`${description} uses an unsupported escaped scalar.`);
+    }
+    return inner;
+  }
+  if (/^[&*!\[{]|^<<\s*:/u.test(trimmed) || /^(?:null|~)$/iu.test(trimmed)) {
+    throw new Error(`${description} uses an opaque flow, alias, anchor, or tag form.`);
+  }
+  return trimmed;
+}
+
+function validateReviewedStatusWriterEnvironment(entries, { scope, requireToken }) {
+  for (const [name, value] of entries) {
+    if (!/^[A-Z][A-Z0-9_]*$/u.test(name)) {
+      throw new Error(`${scope} env has an unsupported variable name ${name}.`);
+    }
+    if (name === "BASH_ENV" || name === "ENV") {
+      if (scope !== "step" || value !== "") {
+        throw new Error(`${scope} env may only clear BASH_ENV and ENV in an inline publisher step.`);
+      }
+      continue;
+    }
+    if (
+      /^(?:GITHUB|RUNNER|ACTIONS)_/u.test(name) ||
+      /^(?:PATH|HOME|SHELL|TMP|TEMP|TMPDIR|CI)$/u.test(name) ||
+      /^(?:LD_|DYLD_)/u.test(name) ||
+      /^(?:PYTHON|NODE|PERL|RUBY|GEM|JAVA|JDK|GIT_CONFIG)/u.test(name) ||
+      /^(?:BASHOPTS|SHELLOPTS)$/u.test(name)
+    ) {
+      throw new Error(`${scope} env may not override runner or interpreter variable ${name}.`);
+    }
+    if (scope === "workflow" && (value.includes("${{") || name === "GH_TOKEN")) {
+      throw new Error("workflow env may contain only harmless literal data, not tokens or expressions.");
+    }
+    if (scope === "step" && name === "GH_TOKEN") {
+      if (!/^\$\{\{\s*github\.token\s*\}\}$/u.test(value)) {
+        throw new Error("inline publisher GH_TOKEN must come directly from github.token.");
+      }
+    }
+  }
+  if (scope === "step") {
+    if (entries.get("BASH_ENV") !== "" || entries.get("ENV") !== "") {
+      throw new Error("inline publisher step must explicitly clear BASH_ENV and ENV.");
+    }
+    if (requireToken && !entries.has("GH_TOKEN")) {
+      throw new Error("inline publisher step must pass github.token through GH_TOKEN.");
+    }
+  }
+}
+
+function validateReviewedStatusWriterJob(tokens, job, jobIds) {
+  if (
+    job.permissions.size !== 1 ||
+    job.permissions.get("statuses") !== "write"
+  ) {
+    throw new Error(`privileged job ${job.id} must grant only job-level statuses: write.`);
+  }
+  const properties = new Map();
+  for (const token of job.properties) {
+    const mapping = parseReviewedStatusWriterMapping(token);
+    if (mapping === null || mapping.sequence) {
+      throw new Error(`privileged job ${job.id} contains an opaque field.`);
+    }
+    if (!REVIEWED_STATUS_WRITER_JOB_FIELDS.has(mapping.key)) {
+      throw new Error(`privileged job ${job.id} uses unsupported field ${mapping.key}.`);
+    }
+    if (properties.has(mapping.key)) {
+      throw new Error(`privileged job ${job.id} repeats field ${mapping.key}.`);
+    }
+    properties.set(mapping.key, { token, mapping });
+  }
+  const runner = properties.get("runs-on");
+  if (runner === undefined || runner.token.blockStyle !== null) {
+    throw new Error(`privileged job ${job.id} must use literal runs-on: ubuntu-slim.`);
+  }
+  if (readReviewedStatusWriterScalar(runner.mapping.value, `job ${job.id} runs-on`) !== "ubuntu-slim") {
+    throw new Error(`privileged job ${job.id} must use literal runs-on: ubuntu-slim.`);
+  }
+  for (const optional of ["name", "timeout-minutes"]) {
+    const field = properties.get(optional);
+    if (field === undefined) {
+      continue;
+    }
+    if (field.token.blockStyle !== null) {
+      throw new Error(`privileged job ${job.id} ${optional} must be a single-line scalar.`);
+    }
+    const scalar = readReviewedStatusWriterScalar(field.mapping.value, `job ${job.id} ${optional}`);
+    if (optional === "timeout-minutes" && !/^[1-9][0-9]*$/u.test(scalar)) {
+      throw new Error(`privileged job ${job.id} timeout-minutes must be a positive integer.`);
+    }
+  }
+  const needs = properties.get("needs");
+  if (needs !== undefined) {
+    for (const neededJob of parseReviewedStatusWriterNeeds(tokens, needs.token)) {
+      if (!jobIds.has(neededJob)) {
+        throw new Error(`privileged job ${job.id} needs unknown job ${neededJob}.`);
+      }
+    }
+  }
+  const condition = properties.get("if");
+  if (condition !== undefined) {
+    if (condition.token.blockStyle !== null) {
+      if (
+        ![">-", "|", "|-"].includes(condition.token.blockStyle) ||
+        !condition.token.blockContent.some((line) => line.trim() !== "")
+      ) {
+        throw new Error(`privileged job ${job.id} has an unsupported if scalar.`);
+      }
+    } else {
+      readReviewedStatusWriterScalar(condition.mapping.value, `job ${job.id} if`);
+    }
+  }
+  const outputs = properties.get("outputs");
+  if (outputs !== undefined) {
+    parseReviewedStatusWriterFlatMapping(tokens, outputs.token, `job ${job.id} outputs`);
+  }
+  const steps = properties.get("steps");
+  if (steps === undefined) {
+    throw new Error(`privileged job ${job.id} must contain an inline run step.`);
+  }
+  validateReviewedStatusWriterSteps(tokens, steps.token, job.id);
+}
+
+function parseReviewedStatusWriterNeeds(tokens, header) {
+  const mapping = parseReviewedStatusWriterMapping(header);
+  if (mapping === null || header.blockStyle !== null) {
+    throw new Error("privileged job needs must use literal job identifiers.");
+  }
+  const value = mapping.value.trim();
+  if (value.startsWith("[")) {
+    const match = value.match(/^\[\s*([A-Za-z0-9_-]+(?:\s*,\s*[A-Za-z0-9_-]+)*)\s*\]$/u);
+    if (match === null) {
+      throw new Error("privileged job needs uses an opaque flow sequence.");
+    }
+    return match[1].split(/\s*,\s*/u);
+  }
+  if (value !== "") {
+    if (!/^[A-Za-z0-9_-]+$/u.test(value)) {
+      throw new Error("privileged job needs must use literal job identifiers.");
+    }
+    return [value];
+  }
+  const children = reviewedStatusWriterSubtree(tokens, header);
+  const result = [];
+  for (const child of children) {
+    if (child.indent !== header.indent + 2) {
+      throw new Error("privileged job needs contains a nested or ambiguous sequence.");
+    }
+    const match = child.text.match(/^-\s+([A-Za-z0-9_-]+)\s*$/u);
+    if (match === null) {
+      throw new Error("privileged job needs must use literal job identifiers.");
+    }
+    result.push(match[1]);
+  }
+  if (result.length === 0) {
+    throw new Error("privileged job needs must not be empty.");
+  }
+  return result;
+}
+
+function validateReviewedStatusWriterSteps(tokens, header, jobId) {
+  const mapping = parseReviewedStatusWriterMapping(header);
+  if (mapping === null || mapping.value !== "") {
+    throw new Error(`privileged job ${jobId} steps must use a block sequence.`);
+  }
+  const children = reviewedStatusWriterSubtree(tokens, header);
+  const stepStarts = children.filter((token) => token.indent === header.indent + 2);
+  if (
+    stepStarts.length !== 1 ||
+    !stepStarts[0].text.startsWith("- ")
+  ) {
+    throw new Error(`privileged job ${jobId} must contain exactly one inline run step.`);
+  }
+  const stepStart = stepStarts[0];
+  const firstMapping = parseReviewedStatusWriterMapping(stepStart);
+  if (firstMapping === null || !firstMapping.sequence) {
+    throw new Error(`privileged job ${jobId} step uses an unsupported sequence item.`);
+  }
+  if (!REVIEWED_STATUS_WRITER_STEP_FIELDS.has(firstMapping.key)) {
+    throw new Error(`privileged job ${jobId} step uses unsupported field ${firstMapping.key}.`);
+  }
+  const stepProperties = new Map([[firstMapping.key, { token: stepStart, mapping: firstMapping }]]);
+  for (const token of children) {
+    if (token === stepStart) {
+      continue;
+    }
+    if (token.indent === header.indent + 6) {
+      // The step env parser below owns this one nested mapping level.
+      continue;
+    }
+    if (token.indent !== header.indent + 4) {
+      throw new Error(`privileged job ${jobId} step contains an opaque nested structure.`);
+    }
+    const field = parseReviewedStatusWriterMapping(token);
+    if (field === null || field.sequence) {
+      throw new Error(`privileged job ${jobId} step contains an unsupported field.`);
+    }
+    if (!REVIEWED_STATUS_WRITER_STEP_FIELDS.has(field.key)) {
+      throw new Error(`privileged job ${jobId} step uses unsupported field ${field.key}.`);
+    }
+    if (stepProperties.has(field.key)) {
+      throw new Error(`privileged job ${jobId} step repeats field ${field.key}.`);
+    }
+    stepProperties.set(field.key, { token, mapping: field });
+  }
+  const stepId = stepProperties.get("id");
+  if (stepId !== undefined) {
+    if (
+      stepId.token.blockStyle !== null ||
+      !/^[A-Za-z_][A-Za-z0-9_-]*$/u.test(
+        readReviewedStatusWriterScalar(stepId.mapping.value, `job ${jobId} step id`),
+      )
+    ) {
+      throw new Error(`privileged job ${jobId} step id must be a literal identifier.`);
+    }
+  }
+  const stepName = stepProperties.get("name");
+  if (stepName !== undefined) {
+    if (stepName.token.blockStyle !== null) {
+      throw new Error(`privileged job ${jobId} step name must be a single-line scalar.`);
+    }
+    readReviewedStatusWriterScalar(stepName.mapping.value, `job ${jobId} step name`);
+  }
+  const shell = stepProperties.get("shell");
+  if (
+    shell === undefined ||
+    shell.token.blockStyle !== null ||
+    readReviewedStatusWriterScalar(shell.mapping.value, `job ${jobId} step shell`) !== "bash"
+  ) {
+    throw new Error(`privileged job ${jobId} inline step must use literal shell: bash.`);
+  }
+  const run = stepProperties.get("run");
+  if (
+    run === undefined ||
+    !["|", "|-"].includes(run.token.blockStyle) ||
+    !run.token.blockContent.some((line) => line.trim() !== "")
+  ) {
+    throw new Error(`privileged job ${jobId} must run a non-empty inline literal block.`);
+  }
+  const env = stepProperties.get("env");
+  if (env === undefined) {
+    throw new Error(`privileged job ${jobId} step must explicitly set its safe environment.`);
+  }
+  validateReviewedStatusWriterEnvironment(
+    parseReviewedStatusWriterFlatMapping(tokens, env.token, `job ${jobId} step env`),
+    { scope: "step", requireToken: true },
+  );
 }
 
 function workflowWritePermissions(value) {
