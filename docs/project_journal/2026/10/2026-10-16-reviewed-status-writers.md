@@ -72,6 +72,17 @@ superseded_by:
   compatibility, not permission policy. The attempted stacked PR #124 was
   superseded because v2 requires the default branch as its PR base; no bypass
   or policy relaxation was used.
+- The next review identified three additional compatibility boundaries:
+  literal quoted root keys such as `"on"` must parse like plain keys, unrelated
+  `statuses: write` data in read-only job metadata is not permission authority,
+  and an env-first step must use its mapping-key indentation and stop before
+  sibling `shell`/`run` fields. Preserve protected-key, duplicate-key, hidden
+  writer and executable-environment rejection while correcting these cases.
+- A passing source CI run is not an Action deployment. The production entry
+  point is `packages/action/src/v2/gate-runtime.mjs`; it does not import the
+  installer parser. Neither the parser prerequisite nor this installer PR
+  changes `packages/action/`, so these fixes do not require a release or a
+  floating `@v2` update. A future runtime fix would need the normal release.
 
 ## Validation
 
@@ -86,6 +97,13 @@ superseded_by:
   policy, CI-inventory and workflow contracts plus four focused CLI tests pass
   (84 total). The actual HDR isolated publisher validation and canonical
   preparation dry-run pass again without applying assets or settings.
+- The same 80-contract and four-CLI validation passes after the subsequent
+  quoted-key, metadata-attribution and env-first fixes, together with syntax,
+  journal validation and the real HDR preparation dry-run. Added cases retain
+  five lexer and six writer-policy test registrations: both quote styles,
+  duplicate plain/quoted roots, quoted protected permission-key denial,
+  read-only block/flow env and output metadata, env-first field orders,
+  hidden/irregular writers, nested environments and forbidden sibling actions.
 - The six policy test registrations include split read-only test jobs with
   isolated pending/final publishers and rejection of mutable/local actions,
   checkout/dependency imports, interpreter environment injection, opaque

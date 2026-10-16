@@ -17,6 +17,10 @@ test("sequence block scalars stop before run-first sibling fields", () => {
     "          BASH_ENV: ''",
     "        shell: bash",
     "        uses: actions/checkout@v4",
+    "      - \"run\": |",
+    "          printf 'quoted key body'",
+    "        \"env\": visible sibling",
+    "      - name: after quoted block",
   ].join("\n"));
   const run = tokens.find((token) => token.text === "- run: |");
   assert.ok(run);
@@ -31,6 +35,14 @@ test("sequence block scalars stop before run-first sibling fields", () => {
     "          printf 'env: shell: uses: are literal body text'",
     "          uses: body-text-not-a-step",
   ]);
+  const quotedRun = tokens.find((token) => token.text === '- "run": |');
+  assert.ok(quotedRun);
+  assert.deepEqual(parseWorkflowYamlMapping(quotedRun), {
+    key: "run",
+    value: "|",
+    sequence: true,
+  });
+  assert.deepEqual(quotedRun.blockContent, ["          printf 'quoted key body'"]);
   assert.deepEqual(
     tokens.map((token) => token.text),
     [
@@ -42,23 +54,31 @@ test("sequence block scalars stop before run-first sibling fields", () => {
       "BASH_ENV: ''",
       "shell: bash",
       "uses: actions/checkout@v4",
+      '- "run": |',
+      '"env": visible sibling',
+      "- name: after quoted block",
     ],
   );
 });
 
 test("ordinary mapping block scalars stop before same-indent sibling keys", () => {
   const tokens = tokenizeWorkflowYaml([
-    "script: >-",
+    '"script": >-',
     "  literal mapping-like text: stays in body",
-    "sibling: visible",
+    '"sibling": visible',
   ].join("\n"));
   assert.deepEqual(tokens[0].blockContent, [
     "  literal mapping-like text: stays in body",
   ]);
-  assert.equal(tokens[1].text, "sibling: visible");
+  assert.equal(tokens[1].text, '"sibling": visible');
   assert.deepEqual(parseWorkflowYamlMapping(tokens[0]), {
     key: "script",
     value: ">-",
+    sequence: false,
+  });
+  assert.deepEqual(parseWorkflowYamlMapping(tokens[1]), {
+    key: "sibling",
+    value: "visible",
     sequence: false,
   });
 });
@@ -126,4 +146,27 @@ test("input admission preserves BOM and CRLF support and rejects tabs and bare C
   );
   assert.equal(parseWorkflowYamlMapping(null), null);
   assert.equal(parseWorkflowYamlMapping({ text: "not a mapping" }), null);
+  for (const [text, key, sequence] of [
+    ['"on": push', "on", false],
+    ["'on': push", "on", false],
+    ['- "on": push', "on", true],
+    ["- 'on': push", "on", true],
+  ]) {
+    assert.deepEqual(parseWorkflowYamlMapping({ text }), {
+      key,
+      value: "push",
+      sequence,
+    });
+  }
+  for (const text of [
+    '"on: push',
+    "'on\": push",
+    String.raw`"on\": push`,
+    "'on''event': push",
+    '!tag "on": push',
+    '&anchor "on": push',
+    '{ "on": push }',
+  ]) {
+    assert.equal(parseWorkflowYamlMapping({ text }), null, text);
+  }
 });

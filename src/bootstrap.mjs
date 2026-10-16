@@ -4773,6 +4773,17 @@ function validateReviewedStatusWriterIsolationProfile(value) {
     }
   }
 
+  const permissionDescendants = new Set();
+  for (const token of tokens) {
+    const mapping = parseReviewedStatusWriterMapping(token);
+    if (mapping?.key !== "permissions" || mapping.value !== "") {
+      continue;
+    }
+    for (const descendant of reviewedStatusWriterSubtree(tokens, token)) {
+      permissionDescendants.add(descendant.index);
+    }
+  }
+
   const attributableStatusWrites = new Set();
   for (const job of jobs) {
     const statusPermission = reviewedStatusWriterSubtree(
@@ -4793,7 +4804,10 @@ function validateReviewedStatusWriterIsolationProfile(value) {
   }
   for (const token of tokens) {
     const mapping = parseReviewedStatusWriterMapping(token);
-    if (mapping?.key !== "statuses") {
+    if (
+      mapping?.key !== "statuses" ||
+      !permissionDescendants.has(token.index)
+    ) {
       continue;
     }
     if (
@@ -4817,10 +4831,12 @@ function reviewedStatusWriterSubtree(tokens, header) {
   if (headerPosition === -1) {
     throw new Error("workflow contains a detached structural token.");
   }
+  const mapping = parseReviewedStatusWriterMapping(header);
+  const mappingIndent = header.indent + (mapping?.sequence ? 2 : 0);
   const descendants = [];
   for (let index = headerPosition + 1; index < tokens.length; index += 1) {
     const token = tokens[index];
-    if (token.indent <= header.indent) {
+    if (token.indent <= mappingIndent) {
       break;
     }
     descendants.push(token);
@@ -4833,10 +4849,11 @@ function parseReviewedStatusWriterFlatMapping(tokens, header, description) {
   if (mapping === null || mapping.value !== "") {
     throw new Error(`${description} must be a block-style mapping.`);
   }
+  const mappingIndent = header.indent + (mapping.sequence ? 2 : 0);
   const children = reviewedStatusWriterSubtree(tokens, header);
   const entries = new Map();
   for (const child of children) {
-    if (child.indent !== header.indent + 2) {
+    if (child.indent !== mappingIndent + 2) {
       throw new Error(`${description} contains a nested or ambiguous mapping.`);
     }
     const childMapping = parseReviewedStatusWriterMapping(child);

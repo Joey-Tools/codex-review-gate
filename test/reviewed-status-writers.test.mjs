@@ -104,6 +104,34 @@ const RUN_FIRST_STATUS_WRITER = [
   "        shell: bash",
   "",
 ].join("\n");
+const ENV_FIRST_STATUS_WRITER = [
+  "name: Reviewed env-first status writer",
+  "on: push",
+  "permissions:",
+  "  contents: read",
+  "jobs:",
+  "  publish:",
+  "    permissions:",
+  "      statuses: write",
+  "    runs-on: ubuntu-slim",
+  "    steps:",
+  "      - env:",
+  '          BASH_ENV: ""',
+  '          ENV: ""',
+  "          GH_TOKEN: ${{ github.token }}",
+  "        shell: bash",
+  "        run: |",
+  "          set -euo pipefail",
+  "          printf 'Reviewed inline publisher\\n'",
+  "",
+].join("\n");
+const ENV_FIRST_RUN_BEFORE_SHELL_STATUS_WRITER = ENV_FIRST_STATUS_WRITER.replace(
+  "        shell: bash\n        run: |\n",
+  "        run: |\n",
+).replace(
+  "          printf 'Reviewed inline publisher\\n'\n",
+  "          printf 'Reviewed inline publisher\\n'\n        shell: bash\n",
+);
 const SPLIT_JOB_STATUS_WRITER = [
   "name: Reviewed split status writer",
   "on: push",
@@ -216,10 +244,39 @@ test("reviewed status writers are denied by default and explicitly returned as p
 });
 
 test("canonical inventory accepts isolated publishers alongside split read-only jobs", () => {
+  const readOnlyEnvBlock = SPLIT_JOB_STATUS_WRITER.replace(
+    "    permissions:\n      contents: read\n",
+    "    permissions:\n      contents: read\n    env:\n      statuses: write\n",
+  );
+  const readOnlyEnvFlow = SPLIT_JOB_STATUS_WRITER.replace(
+    "    permissions:\n      contents: read\n",
+    "    permissions:\n      contents: read\n    env: { statuses: write }\n",
+  );
+  const outputStatusMetadata = JOB_LEVEL_STATUS_WRITER.replace(
+    "    runs-on: ubuntu-slim\n",
+    "    runs-on: ubuntu-slim\n    outputs:\n      statuses: write\n",
+  );
+  const readOnlyOutputStatusMetadata = SPLIT_JOB_STATUS_WRITER.replace(
+    "    permissions:\n      contents: read\n",
+    "    permissions:\n      contents: read\n    outputs:\n      statuses: write\n",
+  );
+  const quotedRootOn = JOB_LEVEL_STATUS_WRITER.replace(
+    /^on: push$/mu,
+    '"on": push',
+  );
+
   for (const [index, content] of [
     JOB_LEVEL_STATUS_WRITER,
     RUN_FIRST_STATUS_WRITER,
+    ENV_FIRST_STATUS_WRITER,
+    ENV_FIRST_RUN_BEFORE_SHELL_STATUS_WRITER,
     SPLIT_JOB_STATUS_WRITER,
+    readOnlyEnvBlock,
+    readOnlyEnvFlow,
+    outputStatusMetadata,
+    readOnlyOutputStatusMetadata,
+    quotedRootOn,
+    quotedRootOn.replace('"on"', "'on'"),
   ].entries()) {
     const path = `.github/workflows/reviewed-status-writer-${index}.yml`;
     const file = { path, content };
@@ -354,6 +411,18 @@ test("reviewed status writer entries cannot excuse callers, other violations, or
       JOB_LEVEL_STATUS_WRITER.replace("      statuses: write\n", "      statuses: read\n"),
     ],
     [
+      "quoted protected permissions key",
+      JOB_LEVEL_STATUS_WRITER.replace(/^permissions:$/mu, '"permissions":'),
+    ],
+    [
+      "quoted protected status permission",
+      JOB_LEVEL_STATUS_WRITER.replace("      statuses: write", '      "statuses": write'),
+    ],
+    [
+      "duplicate plain and quoted root key",
+      JOB_LEVEL_STATUS_WRITER.replace("on: push\n", 'on: push\n"on": push\n'),
+    ],
+    [
       "malformed permission mapping",
       JOB_LEVEL_STATUS_WRITER.replace(
         "      statuses: write\n",
@@ -387,6 +456,20 @@ test("reviewed status writer entries cannot excuse callers, other violations, or
       RUN_FIRST_STATUS_WRITER.replace(
         "        env:\n",
         "        uses: actions/checkout@v4\n        env:\n",
+      ),
+    ],
+    [
+      "env-first step sibling action dependency",
+      ENV_FIRST_STATUS_WRITER.replace(
+        "        shell: bash\n",
+        "        uses: actions/checkout@v4\n        shell: bash\n",
+      ),
+    ],
+    [
+      "env-first nested environment",
+      ENV_FIRST_STATUS_WRITER.replace(
+        "          GH_TOKEN: ${{ github.token }}\n",
+        "          GH_TOKEN:\n            nested: value\n",
       ),
     ],
     [
@@ -428,6 +511,10 @@ test("reviewed status writer entries cannot excuse callers, other violations, or
     [
       "unattributable irregular-indentation status writer",
       `${SPLIT_JOB_STATUS_WRITER}  extra:\n     permissions:\n      statuses: write\n`,
+    ],
+    [
+      "status writer hidden under an opaque job field",
+      `${SPLIT_JOB_STATUS_WRITER}  extra:\n    opaque:\n      permissions:\n        statuses: write\n`,
     ],
     [
       "quoted job header cannot hide a status writer",
