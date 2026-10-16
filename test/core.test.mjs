@@ -2685,6 +2685,276 @@ test("recognizes only the closed official inline-parent review wrapper", () => {
   );
 });
 
+test("opts inline-parent review grammar into the exact v1 receipt envelope", () => {
+  const unwrappedReview = liveCodexReview({
+    state: "COMMENTED",
+    body: officialInlineParentReviewBody(),
+  });
+  const wrappedReview = {
+    ...unwrappedReview,
+    body: codexReviewReceiptEnvelope(unwrappedReview.body),
+  };
+
+  assert.equal(codexInlineParentReviewBodyHasClosedGrammar(unwrappedReview), true);
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar(wrappedReview),
+    false,
+    "legacy default does not unwrap a receipt envelope",
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar(wrappedReview, {
+      allowKnownReceiptEnvelope: false,
+    }),
+    false,
+    "explicit legacy default does not unwrap a receipt envelope",
+  );
+
+  for (const commitRef of [
+    FULL_SHA_A.slice(0, 7),
+    FULL_SHA_A.slice(0, 10),
+    FULL_SHA_A,
+  ]) {
+    const body = officialInlineParentReviewBody(commitRef);
+    for (const candidateBody of [
+      body,
+      codexReviewReceiptEnvelope(body),
+      codexReviewReceiptEnvelope(body).replace(/\n/g, "\r\n"),
+    ]) {
+      assert.equal(
+        codexInlineParentReviewBodyHasClosedGrammar(
+          { ...unwrappedReview, body: candidateBody },
+          {
+            allowShortCommitRefs: true,
+            allowKnownReceiptEnvelope: true,
+          },
+        ),
+        true,
+        `accepted reviewed commit ${commitRef}`,
+      );
+    }
+  }
+
+  for (const commitRef of [FULL_SHA_B.slice(0, 10), FULL_SHA_B]) {
+    assert.equal(
+      codexInlineParentReviewBodyHasClosedGrammar(
+        {
+          ...unwrappedReview,
+          body: codexReviewReceiptEnvelope(
+            officialInlineParentReviewBody(commitRef),
+          ),
+        },
+        {
+          allowShortCommitRefs: true,
+          allowKnownReceiptEnvelope: true,
+        },
+      ),
+      false,
+      `rejected mismatched reviewed commit ${commitRef}`,
+    );
+  }
+
+  const malformedBodies = [
+    ["unknown version", `<!-- codex-review-receipt:v2 -->\n\n${unwrappedReview.body}`],
+    ["malformed marker", `<!-- codex-review-receipt:v1-->\n\n${unwrappedReview.body}`],
+    ["missing blank-line boundary", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n${unwrappedReview.body}`],
+    [
+      "duplicate envelope",
+      `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${unwrappedReview.body}`,
+    ],
+    ["marker only", CODEX_REVIEW_RECEIPT_ENVELOPE_V1],
+    [
+      "misplaced envelope",
+      unwrappedReview.body.replace(
+        "**Reviewed commit:**",
+        `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n**Reviewed commit:**`,
+      ),
+    ],
+    ["unknown HTML wrapper", `<!-- unrelated-wrapper -->\n\n${unwrappedReview.body}`],
+  ];
+  for (const [name, body] of malformedBodies) {
+    assert.equal(
+      codexInlineParentReviewBodyHasClosedGrammar(
+        { ...unwrappedReview, body },
+        {
+          allowShortCommitRefs: true,
+          allowKnownReceiptEnvelope: true,
+        },
+      ),
+      false,
+      name,
+    );
+  }
+});
+
+test("opts native Codex review artifacts into the exact v1 receipt envelope", () => {
+  const cleanBody = `Coverage: \`${FULL_SHA_A.slice(0, 10)}\`.\n\nNo findings.`;
+  const cleanReview = liveCodexReview({ body: cleanBody });
+  const wrappedCleanReview = {
+    ...cleanReview,
+    body: codexReviewReceiptEnvelope(cleanBody),
+  };
+  const cleanArtifact = parseCodexReviewArtifact(cleanReview, {
+    owner: "owner",
+    repo: "repo",
+    allowShortCommitRefs: true,
+  });
+  assert.equal(cleanArtifact.kind, "clean");
+  assert.equal(
+    parseCodexReviewArtifact(wrappedCleanReview, {
+      owner: "owner",
+      repo: "repo",
+      allowShortCommitRefs: true,
+    }).kind,
+    "malformed",
+    "legacy default does not unwrap a receipt envelope",
+  );
+  assert.equal(
+    parseCodexReviewArtifact(wrappedCleanReview, {
+      owner: "owner",
+      repo: "repo",
+      allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: false,
+    }).kind,
+    "malformed",
+    "explicit legacy default does not unwrap a receipt envelope",
+  );
+
+  for (const body of [
+    cleanBody,
+    `Coverage: \`${FULL_SHA_A}\`.\n\nNo findings.`,
+  ]) {
+    const wrappedReview = {
+      ...cleanReview,
+      body: codexReviewReceiptEnvelope(body),
+    };
+    const unwrappedArtifact = parseCodexReviewArtifact(
+      { ...cleanReview, body },
+      { owner: "owner", repo: "repo", allowShortCommitRefs: true },
+    );
+    const wrappedArtifact = parseCodexReviewArtifact(wrappedReview, {
+      owner: "owner",
+      repo: "repo",
+      allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: true,
+    });
+    assert.deepEqual(wrappedArtifact, unwrappedArtifact);
+    assert.equal(wrappedReview.body, codexReviewReceiptEnvelope(body));
+  }
+
+  const crlfReview = {
+    ...cleanReview,
+    body: codexReviewReceiptEnvelope(cleanBody).replace(/\n/g, "\r\n"),
+  };
+  assert.equal(
+    parseCodexReviewArtifact(crlfReview, {
+      owner: "owner",
+      repo: "repo",
+      allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: true,
+    }).kind,
+    "clean",
+    "CRLF receipt envelope is normalized before strict unwrapping",
+  );
+
+  const findingBody = [
+    "### 💡 Codex Review",
+    "",
+    `https://github.com/owner/repo/blob/${FULL_SHA_A}/src/lib.mjs#L7`,
+  ].join("\n");
+  const findingReview = liveCodexReview({
+    state: "COMMENTED",
+    body: codexReviewReceiptEnvelope(findingBody),
+  });
+  const findingArtifact = parseCodexReviewArtifact(findingReview, {
+    owner: "owner",
+    repo: "repo",
+    allowShortCommitRefs: true,
+    allowKnownReceiptEnvelope: true,
+  });
+  assert.equal(findingArtifact.kind, "finding");
+  assert.equal(findingArtifact.headSha, FULL_SHA_A);
+  assert.equal(findingArtifact.findingCount, 1);
+  assert.deepEqual(findingArtifact.samples, ["src/lib.mjs:7"]);
+  assert.equal(findingReview.body, codexReviewReceiptEnvelope(findingBody));
+
+  const mismatchedFinding = parseCodexReviewArtifact(
+    {
+      ...findingReview,
+      body: codexReviewReceiptEnvelope(findingBody.replace(FULL_SHA_A, FULL_SHA_B)),
+    },
+    {
+      owner: "owner",
+      repo: "repo",
+      allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: true,
+    },
+  );
+  assert.equal(mismatchedFinding.kind, "malformed");
+  assert.equal(
+    mismatchedFinding.reason,
+    "Codex review finding links conflict with the parent review commit",
+  );
+
+  for (const [name, body] of [
+    ["unknown version", `<!-- codex-review-receipt:v2 -->\n\n${cleanBody}`],
+    ["malformed marker", `<!-- codex-review-receipt:v1-->\n\n${cleanBody}`],
+    ["missing blank-line boundary", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n${cleanBody}`],
+    [
+      "duplicate envelope",
+      `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${cleanBody}`,
+    ],
+    ["marker only", CODEX_REVIEW_RECEIPT_ENVELOPE_V1],
+    [
+      "misplaced envelope",
+      cleanBody.replace(
+        "No findings.",
+        `No findings.\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}`,
+      ),
+    ],
+  ]) {
+    const artifact = parseCodexReviewArtifact(
+      { ...cleanReview, body },
+      {
+        owner: "owner",
+        repo: "repo",
+        allowShortCommitRefs: true,
+        allowKnownReceiptEnvelope: true,
+      },
+    );
+    assert.equal(artifact.kind, "malformed", name);
+  }
+
+  const wrongType = parseCodexReviewArtifact(
+    {
+      ...wrappedCleanReview,
+      user: { login: "chatgpt-codex-connector[bot]", type: "User" },
+    },
+    {
+      owner: "owner",
+      repo: "repo",
+      allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: true,
+    },
+  );
+  assert.equal(wrongType.kind, "malformed");
+  assert.equal(wrongType.reason, "configured Codex review author is not a Bot");
+
+  const shortParentCommit = parseCodexReviewArtifact(
+    {
+      ...wrappedCleanReview,
+      commit_id: FULL_SHA_A.slice(0, 10),
+    },
+    {
+      owner: "owner",
+      repo: "repo",
+      allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: true,
+    },
+  );
+  assert.equal(shortParentCommit.kind, "malformed");
+  assert.equal(shortParentCommit.reason, "Codex review is not bound to a full commit SHA");
+});
+
 test("accepts only closed APPROVED bodies whose 10/40-hex refs agree with commit_id", () => {
   for (const body of [
     undefined,

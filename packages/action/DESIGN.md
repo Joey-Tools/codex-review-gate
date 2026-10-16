@@ -410,7 +410,7 @@ Provider carriers must bind exact bot identity. Similar names, copied text or
 user-authored claims have no authority. A finding's severity label does not
 affect blocking: any qualifying finding blocks.
 
-The v2 issue-comment parser also accepts one observed presentation envelope:
+The v2 issue-comment and pull-request-review parsers also accept one observed presentation envelope:
 the exact standalone leading `<!-- codex-review-receipt:v1 -->` line followed
 by a blank line. Existing line-ending normalization applies before this narrow
 unwrap. The shared parser opts into this compatibility explicitly; legacy
@@ -421,6 +421,12 @@ Wrapped findings and known service failures keep their non-clean semantics.
 Unknown, malformed, duplicate, misplaced or marker-only envelopes cannot supply
 clean authority; arbitrary HTML is not removed. Original carrier bodies and
 server metadata remain unchanged for identity, edit and fingerprint checks.
+The same opt-in unwrap applies to native inline-parent review receipts before
+their existing closed-grammar and native-commit checks. A historical wrapped
+parent is classified normally rather than becoming a permanent malformed
+artifact; its resolved threads still cannot supply current-head clean, and
+any unresolved thread continues to block. The marker does not change review
+state, finding severity, or historical/current-head attribution.
 The separate official PR-level summary and its embedded state remain
 non-authoritative and cannot substitute for a qualifying terminal carrier.
 
