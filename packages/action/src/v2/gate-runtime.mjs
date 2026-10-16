@@ -4671,6 +4671,7 @@ function providerEventIsStale(event, currentHead, { owner, repo } = {}) {
   const artifact = parseCodexIssueCommentArtifact(comment, {
     botLogins: EXACT_CODEX_LOGINS,
     allowShortCommitRefs: true,
+    allowKnownReceiptEnvelope: true,
     owner,
     repo,
   });
@@ -8332,6 +8333,7 @@ async function collectV2ProviderEvidence(
       botLogins: EXACT_CODEX_LOGINS,
       allowShortCommitRefs: true,
       allowKnownServiceFailure: true,
+      allowKnownReceiptEnvelope: true,
     });
     if (artifact) {
       artifact.htmlUrl = comment.html_url;

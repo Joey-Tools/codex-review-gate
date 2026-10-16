@@ -346,6 +346,16 @@ provider carriers 必须绑定 exact bot identity。相似 name、复制的文�
 claim 都没有 authority。finding severity label 不影响 blocking：任何符合条件的
 finding 都会阻塞。
 
+v2 issue-comment parser 还兼容一个已观察到的展示封套（正文前的固定隐藏标记）：
+独占首行的 `<!-- codex-review-receipt:v1 -->`，随后必须有一个空行。先沿用既有换行
+规范化，再只移除这一层已知封套。shared parser 由 v2 调用方显式启用该兼容；legacy
+调用方默认行为不变。标记本身不是证据：内层正文仍须通过既有 terminal grammar、
+Bot/App provenance、commit 与 request binding，以及完整 snapshot 的 finding 校验。
+包裹后的 finding 与已知 service failure 仍保持 non-clean 语义。未知、格式错误、重复、
+非首部或只有标记的封套都不能提供 clean authority，也不会泛化移除任意 HTML。原始
+carrier body 与 server metadata 不变，继续用于 identity、edit 与 fingerprint 校验。
+独立的官方 PR-level summary 及其内嵌 state 仍不具有判定权，不能替代合格 terminal carrier。
+
 已观察到的官方 service-failure issue comment（provider 执行失败的普通 PR 评论）是单独的
 non-clean carrier，不是 finding，也不是 positive review result。其 closed grammar 只接受
 固定的 `Something went wrong` retry heading、一段 fenced `Unknown error` detail，以及
