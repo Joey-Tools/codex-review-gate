@@ -114,12 +114,30 @@ GitHub Actions (`integration_id: 15368`), a branch that is up to date, and all
 review conversations resolved. Integration ID 15368 identifies the whole
 GitHub Actions App, not this workflow or a unique producer. The compound
 control plane therefore exact-byte verifies both default-branch workflows,
-rejects noncanonical reserved-name producers and relevant write authority,
+rejects noncanonical reserved-name producers and unreviewed relevant write authority,
 requires Code Owner review for `.github/workflows/` and
 `.github/CODEOWNERS`, and dismisses stale approvals. The template's ordinary
 approval count is zero, so ordinary business-code PRs do not require a human
 approval; the bootstrap helper preserves an existing higher approval count.
 It has no bypass actors. Keep it disabled until the live canary succeeds.
+
+Repositories with an unrelated commit-status producer may explicitly retain
+its `statuses: write` permission using the bootstrap helper's repeatable
+`--reviewed-status-writer .github/workflows/FILE.yml@SHA256` option. The
+control-plane owner must review the exact file, its called code, and its
+non-gate status contexts before the digest is supplied. This is an explicit
+trust decision, not static proof of a script's behavior. Each declared file
+must match that SHA-256 of its UTF-8 bytes at every inventory read and must
+have exactly `statuses: write` among the policy's relevant write permissions.
+Gate callers, the reserved native job name, and additional `actions`, `checks`,
+`issues`, or `pull-requests` write authority remain forbidden. Missing,
+changed, duplicate, canonical-path, or no-longer-status-writing declarations
+fail closed. Repeat the same declarations through local preview/apply,
+remote staging/activation, and full-profile cleanup verification; no
+declaration is learned or persisted automatically. Existing canonical
+CODEOWNERS coverage and independent owner review still apply. Historical
+organization handoff/bridge-removal and source-only proofs do not accept
+this exception.
 
 Activation also stops if it would silently make unrelated existing CODEOWNERS
 patterns newly approval-gated. Explicitly review that policy expansion, split

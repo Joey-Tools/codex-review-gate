@@ -71,6 +71,7 @@ const coreTestRelativePaths = [
   "test/producer-receipt.test.mjs",
   "test/release-provenance.test.mjs",
   "test/required-ci-workflow.test.mjs",
+  "test/reviewed-status-writers.test.mjs",
   "test/v2-action.test.mjs",
   "test/v2-gate-runtime.test.mjs",
   "test/v2-workflow-contract.test.mjs",
@@ -90,8 +91,8 @@ const expectedSuites = [
 const expectedReleaseSynchronousTestCalls = 106;
 const expectedReleaseRegistrationCount = 162;
 const expectedReleaseShardDistribution = [41, 41, 40, 40];
-const expectedBootstrapSynchronousTestCalls = 165;
-const expectedBootstrapShardDistribution = [42, 41, 41, 41];
+const expectedBootstrapSynchronousTestCalls = 169;
+const expectedBootstrapShardDistribution = [43, 42, 42, 42];
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");

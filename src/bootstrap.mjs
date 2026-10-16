@@ -4551,6 +4551,114 @@ export function workflowSingleProducerPolicyViolations(
   return violations;
 }
 
+// The digest pins the exact UTF-8 bytes approved through Code Review; it does
+// not prove that a workflow is benign. This explicit exception may suppress
+// only the statuses: write finding and never changes the default policy.
+export function validateReviewedStatusWriters(
+  workflowFiles,
+  reviewedStatusWriters = [],
+) {
+  if (!Array.isArray(workflowFiles)) {
+    throw new Error(
+      "reviewed status writer validation requires a workflow file array.",
+    );
+  }
+  if (!Array.isArray(reviewedStatusWriters)) {
+    throw new Error("reviewed status writers must be an array.");
+  }
+  if (reviewedStatusWriters.length > 32) {
+    throw new Error("reviewed status writers may contain at most 32 entries.");
+  }
+
+  const canonicalPaths = new Set([
+    DEFAULT_WORKFLOW_PATH,
+    DEFAULT_CONTROLLER_WORKFLOW_PATH,
+    DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+  ]);
+  const reviewedPaths = new Set();
+
+  for (const [index, reviewedStatusWriter] of reviewedStatusWriters.entries()) {
+    try {
+      if (
+        reviewedStatusWriter === null ||
+        typeof reviewedStatusWriter !== "object" ||
+        Array.isArray(reviewedStatusWriter)
+      ) {
+        throw new Error("entry must be a non-array object.");
+      }
+      const keys = Object.keys(reviewedStatusWriter);
+      if (
+        keys.length !== 2 ||
+        !keys.includes("path") ||
+        !keys.includes("sha256")
+      ) {
+        throw new Error("entry must contain only path and sha256 fields.");
+      }
+      const path = reviewedStatusWriter.path;
+      const sha256 = reviewedStatusWriter.sha256;
+      if (typeof path !== "string" || /[\s\\@]/u.test(path)) {
+        throw new Error("path must not contain whitespace, backslashes, or @.");
+      }
+      const normalizedPath = normalizeWorkflowPath(path);
+      if (normalizedPath !== path) {
+        throw new Error("path must be exact and contain no surrounding whitespace.");
+      }
+      if (canonicalPaths.has(path)) {
+        throw new Error(
+          "canonical verifier, controller, and bridge paths cannot be allowlisted.",
+        );
+      }
+      if (reviewedPaths.has(path)) {
+        throw new Error(`duplicate path ${path}.`);
+      }
+      if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(sha256)) {
+        throw new Error("sha256 must be exactly 64 lowercase hexadecimal characters.");
+      }
+
+      const matches = workflowFiles.filter((file) => file?.path === path);
+      if (matches.length !== 1) {
+        throw new Error(`${path} must occur exactly once in the workflow inventory.`);
+      }
+      if (typeof matches[0].content !== "string") {
+        throw new Error(`${path} must have string UTF-8 workflow content.`);
+      }
+      const contentBytes = Buffer.from(matches[0].content, "utf8");
+      if (contentBytes.toString("utf8") !== matches[0].content) {
+        throw new Error(`${path} content is not representable as valid UTF-8 text.`);
+      }
+      const actualSha256 = createHash("sha256")
+        .update(contentBytes)
+        .digest("hex");
+      if (actualSha256 !== sha256) {
+        throw new Error(`${path} content does not match its reviewed sha256 digest.`);
+      }
+      if (workflowContainsCodexReviewGateCaller(matches[0].content)) {
+        throw new Error(`${path} contains a Codex review-gate caller.`);
+      }
+      const violations = workflowSingleProducerPolicyViolations(
+        matches[0].content,
+      );
+      if (
+        violations.length !== 1 ||
+        violations[0] !== "statuses: write"
+      ) {
+        throw new Error(
+          `${path} must have exactly the statuses: write violation and no other single-producer policy violation; found ${violations.join(", ") || "none"}.`,
+        );
+      }
+      reviewedPaths.add(path);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `reviewed status writer entry ${index} is invalid: ${detail}`,
+        { cause: error },
+      );
+    }
+  }
+
+  return reviewedPaths;
+}
+
 function workflowWritePermissions(value) {
   if (typeof value !== "string") {
     throw new Error("Workflow content must be text before permissions inspection.");
@@ -4938,13 +5046,14 @@ export function decodeGitHubBlobContent(value) {
 export function validateCanonicalV2WorkflowInventory(
   workflowFiles,
   canonicalWorkflows,
-  { legacyBridge = false } = {},
+  { legacyBridge = false, reviewedStatusWriters = [] } = {},
 ) {
   return validateV2WorkflowInventory(
     workflowFiles,
     canonicalWorkflows,
     {
       legacyBridge,
+      reviewedStatusWriters,
       validateVerifier: validateCanonicalV2VerifierWorkflowContent,
       validateController: validateCanonicalV2ControllerWorkflowContent,
       validateInstalledController: validateInstalledCanonicalV2ControllerWorkflowContent,
@@ -5032,6 +5141,7 @@ function validateV2WorkflowInventory(
   canonicalWorkflows,
   {
     legacyBridge,
+    reviewedStatusWriters = [],
     validateVerifier,
     validateController,
     validateInstalledController = validateController,
@@ -5080,6 +5190,10 @@ function validateV2WorkflowInventory(
   }
 
   const canonicalPaths = new Set(canonicalEntries.map((entry) => entry.path));
+  const reviewedStatusWriterPaths = validateReviewedStatusWriters(
+    workflowFiles,
+    reviewedStatusWriters,
+  );
 
   const callerPaths = workflowFiles
     .filter(
@@ -5099,7 +5213,13 @@ function validateV2WorkflowInventory(
     .filter((file) => !canonicalPaths.has(file?.path))
     .map((file) => ({
       path: file.path,
-      violations: workflowSingleProducerPolicyViolations(file?.content),
+      violations: workflowSingleProducerPolicyViolations(file?.content).filter(
+        (violation) =>
+          !(
+            reviewedStatusWriterPaths.has(file?.path) &&
+            violation === "statuses: write"
+          ),
+      ),
     }))
     .filter((file) => file.violations.length > 0)
     .sort((left, right) => compareCanonicalText(left.path, right.path));

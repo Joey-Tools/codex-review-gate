@@ -1051,6 +1051,27 @@ disable v2 or delete the old organization rule as recovery.
 5. If the helper reports other v1 callers, inspect only the reported workflow
    paths. Remove a file only when it is dedicated to v1; otherwise remove or
    deactivate the legacy job. Repeat the preview until no v1 caller remains.
+
+   If it reports an unrelated `statuses: write` workflow, do not delete a
+   functioning CI producer's permission just to satisfy installation. Obtain
+   explicit control-plane-owner review of that exact workflow and the code it
+   invokes, including the contexts it writes. Only then compute its digest
+   (`shasum -a 256 "$TARGET_ROOT/.github/workflows/FILE.yml"`) and repeat
+   `--reviewed-status-writer .github/workflows/FILE.yml@SHA256` for each reviewed
+   file in both local commands and every subsequent full-profile remote
+   staging, activation, cleanup-plan derivation, and cleanup-verification
+   command. At most 32 unique declarations are accepted. Do not automatically
+   approve every reported writer or regenerate a stale digest without renewed
+   review. The helper checks exact UTF-8 content, requires exactly
+   `statuses: write` among relevant writes, and retains all gate-caller,
+   reserved-job-name, canonical-workflow and other write-permission checks.
+   Read-only/no-op declarations also fail. This binds reviewed content; it
+   does not prove arbitrary scripts cannot write the gate context. Canonical
+   CODEOWNERS and independent exact-head owner approval remain mandatory.
+   Historical organization handoff/bridge-removal and source-only proofs
+   remain unchanged and cannot use these declarations.
+   Existing restrictions on which repositories/modes may apply a cleanup
+   plan are unchanged; this option does not authorise a new cleanup write.
 6. Prove that both installed workflows exactly match the templates, then read
    the final effective CODEOWNERS rules:
 
