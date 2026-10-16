@@ -69,7 +69,7 @@ jobs:
         if: ${{ matrix.suite.kind == 'core' }}
         run: |
           npm run check
-          node --test --test-concurrency=1 test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs test/workflow-yaml.test.mjs
+          node --test --test-concurrency=1 test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/reviewed-status-writers.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs test/workflow-yaml.test.mjs
       - name: Run release pipeline shard
         if: ${{ matrix.suite.kind == 'release' }}
         env:
@@ -134,7 +134,7 @@ jobs:
         if: ${{ matrix.suite.kind == 'core' }}
         run: |
           npm run check
-          node --test --test-concurrency=1 test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs test/workflow-yaml.test.mjs
+          node --test --test-concurrency=1 test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/reviewed-status-writers.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs test/workflow-yaml.test.mjs
       - name: Run release pipeline shard
         if: ${{ matrix.suite.kind == 'release' }}
         env:

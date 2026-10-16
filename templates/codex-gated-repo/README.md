@@ -114,12 +114,43 @@ GitHub Actions (`integration_id: 15368`), a branch that is up to date, and all
 review conversations resolved. Integration ID 15368 identifies the whole
 GitHub Actions App, not this workflow or a unique producer. The compound
 control plane therefore exact-byte verifies both default-branch workflows,
-rejects noncanonical reserved-name producers and relevant write authority,
+rejects noncanonical reserved-name producers and unreviewed relevant write authority,
 requires Code Owner review for `.github/workflows/` and
 `.github/CODEOWNERS`, and dismisses stale approvals. The template's ordinary
 approval count is zero, so ordinary business-code PRs do not require a human
 approval; the bootstrap helper preserves an existing higher approval count.
 It has no bypass actors. Keep it disabled until the live canary succeeds.
+
+Repositories with an unrelated commit-status producer may explicitly retain
+its `statuses: write` permission using the bootstrap helper's repeatable
+`--reviewed-status-writer .github/workflows/FILE.yml@SHA256` option. The
+workflow must first isolate status writers in literal `ubuntu-slim` jobs with
+explicit job-level `statuses: write` and self-contained inline Bash steps.
+Workflow-level permissions stay read-only. Privileged jobs cannot use actions,
+checkouts, artifacts, repository scripts, containers, services, runner overrides
+or inherited executable defaults. PR-executing test jobs keep read-only tokens.
+Each privileged job contains one literal Bash `run: |` step, `shell: bash`,
+and step-level `env` clearing `BASH_ENV`/`ENV` and passing
+`GH_TOKEN: ${{ github.token }}`. Use step env for metadata; literal `needs`,
+`if`, job outputs and one step ID support the metadata handoff.
+The control-plane owner reviews every publisher's inline code and non-gate
+context: use trusted metadata and GitHub job results, never execute PR-produced
+text or downloaded mutable/unprotected code. Structural admission is not a
+static proof of arbitrary shell behavior; a workflow digest cannot bind future
+changes to an unprotected dependency. Each declared file
+must match that SHA-256 of its UTF-8 bytes at every inventory read and must
+have exactly `statuses: write` among the policy's relevant write permissions.
+Gate callers, the reserved native job name, and additional `actions`, `checks`,
+`issues`, or `pull-requests` write authority remain forbidden. Missing,
+changed, duplicate, canonical-path, or no-longer-status-writing declarations
+fail closed. Repeat the same declarations through local preview/apply,
+remote staging/activation, and full-profile cleanup verification; no
+declaration is learned or persisted automatically. Existing canonical
+CODEOWNERS coverage and independent owner review still apply. Initial admission
+rejects `--legacy-bridge` together with this option because later bridge
+removal keeps a frozen policy. Historical
+organization handoff/bridge-removal and source-only proofs do not accept
+this exception.
 
 Activation also stops if it would silently make unrelated existing CODEOWNERS
 patterns newly approval-gated. Explicitly review that policy expansion, split

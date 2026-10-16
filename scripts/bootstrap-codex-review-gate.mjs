@@ -76,6 +76,7 @@ import {
   validateCanonicalLegacyBridgeWorkflowContent,
   validateCanonicalV2VerifierWorkflowContent,
   validateCanonicalV2WorkflowInventory,
+  validateReviewedStatusWriters,
   validateControlPlaneCodeownersContent,
   validateFixedFrozenHandoffV2WorkflowInventory,
   validateOrganizationBridgeRemovalProofOutput,
@@ -139,6 +140,9 @@ async function main() {
       options.deriveSourceBridgeRemovalProof ||
       options.sourceBridgeRemovalProofPath !== null,
   });
+  for (const { path, sha256 } of options.reviewedStatusWriters) {
+    console.error(`Explicitly reviewed status-only writer: ${path} sha256=${sha256}`);
+  }
 
   if (options.prepareWorktree !== null) {
     if (options.removeSourceLegacyBridge) {
@@ -156,6 +160,7 @@ async function main() {
       targetRoot: options.prepareWorktree,
       canonicalWorkflows,
       controlPlaneOwner: options.controlPlaneOwner,
+      reviewedStatusWriters: options.reviewedStatusWriters,
       legacyBridge: options.legacyBridge,
       removeLegacyBridge: options.removeLegacyBridge,
       liveRevalidateFinalClosure: options.liveRevalidateFinalClosure,
@@ -211,6 +216,7 @@ async function main() {
     repoSlug: options.repo.slug,
     canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
+    reviewedStatusWriters: options.reviewedStatusWriters,
   });
   const { defaultBranch } = initialSecuritySnapshot;
   await assertExpectedLegacyInventoryDigest({
@@ -327,6 +333,7 @@ async function main() {
       repoSlug: options.repo.slug,
       canonicalWorkflows,
       controlPlaneOwner: options.controlPlaneOwner,
+      reviewedStatusWriters: options.reviewedStatusWriters,
       expectedDefaultBranch: defaultBranch,
     });
     assertConsumerSecuritySnapshotStable(
@@ -396,6 +403,7 @@ async function main() {
           repoSlug: options.repo.slug,
           canonicalWorkflows,
           controlPlaneOwner: options.controlPlaneOwner,
+          reviewedStatusWriters: options.reviewedStatusWriters,
           expectedDefaultBranch: defaultBranch,
         });
         assertConsumerSecuritySnapshotStable(
@@ -546,6 +554,7 @@ async function main() {
     repoSlug: options.repo.slug,
     canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
+    reviewedStatusWriters: options.reviewedStatusWriters,
     expectedDefaultBranch: defaultBranch,
   });
   assertConsumerSecuritySnapshotStable(
@@ -613,6 +622,7 @@ async function main() {
       repoSlug: options.repo.slug,
       canonicalWorkflows,
       controlPlaneOwner: options.controlPlaneOwner,
+      reviewedStatusWriters: options.reviewedStatusWriters,
       expectedDefaultBranch: defaultBranch,
     });
     assertConsumerSecuritySnapshotStable(
@@ -679,6 +689,7 @@ async function main() {
         repoSlug: options.repo.slug,
         canonicalWorkflows,
         controlPlaneOwner: options.controlPlaneOwner,
+        reviewedStatusWriters: options.reviewedStatusWriters,
         expectedDefaultBranch: defaultBranch,
       });
       assertConsumerSecuritySnapshotStable(
@@ -721,6 +732,7 @@ function readCliOptions() {
       apply: { type: "boolean", default: false },
       activate: { type: "boolean", default: false },
       "legacy-bridge": { type: "boolean", default: false },
+      "reviewed-status-writer": { type: "string", multiple: true },
       "remove-legacy-bridge": { type: "boolean", default: false },
       "live-revalidate-final-closure": { type: "boolean", default: false },
       "remove-source-legacy-bridge": { type: "boolean", default: false },
@@ -803,6 +815,23 @@ function readCliOptions() {
   }
   const repo = hasRepo ? parseRepoSlug(values.repo) : null;
   const rulesetProfile = normalizeRulesetProfile(values["ruleset-profile"]);
+  const reviewedStatusWriters = parseReviewedStatusWriterArguments(
+    values["reviewed-status-writer"] ?? [],
+  );
+  if (reviewedStatusWriters.length > 0 && values["legacy-bridge"]) {
+    throw new Error(
+      "--reviewed-status-writer cannot be combined with --legacy-bridge because the later --remove-legacy-bridge cleanup phase retains a frozen declaration policy.",
+    );
+  }
+  if (
+    reviewedStatusWriters.length > 0 &&
+    (rulesetProfile !== DEFAULT_RULESET_PROFILE ||
+      hasSourceBridgeRemovalLifecycleMode || values["remove-legacy-bridge"])
+  ) {
+    throw new Error(
+      "--reviewed-status-writer is limited to the current full consumer installation/staging/activation/cleanup path; historical bridge-removal and source-only proofs retain their frozen policy.",
+    );
+  }
   if (hasRepo === hasPrepareWorktree) {
     printUsage();
     throw new Error("Choose exactly one mode: --prepare-worktree PATH or --repo OWNER/REPO.");
@@ -1129,6 +1158,7 @@ function readCliOptions() {
     prepareWorktree: hasPrepareWorktree ? resolve(values["prepare-worktree"]) : null,
     apply: values.apply,
     activate: values.activate,
+    reviewedStatusWriters,
     legacyBridge: values["legacy-bridge"],
     removeLegacyBridge: values["remove-legacy-bridge"],
     liveRevalidateFinalClosure: values["live-revalidate-final-closure"],
@@ -1194,6 +1224,25 @@ function readCliOptions() {
   };
 }
 
+function parseReviewedStatusWriterArguments(values) {
+  if (values.length > 32) {
+    throw new Error("At most 32 --reviewed-status-writer declarations are supported.");
+  }
+  const paths = new Set();
+  return values.map((value) => {
+    const match = value.match(/^(\.github\/workflows\/[^\s/@\\]+\.ya?ml)@([0-9a-f]{64})$/u);
+    if (match === null) {
+      throw new Error("--reviewed-status-writer requires an exact .github/workflows/FILE.yml@SHA256 declaration with 64 lowercase hex digits.");
+    }
+    const path = normalizeWorkflowPath(match[1]);
+    if (paths.has(path) || [DEFAULT_WORKFLOW_PATH, DEFAULT_CONTROLLER_WORKFLOW_PATH, DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH].includes(path)) {
+      throw new Error(`--reviewed-status-writer requires unique noncanonical workflow paths: ${path}`);
+    }
+    paths.add(path);
+    return { path, sha256: match[2] };
+  }).sort((left, right) => left.path.localeCompare(right.path));
+}
+
 function printUsage() {
   console.log(`Usage:
   node scripts/bootstrap-codex-review-gate.mjs --prepare-worktree PATH [--legacy-bridge | --remove-legacy-bridge --final-closure-receipt PATH --expected-final-closure-receipt-sha256 SHA256 [--live-revalidate-final-closure]] [--control-plane-owner @USER] [--apply]
@@ -1207,6 +1256,7 @@ Options:
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
   --legacy-bridge         Explicitly require/install the exact temporary v1 producer at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. Keep this flag through legacy cleanup verification.
+  --reviewed-status-writer PATH@SHA256  Repeat for owner-reviewed isolated inline status publishers: read-only workflow permissions, explicit job-level statuses:write and literal ubuntu-slim. No action, checkout, repository script or executable dependency in privileged jobs. Exact raw UTF-8 bytes are required on every read; inline behavior/context still requires owner review. Use only without --legacy-bridge; frozen proof modes do not accept declarations. Other writes, gate callers and reserved job names remain forbidden.
   --remove-legacy-bridge  Freeze-bound, local-only post-cutover removal of an exact canonical bridge. By default it uses no GitHub API reads.
   --live-revalidate-final-closure
                           Explicitly repeat the expensive live organization/canary closure audit for one diagnostic cleanup. Do not use for batch consumer cleanup during a freeze.
@@ -2338,6 +2388,7 @@ async function loadConsumerSecuritySnapshot({
   repoSlug,
   canonicalWorkflows,
   controlPlaneOwner,
+  reviewedStatusWriters = [],
   expectedDefaultBranch = null,
 }) {
   const repoInfo = await ghJson(`repos/${repoSlug}`);
@@ -2397,7 +2448,10 @@ async function loadConsumerSecuritySnapshot({
     validateCanonicalV2WorkflowInventory(
       workflowFiles,
       canonicalWorkflows,
-      { legacyBridge: canonicalWorkflows.legacyBridge !== undefined },
+      {
+        legacyBridge: canonicalWorkflows.legacyBridge !== undefined,
+        reviewedStatusWriters,
+      },
     );
     validateControlPlaneCodeownersContent(
       codeownersContent,
@@ -3895,6 +3949,7 @@ async function loadCleanupSecurityClosure({
     repoSlug: options.repo.slug,
     canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
+    reviewedStatusWriters: options.reviewedStatusWriters,
   });
   const rulesets = await loadRulesets(options.repo.slug);
   const selectedV2 = selectUniqueNamedRepositoryRuleset(
@@ -6193,6 +6248,7 @@ async function prepareConsumerWorktree({
   targetRoot,
   canonicalWorkflows,
   controlPlaneOwner,
+  reviewedStatusWriters,
   legacyBridge,
   removeLegacyBridge,
   liveRevalidateFinalClosure,
@@ -6272,6 +6328,7 @@ async function prepareConsumerWorktree({
   );
   const initialLocalSecurityState = await loadLocalInstallationSecurityState({
     targetRoot,
+    reviewedStatusWriters,
     canonicalWorkflowPaths: [
       verifierWorkflowPath,
       controllerWorkflowPath,
@@ -6341,6 +6398,7 @@ async function prepareConsumerWorktree({
   ) {
     const finalNoopState = await loadLocalInstallationSecurityState({
       targetRoot,
+      reviewedStatusWriters,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -6461,6 +6519,7 @@ async function prepareConsumerWorktree({
     if (!initialLocalSecurityBoundaryComplete) {
       const preMutationState = await loadLocalInstallationSecurityState({
         targetRoot,
+        reviewedStatusWriters,
         canonicalWorkflowPaths: [
           verifierWorkflowPath,
           controllerWorkflowPath,
@@ -6522,6 +6581,7 @@ async function prepareConsumerWorktree({
 
     const finalLocalSecurityState = await loadLocalInstallationSecurityState({
       targetRoot,
+      reviewedStatusWriters,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -6588,6 +6648,7 @@ async function prepareConsumerWorktree({
     await revalidateDirectoryChain(parentWitnesses, "after exact-byte verification");
     const successBoundaryState = await loadLocalInstallationSecurityState({
       targetRoot,
+      reviewedStatusWriters,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -7617,6 +7678,7 @@ async function revalidateDirectoryChain(witnesses, phase) {
 async function loadLocalInstallationSecurityState({
   targetRoot,
   canonicalWorkflowPaths,
+  reviewedStatusWriters = [],
 }) {
   const lowerPrecedenceCodeowners = await findLowerPrecedenceCodeowners(targetRoot);
   if (lowerPrecedenceCodeowners !== null) {
@@ -7633,6 +7695,7 @@ async function loadLocalInstallationSecurityState({
     throw error;
   });
   const workflowFiles = [];
+  const workflowContents = [];
   const conflicts = [];
   for (const entry of entries) {
     if (!/\.ya?ml$/.test(entry.name)) {
@@ -7642,8 +7705,16 @@ async function loadLocalInstallationSecurityState({
     if (!entry.isFile() || entry.isSymbolicLink()) {
       throw new Error(`Cannot safely inspect non-regular workflow: ${absolutePath}`);
     }
-    const content = await readFile(absolutePath, "utf8");
     const relativePath = absolutePath.slice(targetRoot.length + 1);
+    const contentBytes = await readFile(absolutePath);
+    const content = contentBytes.toString("utf8");
+    const explicitlyReviewed = reviewedStatusWriters.some(
+      (writer) => writer.path === relativePath,
+    );
+    if (explicitlyReviewed && !Buffer.from(content, "utf8").equals(contentBytes)) {
+      throw new Error(`reviewed status writer ${relativePath} is not valid UTF-8.`);
+    }
+    workflowContents.push({ path: relativePath, content });
     workflowFiles.push({
       path: relativePath,
       content_sha256: fingerprintText(content),
@@ -7656,12 +7727,17 @@ async function loadLocalInstallationSecurityState({
       violations.push("gate caller");
     }
     violations.push(...workflowSingleProducerPolicyViolations(content));
+    if (explicitlyReviewed) {
+      const statusIndex = violations.indexOf("statuses: write");
+      if (statusIndex !== -1) violations.splice(statusIndex, 1);
+    }
     if (violations.length > 0) {
       conflicts.push(
         `${relativePath} (${violations.join(", ")})`,
       );
     }
   }
+  validateReviewedStatusWriters(workflowContents, reviewedStatusWriters);
   if (conflicts.length > 0) {
     throw new Error(
       `Additional workflows have a v1/v2 gate caller, reserved CheckRun name, or relevant write authority and require explicit removal or review in the same installation PR: ${conflicts.sort().join(", ")}`,

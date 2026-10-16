@@ -1051,6 +1051,47 @@ disable v2 or delete the old organization rule as recovery.
 5. If the helper reports other v1 callers, inspect only the reported workflow
    paths. Remove a file only when it is dedicated to v1; otherwise remove or
    deactivate the legacy job. Repeat the preview until no v1 caller remains.
+
+   If it reports an unrelated `statuses: write` workflow, do not delete a
+   functioning CI producer's permission just to satisfy installation. Obtain
+   explicit control-plane-owner review. First isolate every status publisher
+   from PR execution: use explicit job-level `statuses: write`, literal
+   `runs-on: ubuntu-slim`, and self-contained inline Bash steps. Keep the
+   workflow-level permissions read-only. A privileged job cannot use actions,
+   checkouts, artifacts, repository scripts, containers, services, runner
+   overrides, or inherited executable defaults. Test jobs may retain their
+   normal dependencies but must not receive status-write authority.
+   Each privileged job has exactly one literal `run: |` Bash step with
+   `shell: bash`; its step-level `env` explicitly clears `BASH_ENV` and `ENV`
+   and sets `GH_TOKEN: ${{ github.token }}`. Put metadata in that step's `env`,
+   not a job-level environment. Literal `needs`, `if`, job outputs and one
+   step ID are supported for trusted metadata handoff.
+   Review the inline publishers and their data flow: target SHA/context must
+   come from trusted metadata and the terminal state from GitHub job results,
+   never PR-produced executable text or a claimed result in a test artifact.
+   Do not download or execute mutable/unprotected code in a publisher.
+   Only then compute its digest
+   (`shasum -a 256 "$TARGET_ROOT/.github/workflows/FILE.yml"`) and repeat
+   `--reviewed-status-writer .github/workflows/FILE.yml@SHA256` for each reviewed
+   file in both local commands and every subsequent full-profile remote
+   staging, activation, cleanup-plan derivation, and cleanup-verification
+   command. At most 32 unique declarations are accepted. Do not automatically
+   approve every reported writer or regenerate a stale digest without renewed
+   review. The helper checks exact UTF-8 content, requires exactly
+   `statuses: write` among relevant writes, and retains all gate-caller,
+   reserved-job-name, canonical-workflow and other write-permission checks.
+   Read-only/no-op declarations also fail. Admission checks the isolated
+   publisher structure; owner review of the exact inline script remains the
+   trust boundary for its behavior and contexts, not a shell-code proof. A
+   workflow digest cannot protect future changes to an unprotected script.
+   Canonical
+   CODEOWNERS and independent exact-head owner approval remain mandatory.
+   Do not combine declarations with `--legacy-bridge`: that combination is
+   rejected at initial admission because later bridge removal retains a
+   frozen policy. Historical organization handoff/bridge-removal and source-only
+   proofs remain unchanged and cannot use these declarations.
+   Existing restrictions on which repositories/modes may apply a cleanup
+   plan are unchanged; this option does not authorise a new cleanup write.
 6. Prove that both installed workflows exactly match the templates, then read
    the final effective CODEOWNERS rules:
 

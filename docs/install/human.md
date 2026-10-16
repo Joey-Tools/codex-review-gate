@@ -1266,6 +1266,52 @@ still calls v1, inspect the paths reported by the helper and remove or
 deactivate those callers in this same migration PR. One PR may remove v1,
 install v2, and install the CODEOWNERS control plane.
 
+An unrelated CI workflow may legitimately need `statuses: write` for its own
+commit-status context. Do not remove that permission merely to install this
+gate. An explicit, reviewed exception is available:
+
+```bash
+shasum -a 256 "$TARGET_ROOT/.github/workflows/transport.yml"
+```
+
+After owner review, append
+`--reviewed-status-writer .github/workflows/transport.yml@<printed-sha256>`
+to each bootstrap command.
+
+Before hashing, isolate the writers into explicit job-level `statuses: write`
+jobs on literal `runs-on: ubuntu-slim`. Keep workflow-level permissions
+read-only. The privileged jobs must be self-contained inline Bash publishers,
+without actions, checkout, artifacts, repository scripts, containers, services,
+runner overrides or inherited executable defaults. Jobs that exercise PR code
+may keep their dependencies but must not inherit status-write authority.
+Each privileged job has exactly one literal `run: |` step with `shell: bash`.
+Its step `env` must clear `BASH_ENV` and `ENV` and set
+`GH_TOKEN: ${{ github.token }}`; metadata also belongs in step `env`, not a
+job-level environment. Literal `needs`, `if`, job outputs and one step ID are
+supported for trusted metadata handoff.
+The control-plane owner reviews the exact inline scripts and data flow:
+trusted metadata supplies the target SHA/context, and GitHub job results
+supply the terminal outcome. Do not execute PR-produced text or downloaded
+mutable/unprotected code, or trust a test artifact's claimed outcome.
+
+Then add the declaration to local preview and
+apply, remote staging and activation, and later full-profile cleanup commands.
+Repeat the option for each file (at most 32). Keep the same reviewed paths and
+digests; do not regenerate a digest after a change without reviewing it again.
+Every inventory read requires the exact UTF-8 content hash. Missing or changed
+files, duplicate/canonical paths, read-only no-op declarations, additional
+gate callers, the reserved gate job name, and any other relevant write
+permission are still rejected. The helper checks the isolated writer
+structure; script behavior and non-gate contexts still require explicit owner
+review. A workflow-only digest does not protect later changes to scripts it
+invokes. This does not replace CODEOWNERS or independent exact-head approval.
+Without declarations the original deny policy is unchanged. Do not combine
+the option with `--legacy-bridge`; initial admission rejects that combination
+because the later bridge cleanup has a frozen policy. Historical
+organization handoff/bridge-removal and source-only proofs do not accept this
+exception. Full inventory fingerprints and cleanup-plan digests already bind
+the retained workflows, so this does not add a stored receipt or runtime input.
+
 If the repository currently uses `CODEOWNERS` at the repository root or under
 `docs/`, the helper stops rather than creating `.github/CODEOWNERS` and
 silently shadowing that policy. Move or merge all existing entries into

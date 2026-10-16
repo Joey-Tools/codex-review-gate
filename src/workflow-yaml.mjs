@@ -1,6 +1,7 @@
-// This limited line-oriented lexer preserves simple mapping and block-scalar
-// boundaries for workflow inventory callers. It is not a general YAML parser
-// or validator; callers remain responsible for their own structural policies.
+// This limited line-oriented lexer preserves simple plain/quoted mapping keys
+// and block-scalar boundaries for workflow inventory callers. It is not a
+// general YAML parser or validator; callers remain responsible for their own
+// structural policies.
 
 export function tokenizeWorkflowYaml(value) {
   if (typeof value !== "string") {
@@ -56,10 +57,12 @@ export function parseWorkflowYamlMapping(token) {
     sequence = true;
     text = text.slice(2);
   }
-  const match = text.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/u);
+  const match = text.match(
+    /^([A-Za-z_][A-Za-z0-9_-]*|"([A-Za-z_][A-Za-z0-9_-]*)"|'([A-Za-z_][A-Za-z0-9_-]*)')\s*:\s*(.*?)\s*$/u,
+  );
   return match === null
     ? null
-    : { key: match[1], value: match[2], sequence };
+    : { key: match[2] ?? match[3] ?? match[1], value: match[4], sequence };
 }
 
 function stripYamlComment(line) {

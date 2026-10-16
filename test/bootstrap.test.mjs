@@ -173,6 +173,28 @@ const CANONICAL_WORKFLOWS = {
   verifier: CANONICAL_WORKFLOW,
   controller: CANONICAL_CONTROLLER_WORKFLOW,
 };
+const REVIEWED_INLINE_STATUS_WRITER = [
+  "name: Reviewed transport publisher",
+  "on: push",
+  "permissions:",
+  "  contents: read",
+  "jobs:",
+  "  publish:",
+  "    runs-on: ubuntu-slim",
+  "    permissions:",
+  "      statuses: write",
+  "    steps:",
+  "      - name: Publish",
+  "        env:",
+  '          BASH_ENV: ""',
+  '          ENV: ""',
+  "          GH_TOKEN: ${{ github.token }}",
+  "        shell: bash",
+  "        run: |",
+  "          set -euo pipefail",
+  "          printf 'Reviewed inline publisher\\n'",
+  "",
+].join("\n");
 const CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE = {
   ...CANONICAL_WORKFLOWS,
   legacyBridge: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
@@ -2553,6 +2575,134 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
     assert.match(repeat.stdout, /local controller already matches the canonical v2 bytes/u);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("reviewed status writers survive local preparation only with explicit frozen declarations", () => {
+  const targetRoot = mkdtempSync(join(tmpdir(), "codex-reviewed-writers-"));
+  const writers = [
+    { path: ".github/workflows/transport.yml", content: REVIEWED_INLINE_STATUS_WRITER },
+    { path: ".github/workflows/evidence.yaml", content: REVIEWED_INLINE_STATUS_WRITER.replace("publish:", "evidence:") },
+  ];
+  const declarations = writers.flatMap(({ path, content }) => [
+    "--reviewed-status-writer", `${path}@${createHash("sha256").update(content).digest("hex")}`,
+  ]);
+  try {
+    initializeGitRepository(targetRoot);
+    mkdirSync(join(targetRoot, ".github/workflows"), { recursive: true });
+    for (const { path, content } of writers) writeFileSync(join(targetRoot, path), content);
+    const denied = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
+    assert.equal(denied.status, 1);
+    assert.match(denied.stderr, /relevant write authority/u);
+    assert.equal(existsSync(join(targetRoot, DEFAULT_WORKFLOW_PATH)), false);
+    for (const suffix of [[], ["--apply"], ["--apply"]]) {
+      const result = runBootstrap(["--prepare-worktree", targetRoot, ...declarations, ...suffix]);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stderr, /Explicitly reviewed status-only writer/u);
+      for (const { path, content } of writers) assert.equal(readFileSync(join(targetRoot, path), "utf8"), content);
+    }
+    assert.equal(readFileSync(join(targetRoot, DEFAULT_WORKFLOW_PATH), "utf8"), CANONICAL_WORKFLOW);
+    const unsafeWriter = writers[0].content.replace("runs-on: ubuntu-slim", "runs-on: self-hosted");
+    writeFileSync(join(targetRoot, writers[0].path), unsafeWriter);
+    const unsafe = runBootstrap([
+      "--prepare-worktree", targetRoot,
+      "--reviewed-status-writer", `${writers[0].path}@${createHash("sha256").update(unsafeWriter).digest("hex")}`,
+      ...declarations.slice(2), "--apply",
+    ]);
+    assert.equal(unsafe.status, 1);
+    assert.match(unsafe.stderr, /reviewed status writer/iu);
+    writeFileSync(join(targetRoot, writers[0].path), `${writers[0].content}# changed\n`);
+    const drifted = runBootstrap(["--prepare-worktree", targetRoot, ...declarations, "--apply"]);
+    assert.equal(drifted.status, 1);
+    assert.match(drifted.stderr, /reviewed status writer/iu);
+    const invalidUtf8 = Buffer.concat([Buffer.from("# "), Buffer.from([0xff]), Buffer.from(`\n${writers[0].content}`)]);
+    writeFileSync(join(targetRoot, writers[0].path), invalidUtf8);
+    const decodedDigest = createHash("sha256").update(invalidUtf8.toString("utf8")).digest("hex");
+    const invalid = runBootstrap(["--prepare-worktree", targetRoot, "--reviewed-status-writer", `${writers[0].path}@${decodedDigest}`, ...declarations.slice(2), "--apply"]);
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /reviewed status writer.*not valid UTF-8/u);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("reviewed status writer CLI rejects malformed, duplicate, canonical and frozen-mode declarations", () => {
+  const declaration = `.github/workflows/transport.yml@${"a".repeat(64)}`;
+  const legacyBridgeConflict = runBootstrap([
+    "--prepare-worktree",
+    "/definitely-not-a-worktree",
+    "--reviewed-status-writer",
+    declaration,
+    "--legacy-bridge",
+  ]);
+  assert.equal(legacyBridgeConflict.status, 1);
+  assert.match(
+    legacyBridgeConflict.stderr,
+    /--reviewed-status-writer cannot be combined with --legacy-bridge.*--remove-legacy-bridge/u,
+  );
+
+  for (const args of [
+    ["--reviewed-status-writer", ".github/workflows/transport.yml@short"],
+    ["--reviewed-status-writer", `../transport.yml@${"a".repeat(64)}`],
+    ["--reviewed-status-writer", `${DEFAULT_WORKFLOW_PATH}@${"a".repeat(64)}`],
+    ["--reviewed-status-writer", declaration, "--reviewed-status-writer", declaration],
+    ["--reviewed-status-writer", declaration, "--remove-legacy-bridge"],
+    Array.from({ length: 33 }, (_, index) => ["--reviewed-status-writer", `.github/workflows/writer-${index}.yml@${"a".repeat(64)}`]).flat(),
+  ]) {
+    const result = runBootstrap(["--prepare-worktree", "/definitely-not-a-worktree", ...args]);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /reviewed-status-writer/u);
+  }
+});
+
+test("reviewed status writers remain admitted across remote staging and activation readbacks", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-reviewed-writers-remote-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const content = REVIEWED_INLINE_STATUS_WRITER;
+  const declaration = `.github/workflows/transport.yml@${createHash("sha256").update(content).digest("hex")}`;
+  try {
+    createFakeGhExecutable(fakeBin);
+    const { responses } = stageThenActivationResponseFixtures({ repoSlug });
+    responses[`repos/${repoSlug}/git/trees/workflows-tree`].tree.push({ path: "transport.yml", sha: "transport-blob", type: "blob", mode: "100644" });
+    responses[`repos/${repoSlug}/git/blobs/transport-blob`] = { encoding: "base64", content: Buffer.from(content).toString("base64") };
+    const env = fakeGhEnvironment({ fakeBin, responses, stateDir, callLog });
+    const sharedArgs = ["--repo", repoSlug, "--ruleset-name", "Must Pass Codex Review v2", "--reviewed-status-writer", declaration];
+    const stage = runBootstrap([...sharedArgs, "--apply"], { env });
+    assert.equal(stage.status, 0, stage.stderr);
+    const activate = runBootstrap([...sharedArgs, "--activate", "--canary-pr", "7", "--canary-head", CANARY_HEAD_SHA, "--apply"], { env });
+    assert.equal(activate.status, 0, activate.stderr);
+    const calls = readFileSync(callLog, "utf8");
+    assert.match(calls, new RegExp(`^POST repos/${repoSlug}/rulesets$`, "mu"));
+    assert.match(calls, new RegExp(`^PUT repos/${repoSlug}/rulesets/8$`, "mu"));
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("reviewed status writer drift stops remote staging before the ruleset write", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-reviewed-writers-drift-"));
+  const fakeBin = join(fixtureRoot, "bin");
+  const stateDir = join(fixtureRoot, "state");
+  const callLog = join(fixtureRoot, "calls.log");
+  const repoSlug = "Joey-Tools/consumer";
+  const content = REVIEWED_INLINE_STATUS_WRITER;
+  const declaration = `.github/workflows/transport.yml@${createHash("sha256").update(content).digest("hex")}`;
+  try {
+    createFakeGhExecutable(fakeBin);
+    const { responses } = stageThenActivationResponseFixtures({ repoSlug });
+    responses[`repos/${repoSlug}/git/trees/workflows-tree`].tree.push({ path: "transport.yml", sha: "transport-blob", type: "blob", mode: "100644" });
+    responses[`repos/${repoSlug}/git/blobs/transport-blob`] = { __fake_sequence: [content, `${content}# changed\n`].map((text) => ({ encoding: "base64", content: Buffer.from(text).toString("base64") })) };
+    const result = runBootstrap(["--repo", repoSlug, "--apply", "--reviewed-status-writer", declaration], {
+      env: fakeGhEnvironment({ fakeBin, responses, stateDir, callLog }),
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /reviewed status writer/iu);
+    assert.doesNotMatch(readFileSync(callLog, "utf8"), /^(?:POST|PUT|DELETE) /mu);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
@@ -13956,7 +14106,7 @@ syncBuiltinESMExports();
 
 assert.equal(
   test.registeredCount,
-  165,
+  169,
   "bootstrap test shard registration inventory drift",
 );
 
