@@ -60,6 +60,18 @@ superseded_by:
   contracts remain unchanged and do not admit this exception. No runtime action bytes,
   release manifest, required context, events or consumer workflow templates
   change; a runtime release is not required for this installer-only fix.
+- Follow-up review found that a step beginning with `- run: |` used the dash's
+  indentation as the scalar boundary, swallowing later `env` and `shell`
+  sibling fields. Joey requested a separate repair before this installer PR.
+  [PR #125](https://github.com/Joey-Tools/codex-review-gate/pull/125) landed the
+  corrected limited lexer independently on `master`; this installer imports
+  that module instead of retaining a private tokenizer.
+- Supported publisher fields must not depend on ordering. Keep sibling
+  fields visible after run-first literal blocks, including forbidden action
+  dependencies that the isolation profile must reject. This changes parser
+  compatibility, not permission policy. The attempted stacked PR #124 was
+  superseded because v2 requires the default branch as its PR base; no bypass
+  or policy relaxation was used.
 
 ## Validation
 
@@ -70,11 +82,17 @@ superseded_by:
   no-op revalidation, invalid UTF-8 rejection, remote staging/activation,
   content drift before a ruleset write, matching-digest self-hosted denial,
   and bridge-plus-declaration rejection.
+- After adopting the independently landed parser, all 80 selected lexer,
+  policy, CI-inventory and workflow contracts plus four focused CLI tests pass
+  (84 total). The actual HDR isolated publisher validation and canonical
+  preparation dry-run pass again without applying assets or settings.
 - The six policy test registrations include split read-only test jobs with
   isolated pending/final publishers and rejection of mutable/local actions,
   checkout/dependency imports, interpreter environment injection, opaque
   fields and writer permissions hidden by irregular indentation or quoted/
-  sequence job headers. Bootstrap registration remains 169; required CI
+  sequence job headers. They also cover run-first literal blocks with later
+  environment/shell fields and a later forbidden execution field. Bootstrap
+  registration remains 169; required CI
   matrix/sharding contracts are unchanged by the repairs.
 - The original HDR-streaming preview with unchanged transport workflows
   passed the initial digest-only policy, but the P1 review showed why that

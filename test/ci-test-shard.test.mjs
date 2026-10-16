@@ -76,6 +76,7 @@ const coreTestRelativePaths = [
   "test/v2-gate-runtime.test.mjs",
   "test/v2-workflow-contract.test.mjs",
   "test/workflow-security-contract.test.mjs",
+  "test/workflow-yaml.test.mjs",
 ];
 const expectedSuites = [
   ["bootstrap 1/4", "bootstrap", "1/4", "off"],

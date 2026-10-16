@@ -1,5 +1,9 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import {
+  parseWorkflowYamlMapping as parseReviewedStatusWriterMapping,
+  tokenizeWorkflowYaml as tokenizeReviewedStatusWriterWorkflow,
+} from "./workflow-yaml.mjs";
 
 export const DEFAULT_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
@@ -4806,65 +4810,6 @@ function validateReviewedStatusWriterIsolationProfile(value) {
   for (const job of jobs) {
     validateReviewedStatusWriterJob(tokens, job, jobIds);
   }
-}
-
-function tokenizeReviewedStatusWriterWorkflow(value) {
-  if (typeof value !== "string") {
-    throw new Error("workflow content must be text.");
-  }
-  assertCanonicalWorkflowLineEndings(value);
-  const normalized = value.startsWith("\uFEFF") ? value.slice(1) : value;
-  const lines = normalized.split(/\r?\n/u);
-  const tokens = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    const rawLine = lines[index];
-    const rawIndent = rawLine.match(/^ */u)[0].length;
-    if (/^\s*\t/u.test(rawLine)) {
-      throw new Error("workflow uses tab-indented YAML structure.");
-    }
-    const uncommented = stripYamlComment(rawLine.slice(rawIndent)).trimEnd();
-    if (uncommented.trim() === "") {
-      continue;
-    }
-    const token = {
-      index,
-      indent: rawIndent,
-      text: uncommented,
-      blockStyle: null,
-      blockContent: [],
-    };
-    const mapping = parseReviewedStatusWriterMapping(token);
-    if (mapping !== null && /^[|>][+-]?[1-9]?$|^[|>][1-9]?[+-]?$/u.test(mapping.value)) {
-      token.blockStyle = mapping.value;
-      for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
-        const contentLine = lines[cursor];
-        const contentIndent = contentLine.match(/^ */u)[0].length;
-        if (contentLine.trim() !== "" && contentIndent <= rawIndent) {
-          break;
-        }
-        token.blockContent.push(contentLine);
-        index = cursor;
-      }
-    }
-    tokens.push(token);
-  }
-  return tokens;
-}
-
-function parseReviewedStatusWriterMapping(token) {
-  if (token === undefined || token === null) {
-    return null;
-  }
-  let text = token.text;
-  let sequence = false;
-  if (text.startsWith("- ")) {
-    sequence = true;
-    text = text.slice(2);
-  }
-  const match = text.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/u);
-  return match === null
-    ? null
-    : { key: match[1], value: match[2], sequence };
 }
 
 function reviewedStatusWriterSubtree(tokens, header) {
