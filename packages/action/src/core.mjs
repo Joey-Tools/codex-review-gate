@@ -524,9 +524,15 @@ export function parseCodexReviewArtifact(
     repo = "",
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
     allowShortCommitRefs = false,
+    allowKnownReceiptEnvelope = false,
   } = {},
 ) {
-  const body = String(review?.body || "").trim();
+  const normalizedBody = allowKnownReceiptEnvelope === true
+    ? normalizeCodexCommentBody(review?.body)
+    : String(review?.body || "").trim();
+  const body = allowKnownReceiptEnvelope === true
+    ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
+    : normalizedBody;
   const terminalLooking =
     new Set(["APPROVED", "COMMENTED", "CHANGES_REQUESTED"]).has(review?.state) ||
     body.startsWith("### 💡 Codex Review");
@@ -628,13 +634,19 @@ export function parseCodexReviewArtifact(
 
 export function codexInlineParentReviewBodyHasClosedGrammar(
   review,
-  { allowShortCommitRefs = false } = {},
+  {
+    allowShortCommitRefs = false,
+    allowKnownReceiptEnvelope = false,
+  } = {},
 ) {
   if (review?.state !== "COMMENTED" || !isFullCommitSha(review?.commit_id)) {
     return false;
   }
 
-  const body = normalizeCodexCommentBody(review.body);
+  const normalizedBody = normalizeCodexCommentBody(review.body);
+  const body = allowKnownReceiptEnvelope === true
+    ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
+    : normalizedBody;
   if (!body || body.length > 5_000) {
     return false;
   }

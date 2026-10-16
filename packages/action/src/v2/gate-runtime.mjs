@@ -8413,7 +8413,10 @@ async function collectV2ProviderEvidence(
       });
       continue;
     }
-    if (codexInlineParentReviewBodyHasClosedGrammar(review, { allowShortCommitRefs: true })) {
+    if (codexInlineParentReviewBodyHasClosedGrammar(review, {
+      allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: true,
+    })) {
       // This closed parent wrapper carries no non-inline finding payload. Its
       // children remain entirely outside this REST-only reducer: the required
       // ruleset owns whether every conversation is resolved. Treating the
@@ -8427,6 +8430,7 @@ async function collectV2ProviderEvidence(
       repo: config.repo,
       botLogins: EXACT_CODEX_LOGINS,
       allowShortCommitRefs: true,
+      allowKnownReceiptEnvelope: true,
     });
     if (artifact) {
       if (
