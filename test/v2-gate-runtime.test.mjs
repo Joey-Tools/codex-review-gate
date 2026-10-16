@@ -7348,6 +7348,179 @@ test("a closed Codex inline-parent review can promote one default-any request wi
   );
 });
 
+test("receipt envelope: historical wrapped and unwrapped inline parents allow a current-head clean", async (context) => {
+  const oldReview = inlineParentReview(OLD_HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const cases = [
+    ["unwrapped", oldReview],
+    ["wrapped", receiptWrappedInlineParentReview(OLD_HEAD, {
+      submitted_at: "2026-08-25T08:02:00Z",
+    })],
+  ];
+
+  for (const [suffix, review] of cases) {
+    const github = createGitHubMock({
+      issueComments: [
+        workflowRequest({
+          created_at: "2026-08-25T08:00:00Z",
+          updated_at: "2026-08-25T08:00:00Z",
+        }),
+        cleanIssueComment(HEAD, {
+          created_at: "2026-08-25T08:10:00Z",
+          updated_at: "2026-08-25T08:10:00Z",
+        }),
+      ],
+      reviews: [review],
+      reviewThreads: [reviewThread({
+        id: `PRRT_historical_${suffix}`,
+        isResolved: true,
+        isOutdated: true,
+      })],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `receipt-envelope-historical-${suffix}-resolved-thread`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.gateOutcome, "success", result.report.reason);
+    assert.equal(result.report.counts.indeterminate, 0, suffix);
+    assert.deepEqual(result.report.reviewThreads, {
+      status: "complete",
+      unresolved: 0,
+      resolved: 1,
+      total: 1,
+      diagnostics: [],
+    });
+  }
+});
+
+test("receipt envelope: a historical wrapped inline parent cannot waive an unresolved thread", async (context) => {
+  const review = receiptWrappedInlineParentReview(OLD_HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const github = createGitHubMock({
+    issueComments: [
+      workflowRequest({
+        created_at: "2026-08-25T08:00:00Z",
+        updated_at: "2026-08-25T08:00:00Z",
+      }),
+      cleanIssueComment(HEAD, {
+        created_at: "2026-08-25T08:10:00Z",
+        updated_at: "2026-08-25T08:10:00Z",
+      }),
+    ],
+    reviews: [review],
+    reviewThreads: [reviewThread({
+      id: "PRRT_historical_unresolved",
+      isResolved: false,
+      isOutdated: true,
+    })],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "receipt-envelope-historical-unresolved-thread",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.counts.indeterminate, 0);
+  assert.equal(result.report.reviewThreads.unresolved, 1);
+  assert.match(result.report.reason, /unresolved pull-request review thread/iu);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("receipt envelope: current inline-parent provider identity and eligibility remain required", async (context) => {
+  const request = ordinaryRequest({ user: READER });
+  const valid = receiptWrappedInlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const acceptedGitHub = createGitHubMock({
+    issueComments: [request],
+    reviews: [valid],
+  });
+  const acceptedEnvironment = runtimeEnvironment(context, {
+    suffix: "receipt-envelope-current-inline-parent-valid",
+  });
+  const { result: accepted } = await runGate(acceptedEnvironment, acceptedGitHub);
+
+  assert.equal(accepted.report.gateOutcome, "success", accepted.report.reason);
+  assert.equal(accepted.report.recoveryCode, "none");
+
+  const cases = [
+    ["wrong-author", { ...valid, user: { login: "lookalike-reviewer[bot]", type: "Bot" } }],
+    ["wrong-app", {
+      ...valid,
+      app: { slug: "other-reviewer" },
+      performed_via_github_app: { slug: "other-reviewer" },
+    }],
+    ["non-commented", { ...valid, state: "APPROVED" }],
+  ];
+  for (const [suffix, review] of cases) {
+    const github = createGitHubMock({
+      issueComments: [ordinaryRequest({ user: READER })],
+      reviews: [review],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `receipt-envelope-current-inline-parent-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("receipt envelope: malformed, unknown, and duplicate markers fail closed", async (context) => {
+  const valid = inlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const cases = [
+    ["malformed-separator", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n${valid.body}`],
+    ["unknown-version", `<!-- codex-review-receipt:v2 -->\n\n${valid.body}`],
+    ["duplicate-marker", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${valid.body}`],
+  ];
+
+  for (const [suffix, body] of cases) {
+    const review = { ...valid, body };
+    const github = createGitHubMock({
+      issueComments: [ordinaryRequest({ user: READER })],
+      reviews: [review],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `receipt-envelope-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.ok(result.report.counts.indeterminate >= 1, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("receipt envelope: inline-parent reviewed SHA must match the native commit", async (context) => {
+  const standard = receiptWrappedInlineParentReview(HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const review = {
+    ...standard,
+    body: standard.body.replace(HEAD.slice(0, 10), OLD_HEAD.slice(0, 10)),
+  };
+  const github = createGitHubMock({
+    issueComments: [ordinaryRequest({ user: READER })],
+    reviews: [review],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "receipt-envelope-inline-parent-reviewed-sha-mismatch",
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.ok(result.report.counts.indeterminate >= 1);
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
 test("an inline-parent receipt fails closed when an eligibility predicate is not met", async (context) => {
   const request = ordinaryRequest({ user: READER });
   const valid = inlineParentReview(HEAD, {
@@ -14992,6 +15165,14 @@ function inlineParentReview(commitRef = HEAD, overrides = {}) {
     app: CODEX_APP,
     performed_via_github_app: CODEX_APP,
     ...overrides,
+  };
+}
+
+function receiptWrappedInlineParentReview(commitRef = HEAD, overrides = {}) {
+  const review = inlineParentReview(commitRef, overrides);
+  return {
+    ...review,
+    body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${review.body}`,
   };
 }
 
