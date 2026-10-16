@@ -4836,10 +4836,11 @@ function tokenizeReviewedStatusWriterWorkflow(value) {
     const mapping = parseReviewedStatusWriterMapping(token);
     if (mapping !== null && /^[|>][+-]?[1-9]?$|^[|>][1-9]?[+-]?$/u.test(mapping.value)) {
       token.blockStyle = mapping.value;
+      const blockParentIndent = mapping.sequence ? rawIndent + 2 : rawIndent;
       for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
         const contentLine = lines[cursor];
         const contentIndent = contentLine.match(/^ */u)[0].length;
-        if (contentLine.trim() !== "" && contentIndent <= rawIndent) {
+        if (contentLine.trim() !== "" && contentIndent <= blockParentIndent) {
           break;
         }
         token.blockContent.push(contentLine);

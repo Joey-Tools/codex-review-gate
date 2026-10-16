@@ -83,6 +83,27 @@ const JOB_LEVEL_STATUS_WRITER = [
   "          printf 'Reviewed inline publisher\\n'",
   "",
 ].join("\n");
+const RUN_FIRST_STATUS_WRITER = [
+  "name: Reviewed run-first status writer",
+  "on: push",
+  "permissions:",
+  "  contents: read",
+  "jobs:",
+  "  publish:",
+  "    permissions:",
+  "      statuses: write",
+  "    runs-on: ubuntu-slim",
+  "    steps:",
+  "      - run: |",
+  "          set -euo pipefail",
+  "          printf 'Reviewed inline publisher\\n'",
+  '        env:',
+  '          BASH_ENV: ""',
+  '          ENV: ""',
+  "          GH_TOKEN: ${{ github.token }}",
+  "        shell: bash",
+  "",
+].join("\n");
 const SPLIT_JOB_STATUS_WRITER = [
   "name: Reviewed split status writer",
   "on: push",
@@ -195,7 +216,11 @@ test("reviewed status writers are denied by default and explicitly returned as p
 });
 
 test("canonical inventory accepts isolated publishers alongside split read-only jobs", () => {
-  for (const [index, content] of [JOB_LEVEL_STATUS_WRITER, SPLIT_JOB_STATUS_WRITER].entries()) {
+  for (const [index, content] of [
+    JOB_LEVEL_STATUS_WRITER,
+    RUN_FIRST_STATUS_WRITER,
+    SPLIT_JOB_STATUS_WRITER,
+  ].entries()) {
     const path = `.github/workflows/reviewed-status-writer-${index}.yml`;
     const file = { path, content };
     assert.equal(
@@ -355,6 +380,13 @@ test("reviewed status writer entries cannot excuse callers, other violations, or
       JOB_LEVEL_STATUS_WRITER.replace(
         "      - name: Publish\n",
         "      - name: Publish\n        uses: actions/checkout@v4\n",
+      ),
+    ],
+    [
+      "run-first step sibling action dependency",
+      RUN_FIRST_STATUS_WRITER.replace(
+        "        env:\n",
+        "        uses: actions/checkout@v4\n        env:\n",
       ),
     ],
     [

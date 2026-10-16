@@ -60,6 +60,17 @@ superseded_by:
   contracts remain unchanged and do not admit this exception. No runtime action bytes,
   release manifest, required context, events or consumer workflow templates
   change; a runtime release is not required for this installer-only fix.
+- Follow-up review found that a step beginning with `- run: |` used the dash's
+  indentation as the scalar boundary, swallowing later `env` and `shell`
+  sibling fields. Bind block content to the mapping-key indentation after the
+  sequence marker instead. Supported publisher fields must not depend on
+  ordering; retain rejection of a forbidden action/dependency field after the
+  scalar. This is a parser compatibility fix, not a permission-policy change.
+- Joey requested a separate fix PR before the installer PR. The parser exists
+  only on the installer branch, so land the focused repair into that branch
+  first, then land the complete installer change on `master`. This keeps the
+  repair independently reviewable without introducing unused parser code or
+  enabling the reviewed-writer exception early.
 
 ## Validation
 
@@ -74,7 +85,9 @@ superseded_by:
   isolated pending/final publishers and rejection of mutable/local actions,
   checkout/dependency imports, interpreter environment injection, opaque
   fields and writer permissions hidden by irregular indentation or quoted/
-  sequence job headers. Bootstrap registration remains 169; required CI
+  sequence job headers. They also cover run-first literal blocks with later
+  environment/shell fields and a later forbidden execution field. Bootstrap
+  registration remains 169; required CI
   matrix/sharding contracts are unchanged by the repairs.
 - The original HDR-streaming preview with unchanged transport workflows
   passed the initial digest-only policy, but the P1 review showed why that
