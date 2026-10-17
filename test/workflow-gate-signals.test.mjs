@@ -93,6 +93,93 @@ test("finds a reserved job name in a bounded folded scalar", () => {
   assert.equal(result.matches[0].kind, "reserved-job-name");
 });
 
+test("classifies the complete folded job name rather than matching body fragments", () => {
+  const suffix = inspectWorkflowGateSignals([
+    "jobs:",
+    "  collision:",
+    "    name: >-",
+    "      codex/github-review-gate",
+    "      (Linux)",
+    "    runs-on: ubuntu-slim",
+  ].join("\n"));
+  assert.deepEqual(suffix.matches, []);
+
+  const fragments = inspectWorkflowGateSignals([
+    "jobs:",
+    "  collision:",
+    "    name: >-",
+    "      codex/github-",
+    "      review-gate",
+    "    runs-on: ubuntu-slim",
+  ].join("\n"));
+  assert.deepEqual(fragments.matches, []);
+
+  for (const body of [
+    "      'codex/github-review-gate'",
+    "      codex/github-review-gate # literal block text",
+    "      codex/github-review-gate\n      ---",
+  ]) {
+    const literalText = inspectWorkflowGateSignals([
+      "jobs:",
+      "  collision:",
+      "    name: >-",
+      body,
+      "    runs-on: ubuntu-slim",
+    ].join("\n"));
+    assert.deepEqual(literalText.matches, [], body);
+  }
+});
+
+test("warns instead of classifying an over-budget folded job-name prefix", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  collision:",
+    "    name: >-",
+    "      codex/github-review-gate",
+    "      first extra line",
+    "      second extra line",
+    "      third extra line",
+    "      fourth extra line",
+    "    runs-on: ubuntu-slim",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches, []);
+  assert.ok(result.warnings.some(({ kind }) => kind === "folded-job-name-limit"));
+});
+
+test("closes folded job-name state at dedent and document boundaries", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  first:",
+    "    name: >-",
+    "      codex/github-review-gate",
+    "      (Linux)",
+    "  second:",
+    "    name: >-",
+    "      codex/github-review-gate",
+    "---",
+    "jobs:",
+    "  third:",
+    "    name: >-",
+    "      codex/github-review-gate",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    ["reserved-job-name", "reserved-job-name"],
+  );
+
+  const trailingBlank = inspectWorkflowGateSignals([
+    "jobs:",
+    "  collision:",
+    "    name: >-",
+    "      codex/github-review-gate",
+    "",
+    "    runs-on: ubuntu-slim",
+  ].join("\n"));
+  assert.equal(trailingBlank.matches.length, 1);
+});
+
 test("handles simple scalar anchors consistently on job names and context fields", () => {
   const anchored = inspectWorkflowGateSignals([
     "jobs:",
@@ -203,7 +290,7 @@ test("blocks only job and step uses selectors, warning on unrelated uses data", 
   assert.ok(data.warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"));
 });
 
-test("keeps context-like keys inside block env and with mappings as data", () => {
+test("keeps context-like keys inside block env, with, and outputs mappings as data", () => {
   const result = inspectWorkflowGateSignals([
     "env:",
     "  REVIEW_CONTEXT: codex/github-review-gate",
@@ -219,6 +306,9 @@ test("keeps context-like keys inside block env and with mappings as data", () =>
     "    with:",
     "      context: codex/github-review-gate",
     "      CHECK_NAME: codex/github-review-gate",
+    "    outputs:",
+    "      context: codex/github-review-gate",
+    "      check-name: codex/github-review-gate",
     "    steps:",
     "      - run: echo data only",
     "        env:",
@@ -259,6 +349,23 @@ test("keeps jobs named env or with eligible for actual gate callers", () => {
       "codex-review-gate-action-caller",
       "codex-review-gate-action-caller",
     ],
+  );
+});
+
+test("keeps a job named outputs eligible for real gate signals", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  outputs:",
+    "    name: codex/github-review-gate",
+    "    outputs:",
+    "      context: codex/github-review-gate",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    ["reserved-job-name", "codex-review-gate-action-caller"],
   );
 });
 
@@ -464,6 +571,14 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     "run: gh api repos/o/r/check-runs --method POST -f name=codex/github-review-gate",
   );
   assert.equal(explicitPost.matches[0].kind, "reserved-check-run-name");
+
+  for (const method of ["--method PATCH", "--method=PATCH", "-X PATCH"]) {
+    const updater = inspectWorkflowGateSignals(
+      `run: gh api repos/o/r/check-runs ${method} -f name=codex/github-review-gate`,
+    );
+    assert.equal(updater.matches.length, 1, method);
+    assert.equal(updater.matches[0].kind, "reserved-check-run-name", method);
+  }
 
   for (const method of ["--method GET", "--method=GET", "-X GET", "--method HEAD"]) {
     const reader = inspectWorkflowGateSignals(

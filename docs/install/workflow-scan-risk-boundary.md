@@ -23,11 +23,11 @@ The following eight PR #128 review examples are intentionally accepted as warnin
 
 These accepted scanner-coverage examples do not by themselves establish a security regression or change runtime evidence. They also do not waive ordinary runtime handling of unresolved review findings.
 
-The false-negative allowance does not justify treating known data as execution. Context-like fields inside `env` or `with` data, and YAML-looking selector text inside block scalars, are not by themselves proof of a publisher or caller. The scanner keeps those references nonblocking while retaining its separate recognition of actual command/API publishing patterns. An environment or input value may still flow into a publisher; tracing that data flow remains outside this preflight. This distinction is bounded source classification, not a promise of complete YAML or shell semantics.
+The false-negative allowance does not justify treating known data as execution. Context-like fields inside `env`, `with` or job `outputs` data, and YAML-looking selector text inside block scalars, are not by themselves proof of a publisher or caller. The scanner keeps those references nonblocking while retaining its separate recognition of actual command/API publishing patterns. An environment, input or output value may still flow into a publisher; tracing that data flow remains outside this preflight. This distinction is bounded source classification, not a promise of complete YAML or shell semantics.
 
-Here, `env` / `with` means environment/input mapping properties, not a job ID with the same spelling. Likewise, CLI-shaped output text such as `echo -f context=...` is not a publishing command.
+Here, `env` / `with` / `outputs` means mapping properties, not a job ID with the same spelling. Likewise, CLI-shaped output text such as `echo -f context=...` is not a publishing command. A bounded folded job name is compared as a complete value, not a single physical line; incomplete or over-budget values warn rather than proving a collision from a prefix.
 
-The supported `gh api` creation matches exclude recognized explicit non-POST method forms for both context and CheckRun-name fields. This avoids treating GET/HEAD readers as creators; it does not prove that every other method or unsupported command form is incapable of modifying a check.
+The supported `gh api` publishing matches exclude recognized explicit GET/HEAD method forms for both context and CheckRun-name fields. Other recognized command fields remain candidates, including a PATCH CheckRun-name update; non-POST does not mean read-only. Unsupported command forms remain outside the completeness guarantee.
 
 ## Safeguards that remain strict
 

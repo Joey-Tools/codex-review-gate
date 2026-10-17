@@ -9,6 +9,7 @@ const MAX_YAML_SCALAR_ANCHORS = 32;
 const MAX_YAML_ANCHOR_VALUE_CHARS = 512;
 const MAX_FLOW_COLLECTION_CHARS = 2048;
 const MAX_FLOW_COLLECTION_DEPTH = 8;
+const MAX_FOLDED_JOB_NAME_LINES = 4;
 
 const ACTION_CALLERS = [
   /^JoeyTeng\/codex-review-gate-action(?:\/\.github\/workflows\/codex-review-gate\.ya?ml)?@[^\s,}"']+$/iu,
@@ -92,7 +93,12 @@ export function inspectWorkflowGateSignals(
       );
     }
     const limited = raw.slice(0, MAX_LINE_CHARS);
-    return { line: index + 1, raw: limited, text: stripComments(limited) };
+    return {
+      line: index + 1,
+      raw: limited,
+      text: stripComments(limited),
+      truncated: raw.length > MAX_LINE_CHARS,
+    };
   });
   markYamlJobNameFields(lines);
   inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning);
@@ -116,33 +122,43 @@ export function inspectWorkflowGateSignals(
   let foldedJobName = null;
   const yamlAnchors = new Map();
   for (const line of lines) {
-    if (isYamlDocumentBoundary(line.text)) {
+    if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
+      if (foldedJobName) {
+        finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning);
+        foldedJobName = null;
+      }
       yamlAnchors.clear();
       foldedUses = null;
-      foldedJobName = null;
     } else if (!line.yamlScalarContent && !isRunCommandLine(line.text)) {
       registerYamlScalarAnchors(line, yamlAnchors, addWarning);
     }
     if (foldedJobName) {
-      if (!line.text.trim()) {
-        foldedJobName.remaining -= 1;
-      } else if (indentationOf(line.text) > foldedJobName.indent) {
-        const expression = line.text.trim();
-        if (resolveSimpleLiteral(expression, new Map()) === reserved) {
-          addMatch("reserved-job-name", line.line, line.raw);
-        } else if (isDynamic(expression) || isAmbiguous(expression, new Map(), reserved)) {
-          addWarning(
-            isDynamic(expression) ? "dynamic-context-not-confirmed" : "ambiguous-reserved-context",
-            line.line,
-            "A folded job name may refer to the reserved check, but literal composition could not be confirmed.",
-            line.raw,
-          );
+      const indent = indentationOf(line.raw);
+      if (!line.raw.trim()) {
+        if (foldedJobName.lines < MAX_FOLDED_JOB_NAME_LINES) foldedJobName.lines += 1;
+        else foldedJobName.unclassified = true;
+      } else if (indent > foldedJobName.indent) {
+        if (foldedJobName.lines >= MAX_FOLDED_JOB_NAME_LINES) {
+          foldedJobName.unclassified = true;
+        } else {
+          foldedJobName.lines += 1;
+          if (line.truncated) foldedJobName.unclassified = true;
+          if (foldedJobName.contentIndent === null) foldedJobName.contentIndent = indent;
+          if (indent < foldedJobName.contentIndent) {
+            foldedJobName.unclassified = true;
+          } else if (!line.truncated) {
+            const value = line.raw.slice(foldedJobName.contentIndent);
+            foldedJobName.fragments.push(value);
+            if (value.trim() && foldedJobName.firstContentLine === null) {
+              foldedJobName.firstContentLine = line.line;
+              foldedJobName.firstContentRaw = line.raw;
+            }
+          }
         }
-        foldedJobName.remaining -= 1;
-      } else {
+      } else if (line.text.trim()) {
+        finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning);
         foldedJobName = null;
       }
-      if (foldedJobName && foldedJobName.remaining <= 0) foldedJobName = null;
     }
     if (foldedUses) {
       if (!line.text.trim()) {
@@ -183,8 +199,30 @@ export function inspectWorkflowGateSignals(
     }
     const name = yamlFields.find((field) => isNameField(field.key));
     if (line.jobNameField && name && isBlockScalarIndicator(stripYamlAnchor(name.value))) {
-      foldedJobName = { indent: indentationOf(line.text), remaining: 4 };
+      const indicator = stripYamlAnchor(name.value);
+      const explicitIndent = indicator.match(/[1-9]/u)?.[0];
+      foldedJobName = {
+        indent: indentationOf(line.text),
+        contentIndent: explicitIndent ? indentationOf(line.text) + Number(explicitIndent) : null,
+        lines: 0,
+        fragments: [],
+        firstContentLine: null,
+        firstContentRaw: null,
+        headerLine: line.line,
+        headerRaw: line.raw,
+        unclassified: line.truncated,
+      };
     }
+  }
+
+  if (foldedJobName) {
+    finishFoldedJobName(
+      foldedJobName,
+      reserved,
+      addMatch,
+      addWarning,
+      content.length > clipped.length || rawLines.length > MAX_LINES,
+    );
   }
 
   for (const segment of splitScopes(lines)) {
@@ -216,6 +254,33 @@ export function inspectWorkflowGateSignals(
   matches.sort((left, right) => left.line - right.line || left.kind.localeCompare(right.kind));
   usefulWarnings.sort((left, right) => left.line - right.line || left.kind.localeCompare(right.kind));
   return { matches, warnings: usefulWarnings };
+}
+
+function finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning, inputIncomplete = false) {
+  if (foldedJobName.unclassified || inputIncomplete) {
+    addWarning(
+      "folded-job-name-limit",
+      foldedJobName.headerLine,
+      `Folded job name could not be fully inspected within the ${MAX_FOLDED_JOB_NAME_LINES}-line or input limits; it was not classified.`,
+      foldedJobName.headerRaw,
+    );
+    return;
+  }
+
+  const expression = foldedJobName.fragments.join(" ").trim();
+  if (!expression) return;
+  const line = foldedJobName.firstContentLine ?? foldedJobName.headerLine;
+  const raw = foldedJobName.firstContentRaw ?? foldedJobName.headerRaw;
+  if (expression === reserved) {
+    addMatch("reserved-job-name", line, raw);
+  } else if (isDynamic(expression)) {
+    addWarning(
+      "dynamic-context-not-confirmed",
+      line,
+      "A folded job name uses a dynamic value, so the reserved check could not be confirmed.",
+      raw,
+    );
+  }
 }
 
 function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning) {
@@ -498,19 +563,19 @@ function cliContextExpression(text) {
   const command = runCommand(text);
   if (!/^gh\s+api(?:\s|$)/iu.test(command)) return null;
   if (!/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(command)) return null;
-  if (hasExplicitNonPostGitHubApiMethod(command)) return null;
+  if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
   return cliFieldExpression(command, "context");
 }
 
-function hasExplicitNonPostGitHubApiMethod(command) {
+function hasExplicitReadOnlyGitHubApiMethod(command) {
   const method = command.match(/(?:^|\s)(?:-X|--method)(?:=|\s+)([A-Za-z]+)/iu);
-  return method !== null && method[1].toUpperCase() !== "POST";
+  return method !== null && ["GET", "HEAD"].includes(method[1].toUpperCase());
 }
 
 function cliCheckRunNameExpression(text) {
   const command = runCommand(text);
   if (!/^gh\s+api(?:\s|$)/iu.test(command) || !/\/check-runs(?:[/?#\s]|$)/iu.test(command)) return null;
-  if (hasExplicitNonPostGitHubApiMethod(command)) return null;
+  if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
   return cliFieldExpression(command, "name");
 }
 
@@ -563,7 +628,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
   let index = 0;
   while (index < lines.length) {
     const line = lines[index];
-    if (isYamlDocumentBoundary(line.text)) {
+    if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
       runBlockIndent = null;
       runBlockHeaderChars = 0;
       previousContinues = false;
@@ -722,7 +787,7 @@ function markYamlJobNameFields(lines) {
   let stepIndent = null;
   let stepPropertyIndent = null;
   for (const line of lines) {
-    if (isYamlDocumentBoundary(line.text)) {
+    if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
       jobsIndent = null;
       jobIndent = null;
       jobPropertyIndent = null;
@@ -841,7 +906,10 @@ function markYamlDataAndScalarFields(lines) {
     stepPropertyIndent: null,
   };
   for (const line of lines) {
-    if (isYamlDocumentBoundary(line.text)) {
+    if (
+      isYamlDocumentBoundary(line.text) &&
+      (scalarKeyIndent === null || indentationOf(line.text) <= scalarKeyIndent)
+    ) {
       scalarKeyIndent = null;
       dataMappingIndents.length = 0;
       resetWorkflowYamlScope(workflow);
@@ -868,7 +936,7 @@ function markYamlDataAndScalarFields(lines) {
     if (
       !line.yamlDataField &&
       mapping &&
-      /^(?:env|with)$/iu.test(mapping.key) &&
+      /^(?:env|with|outputs)$/iu.test(mapping.key) &&
       !mapping.value.trim() &&
       isWorkflowYamlProperty(line, mapping, workflow)
     ) {

@@ -7241,6 +7241,18 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "read-only-gh-check-run-name-reference",
       "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method GET -f name=codex/github-review-gate\n",
     ],
+    [
+      "context-like-job-output-data",
+      "jobs:\n  build:\n    outputs:\n      context: codex/github-review-gate\n      check-name: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "folded-job-name-with-suffix",
+      "jobs:\n  build:\n    name: >-\n      codex/github-review-gate\n      (Linux)\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "folded-job-name-with-prefix-at-eof",
+      "jobs:\n  build:\n    name: >-\n      Build\n      codex/github-review-gate\n",
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7294,6 +7306,16 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
+      "gate-step-under-outputs-job-id",
+      "jobs:\n  outputs:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "reserved-name-under-outputs-job-id",
+      "jobs:\n  outputs:\n    name: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
       "gh-status-context-publisher",
       "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/statuses/$SHA --raw-field context=codex/github-review-gate\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
@@ -7338,6 +7360,11 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "gh-api-implicit-post-reserved-check-run",
       "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs --raw-field name=codex/github-review-gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-api-patch-reserved-check-run",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs/123 --method PATCH -f name=codex/github-review-gate -f conclusion=success\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
