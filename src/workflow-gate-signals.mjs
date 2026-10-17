@@ -81,6 +81,7 @@ export function inspectWorkflowGateSignals(
     const limited = raw.slice(0, MAX_LINE_CHARS);
     return { line: index + 1, raw: limited, text: stripComments(limited) };
   });
+  markYamlJobNameFields(lines);
 
   if (content.length > clipped.length) {
     addWarning(
@@ -98,7 +99,29 @@ export function inspectWorkflowGateSignals(
   }
 
   let foldedUses = null;
+  let foldedJobName = null;
   for (const line of lines) {
+    if (foldedJobName) {
+      if (!line.text.trim()) {
+        foldedJobName.remaining -= 1;
+      } else if (indentationOf(line.text) > foldedJobName.indent) {
+        const expression = line.text.trim();
+        if (resolveSimpleLiteral(expression, new Map()) === reserved) {
+          addMatch("reserved-job-name", line.line, line.raw);
+        } else if (isDynamic(expression) || isAmbiguous(expression, new Map(), reserved)) {
+          addWarning(
+            isDynamic(expression) ? "dynamic-context-not-confirmed" : "ambiguous-reserved-context",
+            line.line,
+            "A folded job name may refer to the reserved check, but literal composition could not be confirmed.",
+            line.raw,
+          );
+        }
+        foldedJobName.remaining -= 1;
+      } else {
+        foldedJobName = null;
+      }
+      if (foldedJobName && foldedJobName.remaining <= 0) foldedJobName = null;
+    }
     if (foldedUses) {
       if (!line.text.trim()) {
         foldedUses.remaining -= 1;
@@ -111,10 +134,14 @@ export function inspectWorkflowGateSignals(
       if (foldedUses && foldedUses.remaining <= 0) foldedUses = null;
     }
     if (!line.text.trim()) continue;
-    inspectLineSignals(line, reserved, addMatch);
+    inspectLineSignals(line, reserved, addMatch, addWarning);
     const uses = fieldsOnLine(line.text).find((field) => field.key === "uses");
-    if (uses && /^[>|](?:[+-]?[1-9]?|[1-9]?[+-]?)\s*$/u.test(uses.value)) {
+    if (uses && isBlockScalarIndicator(uses.value)) {
       foldedUses = { indent: indentationOf(line.text), remaining: 4 };
+    }
+    const name = fieldsOnLine(line.text).find((field) => isNameField(field.key));
+    if (line.jobNameField && name && isBlockScalarIndicator(name.value)) {
+      foldedJobName = { indent: indentationOf(line.text), remaining: 4 };
     }
   }
 
@@ -149,35 +176,51 @@ export function inspectWorkflowGateSignals(
   return { matches, warnings: usefulWarnings };
 }
 
-function inspectLineSignals(line, reserved, addMatch) {
+function inspectLineSignals(line, reserved, addMatch, addWarning) {
   const fields = fieldsOnLine(line.text);
   for (const field of fields) {
     if (field.key === "uses") {
-      const value = resolveSimpleLiteral(field.value, new Map());
+      const value = resolveSimpleLiteral(stripYamlAnchor(field.value), new Map());
       addCallerMatch(value, line, addMatch);
-    } else if (isContextField(field.key)) {
+    } else if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
       if (resolveSimpleLiteral(field.value, new Map()) === reserved) {
         addMatch(field.key.toLowerCase() === "name" ? "reserved-job-name" : "reserved-status-context", line.line, line.raw);
       }
+    }
+  }
+  const flowJobNames = flowStyleJobNameFields(line.text);
+  for (const field of flowJobNames) {
+    if (resolveSimpleLiteral(field.value, new Map()) === reserved) {
+      addMatch("reserved-job-name", line.line, line.raw);
     }
   }
   const cliContext = cliContextExpression(line.text);
   if (cliContext && resolveSimpleLiteral(cliContext, new Map()) === reserved) {
     addMatch("reserved-status-context", line.line, line.raw);
   }
+  const cliCheckRunName = cliCheckRunNameExpression(line.text);
+  if (cliCheckRunName && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) {
+    addMatch("reserved-check-run-name", line.line, line.raw);
+  }
   const exactFieldHandled = fields.some(
     (field) =>
-      isContextField(field.key) &&
+      (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) &&
       resolveSimpleLiteral(field.value, new Map()) === reserved,
-  );
+  ) || flowJobNames.some((field) => resolveSimpleLiteral(field.value, new Map()) === reserved);
   const exactCliHandled =
-    cliContext !== null && resolveSimpleLiteral(cliContext, new Map()) === reserved;
+    (cliContext !== null && resolveSimpleLiteral(cliContext, new Map()) === reserved) ||
+    (cliCheckRunName !== null && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved);
   if (
     hasExactToken(line.text, reserved) &&
     !exactFieldHandled &&
     !exactCliHandled
   ) {
-    addMatch("reserved-status-context-reference", line.line, line.raw);
+    addWarning(
+      "reserved-status-context-reference",
+      line.line,
+      "The reserved name appears outside a recognized publishing-like field or workflow job name; this text scan cannot confirm a status publisher.",
+      line.raw,
+    );
   }
 }
 
@@ -187,13 +230,20 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
     for (const field of fieldsOnLine(line.text)) {
       if (field.key === "uses") {
         inspectCaller(field.value, literals, line, addMatch, addWarning);
-      } else if (isContextField(field.key)) {
+      } else if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
         inspectContext(field.key, field.value, literals, line, reserved, addMatch, addWarning);
       }
+    }
+    for (const field of flowStyleJobNameFields(line.text)) {
+      inspectContext("name", field.value, literals, line, reserved, addMatch, addWarning);
     }
     const cliContext = cliContextExpression(line.text);
     if (cliContext) {
       inspectContext("context", cliContext, literals, line, reserved, addMatch, addWarning);
+    }
+    const cliCheckRunName = cliCheckRunNameExpression(line.text);
+    if (cliCheckRunName) {
+      inspectContext("check-run-name", cliCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
 
     for (const statement of splitStatements(line.text)) {
@@ -235,7 +285,16 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
 function inspectContext(key, expression, literals, line, reserved, addMatch, addWarning) {
   const value = resolveSimpleLiteral(expression, literals);
   if (value === reserved) {
-    addMatch(key.toLowerCase() === "name" ? "reserved-job-name" : "reserved-status-context", line.line, line.raw);
+    const normalized = key.toLowerCase();
+    addMatch(
+      normalized === "name"
+        ? "reserved-job-name"
+        : normalized === "check-run-name"
+          ? "reserved-check-run-name"
+          : "reserved-status-context",
+      line.line,
+      line.raw,
+    );
     return;
   }
   if (isDynamic(expression) || isAmbiguous(expression, literals, reserved, value)) {
@@ -251,7 +310,7 @@ function inspectContext(key, expression, literals, line, reserved, addMatch, add
 }
 
 function inspectCaller(expression, literals, line, addMatch, addWarning) {
-  const value = resolveSimpleLiteral(expression, literals);
+  const value = resolveSimpleLiteral(stripYamlAnchor(expression), literals);
   if (
     !addCallerMatch(value, line, addMatch) &&
     /codex-review-gate-action|Joey-Tools\/codex-review-gate|JoeyTeng/iu.test(expression)
@@ -284,16 +343,30 @@ function fieldsOnLine(text) {
   for (const match of text.matchAll(pattern)) {
     const key = match[1];
     const value = match[2].trim();
-    if (key.toLowerCase() === "uses" || isContextField(key)) fields.push({ key, value });
+    if (key.toLowerCase() === "uses" || isContextField(key) || isNameField(key)) fields.push({ key, value });
   }
   return fields;
 }
 
 function cliContextExpression(text) {
-  const wholeField = text.match(/(?:^|\s)(?:-f|--field)(?:\s+|=)\s*(['"])context=([^'"]*)\1/iu);
+  return cliFieldExpression(text, "context");
+}
+
+function cliCheckRunNameExpression(text) {
+  if (!/\/check-runs(?:[/?#\s]|$)/iu.test(text)) return null;
+  return cliFieldExpression(text, "name");
+}
+
+function cliFieldExpression(text, field) {
+  const wholeField = text.match(
+    new RegExp(`(?:^|\\s)(?:-f|--field)(?:\\s+|=)\\s*(['"])${field}=([^'"]*)\\1`, "iu"),
+  );
   if (wholeField) return `${wholeField[1]}${wholeField[2]}${wholeField[1]}`;
   const fieldValue = text.match(
-    /(?:^|\s)(?:-f|--field)(?:\s+|=)\s*context=(?:"([^"]*)"|'([^']*)'|([^\s'"]+))/iu,
+    new RegExp(
+      `(?:^|\\s)(?:-f|--field)(?:\\s+|=)\\s*${field}=(?:"([^"]*)"|'([^']*)'|([^\\s'"]+))`,
+      "iu",
+    ),
   );
   if (!fieldValue) return null;
   if (fieldValue[1] !== undefined) return `"${fieldValue[1]}"`;
@@ -304,11 +377,69 @@ function cliContextExpression(text) {
 function isContextField(key) {
   const normalized = key.toLowerCase();
   return (
-    normalized === "name" ||
     normalized.includes("context") ||
     /(?:^|[-_])check[-_]?name$/u.test(normalized) ||
     normalized === "checkname"
   );
+}
+
+function isNameField(key) {
+  return key.toLowerCase() === "name";
+}
+
+function markYamlJobNameFields(lines) {
+  let jobsIndent = null;
+  let jobIndent = null;
+  let jobPropertyIndent = null;
+  for (const line of lines) {
+    if (!line.text.trim()) continue;
+    const indent = indentationOf(line.text);
+    const text = line.text.trim();
+    const key = simpleYamlKey(text);
+    if (key?.toLowerCase() === "jobs" && /^\s*$/u.test(text.slice(text.indexOf(":") + 1))) {
+      jobsIndent = indent;
+      jobIndent = null;
+      jobPropertyIndent = null;
+      continue;
+    }
+    if (jobsIndent === null) continue;
+    if (indent <= jobsIndent) {
+      jobsIndent = null;
+      jobIndent = null;
+      jobPropertyIndent = null;
+      continue;
+    }
+    if (jobIndent === null || indent === jobIndent) {
+      if (key !== null) {
+        jobIndent = indent;
+        jobPropertyIndent = null;
+      }
+      continue;
+    }
+    if (jobPropertyIndent === null) jobPropertyIndent = indent;
+    if (indent === jobPropertyIndent && key?.toLowerCase() === "name") {
+      line.jobNameField = true;
+    }
+  }
+}
+
+function simpleYamlKey(text) {
+  const match = text.match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*:/u);
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
+}
+
+function flowStyleJobNameFields(text) {
+  const jobs = /\bjobs\s*:\s*\{\s*[A-Za-z0-9_-]+\s*:\s*\{([^{}]*)\}/u.exec(text);
+  if (!jobs) return [];
+  return fieldsOnLine(jobs[1]).filter((field) => isNameField(field.key));
+}
+
+function stripYamlAnchor(value) {
+  return value.replace(/^&[A-Za-z_][A-Za-z0-9_-]*\s+/u, "");
+}
+
+function isBlockScalarIndicator(value) {
+  return /^[>|](?:[+-]?[1-9]?|[1-9]?[+-]?)\s*$/u.test(value);
 }
 
 function resolveSimpleLiteral(expression, literals) {

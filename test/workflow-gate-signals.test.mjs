@@ -4,19 +4,30 @@ import { inspectWorkflowGateSignals } from "../src/workflow-gate-signals.mjs";
 
 test("finds literal reserved names and same-name status contexts", () => {
   const result = inspectWorkflowGateSignals(`
-name: codex/github-review-gate
+name: Maintenance workflow
 jobs:
   publisher:
     name: "codex/github-review-gate"
+    check-context: codex/github-review-gate
     steps:
       - run: echo ready
 `);
 
   assert.deepEqual(
     result.matches.map(({ kind }) => kind),
-    ["reserved-job-name", "reserved-job-name"],
+    ["reserved-job-name", "reserved-status-context"],
   );
   assert.equal(result.warnings.length, 0);
+
+  for (const content of [
+    "jobs:\n    collision:\n        name: codex/github-review-gate",
+    '"jobs":\n  "collision":\n    "name": codex/github-review-gate',
+    "'jobs':\n    'collision':\n        'name': codex/github-review-gate",
+  ]) {
+    const indentedOrQuoted = inspectWorkflowGateSignals(content);
+    assert.equal(indentedOrQuoted.matches.length, 1);
+    assert.equal(indentedOrQuoted.matches[0].kind, "reserved-job-name");
+  }
 });
 
 test("finds a reserved job name nested under a flow-style root mapping", () => {
@@ -24,20 +35,33 @@ test("finds a reserved job name nested under a flow-style root mapping", () => {
     "{name: Other, jobs: {collision: {name: codex/github-review-gate}}}",
   );
   assert.equal(nested.matches.length, 1);
-  assert.equal(nested.matches[0].kind, "reserved-status-context-reference");
+  assert.equal(nested.matches[0].kind, "reserved-job-name");
 
   const direct = inspectWorkflowGateSignals("context: codex/github-review-gate");
   assert.equal(direct.matches.length, 1);
   assert.equal(direct.matches[0].kind, "reserved-status-context");
 
   assert.equal(
-    inspectWorkflowGateSignals("other: check.name", { reservedCheckName: "check.name" }).matches.length,
+    inspectWorkflowGateSignals("context: check.name", { reservedCheckName: "check.name" }).matches.length,
     1,
   );
   assert.equal(
-    inspectWorkflowGateSignals("other: checkXname", { reservedCheckName: "check.name" }).matches.length,
+    inspectWorkflowGateSignals("context: checkXname", { reservedCheckName: "check.name" }).matches.length,
     0,
   );
+});
+
+test("finds a reserved job name in a bounded folded scalar", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  collision:",
+    "    name: >-",
+    "      codex/github-review-gate",
+    "    runs-on: ubuntu-slim",
+  ].join("\n"));
+
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].kind, "reserved-job-name");
 });
 
 test("finds literal action and legacy reusable-workflow callers", () => {
@@ -58,6 +82,17 @@ test("finds literal action and legacy reusable-workflow callers", () => {
       "legacy-codex-review-gate-caller",
     ],
   );
+});
+
+test("finds a literal caller preceded by a simple YAML anchor", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  reuse:",
+    "    steps:",
+    "      - uses: &gate JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].kind, "codex-review-gate-action-caller");
 });
 
 test("finds known caller literals on the next line of folded uses scalars", () => {
@@ -109,10 +144,43 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
   assert.ok(cli.matches.every(({ kind }) => kind === "reserved-status-context"));
 
   const inline = inspectWorkflowGateSignals([
+    "check-name: codex/github-review-gate",
     `const payload = { context: "codex/github-review-gate" };`,
     `const payload = JSON.parse('{"context":"codex/github-review-gate"}');`,
   ].join("\n"));
-  assert.equal(inline.matches.length, 2);
+  assert.equal(inline.matches.length, 3);
+});
+
+test("finds a reserved CheckRun name only beside the explicit check-runs API", () => {
+  const publisher = inspectWorkflowGateSignals(
+    "run: gh api repos/example/check-runs -f name=codex/github-review-gate",
+  );
+  assert.equal(publisher.matches.length, 1);
+  assert.equal(publisher.matches[0].kind, "reserved-check-run-name");
+
+  const unrelated = inspectWorkflowGateSignals(
+    "run: gh api repos/example/releases -f name=codex/github-review-gate",
+  );
+  assert.deepEqual(unrelated.matches, []);
+  assert.ok(unrelated.warnings.some(({ kind }) => kind === "reserved-status-context-reference"));
+});
+
+test("keeps bare references and non-job names as warnings rather than blocking matches", () => {
+  const result = inspectWorkflowGateSignals([
+    "name: codex/github-review-gate",
+    "run: echo codex/github-review-gate",
+    `run: jq '.name == "codex/github-review-gate"' payload.json`,
+    "with:",
+    "  name: codex/github-review-gate",
+    `const artifact = { name: "codex/github-review-gate" };`,
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - name: codex/github-review-gate",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches, []);
+  assert.ok(result.warnings.filter(({ kind }) => kind === "reserved-status-context-reference").length >= 6);
 });
 
 test("does not confuse a neighboring context or generic gate keywords with the reserved name", () => {
@@ -153,7 +221,10 @@ jobs:
 test("warns on ambiguous fragments and readable dynamic contexts without blocking", () => {
   const result = inspectWorkflowGateSignals([
     `context: 'codex/' + unknownSuffix`,
-    `name: \u0024{{ matrix.name }}`,
+    `context: \u0024{{ matrix.context }}`,
+    "jobs:",
+    "  dynamic:",
+    `    name: \u0024{{ matrix.name }}`,
     `uses: \u0024{{ matrix.action }}`,
   ].join("\n"));
 

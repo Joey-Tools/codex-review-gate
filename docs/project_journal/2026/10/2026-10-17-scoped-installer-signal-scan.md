@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-17
 updated: 2026-10-17
 branch: wip/scoped-installer-signal-scan
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/128
 supersedes: []
 superseded_by:
 ---
@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 - The ordinary current-v2 installation boundary keeps canonical verifier/controller workflows, managed CODEOWNERS coverage, the required ruleset, and the repository-wide default-workflow-permissions read-only preflight strict while treating unrelated workflow-local write permissions as operator-trust warnings.
-- The installer uses a best-effort source-text keyword scan to block explicit additional Codex gate callers and explicit uses of the reserved `codex/github-review-gate` signal. Potential gate collisions that the scan cannot resolve are warnings; unrelated keywords and contexts are ignored. The scan does not execute workflows, prove full data flow, prevent a malicious same-name forgery, or establish a unique producer.
+- The installer uses a best-effort source-text keyword scan to block explicit additional Codex gate callers and explicit uses of the reserved `codex/github-review-gate` signal. Potential gate collisions that the scan cannot resolve are warnings; unrelated keywords and contexts do not block installation. Plain-text references may produce nonblocking notices. The scan does not execute workflows, prove full data flow, prevent a malicious same-name forgery, or establish a unique producer.
 
 ## Current State
 - The ordinary install does not require unrelated status, check, action, or contents publishers to be removed or isolated. Fragmented text, literal concatenations, and simple local-variable forms are scanned where possible; only potential gate collisions the keyword scan cannot resolve are warnings. Unrelated workflow-local write permissions remain operator-trust warnings. This policy does not relax the repository-wide default-workflow-permissions read-only preflight.
@@ -25,13 +25,15 @@ superseded_by:
 ## Decision and Reason
 - Ordinary installation should not require refactoring unrelated transport, build, or release publishers. Joey accepted the shared GitHub Actions App and operator-trust boundary instead of an exhaustive unique-producer proof.
 - Scan common literal fragments within bounded local segments, without executing scripts or resolving full data flow. Keep potential unresolved collisions as warnings, and never let the warning-output cap suppress a definite signal match.
+- PR review exposed a missed simple YAML anchor prefix and an overbroad exact-token fallback. Recognize anchored literal callers and actual job-name fields, including simple quoted keys, observed indentation, and bounded folded values. Keep plain references in output, queries, root/step names, and artifact labels nonblocking; retain definite context/check-name publishing fields and explicit CheckRun API payload matches. This remains a heuristic, not full YAML interpretation or alias/data-flow resolution.
+- Align the root Chinese README and packaged READMEs/security guidance with the ordinary operator-trust boundary. The existing release manifest describes its historical exact source commit; documentation corrections do not rewrite that released payload, change executable runtime behavior, or authorize a release or alias move.
 - Restore the HDR transport files to their installation base; the removed isolation requirement must not leave incidental runner, publishing, or lint-policy changes behind.
 
 ## Next Steps
 - Existing consumers need no Action runtime upgrade or floating-tag move for this installer-only change. The remaining HDR deployment and exact-head approval belong to its installation workstream.
 
 ## Validation
-- Node.js 24.15.0: all 170 bootstrap tests passed across four disjoint partitions (43/43/42/42). All 93 scanner, reviewed-writer, canonical workflow, security, YAML, and CI-shard contract tests passed; all 254 historical organization-handoff tests passed.
+- Node.js 24.15.0: all 170 bootstrap tests passed across four disjoint partitions (43/43/42/42). All 97 scanner, reviewed-writer, canonical workflow, security, YAML, and CI-shard contract tests passed; all 254 historical organization-handoff tests passed.
 - `npm run check`, CI `actionlint`, `git diff --check`, and source project-journal validation passed. Synthetic Git fixtures disable signing only in their test-process environment; the landing commit remains signed.
 - The actual HDR worktree passed an ordinary installer dry-run without reviewed-writer declarations: verifier, controller, and CODEOWNERS were all no-ops; unrelated write permissions produced warnings. No API call or `--apply` was used.
 - HDR's 86 focused Python tests passed on available Python 3.14.7; configured Python 3.12 was unavailable. Ruff and all seven workflows' actionlint checks passed. Both transport workflows, both corresponding test files, and the lint configuration match base `e4494ead9b29d00203395981346a09a4029fc395` byte-for-byte.

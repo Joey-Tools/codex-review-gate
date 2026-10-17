@@ -117,11 +117,25 @@ The ruleset must require all server-side conditions:
 - bypass actors are empty.
 
 GitHub's required-check `integration_id: 15368` identifies the entire GitHub
-Actions App, not either workflow alone. Exact-byte verification of both
-canonical workflows, fail-closed workflow inventory, the managed CODEOWNERS
-rules, required Code Owner review, stale-approval dismissal, strict up-to-date
-policy, no bypass actors and canary collision checks form one compound
-control-plane boundary. This is not cryptographic proof of one workflow.
+Actions App, not a particular workflow or unique producer. The ordinary
+current-v2 installer exact-byte verifies both canonical workflows and uses a
+best-effort scoped keyword scan of workflow source text to block explicit
+additional Codex gate callers and explicit uses of the reserved
+`codex/github-review-gate` signal. Fragmented text, literal concatenations and
+simple local-variable forms are scanned where possible. Only potential gate
+collisions the scan cannot resolve are warnings; unrelated keywords and
+contexts do not block installation. Plain-text references such as `echo`,
+`jq` or artifact labels may appear as non-blocking reference warnings; they
+are not treated as gate collisions. Unrelated workflow-local write permissions and opaque
+workflow-local permission declarations are operator-trust warnings, not
+installation blockers, and do not require unrelated publishers to be
+isolated. The repository-wide `default_workflow_permissions=read` preflight
+remains strict. Canonical workflow permissions, managed CODEOWNERS rules,
+required Code Owner review, stale-approval dismissal, strict up-to-date policy,
+no bypass actors and canary checks also remain strict. The scan does not
+execute workflows, prove complete data flow, prevent malicious same-name
+forgery, or establish a unique producer. Frozen historical organization
+handoff, bridge-removal and source-only proof contracts remain strict.
 
 Keep the imported ruleset disabled until a harmless canary has proved the
 actual native CheckRun source and complete wiring. The

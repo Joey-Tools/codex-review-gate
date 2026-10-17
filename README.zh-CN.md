@@ -107,13 +107,27 @@ uses: JoeyTeng/codex-review-gate-action@v2
 Copied workflows 分别负责 triggers、最小 permissions、独立 per-PR concurrency、typed
 `workflow_dispatch`、runner 分配前的 exact Codex-bot filtering，以及受保护 repository
 configuration。Action 仅访问 API，绝不 checkout 或执行 PR code。V2 没有 commit-status
-bridge；只有 verifier 在 feature-head SHA 上、且执行语义绑定 current test-merge 的
-native CheckRun 能满足 gate。
+bridge；gate 的设计围绕 verifier 在 feature-head SHA 上生成的 native CheckRun，且其执行
+语义绑定 current test-merge。
 
 Required CheckRun 是 `codex/github-review-gate`。Importable ruleset 把它绑定到 GitHub
 Actions（`integration_id: 15368`），要求 branch up to date、all review conversations
 resolved、阻止 default-branch non-fast-forward updates，并且没有 bypass actors。
 不支持 “Any source”。
+
+`integration_id` 标识整个 GitHub Actions App，而不是某个 workflow 或唯一 producer。普通
+current-v2 installer 会 exact-byte 验证两份 canonical workflows，并对 workflow 源文本执行
+best-effort scoped keyword scan，阻止显式的额外 Codex gate caller 和显式使用同一 reserved
+signal。被拆分的文本、literal concatenation 与简单 local-variable 形式会在可识别时扫描；只有
+扫描无法解析且可能构成 gate collision 的结构才会告警。无关 keyword/context 不作为阻塞条件；
+普通文本引用（例如 `echo`、`jq` 或 artifact label）可能显示为 non-blocking reference
+warning，但不会被视为 gate collision 或阻塞安装。Unrelated workflow-local write permission
+与 opaque workflow-local permission 声明是 operator-trust warnings，不要求删除权限或隔离无关
+publisher。Repository-wide `default_workflow_permissions=read` preflight 仍是独立严格门槛；
+canonical workflow permissions、CODEOWNERS protection 与 ruleset checks 也保持严格。Scan
+不会执行 workflows、证明完整 data flow、防止恶意同名 signal forgery 或建立唯一 producer；
+operator 仍须自行信任共用 GitHub Actions App 的其他 workflows。此普通安装策略不放宽冻结的
+历史 organization handoff、bridge-removal 或 source-only proof 合约。
 
 安装请读[人类指南](docs/install/human.zh-CN.md)或
 [Agent 执行手册](docs/install/agent.zh-CN.md)。两者执行同一套 two-PR rollout：一个

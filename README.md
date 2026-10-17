@@ -169,10 +169,13 @@ workflow source text) to block explicit additional Codex gate callers or
 explicit uses of the same reserved signal. Fragmented text, literal
 concatenations and simple local-variable forms are scanned where possible;
 potential gate collisions the keyword scan cannot resolve are warnings, while
-unrelated keywords and contexts are ignored. Unrelated workflow-local write
-permissions and opaque workflow-local permission declarations are operator
-warnings, not install blockers, and do not require unrelated publishers to be
-isolated. The repository-wide default-workflow-permissions read-only preflight
+unrelated keywords and contexts do not block installation. Plain-text
+references such as `echo`, `jq` or artifact labels may appear as non-blocking
+reference warnings; they are not treated as gate collisions. Unrelated
+workflow-local write permissions and opaque workflow-local permission
+declarations are operator warnings, not install blockers, and do not require
+unrelated publishers to be isolated. The repository-wide
+default-workflow-permissions read-only preflight
 remains a separate strict requirement. The scan does not execute workflows or
 prove complete data flow, prevent a malicious same-name forgery, or establish
 a unique producer; operators remain responsible for trusting other workflows

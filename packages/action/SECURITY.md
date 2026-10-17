@@ -71,11 +71,25 @@ verification keeps v2 Active and requires read-only diagnosis; never disable
 or roll back v2 in response.
 The active ruleset requires Code Owner review and stale-approval dismissal.
 Required-check `integration_id: 15368` identifies the entire GitHub Actions App,
-not either workflow. Exact-byte verification of both workflows, fail-closed
-inventory of reserved-name producers and relevant write authority, CODEOWNERS,
+not a particular workflow or unique producer. For ordinary current-v2
+installation, exact-byte verification of both canonical workflows is paired
+with a best-effort scoped keyword scan of workflow source text. It blocks
+explicit additional Codex gate callers and explicit uses of the reserved
+`codex/github-review-gate` signal; fragmented text, literal concatenations and
+simple local-variable forms are scanned where possible. Only potential gate
+collisions the scan cannot resolve are warnings. Unrelated keywords and
+contexts do not block installation. Plain-text references such as `echo`,
+`jq` or artifact labels may appear as non-blocking reference warnings; they
+are not treated as gate collisions. Unrelated workflow-local write permissions and opaque workflow-local
+permission declarations are operator-trust warnings, not installation
+blockers, and do not require unrelated publishers to be isolated. The
+repository-wide `default_workflow_permissions=read` preflight remains a
+separate strict requirement. Canonical workflow permissions, CODEOWNERS,
 Code Owner review, stale dismissal, strict up-to-date policy, no bypass actors
-and canary collision readback form one compound control-plane boundary. Do not
-describe this as cryptographic single-workflow provenance.
+and canary collision readback remain strict as well. The scan does not execute
+workflows, prove complete data flow, prevent malicious same-name forgery, or
+establish a unique producer. Frozen historical organization handoff,
+bridge-removal and source-only proof contracts remain strict.
 
 ## Runtime boundary
 
@@ -110,8 +124,8 @@ the protected `workflow_run` boundary avoids the public-repository
 App or ruleset. An edited provider comment does not allocate a canonical
 controller runner; recover it through protected manual reconcile instead.
 
-Only the verifier job's GitHub-managed CheckRun on the exact current PR
-feature-head SHA is the protected signal. Its success is valid only when the
+The verifier job's GitHub-managed CheckRun on the exact current PR feature-head
+SHA is the canonical intended signal. Its success is valid only when the
 run's merge-ref environment, event head/base scope (not event
 `merge_commit_sha`) and fresh PR read bind it to unchanged head, base and
 test-merge SHAs. The controller may create or adopt a review request; its
