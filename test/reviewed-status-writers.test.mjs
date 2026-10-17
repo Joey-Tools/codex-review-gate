@@ -8,6 +8,7 @@ import {
   DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
   DEFAULT_WORKFLOW_PATH,
   FROZEN_HANDOFF_V2_WORKFLOW_IDENTITIES,
+  inspectUnrelatedV2Workflows,
   validateCanonicalV2WorkflowInventory,
   validateFrozenHandoffV2WorkflowInventory,
   validateReviewedStatusWriters,
@@ -225,20 +226,38 @@ function assertReviewedWriterRejected(callback, message) {
   assert.throws(callback, /reviewed status writer/iu, message);
 }
 
-test("reviewed status writers are denied by default and explicitly returned as paths", () => {
+test("ordinary inventory accepts unrelated status writers while declarations remain strict", () => {
   const file = {
     path: DEFAULT_REVIEWED_WRITER_PATH,
     content: TOP_LEVEL_STATUS_WRITER,
   };
 
   assert.deepEqual(validateReviewedStatusWriters([file]), new Set());
-  assert.throws(
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      canonicalInventory([file]),
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+  );
+
+  const signals = inspectUnrelatedV2Workflows(canonicalInventory([file]));
+  assert.ok(
+    signals.warnings.some(
+      (warning) =>
+        warning.path === file.path &&
+        warning.kind === "unrelated-workflow-write",
+    ),
+  );
+
+  assertReviewedWriterRejected(
     () =>
       validateCanonicalV2WorkflowInventory(
         canonicalInventory([file]),
         CANONICAL_WORKFLOWS,
+        { reviewedStatusWriters: [writerRecord(file.path, file.content)] },
       ),
-    /single-producer policy.*reviewed-status-writer\.yml.*statuses: write/iu,
+    "an explicit reviewed-writer declaration remains a strict compatibility check",
   );
 
   assertReviewedWriterRejected(
@@ -258,6 +277,75 @@ test("reviewed status writers are denied by default and explicitly returned as p
       writerRecord(isolatedFile.path, isolatedFile.content),
     ]),
     new Set([isolatedFile.path]),
+  );
+});
+
+test("ordinary inventory accepts transport-like workflows with unrelated write permissions", () => {
+  const path = ".github/workflows/repository-transport.yml";
+  const content = [
+    "name: Repository transport",
+    "on: pull_request",
+    "permissions:",
+    "  actions: write",
+    "  checks: write",
+    "  contents: write",
+    "  packages: write",
+    "  statuses: write",
+    "jobs:",
+    "  collect:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - uses: actions/checkout@v4",
+    "      - run: ./scripts/collect.sh",
+    "",
+  ].join("\n");
+  const file = { path, content };
+  const writeAllPath = ".github/workflows/write-all.yml";
+  const writeAllFile = {
+    path: writeAllPath,
+    content: "name: Repository transport\npermissions: write-all\njobs: {}\n",
+  };
+  const inventory = canonicalInventory([file, writeAllFile]);
+
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(inventory, CANONICAL_WORKFLOWS),
+    CANONICAL_WORKFLOWS,
+  );
+  const signals = inspectUnrelatedV2Workflows(inventory);
+  assert.deepEqual(signals.matches, []);
+  const transportWarning = signals.warnings.find(
+    (warning) =>
+      warning.path === path && warning.kind === "unrelated-workflow-write",
+  );
+  assert.ok(
+    transportWarning,
+  );
+  assert.match(transportWarning.message, /contents: write/u);
+  assert.match(transportWarning.message, /packages: write/u);
+  const writeAllWarning = signals.warnings.find(
+    (warning) =>
+      warning.path === writeAllPath &&
+      warning.kind === "unrelated-workflow-write",
+  );
+  assert.ok(writeAllWarning);
+  assert.match(writeAllWarning.message, /write-all/u);
+});
+
+test("ordinary inventory warns instead of blocking opaque unrelated permissions", () => {
+  const path = ".github/workflows/opaque-permissions.yml";
+  const content = "permissions:\n  {statuses: write}\njobs: {}\n";
+  const inventory = canonicalInventory([{ path, content }]);
+
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(inventory, CANONICAL_WORKFLOWS),
+    CANONICAL_WORKFLOWS,
+  );
+  assert.ok(
+    inspectUnrelatedV2Workflows(inventory).warnings.some(
+      (warning) =>
+        warning.path === path &&
+        warning.kind === "unrelated-workflow-permissions-unclassified",
+    ),
   );
 });
 

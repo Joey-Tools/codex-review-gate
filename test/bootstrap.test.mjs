@@ -2599,7 +2599,7 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
   }
 });
 
-test("reviewed status writers survive local preparation only with explicit frozen declarations", () => {
+test("ordinary local preparation accepts status writers while explicit declarations remain strict", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-reviewed-writers-"));
   const writers = [
     { path: ".github/workflows/transport.yml", content: REVIEWED_INLINE_STATUS_WRITER },
@@ -2612,10 +2612,13 @@ test("reviewed status writers survive local preparation only with explicit froze
     initializeGitRepository(targetRoot);
     mkdirSync(join(targetRoot, ".github/workflows"), { recursive: true });
     for (const { path, content } of writers) writeFileSync(join(targetRoot, path), content);
-    const denied = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
-    assert.equal(denied.status, 1);
-    assert.match(denied.stderr, /relevant write authority/u);
-    assert.equal(existsSync(join(targetRoot, DEFAULT_WORKFLOW_PATH)), false);
+    const accepted = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.stderr, /unrelated-workflow-write/u);
+    assert.equal(
+      readFileSync(join(targetRoot, DEFAULT_WORKFLOW_PATH), "utf8"),
+      CANONICAL_WORKFLOW,
+    );
     for (const suffix of [[], ["--apply"], ["--apply"]]) {
       const result = runBootstrap(["--prepare-worktree", targetRoot, ...declarations, ...suffix]);
       assert.equal(result.status, 0, result.stderr);
@@ -2866,7 +2869,10 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
 
     const strict = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(strict.status, 1);
-    assert.match(strict.stderr, /Additional workflows have a v1\/v2 gate caller/u);
+    assert.match(
+      strict.stderr,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    );
     assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
 
     const removalDryRun = runBootstrap([
@@ -5902,7 +5908,10 @@ test("prepare-worktree blocks additional v1 callers before writing", () => {
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 1);
-    assert.match(apply.stderr, /Additional workflows have a v1\/v2 gate caller/u);
+    assert.match(
+      apply.stderr,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    );
     assert.match(apply.stderr, /\.github\/workflows\/legacy-codex-review\.yml/u);
     assert.equal(existsSync(workflowPath), false);
   } finally {
@@ -5925,7 +5934,10 @@ test("prepare-worktree blocks an additional direct v2 caller before writing", ()
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 1);
-    assert.match(apply.stderr, /Additional workflows have a v1\/v2 gate caller/u);
+    assert.match(
+      apply.stderr,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    );
     assert.match(apply.stderr, /\.github\/workflows\/duplicate-v2\.yml/u);
     assert.equal(existsSync(workflowPath), false);
   } finally {
@@ -7093,7 +7105,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   ];
   assert.throws(
     () => validateCanonicalV2WorkflowInventory(legacyInventory, CANONICAL_WORKFLOWS),
-    /Additional v1\/v2 gate callers remain on the default branch: \.github\/workflows\/legacy-codex-review\.yml/u,
+    /Additional workflows contain Codex gate callers or reserved gate signals.*legacy-codex-review\.yml/u,
   );
 
   const additionalV2Caller = [
@@ -7105,7 +7117,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   ];
   assert.throws(
     () => validateCanonicalV2WorkflowInventory(additionalV2Caller, CANONICAL_WORKFLOWS),
-    /Additional v1\/v2 gate callers.*extra-v2\.yml/u,
+    /Additional workflows contain Codex gate callers or reserved gate signals.*extra-v2\.yml/u,
   );
   for (const blockCaller of [
     "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
@@ -7123,7 +7135,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
           ],
           CANONICAL_WORKFLOWS,
         ),
-      /opaque, escaped, flow-style, or multiline uses scalar/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     );
   }
 
@@ -7134,80 +7146,86 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       content: "permissions:\n  statuses: write\njobs: {}\n",
     },
   ];
-  assert.throws(
-    () => validateCanonicalV2WorkflowInventory(additionalStatusWriter, CANONICAL_WORKFLOWS),
-    /single-producer policy.*status-writer\.yml.*statuses: write/u,
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      additionalStatusWriter,
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "unrelated status writers do not block ordinary v2 inventory",
   );
   for (const quotedStatusWriter of [
     "permissions:\n  \"statuses\": write\njobs: {}\n",
     "permissions:\n  'statuses': write\njobs: {}\n",
   ]) {
-    assert.throws(
-      () =>
-        validateCanonicalV2WorkflowInventory(
-          [
-            ...cleanInventory,
-            {
-              path: ".github/workflows/quoted-status-writer.yml",
-              content: quotedStatusWriter,
-            },
-          ],
-          CANONICAL_WORKFLOWS,
-        ),
-      /quoted protected permissions key|opaque permissions entry/u,
+    assert.equal(
+      validateCanonicalV2WorkflowInventory(
+        [
+          ...cleanInventory,
+          {
+            path: ".github/workflows/quoted-status-writer.yml",
+            content: quotedStatusWriter,
+          },
+        ],
+        CANONICAL_WORKFLOWS,
+      ),
+      CANONICAL_WORKFLOWS,
+      "quoted unrelated write permissions do not block ordinary v2 inventory",
+    );
+  }
+
+  for (const [name, content] of [
+    [
+      "actions-writer",
+      "permissions:\n  actions: write\njobs: {}\n",
+    ],
+    [
+      "checks-writer",
+      "permissions:\n  checks: write\njobs: {}\n",
+    ],
+    [
+      "issues-writer",
+      "permissions:\n  issues: write\njobs: {}\n",
+    ],
+    [
+      "pull-requests-writer",
+      "permissions:\n  pull-requests: write\njobs: {}\n",
+    ],
+    [
+      "line-broken-top-flow",
+      "permissions:\n  {statuses: write}\njobs: {}\n",
+    ],
+    [
+      "line-broken-job-flow",
+      "jobs:\n  test:\n    permissions:\n      {checks: write}\n    runs-on: ubuntu-slim\n",
+    ],
+    ["inline-flow-read", "permissions: {contents: read}\njobs: {}\n"],
+  ]) {
+    assert.equal(
+      validateCanonicalV2WorkflowInventory(
+        [...cleanInventory, { path: `.github/workflows/${name}.yml`, content }],
+        CANONICAL_WORKFLOWS,
+      ),
+      CANONICAL_WORKFLOWS,
+      `${name} is unrelated to ordinary v2 installer inventory`,
     );
   }
 
   for (const [name, content, expected] of [
     [
-      "actions-writer",
-      "permissions:\n  actions: write\njobs: {}\n",
-      /actions: write/u,
-    ],
-    [
-      "checks-writer",
-      "permissions:\n  checks: write\njobs: {}\n",
-      /checks: write/u,
-    ],
-    [
-      "issues-writer",
-      "permissions:\n  issues: write\njobs: {}\n",
-      /issues: write/u,
-    ],
-    [
-      "pull-requests-writer",
-      "permissions:\n  pull-requests: write\njobs: {}\n",
-      /pull-requests: write/u,
-    ],
-    [
       "reserved-job-name",
       "permissions:\n  contents: read\njobs:\n  collision:\n    name: 'codex/github-review-gate'\n    runs-on: ubuntu-slim\n",
-      /job name: codex\/github-review-gate/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
       "block-scalar-job-name",
       "permissions: {}\njobs:\n  collision:\n    name: >-\n      codex/github-review-gate\n    runs-on: ubuntu-slim\n",
-      /job name: codex\/github-review-gate/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
       "flow-root-jobs",
       "{name: Test, on: push, jobs: {collision: {name: codex/github-review-gate}}}\n",
-      /flow-style root mapping/u,
-    ],
-    [
-      "line-broken-top-flow",
-      "permissions:\n  {statuses: write}\njobs: {}\n",
-      /line-broken flow-style permissions mapping/u,
-    ],
-    [
-      "line-broken-job-flow",
-      "jobs:\n  test:\n    permissions:\n      {checks: write}\n    runs-on: ubuntu-slim\n",
-      /line-broken flow-style permissions mapping/u,
-    ],
-    [
-      "inline-flow-read",
-      "permissions: {contents: read}\njobs: {}\n",
-      /flow-style permissions mapping/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
   ]) {
     assert.throws(
@@ -7242,7 +7260,7 @@ test("legacy bridge inventory requires explicit profile, fixed path, and exact b
         bridgeInventory,
         CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
       ),
-    /Additional v1\/v2 gate callers.*codex-review-gate-legacy-bridge\.yml/u,
+    /Additional workflows contain Codex gate callers or reserved gate signals.*codex-review-gate-legacy-bridge\.yml/u,
   );
   assert.throws(
     () =>
@@ -7457,7 +7475,7 @@ test("remote staging and activation reject a post-merge extra v1 caller", () => 
       assert.equal(result.status, 1);
       assert.match(
         result.stderr,
-        /Additional v1\/v2 gate callers remain on the default branch: \.github\/workflows\/legacy-codex-review\.yml/u,
+        /Additional workflows contain Codex gate callers or reserved gate signals.*legacy-codex-review\.yml/u,
       );
     }
   } finally {
@@ -7465,7 +7483,7 @@ test("remote staging and activation reject a post-merge extra v1 caller", () => 
   }
 });
 
-test("remote inventory rejects an extra v2 caller and an extra status writer", () => {
+test("remote inventory blocks gate signals but accepts unrelated workflow writes", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
   try {
@@ -7473,33 +7491,31 @@ test("remote inventory rejects an extra v2 caller and an extra status writer", (
       [
         "extra-v2",
         "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
-        /Additional v1\/v2 gate callers.*extra\.yml/u,
+        /Additional workflows contain Codex gate callers or reserved gate signals.*extra\.yml/u,
       ],
       [
         "status-writer",
         "permissions: write-all\njobs: {}\n",
-        /single-producer policy.*extra\.yml.*checks: write.*issues: write.*pull-requests: write.*statuses: write/u,
       ],
       [
         "issues-writer",
         "permissions:\n  issues: write\njobs: {}\n",
-        /single-producer policy.*extra\.yml.*issues: write/u,
-      ],
-      [
-        "reserved-job-name",
-        "permissions: {}\njobs:\n  collision:\n    name: codex/github-review-gate\n    runs-on: ubuntu-slim\n",
-        /single-producer policy.*extra\.yml.*job name: codex\/github-review-gate/u,
       ],
       [
         "line-broken-flow",
         "permissions:\n  {statuses: write}\njobs: {}\n",
-        /line-broken flow-style permissions mapping/u,
+      ],
+      [
+        "reserved-job-name",
+        "permissions: {}\njobs:\n  collision:\n    name: codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+        /Additional workflows contain Codex gate callers or reserved gate signals.*extra\.yml/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
       createFakeGhExecutable(fakeBin);
       const responses = {
         ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
         [`repos/${repoSlug}/git/trees/workflows-tree`]: {
           truncated: false,
           tree: [
@@ -7535,8 +7551,13 @@ test("remote inventory rejects an extra v2 caller and an extra status writer", (
           FAKE_GH_RESPONSES: JSON.stringify(responses),
         },
       });
-      assert.equal(result.status, 1, name);
-      assert.match(result.stderr, expected, name);
+      if (expected) {
+        assert.equal(result.status, 1, name);
+        assert.match(result.stderr, expected, name);
+      } else {
+        assert.equal(result.status, 0, `${name}: ${result.stderr}`);
+        assert.match(result.stdout, /Dry run: would create repository ruleset/u);
+      }
     }
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
@@ -10293,7 +10314,7 @@ test("remote bridge admission rejects missing, drifted, displaced, unflagged, or
         responses: canonicalRemoteWorkflowResponses(repoSlug, {
           legacyBridge: true,
         }),
-        expected: /Additional v1\/v2 gate callers/u,
+        expected: /Additional workflows contain Codex gate callers or reserved gate signals/u,
       },
       {
         name: "additional-v2",

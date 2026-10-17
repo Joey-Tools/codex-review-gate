@@ -150,19 +150,33 @@ Both workflows call the compatible floating major:
 uses: JoeyTeng/codex-review-gate-action@v2
 ```
 
-The copied workflows own separate triggers, minimal permissions, PR-scoped
-concurrency groups with a per-run fallback for association-empty completion
-events, typed `workflow_dispatch`, exact pre-runner Codex-bot filtering and
-protected repository configuration. The Action remains API-only:
+The copied workflows own separate triggers, explicit minimal permissions,
+PR-scoped concurrency groups with a per-run fallback for association-empty
+completion events, typed `workflow_dispatch`, exact pre-runner Codex-bot
+filtering and protected repository configuration. The Action remains API-only:
 it never checks out or executes pull-request code. There is no commit-status
-bridge: only the verifier's native feature-head CheckRun, execution-bound to the
-current test-merge, can satisfy the gate.
+bridge; the gate is designed around the verifier's native feature-head
+CheckRun, execution-bound to the current test-merge.
 
 The required CheckRun is `codex/github-review-gate`. The importable ruleset
-binds it to GitHub Actions (`integration_id: 15368`), requires the branch to be up to
-date, requires all review conversations to be resolved, blocks
+binds it to GitHub Actions (`integration_id: 15368`), requires an up-to-date
+branch and resolved review conversations, blocks
 non-fast-forward default-branch updates and has no bypass actors. “Any source”
-is not supported.
+is not supported. This integration ID identifies the GitHub Actions App, not a
+unique workflow producer. The ordinary installer exact-byte checks the two
+canonical workflows and uses a scoped keyword scan (a best-effort search of
+workflow source text) to block explicit additional Codex gate callers or
+explicit uses of the same reserved signal. Fragmented text, literal
+concatenations and simple local-variable forms are scanned where possible;
+potential gate collisions the keyword scan cannot resolve are warnings, while
+unrelated keywords and contexts are ignored. Unrelated workflow-local write
+permissions and opaque workflow-local permission declarations are operator
+warnings, not install blockers, and do not require unrelated publishers to be
+isolated. The repository-wide default-workflow-permissions read-only preflight
+remains a separate strict requirement. The scan does not execute workflows or
+prove complete data flow, prevent a malicious same-name forgery, or establish
+a unique producer; operators remain responsible for trusting other workflows
+that share the Actions App.
 
 See [the human installation guide](docs/install/human.md) or
 [the agent execution runbook](docs/install/agent.md). Both implement the same
