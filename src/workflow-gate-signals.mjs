@@ -5,6 +5,8 @@ const MAX_LINE_CHARS = 4096;
 const MAX_WINDOW_LINES = 16;
 const MAX_WINDOW_CHARS = 2048;
 const MAX_FINDINGS = 32;
+const MAX_YAML_SCALAR_ANCHORS = 32;
+const MAX_YAML_ANCHOR_VALUE_CHARS = 512;
 
 const ACTION_CALLERS = [
   /^JoeyTeng\/codex-review-gate-action(?:\/\.github\/workflows\/codex-review-gate\.ya?ml)?@[^\s,}"']+$/iu,
@@ -100,7 +102,15 @@ export function inspectWorkflowGateSignals(
 
   let foldedUses = null;
   let foldedJobName = null;
+  const yamlAnchors = new Map();
   for (const line of lines) {
+    if (isYamlDocumentBoundary(line.text)) {
+      yamlAnchors.clear();
+      foldedUses = null;
+      foldedJobName = null;
+    } else if (!isRunCommandLine(line.text)) {
+      registerYamlScalarAnchors(line, yamlAnchors, addWarning);
+    }
     if (foldedJobName) {
       if (!line.text.trim()) {
         foldedJobName.remaining -= 1;
@@ -134,13 +144,20 @@ export function inspectWorkflowGateSignals(
       if (foldedUses && foldedUses.remaining <= 0) foldedUses = null;
     }
     if (!line.text.trim()) continue;
-    inspectLineSignals(line, reserved, addMatch, addWarning);
+    inspectLineSignals(
+      line,
+      reserved,
+      yamlAnchors,
+      !isRunCommandLine(line.text),
+      addMatch,
+      addWarning,
+    );
     const uses = fieldsOnLine(line.text).find((field) => field.key === "uses");
-    if (uses && isBlockScalarIndicator(uses.value)) {
+    if (uses && isBlockScalarIndicator(stripYamlAnchor(uses.value))) {
       foldedUses = { indent: indentationOf(line.text), remaining: 4 };
     }
     const name = fieldsOnLine(line.text).find((field) => isNameField(field.key));
-    if (line.jobNameField && name && isBlockScalarIndicator(name.value)) {
+    if (line.jobNameField && name && isBlockScalarIndicator(stripYamlAnchor(name.value))) {
       foldedJobName = { indent: indentationOf(line.text), remaining: 4 };
     }
   }
@@ -176,21 +193,25 @@ export function inspectWorkflowGateSignals(
   return { matches, warnings: usefulWarnings };
 }
 
-function inspectLineSignals(line, reserved, addMatch, addWarning) {
+function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning) {
   const fields = fieldsOnLine(line.text);
+  const resolveField = (expression) =>
+    allowYamlAliases
+      ? resolveYamlScalar(expression, yamlAnchors, line, addWarning)
+      : resolveSimpleLiteral(expression, new Map());
   for (const field of fields) {
     if (field.key === "uses") {
-      const value = resolveSimpleLiteral(stripYamlAnchor(field.value), new Map());
+      const value = resolveField(field.value);
       addCallerMatch(value, line, addMatch);
     } else if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
-      if (resolveSimpleLiteral(field.value, new Map()) === reserved) {
+      if (resolveField(field.value) === reserved) {
         addMatch(field.key.toLowerCase() === "name" ? "reserved-job-name" : "reserved-status-context", line.line, line.raw);
       }
     }
   }
   const flowJobNames = flowStyleJobNameFields(line.text);
   for (const field of flowJobNames) {
-    if (resolveSimpleLiteral(field.value, new Map()) === reserved) {
+    if (resolveField(field.value) === reserved) {
       addMatch("reserved-job-name", line.line, line.raw);
     }
   }
@@ -202,14 +223,17 @@ function inspectLineSignals(line, reserved, addMatch, addWarning) {
   if (cliCheckRunName && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) {
     addMatch("reserved-check-run-name", line.line, line.raw);
   }
+  const curlCheckRunName = curlCheckRunNameExpression(line.text, reserved);
+  if (curlCheckRunName) addMatch("reserved-check-run-name", line.line, line.raw);
   const exactFieldHandled = fields.some(
     (field) =>
       (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) &&
-      resolveSimpleLiteral(field.value, new Map()) === reserved,
-  ) || flowJobNames.some((field) => resolveSimpleLiteral(field.value, new Map()) === reserved);
+      resolveField(field.value) === reserved,
+  ) || flowJobNames.some((field) => resolveField(field.value) === reserved);
   const exactCliHandled =
     (cliContext !== null && resolveSimpleLiteral(cliContext, new Map()) === reserved) ||
-    (cliCheckRunName !== null && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved);
+    (cliCheckRunName !== null && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) ||
+    curlCheckRunName !== null;
   if (
     hasExactToken(line.text, reserved) &&
     !exactFieldHandled &&
@@ -244,6 +268,10 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
     const cliCheckRunName = cliCheckRunNameExpression(line.text);
     if (cliCheckRunName) {
       inspectContext("check-run-name", cliCheckRunName, literals, line, reserved, addMatch, addWarning);
+    }
+    const curlCheckRunName = curlCheckRunNameExpression(line.text, reserved);
+    if (curlCheckRunName) {
+      inspectContext("check-run-name", curlCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
 
     for (const statement of splitStatements(line.text)) {
@@ -353,8 +381,39 @@ function cliContextExpression(text) {
 }
 
 function cliCheckRunNameExpression(text) {
-  if (!/\/check-runs(?:[/?#\s]|$)/iu.test(text)) return null;
-  return cliFieldExpression(text, "name");
+  const command = runCommand(text);
+  if (!/^gh\s+api(?:\s|$)/iu.test(command) || !/\/check-runs(?:[/?#\s]|$)/iu.test(command)) return null;
+  return cliFieldExpression(command, "name");
+}
+
+function curlCheckRunNameExpression(text, reserved) {
+  const command = runCommand(text);
+  if (!/^curl(?:\s|$)/iu.test(command)) return null;
+
+  const dataOption = /(?:^|\s)(?:-d|--data(?:-raw|-binary|-urlencode)?|--json)(?:\s+|=)(?:"([^"]*)"|'([^']*)'|([^\s]+))/giu;
+  const dataMatches = [...command.matchAll(dataOption)];
+  if (!dataMatches.length) return null;
+  const withoutData = command.replace(dataOption, " ");
+  if (
+    /[;&|]/u.test(withoutData) ||
+    !/(?:^|\s)(?:-X\s*|--request(?:=|\s+))POST(?:\s|$)/iu.test(withoutData) ||
+    !/https?:\/\/[^/\s"']+\/repos\/[^/\s"']+\/[^/\s"']+\/check-runs(?:[/?#\s"']|$)/iu.test(withoutData)
+  ) {
+    return null;
+  }
+
+  for (const match of dataMatches) {
+    const payload = match[1] ?? match[2] ?? match[3] ?? "";
+    const name = payload.match(/(?:^|[,{])\s*["']name["']\s*:\s*(?:"([^"\\]*)"|'([^'\\]*)')/iu);
+    if (!name) continue;
+    const expression = name[1] === undefined ? `'${name[2]}'` : `"${name[1]}"`;
+    if (resolveSimpleLiteral(expression, new Map()) === reserved) return expression;
+  }
+  return null;
+}
+
+function runCommand(text) {
+  return text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu)?.[1]?.trim() ?? text.trim();
 }
 
 function cliFieldExpression(text, field) {
@@ -436,6 +495,70 @@ function flowStyleJobNameFields(text) {
 
 function stripYamlAnchor(value) {
   return value.replace(/^&[A-Za-z_][A-Za-z0-9_-]*\s+/u, "");
+}
+
+function isYamlDocumentBoundary(text) {
+  return /^\s*(?:---|\.\.\.)\s*$/u.test(text);
+}
+
+function isRunCommandLine(text) {
+  return /^\s*(?:-\s*)?run\s*:/iu.test(text);
+}
+
+function registerYamlScalarAnchors(line, anchors, addWarning) {
+  const pattern = /(?:^|[,{])\s*(?:-\s*)?(?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\s*:\s*&([A-Za-z_][A-Za-z0-9_-]*)\s+("[^"]*"|'[^']*'|[^,}\]\n]+)/gu;
+  for (const match of line.text.matchAll(pattern)) {
+    const [, name, rawValue] = match;
+    const expression = rawValue.trim();
+    if (isBlockScalarIndicator(expression)) {
+      anchors.delete(name);
+      addWarning(
+        "complex-yaml-scalar-anchor",
+        line.line,
+        "A folded YAML anchor value is not resolved by this bounded scalar scan.",
+        line.raw,
+      );
+      continue;
+    }
+    const value = literalAtom(expression, new Map());
+    if (expression.length > MAX_YAML_ANCHOR_VALUE_CHARS || value === null || value.length > MAX_YAML_ANCHOR_VALUE_CHARS) {
+      anchors.delete(name);
+      addWarning(
+        "complex-yaml-scalar-anchor",
+        line.line,
+        "A YAML anchor value is not a bounded simple scalar and was not resolved.",
+        line.raw,
+      );
+      continue;
+    }
+    if (!anchors.has(name) && anchors.size >= MAX_YAML_SCALAR_ANCHORS) {
+      addWarning(
+        "yaml-scalar-anchor-limit",
+        line.line,
+        `YAML scalar anchor tracking is capped at ${MAX_YAML_SCALAR_ANCHORS} entries for this document.`,
+        line.raw,
+      );
+      continue;
+    }
+    anchors.set(name, value);
+  }
+}
+
+function resolveYamlScalar(expression, anchors, line, addWarning) {
+  const value = stripYamlAnchor(expression).trim();
+  if (!value.startsWith("*")) return resolveSimpleLiteral(value, new Map());
+
+  const alias = value.match(/^\*([A-Za-z_][A-Za-z0-9_-]*)$/u);
+  if (alias && anchors.has(alias[1])) return anchors.get(alias[1]);
+  addWarning(
+    alias ? "unknown-yaml-scalar-alias" : "complex-yaml-scalar-alias",
+    line.line,
+    alias
+      ? "A YAML scalar alias is unknown within this bounded document scan."
+      : "A complex YAML alias expression was not resolved by this bounded scan.",
+    line.raw,
+  );
+  return null;
 }
 
 function isBlockScalarIndicator(value) {

@@ -7200,6 +7200,14 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "jobs:\n  test:\n    permissions:\n      {checks: write}\n    runs-on: ubuntu-slim\n",
     ],
     ["inline-flow-read", "permissions: {contents: read}\njobs: {}\n"],
+    [
+      "unrelated-scalar-alias",
+      "env: { ACTION: &checkout actions/checkout@v4 }\njobs:\n  build:\n    steps:\n      - uses: *checkout\n",
+    ],
+    [
+      "plain-check-name-reference",
+      "jobs:\n  build:\n    steps:\n      - run: echo codex/github-review-gate\n",
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7225,6 +7233,26 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "flow-root-jobs",
       "{name: Test, on: push, jobs: {collision: {name: codex/github-review-gate}}}\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "scalar-alias-caller",
+      "env: { ACTION: &gate JoeyTeng/codex-review-gate-action@v2 }\njobs:\n  build:\n    steps:\n      - uses: *gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "anchored-job-name",
+      "jobs:\n  collision:\n    name: &gate codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "anchored-status-context",
+      "jobs:\n  publish:\n    steps:\n      - with:\n          context: &gate codex/github-review-gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "literal-json-check-run",
+      `jobs:\n  publish:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs\n`,
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
   ]) {
