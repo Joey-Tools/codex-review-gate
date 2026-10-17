@@ -66,6 +66,8 @@ const ACTION_OUTPUTS = [
   "recovery_code",
   "retry_safe",
 ];
+const RUNNER_LABELS_EXPRESSION =
+  "${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || (vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && '[\"ubuntu-latest\"]' || '[\"ubuntu-slim\"]')) }}";
 
 test("v2 publishes one direct JavaScript Action and no reusable-workflow ABI", () => {
   assert.equal(existsSync(packageReusable), false);
@@ -248,10 +250,7 @@ test("canonical verifier is read-only, latest-wins, and uses the direct Action",
     /group: codex-review-gate-verifier-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.pull_request\.number \}\}/u,
   );
   assert.match(templateVerifier, /^  cancel-in-progress: true$/mu);
-  assert.match(
-    templateVerifier,
-    /^    runs-on: \$\{\{ vars\.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' \|\| 'ubuntu-slim' \}\}$/mu,
-  );
+  assert.ok(templateVerifier.includes(`    runs-on: ${RUNNER_LABELS_EXPRESSION}\n`));
   assert.match(templateVerifier, /^    timeout-minutes: 14$/mu);
   assert.equal(
     (templateVerifier.match(/uses: JoeyTeng\/codex-review-gate-action@v2/gu) ?? [])
@@ -297,10 +296,7 @@ test("canonical controller has only the adopted write authority and ledgerless i
   );
   assert.match(templateController, /^  cancel-in-progress: false$/mu);
   assert.match(templateController, /^    name: codex\/review-gate-controller$/mu);
-  assert.match(
-    templateController,
-    /^    runs-on: \$\{\{ vars\.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' \|\| 'ubuntu-slim' \}\}$/mu,
-  );
+  assert.ok(templateController.includes(`    runs-on: ${RUNNER_LABELS_EXPRESSION}\n`));
   assert.match(templateController, /^    timeout-minutes: 14$/mu);
   assert.equal(
     (templateController.match(/uses: JoeyTeng\/codex-review-gate-action@v2/gu) ?? [])

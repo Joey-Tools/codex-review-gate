@@ -376,7 +376,7 @@ test("consumer permissions and runtime shape cannot read or execute pull-request
   });
   assert.equal(
     blockScalar(verifier.job, "runs-on"),
-    "${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}",
+    "${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || (vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && '[\"ubuntu-latest\"]' || '[\"ubuntu-slim\"]')) }}",
   );
   assert.equal(blockScalar(verifier.job, "timeout-minutes"), "14");
   assert.equal(verifier.steps.length, 1);

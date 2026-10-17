@@ -18,7 +18,7 @@ concurrency:
 jobs:
   codex-review-gate:
     name: codex/github-review-gate
-    runs-on: ${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}
+    runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || (vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && '["ubuntu-latest"]' || '["ubuntu-slim"]')) }}
     timeout-minutes: 14
     steps:
       - name: Verify Codex review evidence

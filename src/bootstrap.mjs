@@ -268,6 +268,14 @@ const CANONICAL_VERIFIER_PERMISSION_MAPPING =
 // The immutable handoff predates the Actions run readback requirement.
 const FROZEN_HANDOFF_VERIFIER_PERMISSION_MAPPING =
   "permissions:\n  contents: read\n  issues: read\n  pull-requests: read";
+const CANONICAL_RUNNER_LABELS_EXPRESSION =
+  "${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || (vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && '[\"ubuntu-latest\"]' || '[\"ubuntu-slim\"]')) }}";
+const PREVIOUS_CANONICAL_RUNNER_LABELS_EXPRESSION =
+  "${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}";
+const INSTALLED_RUNNER_LABELS_EXPRESSIONS = Object.freeze([
+  CANONICAL_RUNNER_LABELS_EXPRESSION,
+  PREVIOUS_CANONICAL_RUNNER_LABELS_EXPRESSION,
+]);
 
 const DEFAULT_REF_CONDITIONS = {
   ref_name: {
@@ -3770,6 +3778,15 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
   return validateV2VerifierWorkflowContent(value, {
     requestAuthorPermission: CANONICAL_REQUEST_AUTHOR_PERMISSION,
     permissionMapping: CANONICAL_VERIFIER_PERMISSION_MAPPING,
+    runnerExpressions: [CANONICAL_RUNNER_LABELS_EXPRESSION],
+  });
+}
+
+function validateInstalledCanonicalV2VerifierWorkflowContent(value) {
+  return validateV2VerifierWorkflowContent(value, {
+    requestAuthorPermission: CANONICAL_REQUEST_AUTHOR_PERMISSION,
+    permissionMapping: CANONICAL_VERIFIER_PERMISSION_MAPPING,
+    runnerExpressions: INSTALLED_RUNNER_LABELS_EXPRESSIONS,
   });
 }
 
@@ -3777,12 +3794,14 @@ function validateFrozenHandoffV2VerifierWorkflowContent(value) {
   return validateV2VerifierWorkflowContent(value, {
     requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
     permissionMapping: FROZEN_HANDOFF_VERIFIER_PERMISSION_MAPPING,
+    runnerExpressions: [PREVIOUS_CANONICAL_RUNNER_LABELS_EXPRESSION],
   });
 }
 
 function validateV2VerifierWorkflowContent(value, {
   requestAuthorPermission,
   permissionMapping,
+  runnerExpressions,
 }) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 verifier workflow must be non-empty UTF-8 text.");
@@ -3803,7 +3822,7 @@ function validateV2VerifierWorkflowContent(value, {
     );
   }
   assertOneCanonicalActionCall(value, "verifier");
-  assertCommonWorkflowSafety(value, "verifier");
+  assertCommonWorkflowSafety(value, "verifier", runnerExpressions);
   if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
     throw new Error("Canonical v2 verifier workflow must not retain a v1 caller.");
   }
@@ -3889,6 +3908,7 @@ export function validateCanonicalV2ControllerWorkflowContent(value) {
     issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
     workflowRun: true,
     reviewRequestTokenPolicy: "required",
+    runnerExpressions: [CANONICAL_RUNNER_LABELS_EXPRESSION],
   });
 }
 
@@ -3899,6 +3919,7 @@ function validateInstalledCanonicalV2ControllerWorkflowContent(value) {
     issueCommentTypes: CANONICAL_CONTROLLER_ISSUE_COMMENT_TYPES,
     workflowRun: true,
     reviewRequestTokenPolicy: "optional",
+    runnerExpressions: INSTALLED_RUNNER_LABELS_EXPRESSIONS,
   });
 }
 
@@ -3909,6 +3930,7 @@ function validateFrozenHandoffV2ControllerWorkflowContent(value) {
     requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
     workflowRun: false,
     reviewRequestTokenPolicy: "forbidden",
+    runnerExpressions: [PREVIOUS_CANONICAL_RUNNER_LABELS_EXPRESSION],
   });
 }
 
@@ -3919,6 +3941,7 @@ function validateV2ControllerWorkflowContent(value, {
   requestAuthorPermission = CANONICAL_REQUEST_AUTHOR_PERMISSION,
   workflowRun,
   reviewRequestTokenPolicy,
+  runnerExpressions,
 }) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 controller workflow must be non-empty UTF-8 text.");
@@ -3929,7 +3952,7 @@ function validateV2ControllerWorkflowContent(value, {
     reviewRequestTokenPolicy,
   });
   assertOneCanonicalActionCall(value, "controller");
-  assertCommonWorkflowSafety(value, "controller");
+  assertCommonWorkflowSafety(value, "controller", runnerExpressions);
   if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
     throw new Error("Canonical v2 controller workflow must not retain a v1 caller.");
   }
@@ -4065,10 +4088,6 @@ function validateV2ControllerWorkflowContent(value, {
     ["concurrency.cancel-in-progress", "false"],
     ["jobs.codex-review-gate-controller.name", "codex/review-gate-controller"],
     ["jobs.codex-review-gate-controller.if", ">-"],
-    [
-      "jobs.codex-review-gate-controller.runs-on",
-      "${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}",
-    ],
     ["jobs.codex-review-gate-controller.timeout-minutes", "14"],
     ["jobs.codex-review-gate-controller.steps.name", "Refresh Codex review gate"],
     ["jobs.codex-review-gate-controller.steps.id", "controller"],
@@ -4107,6 +4126,15 @@ function validateV2ControllerWorkflowContent(value, {
     ],
   ]) {
     assertControllerMappingScalar(controllerMappings, path, expected);
+  }
+  if (
+    !runnerExpressions.includes(
+      controllerMappings.get("jobs.codex-review-gate-controller.runs-on"),
+    )
+  ) {
+    throw new Error(
+      "Canonical v2 controller workflow has an unexpected jobs.codex-review-gate-controller.runs-on value.",
+    );
   }
   if (
     reviewRequestTokenPolicy === "required" ||
@@ -4464,6 +4492,36 @@ function installedControllerMatchesCanonical(installed, canonical) {
   return false;
 }
 
+function installedControllerMatchesCanonicalWithRunnerUpgrade(installed, canonical) {
+  return installedControllerMatchesCanonical(
+    normalizePreviousRunnerExpression(installed),
+    canonical,
+  );
+}
+
+function installedVerifierMatchesCanonical(installed, canonical) {
+  return installedWorkflowMatchesCanonical(installed, canonical);
+}
+
+function installedVerifierMatchesCanonicalWithRunnerUpgrade(installed, canonical) {
+  return installedWorkflowMatchesCanonical(
+    normalizePreviousRunnerExpression(installed),
+    canonical,
+  );
+}
+
+function normalizePreviousRunnerExpression(value) {
+  const previousRunnerLine =
+    `    runs-on: ${PREVIOUS_CANONICAL_RUNNER_LABELS_EXPRESSION}`;
+  if (typeof value !== "string" || value.split(previousRunnerLine).length !== 2) {
+    return value;
+  }
+  return value.replace(
+    previousRunnerLine,
+    `    runs-on: ${CANONICAL_RUNNER_LABELS_EXPRESSION}`,
+  );
+}
+
 function assertOneCanonicalActionCall(value, role) {
   const usesMatches = value.match(/^\s*uses:\s*([^\s#]+)\s*$/gm) ?? [];
   const expectedUses = `uses: ${CANONICAL_V2_WORKFLOW_USES}`;
@@ -4474,15 +4532,30 @@ function assertOneCanonicalActionCall(value, role) {
   }
 }
 
-function assertCommonWorkflowSafety(value, role) {
+function assertCommonWorkflowSafety(value, role, runnerExpressions) {
   if (/^\s*schedule:\s*$/m.test(value) || /^\s*-?\s*cron:\s*/m.test(value)) {
     throw new Error(`Canonical v2 ${role} workflow must not allocate cron runners.`);
   }
   if (/^\s*repository_dispatch:\s*$/m.test(value)) {
     throw new Error(`Canonical v2 ${role} workflow must not expose repository_dispatch.`);
   }
+  const runnerMappings = tokenizeReviewedStatusWriterWorkflow(value).flatMap((token) => {
+    const mapping = parseReviewedStatusWriterMapping(token);
+    return mapping?.key === "runs-on" ? [{ token, mapping }] : [];
+  });
+  if (
+    runnerMappings.length !== 1 ||
+    runnerMappings[0].token.indent !== 4 ||
+    runnerMappings[0].token.blockStyle !== null ||
+    runnerMappings[0].mapping.sequence ||
+    runnerMappings[0].token.text !== `runs-on: ${runnerMappings[0].mapping.value}` ||
+    !runnerExpressions.includes(runnerMappings[0].mapping.value)
+  ) {
+    throw new Error(
+      `Canonical v2 ${role} workflow must use one exact supported runs-on expression.`,
+    );
+  }
   for (const fragment of [
-    "runs-on: ${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}",
     "timeout-minutes: 14",
     "github_token:",
   ]) {
@@ -4558,9 +4631,12 @@ export function workflowSingleProducerPolicyViolations(
 // The digest pins exact UTF-8 bytes approved through Code Review; it does not
 // prove that the inline shell program is benign. The structural profile below
 // only excludes implicit permissions and YAML-provided executable inputs such
-// as actions, reusable workflows, containers, and self-hosted runners. Review
-// of the frozen inline bytes remains responsible for script semantics and for
-// ensuring that PR-controlled data is never treated as executable input.
+// as actions, reusable workflows, and containers. Runner selection is limited
+// to literal labels or a literal-label fallback on a repository variable;
+// trust in the selected host remains an owner assumption, not a property
+// proved by the workflow digest. Review of the frozen inline bytes remains
+// responsible for script semantics and for ensuring that PR-controlled data
+// is never treated as executable input.
 // This explicit exception may suppress only the statuses: write finding and
 // never changes the default policy.
 export function validateReviewedStatusWriters(
@@ -4990,12 +5066,10 @@ function validateReviewedStatusWriterJob(tokens, job, jobIds) {
     properties.set(mapping.key, { token, mapping });
   }
   const runner = properties.get("runs-on");
-  if (runner === undefined || runner.token.blockStyle !== null) {
-    throw new Error(`privileged job ${job.id} must use literal runs-on: ubuntu-slim.`);
+  if (runner === undefined) {
+    throw new Error(`privileged job ${job.id} must declare a supported runs-on value.`);
   }
-  if (readReviewedStatusWriterScalar(runner.mapping.value, `job ${job.id} runs-on`) !== "ubuntu-slim") {
-    throw new Error(`privileged job ${job.id} must use literal runs-on: ubuntu-slim.`);
-  }
+  validateReviewedStatusWriterRunner(tokens, runner, job.id);
   for (const optional of ["name", "timeout-minutes"]) {
     const field = properties.get(optional);
     if (field === undefined) {
@@ -5039,6 +5113,126 @@ function validateReviewedStatusWriterJob(tokens, job, jobIds) {
     throw new Error(`privileged job ${job.id} must contain an inline run step.`);
   }
   validateReviewedStatusWriterSteps(tokens, steps.token, job.id);
+}
+
+function validateReviewedStatusWriterRunner(tokens, runner, jobId) {
+  if (runner.token.blockStyle !== null || runner.mapping.sequence) {
+    throw new Error(`privileged job ${jobId} runs-on must use a supported literal form.`);
+  }
+  const value = runner.mapping.value.trim();
+  if (value === "") {
+    const children = reviewedStatusWriterSubtree(tokens, runner.token);
+    if (children.length === 0) {
+      throw new Error(`privileged job ${jobId} runs-on label sequence must not be empty.`);
+    }
+    const labels = children.map((child) => {
+      if (child.indent !== runner.token.indent + 2 || child.blockStyle !== null) {
+        throw new Error(`privileged job ${jobId} runs-on contains a nested or ambiguous sequence.`);
+      }
+      const match = child.text.match(/^[-]\s+(.+)$/u);
+      if (match === null) {
+        throw new Error(`privileged job ${jobId} runs-on must contain only literal labels.`);
+      }
+      return parseReviewedStatusWriterRunnerLabel(
+        match[1],
+        `job ${jobId} runs-on label`,
+      );
+    });
+    validateReviewedStatusWriterRunnerLabels(labels, `job ${jobId} runs-on`);
+    return;
+  }
+  if (reviewedStatusWriterSubtree(tokens, runner.token).length > 0) {
+    throw new Error(
+      `privileged job ${jobId} runs-on may not contain nested mapping or sequence entries.`,
+    );
+  }
+  if (value.startsWith("${{")) {
+    validateReviewedStatusWriterRunnerVariable(value, jobId);
+    return;
+  }
+  if (value.startsWith("[")) {
+    const labels = parseReviewedStatusWriterRunnerFlowSequence(value, jobId);
+    validateReviewedStatusWriterRunnerLabels(labels, `job ${jobId} runs-on`);
+    return;
+  }
+  const label = parseReviewedStatusWriterRunnerLabel(
+    value,
+    `job ${jobId} runs-on`,
+  );
+  validateReviewedStatusWriterRunnerLabels([label], `job ${jobId} runs-on`);
+}
+
+function parseReviewedStatusWriterRunnerFlowSequence(value, jobId) {
+  const match = value.match(/^\[\s*(.*?)\s*\]$/u);
+  if (match === null || match[1].trim() === "") {
+    throw new Error(`privileged job ${jobId} runs-on must be a non-empty literal label sequence.`);
+  }
+  return match[1].split(",").map((item) =>
+    parseReviewedStatusWriterRunnerLabel(
+      item,
+      `job ${jobId} runs-on label`,
+    ),
+  );
+}
+
+function parseReviewedStatusWriterRunnerLabel(value, description) {
+  const trimmed = value.trim();
+  const quoted =
+    (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+    (trimmed.startsWith('"') && trimmed.endsWith('"'));
+  if (
+    !quoted &&
+    /^(?:[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?\d+)?|0[xX][0-9A-Fa-f]+|0[oO][0-7]+|0[bB][01]+|\.inf|\.nan|true|false|yes|no|on|off|null|~)$/iu.test(trimmed)
+  ) {
+    throw new Error(`${description} must be a string label, not a typed scalar.`);
+  }
+  const label = readReviewedStatusWriterScalar(value, description);
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*(?: [A-Za-z0-9][A-Za-z0-9_.-]*)*$/u.test(label)) {
+    throw new Error(`${description} must be a literal runner label.`);
+  }
+  return label;
+}
+
+function validateReviewedStatusWriterRunnerLabels(labels, description) {
+  if (!Array.isArray(labels) || labels.length === 0) {
+    throw new Error(`${description} must contain at least one runner label.`);
+  }
+  const uniqueLabels = new Set(labels.map((label) => label.toLowerCase()));
+  if (uniqueLabels.size !== labels.length) {
+    throw new Error(`${description} must not repeat runner labels.`);
+  }
+}
+
+function validateReviewedStatusWriterRunnerVariable(value, jobId) {
+  const match = value.match(
+    /^\$\{\{\s*fromJSON\(\s*vars\.([A-Z][A-Z0-9_]*_RUNNER_LABELS)\s*\|\|\s*'([^'\\]*)'\s*\)\s*\}\}$/u,
+  );
+  if (match === null) {
+    throw new Error(
+      `privileged job ${jobId} runs-on must use an exact runner-label variable with a literal JSON fallback.`,
+    );
+  }
+  let fallback;
+  try {
+    fallback = JSON.parse(match[2]);
+  } catch {
+    throw new Error(`privileged job ${jobId} runs-on fallback must be valid JSON.`);
+  }
+  if (!Array.isArray(fallback) || fallback.some((label) => typeof label !== "string")) {
+    throw new Error(
+      `privileged job ${jobId} runs-on fallback must be a non-empty JSON array of string labels.`,
+    );
+  }
+  validateReviewedStatusWriterRunnerLabels(
+    fallback,
+    `job ${jobId} runs-on fallback`,
+  );
+  for (const label of fallback) {
+    parseReviewedStatusWriterRunnerLabel(
+      JSON.stringify(label),
+      `job ${jobId} runs-on fallback label`,
+    );
+  }
 }
 
 function parseReviewedStatusWriterNeeds(tokens, header) {
@@ -5564,7 +5758,10 @@ export function validateCanonicalV2WorkflowInventory(
       reviewedStatusWriters,
       validateVerifier: validateCanonicalV2VerifierWorkflowContent,
       validateController: validateCanonicalV2ControllerWorkflowContent,
+      validateInstalledVerifier: validateInstalledCanonicalV2VerifierWorkflowContent,
       validateInstalledController: validateInstalledCanonicalV2ControllerWorkflowContent,
+      matchInstalledVerifier: installedVerifierMatchesCanonicalWithRunnerUpgrade,
+      matchInstalledController: installedControllerMatchesCanonicalWithRunnerUpgrade,
       validateLegacyBridge: validateCanonicalLegacyBridgeWorkflowContent,
     },
   );
@@ -5652,7 +5849,10 @@ function validateV2WorkflowInventory(
     reviewedStatusWriters = [],
     validateVerifier,
     validateController,
+    validateInstalledVerifier = validateVerifier,
     validateInstalledController = validateController,
+    matchInstalledVerifier = installedWorkflowMatchesCanonical,
+    matchInstalledController = installedWorkflowMatchesCanonical,
     validateLegacyBridge,
   },
 ) {
@@ -5679,15 +5879,17 @@ function validateV2WorkflowInventory(
       );
     }
     if (role === "verifier") {
-      validateVerifier(matches[0].content);
+      validateInstalledVerifier(matches[0].content);
     } else if (role === "controller") {
       validateInstalledController(matches[0].content);
     } else {
       validateLegacyBridge(matches[0].content);
     }
     const matchesCanonical = role === "controller"
-      ? installedControllerMatchesCanonical(matches[0].content, content)
-      : installedWorkflowMatchesCanonical(matches[0].content, content);
+      ? matchInstalledController(matches[0].content, content)
+      : role === "verifier"
+        ? matchInstalledVerifier(matches[0].content, content)
+        : installedWorkflowMatchesCanonical(matches[0].content, content);
     if (!matchesCanonical) {
       throw new Error(
         role === "legacy bridge"

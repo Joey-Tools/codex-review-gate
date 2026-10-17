@@ -1055,21 +1055,37 @@ disable v2 or delete the old organization rule as recovery.
    If it reports an unrelated `statuses: write` workflow, do not delete a
    functioning CI producer's permission just to satisfy installation. Obtain
    explicit control-plane-owner review. First isolate every status publisher
-   from PR execution: use explicit job-level `statuses: write`, literal
-   `runs-on: ubuntu-slim`, and self-contained inline Bash steps. Keep the
-   workflow-level permissions read-only. A privileged job cannot use actions,
-   checkouts, artifacts, repository scripts, containers, services, runner
-   overrides, or inherited executable defaults. Test jobs may retain their
-   normal dependencies but must not receive status-write authority.
+   from PR execution with explicit job-level `statuses: write` and
+   self-contained inline Bash steps. Keep workflow-level permissions
+   read-only. The publisher `runs-on` may be a literal runner-label string, a
+   literal label array, or the exact
+   `fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` form. The variable
+   name must match `[A-Z][A-Z0-9_]*_RUNNER_LABELS`, and the fallback must be a
+   non-empty JSON array of string labels. When set, the variable value must
+   also be valid JSON resolving to a label string or non-empty label array.
+   For example:
+
+   ```yaml
+   runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
+   ```
+
+   Do not use arbitrary runner expressions.
+   A privileged job cannot use actions, checkouts, artifacts, repository
+   scripts, containers, services, or inherited executable defaults. Test jobs
+   may retain their normal dependencies but must not receive status-write
+   authority.
    Each privileged job has exactly one literal `run: |` Bash step with
    `shell: bash`; its step-level `env` explicitly clears `BASH_ENV` and `ENV`
    and sets `GH_TOKEN: ${{ github.token }}`. Put metadata in that step's `env`,
    not a job-level environment. Literal `needs`, `if`, job outputs and one
    step ID are supported for trusted metadata handoff.
-   Review the inline publishers and their data flow: target SHA/context must
-   come from trusted metadata and the terminal state from GitHub job results,
-   never PR-produced executable text or a claimed result in a test artifact.
-   Do not download or execute mutable/unprotected code in a publisher.
+   Review the exact runner selector, inline publishers and their data flow:
+   target SHA/context must come from trusted metadata and the terminal state
+   from GitHub job results, never PR-produced executable text or a claimed
+   result in a test artifact. A workflow digest does not bind variable values
+   or self-hosted host state, and separate jobs are not host isolation; use
+   dedicated or ephemeral trusted runners for token-bearing publishers. Do not
+   download or execute mutable/unprotected code in a publisher.
    Only then compute its digest
    (`shasum -a 256 "$TARGET_ROOT/.github/workflows/FILE.yml"`) and repeat
    `--reviewed-status-writer .github/workflows/FILE.yml@SHA256` for each reviewed
@@ -1335,8 +1351,9 @@ The canonical workflows must have this contract after the merge:
 - `workflow_dispatch` as the only manual trigger, with `operation`,
   `pr_number`, `expected_head_sha`, optional `request_comment_id`,
   and `request_review` defaulting to `true`; no dispatch limits profile;
-- `ubuntu-slim` by default, with only
-  `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` selecting `ubuntu-latest`;
+- both canonical workflows use `CODEX_REVIEW_GATE_RUNNER_LABELS` when set;
+  otherwise `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` selects
+  `ubuntu-latest`, with `ubuntu-slim` as the default;
 - separate verifier/controller concurrency namespaces; associated controller
   events remain PR-scoped, association-empty completion events use a per-run
   fallback group, verifier cancellation is latest-wins, and controller
@@ -2019,16 +2036,44 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    Manual dispatch has no profile input. Do not add page, object, attempt,
    timeout, or other numeric inputs.
 
-5. If `ubuntu-slim` is unavailable for this repository, select the only
-   supported runner fallback:
+5. If these workflows need a selected runner, set the organization- or
+   repository-level Actions variable `CODEX_REVIEW_GATE_RUNNER_LABELS`. Its
+   value must be valid JSON that decodes to one literal runner-label string or
+   a non-empty array of literal labels. For example:
+
+   ```bash
+   gh variable set CODEX_REVIEW_GATE_RUNNER_LABELS \
+     --repo "github.com/$REPO" \
+     --body '["self-hosted","Linux","X64","hdr-streaming-linux"]'
+   ```
+
+   The value selects the runner for both verifier and controller, and takes
+   precedence over `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true`. If it is unset,
+   the legacy variable selects `ubuntu-latest` when true; otherwise the
+   default is `ubuntu-slim`. Runner labels do not discover or register runners,
+   alter branch protections, grant credentials or permissions, or change workflow
+   event filters or permission declarations. If using an
+   organization variable, limit its visibility to the intended repositories.
+   A variable alone does not update previously installed workflows; consumers
+   must update both canonical workflow files to the new `runs-on` expression.
+   No Action runtime release is needed.
+
+   Treat the variable and selected self-hosted host as trusted,
+   operator-controlled configuration. The controller has `actions: write` and
+   `pull-requests: write`, and may also receive the optional
+   `CODEX_REVIEW_GATE_REQUEST_TOKEN` secret. An exact workflow digest does not
+   bind variable values or host state, and separate GitHub jobs are not host
+   isolation. Any self-hosted host handling the controller token must be
+   trusted; use dedicated or ephemeral trusted runners for token-bearing jobs.
+
+   If `CODEX_REVIEW_GATE_RUNNER_LABELS` is unset and `ubuntu-slim` is
+   unavailable, the legacy hosted fallback remains available:
 
    ```bash
    gh variable set CODEX_REVIEW_GATE_USE_UBUNTU_LATEST \
      --repo "github.com/$REPO" \
      --body true
    ```
-
-   Do not add an arbitrary runner-label input or variable.
 
 ## Phase 5: prove the canary and activate protection
 

@@ -99,12 +99,36 @@ uses: JoeyTeng/codex-review-gate-action@v2
   `chatgpt-codex-connector[bot]`，GitHub type 必须是 `Bot`；
 - 唯一手动入口是 `workflow_dispatch`，每次只处理一个 PR；
 - 手动 run 必须使用仓库默认分支上的 workflow；
-- API-only job 默认使用 `ubuntu-slim`；仅当该 runner 不可用时，repository Actions
-  variable `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` 才选择 `ubuntu-latest`；
+- verifier 与 controller 在设置时都使用生效的 organization 或 repository Actions
+  variable `CODEX_REVIEW_GATE_RUNNER_LABELS`；否则 `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true`
+  选择 `ubuntu-latest`，默认仍为 `ubuntu-slim`；
 - verifier 只有 evidence read permissions；controller 才有创建 request 与 rerun exact
   verifier 所需的窄 `pull-requests: write` 与 `actions: write`。它只面向 PR conversation
   comment；GitHub 的 issue-comment REST endpoint 对该目标接受 pull-request write。两者都
   没有 `issues: write`、`statuses: write`、`checks: write` 或 `contents: write`。
+
+`CODEX_REVIEW_GATE_RUNNER_LABELS` 的值必须是有效 JSON，解析后可以是一个 runner label
+字符串，也可以是非空的 literal label 数组。例如，以下 repository-scope 值选择专用的 HDR
+Linux runner：
+
+```bash
+gh variable set CODEX_REVIEW_GATE_RUNNER_LABELS \
+  --repo "github.com/$REPO" \
+  --body '["self-hosted","Linux","X64","hdr-streaming-linux"]'
+```
+
+该 variable 优先于旧的 `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` fallback。两者都未设置时，
+workflow 使用 `ubuntu-slim`。Runner label 不会自动发现或注册 runner、修改 branch protection，
+授予 credentials 或 permissions，也不会改变 workflow event filters 或 permission 声明。
+Organization variable 的 visibility 决定哪些 repository 会收到这个选择。该值同时
+影响 verifier 和 controller；已安装的 consumer 必须更新两份 canonical workflow 文件才会生效，
+但不需要发布新的 Action runtime。仅设置 variable 不会改变旧版已安装 workflow。
+
+请把 runner variable 与它选择的 self-hosted runner 都视为由 operator 控制的 trusted
+configuration。Controller 拥有 `actions: write` 和 `pull-requests: write`，并且在配置时还可能
+收到可选的 `CODEX_REVIEW_GATE_REQUEST_TOKEN` secret。Exact workflow digest 不绑定 variable
+值或 runner host state；独立 GitHub jobs 也不提供 host isolation。能够接收 controller token
+的 self-hosted host 必须可信；对携带 token 的 jobs 使用专用或 ephemeral trusted runner。
 
 Verifier 的只读权限包括 `actions: read`：它必须通过 Actions run API 取得自身
 `pull_request` run 由 GitHub 服务器记录的 `created_at`。Private repository 必须有
@@ -1031,6 +1055,26 @@ checkpoint 之间 race path-based operation。只在这些 parent 不会被不�
 control-plane block 合并到 `.github/CODEOWNERS` 的最终有效位置。若 helper 报告其他 v1
 caller，只检查它列出的路径，并在同一个 migration PR 中移除或停用精确 legacy job。
 一个 PR 可以同时移除 v1、安装 v2 与 CODEOWNERS 控制面。
+
+若 unrelated CI workflow 需要自己的 `statuses: write`，不要为了安装 gate 删除该 permission。
+先取得显式 control-plane-owner review，并把 publisher 与 PR execution 隔离到显式 job-level
+`statuses: write` job；workflow-level permissions 仍保持 read-only。其 `runs-on` 仅使用 literal
+runner-label string、literal label array，或精确的
+`fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` fallback 形式。变量名必须匹配
+`[A-Z][A-Z0-9_]*_RUNNER_LABELS`，fallback 必须是非空 JSON 字符串数组；变量值若已设置，
+也必须是有效 JSON，解析后为 label string 或非空 label array。示例如下：
+
+```yaml
+runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
+```
+
+不得使用任意 runner expression。Publisher 仍须是 self-contained inline Bash，不得使用 actions、checkout、artifacts、repository scripts、
+containers、services 或 inherited executable defaults；必须清除 `BASH_ENV`/`ENV` 并只在 step env
+传入 `GH_TOKEN`，且不得给 PR-executing jobs status-write authority。
+
+Owner review 还要覆盖 runner selector 与数据流。Workflow digest 不绑定引用的 variable 值或
+self-hosted host state；独立 jobs 不提供 host isolation。使用 operator-controlled runner
+configuration，并为带 token 的 publisher 配置专用或 ephemeral trusted runner。
 
 如果仓库当前使用根目录 `CODEOWNERS` 或 `docs/CODEOWNERS`，helper 会停止，避免新建
 `.github/CODEOWNERS` 后静默遮蔽旧 policy。请在同一个 migration PR 中把原有 entries

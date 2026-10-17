@@ -131,15 +131,45 @@ boundaries that an Action step cannot define:
   request;
 - manual dispatches must use the workflow from the repository's default
   branch;
-- API-only work uses `ubuntu-slim` by default; the repository Actions variable
-  `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` selects the sole supported
-  fallback, `ubuntu-latest`;
+- the verifier and controller use the effective organization- or
+  repository-level Actions variable `CODEX_REVIEW_GATE_RUNNER_LABELS` when set;
+  otherwise `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` selects `ubuntu-latest`,
+  with `ubuntu-slim` as the default;
 - the verifier has read-only evidence permissions; the controller alone has
   narrow `pull-requests: write` and `actions: write` authority for requests
   and exact verifier reruns. It targets only PR conversation comments, for
   which GitHub accepts pull-request write authority through the issue-comment
   REST endpoints. Neither workflow has `issues: write`, `statuses: write`,
   `checks: write`, or `contents: write`.
+
+`CODEX_REVIEW_GATE_RUNNER_LABELS` must contain valid JSON that decodes to one
+runner-label string or a non-empty array of literal runner labels. For example,
+this repository-scoped value selects a dedicated HDR Linux runner:
+
+```bash
+gh variable set CODEX_REVIEW_GATE_RUNNER_LABELS \
+  --repo "github.com/$REPO" \
+  --body '["self-hosted","Linux","X64","hdr-streaming-linux"]'
+```
+
+This variable takes precedence over the legacy
+`CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` fallback. If neither is set, the
+workflows use `ubuntu-slim`. Runner labels do not register or discover a runner,
+alter branch protections, grant credentials or permissions, or change workflow
+event filters or permission declarations. Organization-variable visibility
+determines which repositories receive the selection. This variable affects
+both workflows. Updating an installed consumer requires updating both
+canonical workflow files, but no Action runtime release. The variable alone
+cannot change an older installed workflow.
+
+Treat the runner variable and any self-hosted runner it selects as trusted
+operator-controlled configuration. The controller has `actions: write` and
+`pull-requests: write`, and may also receive the optional
+`CODEX_REVIEW_GATE_REQUEST_TOKEN` secret. An exact workflow digest does not bind
+variable values or runner host state, and separate GitHub jobs do not provide
+host isolation. Any self-hosted host that can receive the controller's token
+must be trusted; use dedicated or ephemeral trusted runners for token-bearing
+jobs.
 
 The verifier's read-only permissions include `actions: read`: it must fetch its
 own `pull_request` run's GitHub-server `created_at` through the Actions run
@@ -1279,20 +1309,34 @@ After owner review, append
 to each bootstrap command.
 
 Before hashing, isolate the writers into explicit job-level `statuses: write`
-jobs on literal `runs-on: ubuntu-slim`. Keep workflow-level permissions
-read-only. The privileged jobs must be self-contained inline Bash publishers,
-without actions, checkout, artifacts, repository scripts, containers, services,
-runner overrides or inherited executable defaults. Jobs that exercise PR code
-may keep their dependencies but must not inherit status-write authority.
+jobs. Keep workflow-level permissions read-only. Their `runs-on` may be a
+literal runner-label string, a literal label array, or the exact
+`fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` form, where the
+variable name matches `[A-Z][A-Z0-9_]*_RUNNER_LABELS` and the fallback is a
+non-empty JSON array of string labels. When set, the variable value must also
+be valid JSON resolving to a label string or non-empty label array. For example:
+
+```yaml
+runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
+```
+
+Do not use arbitrary runner expressions. The privileged jobs must be
+self-contained inline Bash publishers, without actions, checkout, artifacts,
+repository scripts, containers, services or inherited executable defaults.
+Jobs that exercise PR code may keep their dependencies but must not inherit
+status-write authority.
 Each privileged job has exactly one literal `run: |` step with `shell: bash`.
 Its step `env` must clear `BASH_ENV` and `ENV` and set
 `GH_TOKEN: ${{ github.token }}`; metadata also belongs in step `env`, not a
 job-level environment. Literal `needs`, `if`, job outputs and one step ID are
 supported for trusted metadata handoff.
-The control-plane owner reviews the exact inline scripts and data flow:
-trusted metadata supplies the target SHA/context, and GitHub job results
-supply the terminal outcome. Do not execute PR-produced text or downloaded
-mutable/unprotected code, or trust a test artifact's claimed outcome.
+The control-plane owner reviews the exact runner selector, inline scripts and
+data flow: trusted metadata supplies the target SHA/context, and GitHub job
+results supply the terminal outcome. The workflow digest does not bind
+referenced variable values or self-hosted host state, and separate jobs are not
+host isolation; use dedicated or ephemeral trusted runners for token-bearing
+publishers. Do not execute PR-produced text or downloaded mutable/unprotected
+code, or trust a test artifact's claimed outcome.
 
 Then add the declaration to local preview and
 apply, remote staging and activation, and later full-profile cleanup commands.

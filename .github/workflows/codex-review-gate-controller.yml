@@ -77,7 +77,7 @@ jobs:
           !github.event.workflow_run.pull_requests[1]
         )
       }}
-    runs-on: ${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}
+    runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || (vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && '["ubuntu-latest"]' || '["ubuntu-slim"]')) }}
     timeout-minutes: 14
     steps:
       - name: Refresh Codex review gate

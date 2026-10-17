@@ -878,6 +878,29 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
 
 5. Helper 若报告其他 v1 caller，只检查它列出的 paths。整个文件专用于 v1 时才删除；
    否则只移除或停用 legacy job。重复 preview，直到无 v1 caller。
+
+   若 helper 报告 unrelated `statuses: write` workflow，不要删除正常 CI producer 的 permission。
+   先取得显式 control-plane-owner review；publisher 必须与 PR execution 隔离，只在 job-level
+   声明 `statuses: write`，workflow-level permissions 保持 read-only。Publisher 的 `runs-on` 可以是
+   literal runner-label string、literal label array，或精确的
+   `fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` fallback 形式。变量名必须匹配
+   `[A-Z][A-Z0-9_]*_RUNNER_LABELS`，fallback 必须是非空的 JSON 字符串数组；变量值若已设置，
+   也必须是有效 JSON，解析后为 label string 或非空 label array。示例如下：
+
+   ```yaml
+   runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
+   ```
+
+   不得使用任意 runner expression。
+   每个 publisher 仍必须只有一个 `shell: bash` 的 literal inline Bash `run: |` step，清除
+   `BASH_ENV`/`ENV`，只在 step env 传入 `GH_TOKEN` 并放置 metadata；不得使用 actions、checkout、
+   artifacts、repository scripts、containers、services 或 inherited executable defaults。执行 PR
+   代码的 jobs 不得获得 status-write authority。Owner 必须 review runner selector、inline code
+   与数据流，再计算 exact UTF-8 workflow digest 并在每个 bootstrap command 重复
+   `--reviewed-status-writer .github/workflows/FILE.yml@SHA256`；helper 仅允许 relevant writes 中
+   恰有 `statuses: write` 的 workflow。Digest 不绑定 variable 值或 self-hosted host state，独立
+   jobs 也不提供 host isolation；token-bearing publisher 应使用专用或 ephemeral trusted runner。
+
 6. 证明两份 workflow bytes 等于各自 canonical template，并读取最终有效的 CODEOWNERS
    rules：
 
@@ -1103,8 +1126,9 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
 - manual trigger 只有 `workflow_dispatch`，inputs 为 `operation`、`pr_number`、
   `expected_head_sha`、可选 `request_comment_id`、默认 `true` 的
   `request_review`；没有 dispatch limits profile；
-- 默认 `ubuntu-slim`，只有
-  `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` 选择 `ubuntu-latest`；
+- 两份 canonical workflow 在设置时都使用
+  `CODEX_REVIEW_GATE_RUNNER_LABELS`；否则 `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true`
+  选择 `ubuntu-latest`，默认仍为 `ubuntu-slim`；
 - verifier/controller 使用独立 concurrency namespaces；已关联的 controller event 仍按 PR
   分组，空关联 completion event 使用 per-run fallback group；verifier latest-wins cancel，
   controller operations 不 cancel；
@@ -1652,7 +1676,32 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    随后刷新 `CANARY_HEAD`，并 dispatch 一次 scoped controller reconcile。Manual dispatch
    没有 profile input。不得增加 page/object/attempt/timeout 等 numeric input。
 
-5. `ubuntu-slim` 不可用时，只允许：
+5. 若两份 workflow 需要选择 runner，请设置 organization 或 repository Actions variable
+   `CODEX_REVIEW_GATE_RUNNER_LABELS`。其值必须是有效 JSON，解析后为一个 literal runner-label
+   string 或非空的 literal label array。例如：
+
+   ```bash
+   gh variable set CODEX_REVIEW_GATE_RUNNER_LABELS \
+     --repo "github.com/$REPO" \
+     --body '["self-hosted","Linux","X64","hdr-streaming-linux"]'
+   ```
+
+   该值同时选择 verifier 与 controller 的 runner，并优先于
+   `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true`。如果它未设置，旧 variable 为 true 时选择
+   `ubuntu-latest`，否则默认使用 `ubuntu-slim`。Runner label 不会自动发现或注册 runner，也不会
+   修改 branch protection、授予 credentials/permissions 或改变 workflow event filters 与
+   permission declarations。Organization variable 的 visibility 应限制到预期 repository。
+   仅设置 variable 不会更新已经安装的 workflow；consumer 必须更新两份 canonical workflow 的
+   `runs-on` expression，但无需发布新的 Action runtime。
+
+   请把该 variable 与它选择的 self-hosted host 都视为 operator-controlled trusted
+   configuration。Controller 有 `actions: write` 和 `pull-requests: write`，并且配置时可能还会
+   收到可选的 `CODEX_REVIEW_GATE_REQUEST_TOKEN` secret。Exact workflow digest 不绑定 variable
+   值或 host state，独立 GitHub jobs 也不提供 host isolation。能够处理 controller token 的
+   self-hosted host 必须可信；带 token 的 jobs 应使用专用或 ephemeral trusted runner。
+
+   若未设置 `CODEX_REVIEW_GATE_RUNNER_LABELS` 且 `ubuntu-slim` 不可用，仍可使用旧的 hosted
+   runner fallback：
 
    ```bash
    gh variable set CODEX_REVIEW_GATE_USE_UBUNTU_LATEST \
