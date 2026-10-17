@@ -7216,6 +7216,23 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "nested-flow-with-uses-data-only",
       'jobs: {test: {steps: [{name: metadata, uses: actions/github-script@v7, with: {uses: JoeyTeng/codex-review-gate-action@v2}}]}}\n',
     ],
+    [
+      "context-like-env-data",
+      "env:\n  context: codex/github-review-gate\njobs:\n  build:\n    env:\n      check-name: codex/github-review-gate\n    steps:\n      - run: echo ready\n        env:\n          custom_context: codex/github-review-gate\n",
+    ],
+    [
+      "anchored-context-input",
+      "jobs:\n  build:\n    steps:\n      - uses: custom/action@v1\n        with:\n          context: &gate codex/github-review-gate\n          check-name: codex/github-review-gate\n",
+    ],
+    [
+      "workflow-example-inside-run-scalar",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          cat <<'YAML'\n          uses: JoeyTeng/codex-review-gate-action@v2\n          YAML\n",
+    ],
+    [
+      "accepted-block-sequence-flow-map-gap",
+      // Ordinary preflight accepts this documented heuristic false negative.
+      "jobs:\n  build:\n    steps:\n      - { uses: JoeyTeng/codex-review-gate-action@v2 }\n",
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7261,11 +7278,6 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "anchored-job-name",
       "jobs:\n  collision:\n    name: &gate codex/github-review-gate\n    runs-on: ubuntu-slim\n",
-      /Additional workflows contain Codex gate callers or reserved gate signals/u,
-    ],
-    [
-      "anchored-status-context",
-      "jobs:\n  publish:\n    steps:\n      - with:\n          context: &gate codex/github-review-gate\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

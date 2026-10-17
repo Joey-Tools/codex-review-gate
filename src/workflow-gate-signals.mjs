@@ -18,7 +18,7 @@ const ACTION_CALLERS = [
 /**
  * Best-effort segmented text heuristic covering only a recognized subset of
  * literal workflow forms; matches does not guarantee detection of every
- * literal, syntax, or transport mechanism. The seven warning-only examples
+ * literal, syntax, or transport mechanism. The documented warning-only examples
  * listed in docs/install/workflow-scan-risk-boundary.md are intentional
  * accepted coverage limits. This heuristic is not an installation safety
  * boundary or proof of a unique producer; ordinary installation relies on
@@ -120,7 +120,7 @@ export function inspectWorkflowGateSignals(
       yamlAnchors.clear();
       foldedUses = null;
       foldedJobName = null;
-    } else if (!isRunCommandLine(line.text)) {
+    } else if (!line.yamlScalarContent && !isRunCommandLine(line.text)) {
       registerYamlScalarAnchors(line, yamlAnchors, addWarning);
     }
     if (foldedJobName) {
@@ -172,7 +172,8 @@ export function inspectWorkflowGateSignals(
       addMatch,
       addWarning,
     );
-    const uses = fieldsOnLine(line.text).find((field) => field.key === "uses");
+    const yamlFields = line.yamlScalarContent || line.yamlDataField ? [] : fieldsOnLine(line.text);
+    const uses = yamlFields.find((field) => field.key === "uses");
     if (uses && isBlockScalarIndicator(stripYamlAnchor(uses.value))) {
       foldedUses = {
         indent: indentationOf(line.text),
@@ -180,7 +181,7 @@ export function inspectWorkflowGateSignals(
         selector: uses && line.selectorUseStarts?.has(uses.start) === true,
       };
     }
-    const name = fieldsOnLine(line.text).find((field) => isNameField(field.key));
+    const name = yamlFields.find((field) => isNameField(field.key));
     if (line.jobNameField && name && isBlockScalarIndicator(stripYamlAnchor(name.value))) {
       foldedJobName = { indent: indentationOf(line.text), remaining: 4 };
     }
@@ -226,9 +227,13 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
       line.raw,
     );
   }
-  const fields = isRunCommandLine(line.text) || line.continuedCurlCommandPart
-    ? []
-    : fieldsOnLine(line.text);
+  const fields =
+    line.yamlScalarContent ||
+    line.yamlDataField ||
+    isRunCommandLine(line.text) ||
+    line.continuedCurlCommandPart
+      ? []
+      : fieldsOnLine(line.text);
   const recognizedUses = [];
   const resolveField = (expression) =>
     allowYamlAliases
@@ -269,7 +274,10 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
       warnUnscopedCaller(field.value, value, line, addWarning);
     }
   }
-  for (const expression of useFieldExpressions(line.text)) {
+  const useExpressions = line.yamlScalarContent || line.yamlDataField
+    ? []
+    : useFieldExpressions(line.text);
+  for (const expression of useExpressions) {
     const recognizedIndex = recognizedUses.indexOf(expression);
     if (recognizedIndex !== -1) {
       recognizedUses.splice(recognizedIndex, 1);
@@ -316,7 +324,12 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
 function inspectWindow(window, reserved, addMatch, addWarning) {
   const literals = new Map();
   for (const line of window) {
-    if (!isRunCommandLine(line.text) && !line.continuedCurlCommandPart) {
+    if (
+      !line.yamlScalarContent &&
+      !line.yamlDataField &&
+      !isRunCommandLine(line.text) &&
+      !line.continuedCurlCommandPart
+    ) {
       for (const field of fieldsOnLine(line.text)) {
         if (field.key === "uses") {
           if (line.selectorUseStarts?.has(field.start)) {
@@ -691,6 +704,7 @@ function isNameField(key) {
 }
 
 function markYamlJobNameFields(lines) {
+  markYamlDataAndScalarFields(lines);
   let jobsIndent = null;
   let jobIndent = null;
   let jobPropertyIndent = null;
@@ -708,12 +722,15 @@ function markYamlJobNameFields(lines) {
       continue;
     }
     if (!line.text.trim()) continue;
-    line.flowJobFields = flowStyleJobFields(line.text);
+    if (line.yamlScalarContent) continue;
+    line.flowJobFields = line.yamlDataField
+      ? { names: [], uses: [], steps: [], ambiguous: false }
+      : flowStyleJobFields(line.text);
     line.flowStepUses = line.flowJobFields.steps;
     line.flowScanAmbiguous = line.flowJobFields.ambiguous;
     const indent = indentationOf(line.text);
     const text = line.text.trim();
-    const key = simpleYamlKey(text);
+    const key = line.yamlDataField ? null : simpleYamlKey(text);
     if (key?.toLowerCase() === "jobs" && /^\s*$/u.test(text.slice(text.indexOf(":") + 1))) {
       jobsIndent = indent;
       jobIndent = null;
@@ -791,6 +808,7 @@ function markYamlJobNameFields(lines) {
 }
 
 function markSelectorUse(line) {
+  if (line.yamlDataField || line.yamlScalarContent) return;
   const field = fieldsOnLine(line.text).find(
     (candidate) =>
       candidate.key.toLowerCase() === "uses" &&
@@ -799,6 +817,56 @@ function markSelectorUse(line) {
   if (!field) return;
   line.selectorUseStarts ??= new Set();
   line.selectorUseStarts.add(field.start);
+}
+
+function markYamlDataAndScalarFields(lines) {
+  let scalarKeyIndent = null;
+  const dataMappingIndents = [];
+  for (const line of lines) {
+    if (isYamlDocumentBoundary(line.text)) {
+      scalarKeyIndent = null;
+      dataMappingIndents.length = 0;
+      continue;
+    }
+    if (!line.text.trim()) continue;
+
+    const mapping = simpleYamlMapping(line.text);
+    if (scalarKeyIndent !== null) {
+      if (mapping && mapping.indent <= scalarKeyIndent) {
+        scalarKeyIndent = null;
+      } else {
+        line.yamlScalarContent = true;
+        continue;
+      }
+    }
+
+    const fieldIndent = mapping?.indent ?? indentationOf(line.text);
+    while (dataMappingIndents.length && dataMappingIndents.at(-1) >= fieldIndent) {
+      dataMappingIndents.pop();
+    }
+    line.yamlDataField = dataMappingIndents.length > 0;
+
+    if (
+      !line.yamlDataField &&
+      mapping &&
+      /^(?:env|with)$/iu.test(mapping.key) &&
+      !mapping.value.trim()
+    ) {
+      dataMappingIndents.push(mapping.indent);
+    }
+    if (mapping && isBlockScalarIndicator(stripYamlAnchor(mapping.value))) {
+      scalarKeyIndent = mapping.indent;
+    }
+  }
+}
+
+function simpleYamlMapping(text) {
+  const match = text.match(/^\s*(?:-\s+)?(?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\s*:\s*(.*)$/u);
+  if (!match) return null;
+  const key = simpleYamlKey(text.trimStart());
+  if (key === null) return null;
+  const prefix = text.match(/^\s*(?:-\s+)?/u)?.[0] ?? "";
+  return { key, value: match[1], indent: prefix.length };
 }
 
 function simpleYamlKey(text) {

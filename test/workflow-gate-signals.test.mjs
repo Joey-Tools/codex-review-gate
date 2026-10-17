@@ -203,6 +203,77 @@ test("blocks only job and step uses selectors, warning on unrelated uses data", 
   assert.ok(data.warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"));
 });
 
+test("keeps context-like keys inside block env and with mappings as data", () => {
+  const result = inspectWorkflowGateSignals([
+    "env:",
+    "  REVIEW_CONTEXT: codex/github-review-gate",
+    "  check-name: codex/github-review-gate",
+    "with:",
+    "  context: codex/github-review-gate",
+    "  check_name: codex/github-review-gate",
+    "jobs:",
+    "  build:",
+    "    env:",
+    "      status-context: codex/github-review-gate",
+    "      check-name: codex/github-review-gate",
+    "    with:",
+    "      context: codex/github-review-gate",
+    "      CHECK_NAME: codex/github-review-gate",
+    "    steps:",
+    "      - run: echo data only",
+    "        env:",
+    "          context: codex/github-review-gate",
+    "          check-name: codex/github-review-gate",
+    "        with:",
+    "          status-context: codex/github-review-gate",
+    "          check_name: codex/github-review-gate",
+    "          uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches, []);
+});
+
+test("ignores YAML-looking block scalar contents while retaining selectors and run publishers", () => {
+  const selectors = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - run: |",
+    '          "uses": JoeyTeng/codex-review-gate-action@v2',
+    "          check-name: codex/github-review-gate",
+    "        with:",
+    "          script: >",
+    "            uses: JoeyTeng/codex-review-gate-action@v2",
+    "            context: codex/github-review-gate",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+  assert.deepEqual(
+    selectors.matches.map(({ kind }) => kind),
+    ["codex-review-gate-action-caller"],
+  );
+
+  const publishers = [
+    [
+      "gh api repos/example/check-runs --method POST -f name=codex/github-review-gate",
+      "reserved-check-run-name",
+    ],
+    [
+      `curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+      "reserved-status-context",
+    ],
+  ];
+  for (const [command, expectedKind] of publishers) {
+    const result = inspectWorkflowGateSignals([
+      "jobs:",
+      "  publish:",
+      "    steps:",
+      "      - run: |",
+      `          ${command}`,
+    ].join("\n"));
+    assert.deepEqual(result.matches.map(({ kind }) => kind), [expectedKind], command);
+  }
+});
+
 test("finds a literal caller preceded by a simple YAML anchor", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -564,6 +635,15 @@ test("keeps accepted ordinary-installer coverage examples warning-only", () => {
         "        with:",
         "          script: |",
         '            github.rest.checks.create({name: "codex/github-review-gate", owner: "o", repo: "r", head_sha: "abc"})',
+      ].join("\n"),
+    },
+    {
+      issue: "4304433545",
+      content: [
+        "jobs:",
+        "  build:",
+        "    steps:",
+        "      - { uses: JoeyTeng/codex-review-gate-action@v2 }",
       ].join("\n"),
     },
   ];

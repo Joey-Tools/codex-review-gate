@@ -10,10 +10,11 @@ This preflight is neither security isolation nor proof of a unique producer. Req
 
 ## Accepted warning-only coverage gaps
 
-The following seven PR #128 review examples are intentionally accepted as warning-only coverage gaps in this change. No new recognition logic is added for them, and the scanner does not promise to warn for every instance:
+The following eight PR #128 review examples are intentionally accepted as warning-only coverage gaps in this change. No new recognition logic is added for them, and the scanner does not promise to warn for every instance:
 
 - `curl` body options such as `--data` or `--json`, whose implicit POST semantics may require interpreting other method-selection options ([review discussion](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4304322776)).
 - A bare YAML `-` step ([review discussion](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4304322781)).
+- A flow mapping used as one block-sequence step, such as `- { uses: ... }` ([review discussion](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4304433545)).
 - Multiline YAML flow-style syntax ([review discussion](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4304322783)).
 - A `run` command inside a flow-style step ([review discussion](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4304322787)).
 - A folded `run: >` scalar ([review discussion](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4304322790)).
@@ -21,6 +22,8 @@ The following seven PR #128 review examples are intentionally accepted as warnin
 - An Octokit JavaScript `checks.create` body ([review discussion](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4304322794)).
 
 These accepted scanner-coverage examples do not by themselves establish a security regression or change runtime evidence. They also do not waive ordinary runtime handling of unresolved review findings.
+
+The false-negative allowance does not justify treating known data as execution. Context-like fields inside `env` or `with` data, and YAML-looking selector text inside block scalars, are not by themselves proof of a publisher or caller. The scanner keeps those references nonblocking while retaining its separate recognition of actual command/API publishing patterns. An environment or input value may still flow into a publisher; tracing that data flow remains outside this preflight. This distinction is bounded source classification, not a promise of complete YAML or shell semantics.
 
 ## Safeguards that remain strict
 
