@@ -2392,6 +2392,7 @@ async function loadConsumerSecuritySnapshot({
   canonicalWorkflows,
   controlPlaneOwner,
   reviewedStatusWriters = [],
+  strictUnrelatedWorkflows,
   expectedDefaultBranch = null,
 }) {
   const repoInfo = await ghJson(`repos/${repoSlug}`);
@@ -2454,6 +2455,7 @@ async function loadConsumerSecuritySnapshot({
       {
         legacyBridge: canonicalWorkflows.legacyBridge !== undefined,
         reviewedStatusWriters,
+        strictUnrelatedWorkflows,
       },
     );
     if (canonicalWorkflows.legacyBridge === undefined) {
@@ -3956,6 +3958,7 @@ async function loadCleanupSecurityClosure({
     canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
     reviewedStatusWriters: options.reviewedStatusWriters,
+    strictUnrelatedWorkflows: true,
   });
   const rulesets = await loadRulesets(options.repo.slug);
   const selectedV2 = selectUniqueNamedRepositoryRuleset(

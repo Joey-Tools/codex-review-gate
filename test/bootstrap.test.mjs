@@ -7208,6 +7208,10 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "plain-check-name-reference",
       "jobs:\n  build:\n    steps:\n      - run: echo codex/github-review-gate\n",
     ],
+    [
+      "with-uses-input",
+      "jobs:\n  build:\n    steps:\n      - uses: actions/github-script@v7\n        with:\n          uses: JoeyTeng/codex-review-gate-action@v2\n          script: core.info('ordinary input')\n",
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7253,6 +7257,25 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "literal-json-check-run",
       `jobs:\n  publish:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs\n`,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "continued-curl-post-json-check-run",
+      [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        "      - run: |",
+        "          curl -X POST " + "\\",
+        "            -H 'Accept: application/vnd.github+json' " + "\\",
+        "            -d '{\"name\":\"codex/github-review-gate\"}' " + "\\",
+        "            https://api.github.com/repos/example/repo/check-runs",
+      ].join("\n"),
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "quoted-flow-job-id",
+      'jobs: {"collision": {name: codex/github-review-gate, runs-on: ubuntu-slim}}\n',
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
   ]) {
@@ -10693,6 +10716,66 @@ test("post-cleanup verification accepts empty legacy surfaces and unrelated clas
       ],
       [`repos/${repoSlug}/rulesets/7`]: activeV2,
     };
+    const workflowsTreeKey = `repos/${repoSlug}/git/trees/workflows-tree`;
+    const unrelatedWriterContent = [
+      "name: unrelated status writer",
+      "on:",
+      "  workflow_dispatch:",
+      "permissions:",
+      "  statuses: write",
+      "jobs:",
+      "  status:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - run: echo unrelated",
+      "",
+    ].join("\n");
+    const responsesWithUnrelatedWriter = {
+      ...responses,
+      [workflowsTreeKey]: {
+        ...responses[workflowsTreeKey],
+        tree: [
+          ...responses[workflowsTreeKey].tree,
+          {
+            path: "unrelated-status-writer.yml",
+            sha: "unrelated-status-writer-blob",
+            type: "blob",
+            mode: "100644",
+          },
+        ],
+      },
+      [`repos/${repoSlug}/git/blobs/unrelated-status-writer-blob`]: {
+        encoding: "base64",
+        content: Buffer.from(unrelatedWriterContent, "utf8").toString("base64"),
+      },
+    };
+    const blockedDeriveLog = join(fixtureRoot, "blocked-derive-calls.log");
+    const blockedDerive = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--derive-post-cleanup-plan",
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responsesWithUnrelatedWriter),
+        FAKE_GH_CALL_LOG: blockedDeriveLog,
+      },
+    });
+    assert.equal(blockedDerive.status, 1, blockedDerive.stderr);
+    assert.match(
+      blockedDerive.stderr,
+      /Additional workflows violate the codex\/github-review-gate single-producer policy: .*unrelated-status-writer\.yml \(statuses: write\)/u,
+    );
+    assert.doesNotMatch(
+      blockedDerive.stdout,
+      /schema_version|expected_post_cleanup_security_sha256/u,
+    );
+    assert.doesNotMatch(
+      readFileSync(blockedDeriveLog, "utf8"),
+      /^(?:POST|PUT) /mu,
+    );
+
     const derive = runBootstrap([
       "--repo",
       repoSlug,
@@ -10708,6 +10791,33 @@ test("post-cleanup verification accepts empty legacy surfaces and unrelated clas
     assert.equal(derive.status, 0, derive.stderr);
     const plan = JSON.parse(derive.stdout);
     assert.match(plan.expected_post_cleanup_security_sha256, /^[0-9a-f]{64}$/u);
+
+    const blockedVerifyLog = join(fixtureRoot, "blocked-verify-calls.log");
+    const blockedVerify = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--verify-post-cleanup",
+      "--expected-post-cleanup-security-sha256",
+      plan.expected_post_cleanup_security_sha256,
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responsesWithUnrelatedWriter),
+        FAKE_GH_CALL_LOG: blockedVerifyLog,
+      },
+    });
+    assert.equal(blockedVerify.status, 1, blockedVerify.stderr);
+    assert.match(
+      blockedVerify.stderr,
+      /Additional workflows violate the codex\/github-review-gate single-producer policy: .*unrelated-status-writer\.yml \(statuses: write\)/u,
+    );
+    assert.doesNotMatch(blockedVerify.stdout, /Post-cleanup verified/u);
+    assert.doesNotMatch(
+      readFileSync(blockedVerifyLog, "utf8"),
+      /^(?:POST|PUT) /mu,
+    );
+
     const result = runBootstrap([
       "--repo",
       repoSlug,

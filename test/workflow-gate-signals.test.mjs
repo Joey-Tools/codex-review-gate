@@ -31,11 +31,18 @@ jobs:
 });
 
 test("finds a reserved job name nested under a flow-style root mapping", () => {
-  const nested = inspectWorkflowGateSignals(
+  for (const content of [
     "{name: Other, jobs: {collision: {name: codex/github-review-gate}}}",
-  );
-  assert.equal(nested.matches.length, 1);
-  assert.equal(nested.matches[0].kind, "reserved-job-name");
+    "{name: Other, jobs: {\"collision\": {name: codex/github-review-gate}}}",
+    "{name: Other, jobs: {'collision': {name: codex/github-review-gate}}}",
+    "jobs:\n  collision: {name: codex/github-review-gate}",
+    "jobs:\n  \"collision\": {name: codex/github-review-gate}",
+    "jobs:\n  'collision': {name: codex/github-review-gate}",
+  ]) {
+    const nested = inspectWorkflowGateSignals(content);
+    assert.equal(nested.matches.length, 1, content);
+    assert.equal(nested.matches[0].kind, "reserved-job-name", content);
+  }
 
   const direct = inspectWorkflowGateSignals("context: codex/github-review-gate");
   assert.equal(direct.matches.length, 1);
@@ -112,6 +119,53 @@ test("finds literal action and legacy reusable-workflow callers", () => {
       "legacy-codex-review-gate-caller",
     ],
   );
+
+  const segmented = inspectWorkflowGateSignals([
+    "jobs:",
+    "  segmented:",
+    "    steps:",
+    "      - uses: 'JoeyTeng/' + 'codex-review-gate-action@v2'",
+  ].join("\n"));
+  assert.equal(segmented.matches.length, 1);
+  assert.equal(segmented.matches[0].kind, "codex-review-gate-action-caller");
+});
+
+test("blocks only job and step uses selectors, warning on unrelated uses data", () => {
+  const selectors = inspectWorkflowGateSignals([
+    "jobs:",
+    "  reusable:",
+    "    uses: JoeyTeng/codex-review-gate-action@v2",
+    "  steps:",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+  assert.equal(selectors.matches.length, 2);
+  assert.ok(selectors.matches.every(({ kind }) => kind === "codex-review-gate-action-caller"));
+
+  const flowJobSelector = inspectWorkflowGateSignals(
+    "{jobs: {reusable: {uses: JoeyTeng/codex-review-gate-action@v2}}}",
+  );
+  assert.equal(flowJobSelector.matches.length, 1);
+  assert.equal(flowJobSelector.matches[0].kind, "codex-review-gate-action-caller");
+
+  const flowStepSelector = inspectWorkflowGateSignals(
+    "{jobs: {build: {steps: [{uses: JoeyTeng/codex-review-gate-action@v2}]}}}",
+  );
+  assert.equal(flowStepSelector.matches.length, 1);
+  assert.equal(flowStepSelector.matches[0].kind, "codex-review-gate-action-caller");
+
+  const data = inspectWorkflowGateSignals([
+    "with: { uses: JoeyTeng/codex-review-gate-action@v2 }",
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - name: metadata only",
+    "        with: { uses: JoeyTeng/codex-review-gate-action@v2 }",
+    "      - uses: actions/checkout@v4, with: { uses: JoeyTeng/codex-review-gate-action@v2 }",
+    "{jobs: {build: {steps: [{uses: actions/checkout@v4, with: {uses: JoeyTeng/codex-review-gate-action@v2}}]}}}",
+  ].join("\n"));
+  assert.deepEqual(data.matches, []);
+  assert.ok(data.warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"));
 });
 
 test("finds a literal caller preceded by a simple YAML anchor", () => {
@@ -128,14 +182,20 @@ test("finds a literal caller preceded by a simple YAML anchor", () => {
 test("resolves bounded scalar aliases only within their YAML document", () => {
   const caller = inspectWorkflowGateSignals([
     "env: { ACTION: &gate JoeyTeng/codex-review-gate-action@v2 }",
-    "uses: *gate",
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - uses: *gate",
   ].join("\n"));
   assert.equal(caller.matches.length, 1);
   assert.equal(caller.matches[0].kind, "codex-review-gate-action-caller");
 
   const checkout = inspectWorkflowGateSignals([
     "env: { ACTION: &checkout actions/checkout@v4 }",
-    "uses: *checkout",
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - uses: *checkout",
   ].join("\n"));
   assert.deepEqual(checkout.matches, []);
   assert.deepEqual(checkout.warnings, []);
@@ -283,6 +343,88 @@ test("finds inline JSON CheckRun POST names across common curl data flags", () =
     "run: echo https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.deepEqual(nonPublishers.matches, []);
+});
+
+test("joins only bounded backslash continuations inside a run block for curl publishers", () => {
+  const publisher = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    "            https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.equal(publisher.matches.length, 1);
+  assert.equal(publisher.matches[0].kind, "reserved-check-run-name");
+
+  const chained = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    "            https://api.github.com/repos/example/repo/releases; echo https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(chained.matches, []);
+
+  const unclosed = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+  ].join("\n"));
+  assert.deepEqual(unclosed.matches, []);
+  assert.ok(unclosed.warnings.some(({ kind }) => kind === "continued-curl-command-unclosed"));
+
+  const overBudget = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    ...Array.from({ length: 16 }, (_, index) => `            --header X-Test-${index}: value \\`),
+    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    "            https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(overBudget.matches, []);
+  assert.ok(overBudget.warnings.some(({ kind }) => kind === "continued-curl-command-limit"));
+
+  const splitAtStep = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    "      - run: |",
+    `          -d '{"name":"codex/github-review-gate"}' \\`,
+    "          https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(splitAtStep.matches, []);
+
+  const splitAtDocument = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    "---",
+    `-d '{"name":"codex/github-review-gate"}' \\`,
+    "https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(splitAtDocument.matches, []);
+
+  const followsOtherContinuation = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          echo placeholder \\",
+    `          curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
+  ].join("\n"));
+  assert.deepEqual(followsOtherContinuation.matches, []);
 });
 
 test("keeps bare references and non-job names as warnings rather than blocking matches", () => {

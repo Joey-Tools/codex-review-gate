@@ -84,6 +84,7 @@ export function inspectWorkflowGateSignals(
     return { line: index + 1, raw: limited, text: stripComments(limited) };
   });
   markYamlJobNameFields(lines);
+  inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning);
 
   if (content.length > clipped.length) {
     addWarning(
@@ -136,7 +137,15 @@ export function inspectWorkflowGateSignals(
       if (!line.text.trim()) {
         foldedUses.remaining -= 1;
       } else if (indentationOf(line.text) > foldedUses.indent) {
-        addCallerMatch(resolveSimpleLiteral(line.text.trim(), new Map()), line, addMatch);
+        const expression = line.text.trim();
+        const value = resolveSimpleLiteral(expression, new Map());
+        if (foldedUses.selector) {
+          if (!addCallerMatch(value, line, addMatch)) {
+            warnUnscopedCaller(expression, value, line, addWarning);
+          }
+        } else {
+          warnUnscopedCaller(expression, value, line, addWarning);
+        }
         foldedUses.remaining -= 1;
       } else {
         foldedUses = null;
@@ -154,7 +163,11 @@ export function inspectWorkflowGateSignals(
     );
     const uses = fieldsOnLine(line.text).find((field) => field.key === "uses");
     if (uses && isBlockScalarIndicator(stripYamlAnchor(uses.value))) {
-      foldedUses = { indent: indentationOf(line.text), remaining: 4 };
+      foldedUses = {
+        indent: indentationOf(line.text),
+        remaining: 4,
+        selector: uses && line.selectorUseStarts?.has(uses.start) === true,
+      };
     }
     const name = fieldsOnLine(line.text).find((field) => isNameField(field.key));
     if (line.jobNameField && name && isBlockScalarIndicator(stripYamlAnchor(name.value))) {
@@ -195,6 +208,7 @@ export function inspectWorkflowGateSignals(
 
 function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning) {
   const fields = fieldsOnLine(line.text);
+  const recognizedUses = [];
   const resolveField = (expression) =>
     allowYamlAliases
       ? resolveYamlScalar(expression, yamlAnchors, line, addWarning)
@@ -202,18 +216,46 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
   for (const field of fields) {
     if (field.key === "uses") {
       const value = resolveField(field.value);
-      addCallerMatch(value, line, addMatch);
+      if (line.selectorUseStarts?.has(field.start)) {
+        recognizedUses.push(field.value);
+        if (!addCallerMatch(value, line, addMatch)) {
+          warnUnscopedCaller(field.value, value, line, addWarning);
+        }
+      }
     } else if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
       if (resolveField(field.value) === reserved) {
         addMatch(field.key.toLowerCase() === "name" ? "reserved-job-name" : "reserved-status-context", line.line, line.raw);
       }
     }
   }
-  const flowJobNames = flowStyleJobNameFields(line.text);
+  const flowJobNames = [
+    ...(line.flowJobFields?.names ?? []),
+    ...(line.inlineJobFields?.names ?? []),
+  ];
   for (const field of flowJobNames) {
     if (resolveField(field.value) === reserved) {
       addMatch("reserved-job-name", line.line, line.raw);
     }
+  }
+  for (const field of [
+    ...(line.flowJobFields?.uses ?? []),
+    ...(line.inlineJobFields?.uses ?? []),
+    ...(line.flowStepUses ?? []),
+  ]) {
+    recognizedUses.push(field.value);
+    const value = resolveField(field.value);
+    if (!addCallerMatch(value, line, addMatch)) {
+      warnUnscopedCaller(field.value, value, line, addWarning);
+    }
+  }
+  for (const expression of useFieldExpressions(line.text)) {
+    const recognizedIndex = recognizedUses.indexOf(expression);
+    if (recognizedIndex !== -1) {
+      recognizedUses.splice(recognizedIndex, 1);
+      continue;
+    }
+    const value = resolveField(expression);
+    warnUnscopedCaller(expression, value, line, addWarning);
   }
   const cliContext = cliContextExpression(line.text);
   if (cliContext && resolveSimpleLiteral(cliContext, new Map()) === reserved) {
@@ -223,7 +265,9 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
   if (cliCheckRunName && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) {
     addMatch("reserved-check-run-name", line.line, line.raw);
   }
-  const curlCheckRunName = curlCheckRunNameExpression(line.text, reserved);
+  const curlCheckRunName = line.continuedCurlCommandPart
+    ? null
+    : curlCheckRunNameExpression(line.text, reserved);
   if (curlCheckRunName) addMatch("reserved-check-run-name", line.line, line.raw);
   const exactFieldHandled = fields.some(
     (field) =>
@@ -253,13 +297,27 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
   for (const line of window) {
     for (const field of fieldsOnLine(line.text)) {
       if (field.key === "uses") {
-        inspectCaller(field.value, literals, line, addMatch, addWarning);
-      } else if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
+        if (line.selectorUseStarts?.has(field.start)) {
+          inspectCaller(field.value, literals, line, addMatch, addWarning);
+        }
+        continue;
+      }
+      if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
         inspectContext(field.key, field.value, literals, line, reserved, addMatch, addWarning);
       }
     }
-    for (const field of flowStyleJobNameFields(line.text)) {
+    for (const field of [
+      ...(line.flowJobFields?.names ?? []),
+      ...(line.inlineJobFields?.names ?? []),
+    ]) {
       inspectContext("name", field.value, literals, line, reserved, addMatch, addWarning);
+    }
+    for (const field of [
+      ...(line.flowJobFields?.uses ?? []),
+      ...(line.inlineJobFields?.uses ?? []),
+      ...(line.flowStepUses ?? []),
+    ]) {
+      inspectCaller(field.value, literals, line, addMatch, addWarning);
     }
     const cliContext = cliContextExpression(line.text);
     if (cliContext) {
@@ -269,7 +327,9 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
     if (cliCheckRunName) {
       inspectContext("check-run-name", cliCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
-    const curlCheckRunName = curlCheckRunNameExpression(line.text, reserved);
+    const curlCheckRunName = line.continuedCurlCommandPart
+      ? null
+      : curlCheckRunNameExpression(line.text, reserved);
     if (curlCheckRunName) {
       inspectContext("check-run-name", curlCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
@@ -341,7 +401,7 @@ function inspectCaller(expression, literals, line, addMatch, addWarning) {
   const value = resolveSimpleLiteral(stripYamlAnchor(expression), literals);
   if (
     !addCallerMatch(value, line, addMatch) &&
-    /codex-review-gate-action|Joey-Tools\/codex-review-gate|JoeyTeng/iu.test(expression)
+    looksLikeGateCaller(`${expression} ${value ?? ""}`)
   ) {
     addWarning(
       "ambiguous-codex-review-gate-caller",
@@ -350,6 +410,20 @@ function inspectCaller(expression, literals, line, addMatch, addWarning) {
       line.raw,
     );
   }
+}
+
+function warnUnscopedCaller(expression, value, line, addWarning) {
+  if (!looksLikeGateCaller(`${expression} ${value ?? ""}`)) return;
+  addWarning(
+    "ambiguous-codex-review-gate-caller",
+    line.line,
+    "A uses-like field resembles a Codex review gate caller, but its job or step selector scope could not be confirmed.",
+    line.raw,
+  );
+}
+
+function looksLikeGateCaller(value) {
+  return /codex-review-gate-action|Joey-Tools\/codex-review-gate|JoeyTeng/iu.test(value);
 }
 
 function addCallerMatch(value, line, addMatch) {
@@ -371,9 +445,17 @@ function fieldsOnLine(text) {
   for (const match of text.matchAll(pattern)) {
     const key = match[1];
     const value = match[2].trim();
-    if (key.toLowerCase() === "uses" || isContextField(key) || isNameField(key)) fields.push({ key, value });
+    const start = match.index + match[0].indexOf(key);
+    if (key.toLowerCase() === "uses" || isContextField(key) || isNameField(key)) {
+      fields.push({ key, value, start });
+    }
   }
   return fields;
+}
+
+function useFieldExpressions(text) {
+  const pattern = /(?:^|[,{])\s*(?:-\s*)?(?:"uses"|'uses'|uses)\s*:\s*([^,}\n]*)/gu;
+  return [...text.matchAll(pattern)].map((match) => match[1].trim());
 }
 
 function cliContextExpression(text) {
@@ -389,6 +471,7 @@ function cliCheckRunNameExpression(text) {
 function curlCheckRunNameExpression(text, reserved) {
   const command = runCommand(text);
   if (!/^curl(?:\s|$)/iu.test(command)) return null;
+  if (hasShellLineContinuation(command)) return null;
 
   const dataOption = /(?:^|\s)(?:-d|--data(?:-raw|-binary|-urlencode)?|--json)(?:\s+|=)(?:"([^"]*)"|'([^']*)'|([^\s]+))/giu;
   const dataMatches = [...command.matchAll(dataOption)];
@@ -410,6 +493,130 @@ function curlCheckRunNameExpression(text, reserved) {
     if (resolveSimpleLiteral(expression, new Map()) === reserved) return expression;
   }
   return null;
+}
+
+function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
+  let runBlockIndent = null;
+  let runBlockHeaderChars = 0;
+  let previousContinues = false;
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (isYamlDocumentBoundary(line.text)) {
+      runBlockIndent = null;
+      runBlockHeaderChars = 0;
+      previousContinues = false;
+      index += 1;
+      continue;
+    }
+    const runHeader = line.text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu);
+    if (runHeader) {
+      runBlockIndent = isBlockScalarIndicator(stripYamlAnchor(runHeader[1].trim()))
+        ? indentationOf(line.text)
+        : null;
+      runBlockHeaderChars = runBlockIndent === null ? 0 : line.text.length + 1;
+      previousContinues = false;
+      index += 1;
+      continue;
+    }
+    if (runBlockIndent === null) {
+      index += 1;
+      continue;
+    }
+    if (!line.text.trim()) {
+      previousContinues = false;
+      index += 1;
+      continue;
+    }
+    if (indentationOf(line.text) <= runBlockIndent) {
+      runBlockIndent = null;
+      runBlockHeaderChars = 0;
+      previousContinues = false;
+      index += 1;
+      continue;
+    }
+
+    const initialCommand = line.text.trim();
+    if (previousContinues) line.continuedCurlCommandPart = true;
+    if (
+      previousContinues ||
+      !/^curl(?:\s|$)/iu.test(initialCommand) ||
+      !hasShellLineContinuation(initialCommand)
+    ) {
+      previousContinues = hasShellLineContinuation(initialCommand);
+      index += 1;
+      continue;
+    }
+
+    const firstLine = line;
+    const chunks = [];
+    let totalChars = runBlockHeaderChars;
+    let consumed = 1;
+    let current = index;
+    let complete = false;
+    let exceeded = false;
+    while (current < lines.length) {
+      const physical = lines[current];
+      if (
+        isYamlDocumentBoundary(physical.text) ||
+        !physical.text.trim() ||
+        indentationOf(physical.text) <= runBlockIndent
+      ) {
+        break;
+      }
+      const part = physical.text.trim();
+      physical.continuedCurlCommandPart = true;
+      const continuation = hasShellLineContinuation(part);
+      const chunk = continuation ? part.replace(/\\\s*$/u, "").trimEnd() : part;
+      consumed += 1;
+      totalChars += chunk.length + (chunks.length ? 1 : 0);
+      if (consumed > MAX_WINDOW_LINES || totalChars > MAX_WINDOW_CHARS) {
+        exceeded = true;
+        break;
+      }
+      chunks.push(chunk);
+      if (!continuation) {
+        complete = true;
+        current += 1;
+        break;
+      }
+      current += 1;
+    }
+
+    if (exceeded) {
+      addWarning(
+        "continued-curl-command-limit",
+        firstLine.line,
+        `A continued curl command exceeds the ${MAX_WINDOW_LINES}-line or ${MAX_WINDOW_CHARS}-character scan limit and was not joined.`,
+        firstLine.raw,
+      );
+      previousContinues = false;
+      index = Math.max(index + 1, current + 1);
+      continue;
+    }
+    if (!complete) {
+      addWarning(
+        "continued-curl-command-unclosed",
+        firstLine.line,
+        "A continued curl command ended before a bounded completion could be confirmed.",
+        firstLine.raw,
+      );
+      previousContinues = false;
+      index = Math.max(index + 1, current);
+      continue;
+    }
+
+    if (curlCheckRunNameExpression(chunks.join(" "), reserved)) {
+      addMatch("reserved-check-run-name", firstLine.line, firstLine.raw);
+    }
+    previousContinues = false;
+    index = current;
+  }
+}
+
+function hasShellLineContinuation(value) {
+  const trailingSlashes = value.match(/\\+\s*$/u)?.[0].trimEnd().length ?? 0;
+  return trailingSlashes % 2 === 1;
 }
 
 function runCommand(text) {
@@ -450,8 +657,22 @@ function markYamlJobNameFields(lines) {
   let jobsIndent = null;
   let jobIndent = null;
   let jobPropertyIndent = null;
+  let stepsIndent = null;
+  let stepIndent = null;
+  let stepPropertyIndent = null;
   for (const line of lines) {
+    if (isYamlDocumentBoundary(line.text)) {
+      jobsIndent = null;
+      jobIndent = null;
+      jobPropertyIndent = null;
+      stepsIndent = null;
+      stepIndent = null;
+      stepPropertyIndent = null;
+      continue;
+    }
     if (!line.text.trim()) continue;
+    line.flowJobFields = flowStyleJobFields(line.text);
+    line.flowStepUses = flowStyleStepUses(line.text);
     const indent = indentationOf(line.text);
     const text = line.text.trim();
     const key = simpleYamlKey(text);
@@ -459,6 +680,9 @@ function markYamlJobNameFields(lines) {
       jobsIndent = indent;
       jobIndent = null;
       jobPropertyIndent = null;
+      stepsIndent = null;
+      stepIndent = null;
+      stepPropertyIndent = null;
       continue;
     }
     if (jobsIndent === null) continue;
@@ -466,31 +690,118 @@ function markYamlJobNameFields(lines) {
       jobsIndent = null;
       jobIndent = null;
       jobPropertyIndent = null;
+      stepsIndent = null;
+      stepIndent = null;
+      stepPropertyIndent = null;
       continue;
     }
     if (jobIndent === null || indent === jobIndent) {
       if (key !== null) {
         jobIndent = indent;
         jobPropertyIndent = null;
+        stepsIndent = null;
+        stepIndent = null;
+        stepPropertyIndent = null;
+        line.inlineJobFields = simpleInlineJobFields(text.slice(text.indexOf(":") + 1));
       }
       continue;
     }
     if (jobPropertyIndent === null) jobPropertyIndent = indent;
-    if (indent === jobPropertyIndent && key?.toLowerCase() === "name") {
-      line.jobNameField = true;
+    if (indent === jobPropertyIndent) {
+      if (key?.toLowerCase() === "name") line.jobNameField = true;
+      if (key?.toLowerCase() === "uses") {
+        markSelectorUse(line);
+      }
+      if (key?.toLowerCase() === "steps") {
+        stepsIndent = indent;
+        stepIndent = null;
+        stepPropertyIndent = null;
+      } else if (stepsIndent !== null) {
+        stepsIndent = null;
+        stepIndent = null;
+        stepPropertyIndent = null;
+      }
+      continue;
+    }
+    if (stepsIndent === null) continue;
+    if (indent <= stepsIndent) {
+      stepsIndent = null;
+      stepIndent = null;
+      stepPropertyIndent = null;
+      continue;
+    }
+    if (/^\s*-\s+/u.test(line.text)) {
+      stepIndent = indent;
+      stepPropertyIndent = null;
+      if (key?.toLowerCase() === "uses") {
+        markSelectorUse(line);
+      }
+      continue;
+    }
+    if (stepIndent !== null && indent > stepIndent) {
+      if (stepPropertyIndent === null) stepPropertyIndent = indent;
+      if (indent === stepPropertyIndent && key?.toLowerCase() === "uses") {
+        markSelectorUse(line);
+      }
     }
   }
 }
 
+function markSelectorUse(line) {
+  const field = fieldsOnLine(line.text).find(
+    (candidate) =>
+      candidate.key.toLowerCase() === "uses" &&
+      /^\s*(?:-\s*)?["']?$/u.test(line.text.slice(0, candidate.start)),
+  );
+  if (!field) return;
+  line.selectorUseStarts ??= new Set();
+  line.selectorUseStarts.add(field.start);
+}
+
+function flowStyleStepUses(text) {
+  if (!/(?:^|[,{])\s*(?:"jobs"|'jobs'|jobs)\s*:\s*\{/u.test(text)) return [];
+  const stepUses = [];
+  const steps = /(?:^|[,{])\s*(?:"steps"|'steps'|steps)\s*:\s*\[([^\]]{0,2048})\]/gu;
+  for (const stepsMatch of text.matchAll(steps)) {
+    const body = stepsMatch[1];
+    const selector = /(?:^|,)\s*\{\s*(?:"uses"|'uses'|uses)\s*:\s*([^,}\n]+)/gu;
+    for (const match of body.matchAll(selector)) {
+      stepUses.push({ key: "uses", value: match[1].trim() });
+    }
+  }
+  return stepUses;
+}
+
 function simpleYamlKey(text) {
-  const match = text.match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*:/u);
+  const normalized = text.replace(/^\s*-\s+/u, "");
+  const match = normalized.match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*:/u);
   return match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
 }
 
-function flowStyleJobNameFields(text) {
-  const jobs = /\bjobs\s*:\s*\{\s*[A-Za-z0-9_-]+\s*:\s*\{([^{}]*)\}/u.exec(text);
-  if (!jobs) return [];
-  return fieldsOnLine(jobs[1]).filter((field) => isNameField(field.key));
+function flowStyleJobFields(text) {
+  const result = { names: [], uses: [] };
+  const jobsPattern = /(?:^|[,{])\s*(?:"jobs"|'jobs'|jobs)\s*:\s*\{((?:[^{}]|\{[^{}]*\})*)\}/gu;
+  const jobPattern = /(?:^|,)\s*(?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\s*:\s*\{([^{}]*)\}/gu;
+  for (const jobs of text.matchAll(jobsPattern)) {
+    for (const job of jobs[1].matchAll(jobPattern)) {
+      for (const field of fieldsOnLine(job[1])) {
+        if (isNameField(field.key)) result.names.push(field);
+        if (field.key.toLowerCase() === "uses") result.uses.push(field);
+      }
+    }
+  }
+  return result;
+}
+
+function simpleInlineJobFields(value) {
+  const body = value.trim().match(/^\{\s*([^{}]*)\}\s*,?$/u);
+  if (!body) return null;
+  const result = { names: [], uses: [] };
+  for (const field of fieldsOnLine(body[1])) {
+    if (isNameField(field.key)) result.names.push(field);
+    if (field.key.toLowerCase() === "uses") result.uses.push(field);
+  }
+  return result;
 }
 
 function stripYamlAnchor(value) {
