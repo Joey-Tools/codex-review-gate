@@ -7233,6 +7233,10 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       // Ordinary preflight accepts this documented heuristic false negative.
       "jobs:\n  build:\n    steps:\n      - { uses: JoeyTeng/codex-review-gate-action@v2 }\n",
     ],
+    [
+      "echo-cli-context-reference",
+      "jobs:\n  build:\n    steps:\n      - run: echo -f context=codex/github-review-gate\n",
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7273,6 +7277,21 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "scalar-alias-caller",
       "env: { ACTION: &gate JoeyTeng/codex-review-gate-action@v2 }\njobs:\n  build:\n    steps:\n      - uses: *gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gate-step-under-env-job-id",
+      "jobs:\n  env:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gate-step-under-with-job-id",
+      "jobs:\n  with:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-status-context-publisher",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/statuses/$SHA --raw-field context=codex/github-review-gate\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

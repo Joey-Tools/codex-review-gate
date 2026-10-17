@@ -495,7 +495,16 @@ function useFieldExpressions(text) {
 }
 
 function cliContextExpression(text) {
-  return cliFieldExpression(text, "context");
+  const command = runCommand(text);
+  if (!/^gh\s+api(?:\s|$)/iu.test(command)) return null;
+  if (!/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(command)) return null;
+  if (hasExplicitNonPostGitHubApiMethod(command)) return null;
+  return cliFieldExpression(command, "context");
+}
+
+function hasExplicitNonPostGitHubApiMethod(command) {
+  const method = command.match(/(?:^|\s)(?:-X|--method)(?:=|\s+)([A-Za-z]+)/iu);
+  return method !== null && method[1].toUpperCase() !== "POST";
 }
 
 function cliCheckRunNameExpression(text) {
@@ -822,10 +831,19 @@ function markSelectorUse(line) {
 function markYamlDataAndScalarFields(lines) {
   let scalarKeyIndent = null;
   const dataMappingIndents = [];
+  const workflow = {
+    jobsIndent: null,
+    jobIndent: null,
+    jobPropertyIndent: null,
+    stepsIndent: null,
+    stepIndent: null,
+    stepPropertyIndent: null,
+  };
   for (const line of lines) {
     if (isYamlDocumentBoundary(line.text)) {
       scalarKeyIndent = null;
       dataMappingIndents.length = 0;
+      resetWorkflowYamlScope(workflow);
       continue;
     }
     if (!line.text.trim()) continue;
@@ -850,14 +868,85 @@ function markYamlDataAndScalarFields(lines) {
       !line.yamlDataField &&
       mapping &&
       /^(?:env|with)$/iu.test(mapping.key) &&
-      !mapping.value.trim()
+      !mapping.value.trim() &&
+      isWorkflowYamlProperty(line, mapping, workflow)
     ) {
       dataMappingIndents.push(mapping.indent);
+    } else if (!line.yamlDataField) {
+      isWorkflowYamlProperty(line, mapping, workflow);
     }
     if (mapping && isBlockScalarIndicator(stripYamlAnchor(mapping.value))) {
       scalarKeyIndent = mapping.indent;
     }
   }
+}
+
+function isWorkflowYamlProperty(line, mapping, scope) {
+  const indent = indentationOf(line.text);
+  const key = mapping?.key.toLowerCase() ?? null;
+  if (key === "jobs" && !mapping.value.trim()) {
+    scope.jobsIndent = indent;
+    scope.jobIndent = null;
+    scope.jobPropertyIndent = null;
+    scope.stepsIndent = null;
+    scope.stepIndent = null;
+    scope.stepPropertyIndent = null;
+    return false;
+  }
+  if (scope.jobsIndent === null) return indent === 0;
+  if (indent <= scope.jobsIndent) {
+    resetWorkflowYamlScope(scope);
+    return indent === 0;
+  }
+  if (scope.jobIndent === null || indent === scope.jobIndent) {
+    if (mapping) {
+      scope.jobIndent = indent;
+      scope.jobPropertyIndent = null;
+      scope.stepsIndent = null;
+      scope.stepIndent = null;
+      scope.stepPropertyIndent = null;
+    }
+    return false;
+  }
+  if (scope.jobPropertyIndent === null) scope.jobPropertyIndent = indent;
+  if (indent === scope.jobPropertyIndent) {
+    if (key === "steps") {
+      scope.stepsIndent = indent;
+      scope.stepIndent = null;
+      scope.stepPropertyIndent = null;
+    } else if (scope.stepsIndent !== null) {
+      scope.stepsIndent = null;
+      scope.stepIndent = null;
+      scope.stepPropertyIndent = null;
+    }
+    return true;
+  }
+  if (scope.stepsIndent === null) return false;
+  if (indent <= scope.stepsIndent) {
+    scope.stepsIndent = null;
+    scope.stepIndent = null;
+    scope.stepPropertyIndent = null;
+    return false;
+  }
+  if (/^\s*-\s+/u.test(line.text)) {
+    scope.stepIndent = indent;
+    scope.stepPropertyIndent = null;
+    return true;
+  }
+  if (scope.stepIndent !== null && indent > scope.stepIndent) {
+    if (scope.stepPropertyIndent === null) scope.stepPropertyIndent = indent;
+    return indent === scope.stepPropertyIndent;
+  }
+  return false;
+}
+
+function resetWorkflowYamlScope(scope) {
+  scope.jobsIndent = null;
+  scope.jobIndent = null;
+  scope.jobPropertyIndent = null;
+  scope.stepsIndent = null;
+  scope.stepIndent = null;
+  scope.stepPropertyIndent = null;
 }
 
 function simpleYamlMapping(text) {

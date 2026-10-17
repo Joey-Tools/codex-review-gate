@@ -233,6 +233,35 @@ test("keeps context-like keys inside block env and with mappings as data", () =>
   assert.deepEqual(result.matches, []);
 });
 
+test("keeps jobs named env or with eligible for actual gate callers", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  env:",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  with:",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  ordinary:",
+    "    env:",
+    "      REVIEW_CONTEXT: codex/github-review-gate",
+    "    steps:",
+    "      - run: echo data only",
+    "        with:",
+    "          CHECK_CONTEXT: codex/github-review-gate",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    [
+      "codex-review-gate-action-caller",
+      "codex-review-gate-action-caller",
+      "codex-review-gate-action-caller",
+    ],
+  );
+});
+
 test("ignores YAML-looking block scalar contents while retaining selectors and run publishers", () => {
   const selectors = inspectWorkflowGateSignals([
     "jobs:",
@@ -397,6 +426,18 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
   ].join("\n"));
   assert.equal(cli.matches.length, 3);
   assert.ok(cli.matches.every(({ kind }) => kind === "reserved-status-context"));
+
+  const nonPublishers = inspectWorkflowGateSignals([
+    "run: echo -f context=codex/github-review-gate",
+    "run: jq -f context=codex/github-review-gate",
+    "run: gh api repos/o/r/statuses/$SHA --method GET --raw-field context=codex/github-review-gate",
+    "run: gh api repos/o/r/releases --raw-field context=codex/github-review-gate",
+  ].join("\n"));
+  assert.deepEqual(nonPublishers.matches, []);
+  assert.equal(
+    nonPublishers.warnings.filter(({ kind }) => kind === "reserved-status-context-reference").length,
+    4,
+  );
 
   const inline = inspectWorkflowGateSignals([
     "check-name: codex/github-review-gate",
