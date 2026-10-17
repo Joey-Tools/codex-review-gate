@@ -7265,6 +7265,22 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "unrelated-rest-endpoint-with-check-run-marker",
       "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/issues --method POST -f body=/check-runs -f name=codex/github-review-gate\n",
     ],
+    [
+      "nested-container-env-data",
+      "jobs:\n  build:\n    container:\n      image: ubuntu:24.04\n      env:\n        context: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "reusable-caller-secret-data",
+      "jobs:\n  build:\n    uses: example/reusable/.github/workflows/build.yml@v1\n    secrets:\n      context: codex/github-review-gate\n",
+    ],
+    [
+      "echo-flags-after-gh-command",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method POST && echo -f name=codex/github-review-gate\n",
+    ],
+    [
+      "isolated-shell-first-step-literals",
+      'jobs:\n  build:\n    steps:\n      - shell: bash\n        run: NAME=codex/github-review-gate\n      - shell: bash\n        run: context="$NAME"\n',
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7328,6 +7344,11 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
+      "gate-step-under-secrets-job-id",
+      "jobs:\n  secrets:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
       "gh-status-context-publisher",
       "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/statuses/$SHA --raw-field context=codex/github-review-gate\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
@@ -7382,6 +7403,11 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "gh-api-quoted-check-run-endpoint",
       "jobs:\n  publish:\n    steps:\n      - run: gh api 'repos/example/repo/check-runs/123' --method PATCH -f name=codex/github-review-gate -f conclusion=success\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "publisher-before-compound-boundary",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method POST -f name=codex/github-review-gate -f head_sha=$SHA && echo ready\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

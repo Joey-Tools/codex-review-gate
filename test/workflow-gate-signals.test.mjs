@@ -323,6 +323,26 @@ test("keeps context-like keys inside block env, with, and outputs mappings as da
   assert.deepEqual(result.matches, []);
 });
 
+test("keeps nested container env and reusable caller secrets values as data", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    container:",
+    "      env:",
+    "        context: codex/github-review-gate",
+    "        check-name: codex/github-review-gate",
+    "    steps:",
+    "      - run: echo data only",
+    "  reusable:",
+    "    uses: owner/repo/.github/workflows/reusable.yml@v1",
+    "    secrets:",
+    "      context: codex/github-review-gate",
+    "      check-name: codex/github-review-gate",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches, []);
+});
+
 test("keeps jobs named env or with eligible for actual gate callers", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -366,6 +386,28 @@ test("keeps a job named outputs eligible for real gate signals", () => {
   assert.deepEqual(
     result.matches.map(({ kind }) => kind),
     ["reserved-job-name", "codex-review-gate-action-caller"],
+  );
+});
+
+test("keeps data-map-like job IDs eligible for actual names and selectors", () => {
+  const jobIds = ["env", "with", "outputs", "secrets"];
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    ...jobIds.flatMap((jobId) => [
+      `  ${jobId}:`,
+      "    name: codex/github-review-gate",
+      "    steps:",
+      "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    ]),
+  ].join("\n"));
+
+  assert.equal(
+    result.matches.filter(({ kind }) => kind === "reserved-job-name").length,
+    jobIds.length,
+  );
+  assert.equal(
+    result.matches.filter(({ kind }) => kind === "codex-review-gate-action-caller").length,
+    jobIds.length,
   );
 });
 
@@ -560,6 +602,37 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
     `const payload = JSON.parse('{"context":"codex/github-review-gate"}');`,
   ].join("\n"));
   assert.equal(inline.matches.length, 3);
+});
+
+test("limits CLI publisher fields and methods to the first shell command", () => {
+  const firstCommandWriter = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate && echo --method GET -f name=other",
+  );
+  assert.deepEqual(
+    firstCommandWriter.matches.map(({ kind }) => kind),
+    ["reserved-check-run-name"],
+  );
+
+  for (const command of [
+    "run: gh api repos/o/r/check-runs && echo -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -f context=ordinary; echo -f context=codex/github-review-gate",
+    "run: gh api repos/o/r/releases; gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ]) {
+    assert.deepEqual(inspectWorkflowGateSignals(command).matches, [], command);
+  }
+
+  const quotedSeparators = inspectWorkflowGateSignals(
+    "run: gh api graphql -f 'query={ checkRuns; statuses & other | fields }' -f context=codex/github-review-gate",
+  );
+  assert.deepEqual(quotedSeparators.matches, []);
+
+  const quotedPayloadWriter = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/statuses/$SHA -f note='first; second | third' --raw-field context=codex/github-review-gate",
+  );
+  assert.deepEqual(
+    quotedPayloadWriter.matches.map(({ kind }) => kind),
+    ["reserved-status-context"],
+  );
 });
 
 test("finds a reserved CheckRun name only beside the explicit check-runs API", () => {
@@ -924,6 +997,19 @@ test("does not join local literals across step or job boundaries", () => {
   ].join("\n"));
 
   assert.deepEqual(result.matches, []);
+
+  const unrecognizedFirstStepFields = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - run: prefix='codex/'",
+    "      - shell: bash",
+    "        run: suffix='github-review-gate'",
+    "      - working-directory: .",
+    '        run: context="$prefix$suffix"',
+  ].join("\n"));
+
+  assert.deepEqual(unrecognizedFirstStepFields.matches, []);
 });
 
 test("ignores comment-only signals and CRLF is counted as one line break", () => {

@@ -23,13 +23,15 @@ The following eight PR #128 review examples are intentionally accepted as warnin
 
 These accepted scanner-coverage examples do not by themselves establish a security regression or change runtime evidence. They also do not waive ordinary runtime handling of unresolved review findings.
 
-The false-negative allowance does not justify treating known data as execution. Context-like fields inside `env`, `with` or job `outputs` data, and YAML-looking selector text inside block scalars, are not by themselves proof of a publisher or caller. The scanner keeps those references nonblocking while retaining its separate recognition of actual command/API publishing patterns. An environment, input or output value may still flow into a publisher; tracing that data flow remains outside this preflight. This distinction is bounded source classification, not a promise of complete YAML or shell semantics.
+The false-negative allowance does not justify treating known data as execution. Context-like fields inside `env`, `with`, `outputs` or `secrets` data, including nested container environment mappings, and YAML-looking selector text inside block scalars, are not by themselves proof of a publisher or caller. The scanner keeps those references nonblocking while retaining its separate recognition of actual command/API publishing patterns. An environment, input, output or secret value may still flow into a publisher; tracing that data flow remains outside this preflight. This distinction is bounded source classification, not a promise of complete YAML or shell semantics.
 
-Here, `env` / `with` / `outputs` means mapping properties, not a job ID with the same spelling. Likewise, CLI-shaped output text such as `echo -f context=...` is not a publishing command. A bounded folded job name is compared as a complete value, not a single physical line; incomplete or over-budget values warn rather than proving a collision from a prefix.
+Here, `env` / `with` / `outputs` / `secrets` means mapping properties, not a job ID with the same spelling. Likewise, CLI-shaped output text such as `echo -f context=...` is not a publishing command. A bounded folded job name is compared as a complete value, not a single physical line; incomplete or over-budget values warn rather than proving a collision from a prefix. Known YAML step boundaries reset local literal tracking regardless of the first step field; list-looking text inside data or a scalar is not an execution boundary.
 
 The supported `gh api` publishing matches exclude recognized explicit GET/HEAD method forms for both context and CheckRun-name fields. Other recognized command fields remain candidates, including a PATCH CheckRun-name update; non-POST does not mean read-only. Unsupported command forms remain outside the completeness guarantee.
 
 Endpoint classification uses the leading literal endpoint directly after `gh api`, allowing simple surrounding quotes. Endpoint-like text inside a GraphQL query, header or other payload is not an endpoint. This deliberately does not interpret arbitrary argument ordering, option arity or shell expansion; option-before-endpoint and other unsupported forms can remain warning-only coverage limits.
+
+The supported CLI match is confined to the first command before an unquoted shell separator. Flags belonging to a later command are not request parameters of the first one. This bounded prefix scan is not a full shell parser or a guarantee of detecting writers in later commands or complex substitutions.
 
 ## Safeguards that remain strict
 

@@ -560,7 +560,7 @@ function useFieldExpressions(text) {
 }
 
 function cliContextExpression(text) {
-  const command = runCommand(text);
+  const command = firstShellCommand(runCommand(text));
   const endpoint = cliApiEndpoint(command);
   if (endpoint === null || !/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(endpoint)) return null;
   if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
@@ -579,7 +579,7 @@ function hasExplicitReadOnlyGitHubApiMethod(command) {
 }
 
 function cliCheckRunNameExpression(text) {
-  const command = runCommand(text);
+  const command = firstShellCommand(runCommand(text));
   const endpoint = cliApiEndpoint(command);
   if (endpoint === null || !/\/check-runs(?:[/?#\s]|$)/iu.test(endpoint)) return null;
   if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
@@ -753,6 +753,34 @@ function hasShellLineContinuation(value) {
 
 function runCommand(text) {
   return text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu)?.[1]?.trim() ?? text.trim();
+}
+
+function firstShellCommand(command) {
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === ";" || character === "&" || character === "|") {
+      return command.slice(0, index).trim();
+    }
+  }
+  return command.trim();
 }
 
 function cliFieldExpression(text, field) {
@@ -939,17 +967,20 @@ function markYamlDataAndScalarFields(lines) {
       dataMappingIndents.pop();
     }
     line.yamlDataField = dataMappingIndents.length > 0;
+    const workflowProperty = !line.yamlDataField && isWorkflowYamlProperty(line, mapping, workflow);
+    const nestedJobProperty =
+      workflow.jobsIndent !== null &&
+      workflow.jobIndent !== null &&
+      fieldIndent > workflow.jobIndent;
 
     if (
       !line.yamlDataField &&
       mapping &&
-      /^(?:env|with|outputs)$/iu.test(mapping.key) &&
+      /^(?:env|with|outputs|secrets)$/iu.test(mapping.key) &&
       !mapping.value.trim() &&
-      isWorkflowYamlProperty(line, mapping, workflow)
+      (workflowProperty || nestedJobProperty)
     ) {
       dataMappingIndents.push(mapping.indent);
-    } else if (!line.yamlDataField) {
-      isWorkflowYamlProperty(line, mapping, workflow);
     }
     if (mapping && isBlockScalarIndicator(stripYamlAnchor(mapping.value))) {
       scalarKeyIndent = mapping.indent;
@@ -1007,6 +1038,7 @@ function isWorkflowYamlProperty(line, mapping, scope) {
   if (/^\s*-\s+/u.test(line.text)) {
     scope.stepIndent = indent;
     scope.stepPropertyIndent = null;
+    line.yamlStepBoundary = true;
     return true;
   }
   if (scope.stepIndent !== null && indent > scope.stepIndent) {
@@ -1413,7 +1445,10 @@ function splitScopes(lines) {
   const scopes = [];
   let scope = [];
   for (const line of lines) {
-    if (scope.length && isScopeBoundary(line.text)) {
+    const boundary =
+      line.yamlStepBoundary ||
+      (!line.yamlScalarContent && !line.yamlDataField && isScopeBoundary(line.text));
+    if (scope.length && boundary) {
       scopes.push(scope);
       scope = [];
     }
@@ -1427,8 +1462,7 @@ function isScopeBoundary(text) {
   return (
     /^\s*---\s*$/u.test(text) ||
     /^\S[A-Za-z0-9_-]*:\s*$/u.test(text) ||
-    /^ {2}[A-Za-z0-9_-]+:\s*$/u.test(text) ||
-    /^\s{4,}-\s+(?:name|uses|run|id)\s*:/iu.test(text)
+    /^ {2}[A-Za-z0-9_-]+:\s*$/u.test(text)
   );
 }
 
