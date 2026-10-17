@@ -29,6 +29,8 @@ Here, `env` / `with` / `outputs` means mapping properties, not a job ID with the
 
 The supported `gh api` publishing matches exclude recognized explicit GET/HEAD method forms for both context and CheckRun-name fields. Other recognized command fields remain candidates, including a PATCH CheckRun-name update; non-POST does not mean read-only. Unsupported command forms remain outside the completeness guarantee.
 
+Endpoint classification uses the leading literal endpoint directly after `gh api`, allowing simple surrounding quotes. Endpoint-like text inside a GraphQL query, header or other payload is not an endpoint. This deliberately does not interpret arbitrary argument ordering, option arity or shell expansion; option-before-endpoint and other unsupported forms can remain warning-only coverage limits.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

@@ -546,6 +546,14 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
     4,
   );
 
+  const endpointMarkersInData = inspectWorkflowGateSignals([
+    "run: gh api graphql -f 'query={ checkRuns # /check-runs /statuses/$SHA }' -f name=codex/github-review-gate",
+    "run: gh api graphql -f 'query={ statuses # /statuses/$SHA /check-runs }' -f context=codex/github-review-gate",
+    "run: gh api repos/o/r/releases -f note='/check-runs /statuses/$SHA' -f name=codex/github-review-gate",
+    "run: gh api --header=example/check-runs graphql -f name=codex/github-review-gate",
+  ].join("\n"));
+  assert.deepEqual(endpointMarkersInData.matches, []);
+
   const inline = inspectWorkflowGateSignals([
     "check-name: codex/github-review-gate",
     `const payload = { context: "codex/github-review-gate" };`,
@@ -566,6 +574,12 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   );
   assert.equal(rawField.matches.length, 1);
   assert.equal(rawField.matches[0].kind, "reserved-check-run-name");
+
+  const quotedEndpoint = inspectWorkflowGateSignals(
+    "run: gh api '/repos/o/r/check-runs' --method PATCH -f name=codex/github-review-gate",
+  );
+  assert.equal(quotedEndpoint.matches.length, 1);
+  assert.equal(quotedEndpoint.matches[0].kind, "reserved-check-run-name");
 
   const explicitPost = inspectWorkflowGateSignals(
     "run: gh api repos/o/r/check-runs --method POST -f name=codex/github-review-gate",

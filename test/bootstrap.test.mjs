@@ -7253,6 +7253,18 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "folded-job-name-with-prefix-at-eof",
       "jobs:\n  build:\n    name: >-\n      Build\n      codex/github-review-gate\n",
     ],
+    [
+      "graphql-variable-with-check-run-marker",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          gh api graphql -f 'query=query { viewer { login } } # /check-runs marker' -f name=codex/github-review-gate\n",
+    ],
+    [
+      "graphql-variable-with-status-marker",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          gh api graphql -f 'query=query { viewer { login } } # /statuses/HEAD marker' -f context=codex/github-review-gate\n",
+    ],
+    [
+      "unrelated-rest-endpoint-with-check-run-marker",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/issues --method POST -f body=/check-runs -f name=codex/github-review-gate\n",
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7365,6 +7377,11 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "gh-api-patch-reserved-check-run",
       "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs/123 --method PATCH -f name=codex/github-review-gate -f conclusion=success\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-api-quoted-check-run-endpoint",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api 'repos/example/repo/check-runs/123' --method PATCH -f name=codex/github-review-gate -f conclusion=success\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

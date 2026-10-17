@@ -561,10 +561,16 @@ function useFieldExpressions(text) {
 
 function cliContextExpression(text) {
   const command = runCommand(text);
-  if (!/^gh\s+api(?:\s|$)/iu.test(command)) return null;
-  if (!/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(command)) return null;
+  const endpoint = cliApiEndpoint(command);
+  if (endpoint === null || !/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(endpoint)) return null;
   if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
   return cliFieldExpression(command, "context");
+}
+
+function cliApiEndpoint(command) {
+  const match = command.match(/^gh\s+api\s+(?:"([^"]*)"|'([^']*)'|([^\s]+))/iu);
+  const endpoint = match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
+  return endpoint?.startsWith("-") ? null : endpoint;
 }
 
 function hasExplicitReadOnlyGitHubApiMethod(command) {
@@ -574,7 +580,8 @@ function hasExplicitReadOnlyGitHubApiMethod(command) {
 
 function cliCheckRunNameExpression(text) {
   const command = runCommand(text);
-  if (!/^gh\s+api(?:\s|$)/iu.test(command) || !/\/check-runs(?:[/?#\s]|$)/iu.test(command)) return null;
+  const endpoint = cliApiEndpoint(command);
+  if (endpoint === null || !/\/check-runs(?:[/?#\s]|$)/iu.test(endpoint)) return null;
   if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
   return cliFieldExpression(command, "name");
 }
