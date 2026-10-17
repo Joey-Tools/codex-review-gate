@@ -56,6 +56,28 @@ test("finds a reserved job name nested under a flow-style root mapping", () => {
     inspectWorkflowGateSignals("context: checkXname", { reservedCheckName: "check.name" }).matches.length,
     0,
   );
+
+  for (const content of [
+    "jobs: {test: {name: codex/github-review-gate, permissions: {contents: read}, runs-on: ubuntu-latest}}",
+    "jobs:\n  test: {name: codex/github-review-gate, permissions: {contents: read}}",
+  ]) {
+    const nestedProperties = inspectWorkflowGateSignals(content);
+    assert.equal(nestedProperties.matches.length, 1, content);
+    assert.equal(nestedProperties.matches[0].kind, "reserved-job-name", content);
+  }
+});
+
+test("bounds flow collection traversal and warns without classifying overflow", () => {
+  const nested = `{jobs: {test: {name: codex/github-review-gate, permissions: ${"{".repeat(9)}x${"}".repeat(9)}}}}`;
+  const tooDeep = inspectWorkflowGateSignals(nested);
+  assert.deepEqual(tooDeep.matches, []);
+  assert.ok(tooDeep.warnings.some(({ kind }) => kind === "ambiguous-flow-structure"));
+
+  const tooLong = inspectWorkflowGateSignals(
+    `{jobs: {test: {name: codex/github-review-gate, metadata: '${"x".repeat(2100)}'}}}`,
+  );
+  assert.deepEqual(tooLong.matches, []);
+  assert.ok(tooLong.warnings.some(({ kind }) => kind === "ambiguous-flow-structure"));
 });
 
 test("finds a reserved job name in a bounded folded scalar", () => {
@@ -153,6 +175,19 @@ test("blocks only job and step uses selectors, warning on unrelated uses data", 
   );
   assert.equal(flowStepSelector.matches.length, 1);
   assert.equal(flowStepSelector.matches[0].kind, "codex-review-gate-action-caller");
+
+  for (const content of [
+    "jobs: {build: {steps: [{name: gate, uses: JoeyTeng/codex-review-gate-action@v2, with: {uses: JoeyTeng/codex-review-gate-action@v1}}]}}",
+    [
+      "jobs:",
+      "  build:",
+      "    steps: [{name: gate, uses: JoeyTeng/codex-review-gate-action@v2, with: {uses: JoeyTeng/codex-review-gate-action@v1}}]",
+    ].join("\n"),
+  ]) {
+    const laterStepSelector = inspectWorkflowGateSignals(content);
+    assert.equal(laterStepSelector.matches.length, 1, content);
+    assert.equal(laterStepSelector.matches[0].kind, "codex-review-gate-action-caller");
+  }
 
   const data = inspectWorkflowGateSignals([
     "with: { uses: JoeyTeng/codex-review-gate-action@v2 }",
@@ -286,9 +321,10 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
   const cli = inspectWorkflowGateSignals([
     "run: gh api repos/example/check-runs -f context=codex/github-review-gate",
     "run: gh api repos/example/check-runs --field 'context=codex/github-review-gate'",
+    "run: gh api repos/o/r/statuses/$SHA --raw-field context=codex/github-review-gate",
     "run: gh api repos/example/check-runs -f context=codex/github-review-gate-extra",
   ].join("\n"));
-  assert.equal(cli.matches.length, 2);
+  assert.equal(cli.matches.length, 3);
   assert.ok(cli.matches.every(({ kind }) => kind === "reserved-status-context"));
 
   const inline = inspectWorkflowGateSignals([
@@ -305,6 +341,12 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   );
   assert.equal(publisher.matches.length, 1);
   assert.equal(publisher.matches[0].kind, "reserved-check-run-name");
+
+  const rawField = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs --raw-field name=codex/github-review-gate",
+  );
+  assert.equal(rawField.matches.length, 1);
+  assert.equal(rawField.matches[0].kind, "reserved-check-run-name");
 
   const unrelated = inspectWorkflowGateSignals(
     "run: gh api repos/example/releases -f name=codex/github-review-gate",
@@ -341,6 +383,33 @@ test("finds inline JSON CheckRun POST names across common curl data flags", () =
     "run: jq '.name == \"codex/github-review-gate\"' payload.json",
     `run: curl -X POST -d '{"name":"codex/github-review-gate"}'`,
     "run: echo https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(nonPublishers.matches, []);
+});
+
+test("finds only explicit commit-status POST publishers in bounded curl commands", () => {
+  const publisher = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+  );
+  assert.equal(publisher.matches.length, 1);
+  assert.equal(publisher.matches[0].kind, "reserved-status-context");
+
+  const continued = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    `            -d '{"context":"codex/github-review-gate"}' \\`,
+    "            https://api.github.com/repos/o/r/statuses/$SHA",
+  ].join("\n"));
+  assert.equal(continued.matches.length, 1);
+  assert.equal(continued.matches[0].kind, "reserved-status-context");
+
+  const nonPublishers = inspectWorkflowGateSignals([
+    `run: curl -X GET -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/releases`,
+    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA; echo done`,
   ].join("\n"));
   assert.deepEqual(nonPublishers.matches, []);
 });

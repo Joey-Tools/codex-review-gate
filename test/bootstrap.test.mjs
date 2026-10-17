@@ -7212,6 +7212,10 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "with-uses-input",
       "jobs:\n  build:\n    steps:\n      - uses: actions/github-script@v7\n        with:\n          uses: JoeyTeng/codex-review-gate-action@v2\n          script: core.info('ordinary input')\n",
     ],
+    [
+      "nested-flow-with-uses-data-only",
+      'jobs: {test: {steps: [{name: metadata, uses: actions/github-script@v7, with: {uses: JoeyTeng/codex-review-gate-action@v2}}]}}\n',
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
@@ -7237,6 +7241,16 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "flow-root-jobs",
       "{name: Test, on: push, jobs: {collision: {name: codex/github-review-gate}}}\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "flow-step-gate-caller",
+      "jobs: {test: {steps: [{name: gate, uses: JoeyTeng/codex-review-gate-action@v2}]}}\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "nested-flow-reserved-job-name",
+      "jobs: {test: {name: codex/github-review-gate, permissions: {contents: read}}}\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
@@ -7271,6 +7285,24 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
         "            -d '{\"name\":\"codex/github-review-gate\"}' " + "\\",
         "            https://api.github.com/repos/example/repo/check-runs",
       ].join("\n"),
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "curl-post-json-status-context",
+      [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        "      - run: |",
+        "          curl -X POST https://api.github.com/repos/example/repo/statuses/$SHA " + "\\",
+        "            -H 'Accept: application/vnd.github+json' " + "\\",
+        "            -d '{\"context\":\"codex/github-review-gate\",\"state\":\"success\"}'",
+      ].join("\n"),
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-api-implicit-post-reserved-check-run",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs --raw-field name=codex/github-review-gate\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

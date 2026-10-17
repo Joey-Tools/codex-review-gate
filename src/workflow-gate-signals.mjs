@@ -7,6 +7,8 @@ const MAX_WINDOW_CHARS = 2048;
 const MAX_FINDINGS = 32;
 const MAX_YAML_SCALAR_ANCHORS = 32;
 const MAX_YAML_ANCHOR_VALUE_CHARS = 512;
+const MAX_FLOW_COLLECTION_CHARS = 2048;
+const MAX_FLOW_COLLECTION_DEPTH = 8;
 
 const ACTION_CALLERS = [
   /^JoeyTeng\/codex-review-gate-action(?:\/\.github\/workflows\/codex-review-gate\.ya?ml)?@[^\s,}"']+$/iu,
@@ -207,7 +209,17 @@ export function inspectWorkflowGateSignals(
 }
 
 function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning) {
-  const fields = fieldsOnLine(line.text);
+  if (line.flowScanAmbiguous) {
+    addWarning(
+      "ambiguous-flow-structure",
+      line.line,
+      `A flow-style jobs or steps collection exceeds the ${MAX_FLOW_COLLECTION_CHARS}-character or ${MAX_FLOW_COLLECTION_DEPTH}-level scan limit, or has unsupported structure; it was not classified.`,
+      line.raw,
+    );
+  }
+  const fields = isRunCommandLine(line.text) || line.continuedCurlCommandPart
+    ? []
+    : fieldsOnLine(line.text);
   const recognizedUses = [];
   const resolveField = (expression) =>
     allowYamlAliases
@@ -265,10 +277,10 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
   if (cliCheckRunName && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) {
     addMatch("reserved-check-run-name", line.line, line.raw);
   }
-  const curlCheckRunName = line.continuedCurlCommandPart
+  const curlSignal = line.continuedCurlCommandPart
     ? null
-    : curlCheckRunNameExpression(line.text, reserved);
-  if (curlCheckRunName) addMatch("reserved-check-run-name", line.line, line.raw);
+    : curlPublisherSignal(line.text, reserved);
+  if (curlSignal) addMatch(curlSignal.kind, line.line, line.raw);
   const exactFieldHandled = fields.some(
     (field) =>
       (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) &&
@@ -277,7 +289,7 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
   const exactCliHandled =
     (cliContext !== null && resolveSimpleLiteral(cliContext, new Map()) === reserved) ||
     (cliCheckRunName !== null && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) ||
-    curlCheckRunName !== null;
+    curlSignal !== null;
   if (
     hasExactToken(line.text, reserved) &&
     !exactFieldHandled &&
@@ -295,15 +307,17 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
 function inspectWindow(window, reserved, addMatch, addWarning) {
   const literals = new Map();
   for (const line of window) {
-    for (const field of fieldsOnLine(line.text)) {
-      if (field.key === "uses") {
-        if (line.selectorUseStarts?.has(field.start)) {
-          inspectCaller(field.value, literals, line, addMatch, addWarning);
+    if (!isRunCommandLine(line.text) && !line.continuedCurlCommandPart) {
+      for (const field of fieldsOnLine(line.text)) {
+        if (field.key === "uses") {
+          if (line.selectorUseStarts?.has(field.start)) {
+            inspectCaller(field.value, literals, line, addMatch, addWarning);
+          }
+          continue;
         }
-        continue;
-      }
-      if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
-        inspectContext(field.key, field.value, literals, line, reserved, addMatch, addWarning);
+        if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
+          inspectContext(field.key, field.value, literals, line, reserved, addMatch, addWarning);
+        }
       }
     }
     for (const field of [
@@ -327,11 +341,11 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
     if (cliCheckRunName) {
       inspectContext("check-run-name", cliCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
-    const curlCheckRunName = line.continuedCurlCommandPart
+    const curlSignal = line.continuedCurlCommandPart
       ? null
-      : curlCheckRunNameExpression(line.text, reserved);
-    if (curlCheckRunName) {
-      inspectContext("check-run-name", curlCheckRunName, literals, line, reserved, addMatch, addWarning);
+      : curlPublisherSignal(line.text, reserved);
+    if (curlSignal) {
+      inspectContext(curlSignal.field, curlSignal.expression, literals, line, reserved, addMatch, addWarning);
     }
 
     for (const statement of splitStatements(line.text)) {
@@ -468,7 +482,7 @@ function cliCheckRunNameExpression(text) {
   return cliFieldExpression(command, "name");
 }
 
-function curlCheckRunNameExpression(text, reserved) {
+function curlPublisherSignal(text, reserved) {
   const command = runCommand(text);
   if (!/^curl(?:\s|$)/iu.test(command)) return null;
   if (hasShellLineContinuation(command)) return null;
@@ -477,22 +491,37 @@ function curlCheckRunNameExpression(text, reserved) {
   const dataMatches = [...command.matchAll(dataOption)];
   if (!dataMatches.length) return null;
   const withoutData = command.replace(dataOption, " ");
+  const checkRunsEndpoint = /https?:\/\/[^/\s"']+\/repos\/[^/\s"']+\/[^/\s"']+\/check-runs(?:[/?#\s"']|$)/iu.test(withoutData);
+  const statusesEndpoint = /https?:\/\/[^/\s"']+\/repos\/[^/\s"']+\/[^/\s"']+\/statuses\/[^/?#\s"']+(?:[/?#\s"']|$)/iu.test(withoutData);
   if (
     /[;&|]/u.test(withoutData) ||
     !/(?:^|\s)(?:-X\s*|--request(?:=|\s+))POST(?:\s|$)/iu.test(withoutData) ||
-    !/https?:\/\/[^/\s"']+\/repos\/[^/\s"']+\/[^/\s"']+\/check-runs(?:[/?#\s"']|$)/iu.test(withoutData)
+    (!checkRunsEndpoint && !statusesEndpoint)
   ) {
     return null;
   }
 
   for (const match of dataMatches) {
     const payload = match[1] ?? match[2] ?? match[3] ?? "";
-    const name = payload.match(/(?:^|[,{])\s*["']name["']\s*:\s*(?:"([^"\\]*)"|'([^'\\]*)')/iu);
-    if (!name) continue;
-    const expression = name[1] === undefined ? `'${name[2]}'` : `"${name[1]}"`;
-    if (resolveSimpleLiteral(expression, new Map()) === reserved) return expression;
+    if (checkRunsEndpoint) {
+      const name = jsonStringField(payload, "name");
+      if (name === reserved) {
+        return { kind: "reserved-check-run-name", field: "check-run-name", expression: JSON.stringify(name) };
+      }
+    }
+    if (statusesEndpoint) {
+      const context = jsonStringField(payload, "context");
+      if (context === reserved) {
+        return { kind: "reserved-status-context", field: "context", expression: JSON.stringify(context) };
+      }
+    }
   }
   return null;
+}
+
+function jsonStringField(payload, key) {
+  const field = payload.match(new RegExp(`(?:^|[,{])\\s*["']${key}["']\\s*:\\s*(?:"([^"\\\\]*)"|'([^'\\\\]*)')`, "iu"));
+  return field ? field[1] ?? field[2] : null;
 }
 
 function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
@@ -606,9 +635,8 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
       continue;
     }
 
-    if (curlCheckRunNameExpression(chunks.join(" "), reserved)) {
-      addMatch("reserved-check-run-name", firstLine.line, firstLine.raw);
-    }
+    const signal = curlPublisherSignal(chunks.join(" "), reserved);
+    if (signal) addMatch(signal.kind, firstLine.line, firstLine.raw);
     previousContinues = false;
     index = current;
   }
@@ -625,12 +653,12 @@ function runCommand(text) {
 
 function cliFieldExpression(text, field) {
   const wholeField = text.match(
-    new RegExp(`(?:^|\\s)(?:-f|--field)(?:\\s+|=)\\s*(['"])${field}=([^'"]*)\\1`, "iu"),
+    new RegExp(`(?:^|\\s)(?:-f|--field|--raw-field)(?:\\s+|=)\\s*(['"])${field}=([^'"]*)\\1`, "iu"),
   );
   if (wholeField) return `${wholeField[1]}${wholeField[2]}${wholeField[1]}`;
   const fieldValue = text.match(
     new RegExp(
-      `(?:^|\\s)(?:-f|--field)(?:\\s+|=)\\s*${field}=(?:"([^"]*)"|'([^']*)'|([^\\s'"]+))`,
+      `(?:^|\\s)(?:-f|--field|--raw-field)(?:\\s+|=)\\s*${field}=(?:"([^"]*)"|'([^']*)'|([^\\s'"]+))`,
       "iu",
     ),
   );
@@ -672,7 +700,8 @@ function markYamlJobNameFields(lines) {
     }
     if (!line.text.trim()) continue;
     line.flowJobFields = flowStyleJobFields(line.text);
-    line.flowStepUses = flowStyleStepUses(line.text);
+    line.flowStepUses = line.flowJobFields.steps;
+    line.flowScanAmbiguous = line.flowJobFields.ambiguous;
     const indent = indentationOf(line.text);
     const text = line.text.trim();
     const key = simpleYamlKey(text);
@@ -703,6 +732,8 @@ function markYamlJobNameFields(lines) {
         stepIndent = null;
         stepPropertyIndent = null;
         line.inlineJobFields = simpleInlineJobFields(text.slice(text.indexOf(":") + 1));
+        line.flowScanAmbiguous ||= line.inlineJobFields.ambiguous;
+        line.flowStepUses = [...line.flowStepUses, ...line.inlineJobFields.steps];
       }
       continue;
     }
@@ -713,6 +744,9 @@ function markYamlJobNameFields(lines) {
         markSelectorUse(line);
       }
       if (key?.toLowerCase() === "steps") {
+        const flowSteps = simpleFlowStepUses(text.slice(text.indexOf(":") + 1));
+        line.flowStepUses = flowSteps.uses;
+        line.flowScanAmbiguous ||= flowSteps.ambiguous;
         stepsIndent = indent;
         stepIndent = null;
         stepPropertyIndent = null;
@@ -758,20 +792,6 @@ function markSelectorUse(line) {
   line.selectorUseStarts.add(field.start);
 }
 
-function flowStyleStepUses(text) {
-  if (!/(?:^|[,{])\s*(?:"jobs"|'jobs'|jobs)\s*:\s*\{/u.test(text)) return [];
-  const stepUses = [];
-  const steps = /(?:^|[,{])\s*(?:"steps"|'steps'|steps)\s*:\s*\[([^\]]{0,2048})\]/gu;
-  for (const stepsMatch of text.matchAll(steps)) {
-    const body = stepsMatch[1];
-    const selector = /(?:^|,)\s*\{\s*(?:"uses"|'uses'|uses)\s*:\s*([^,}\n]+)/gu;
-    for (const match of body.matchAll(selector)) {
-      stepUses.push({ key: "uses", value: match[1].trim() });
-    }
-  }
-  return stepUses;
-}
-
 function simpleYamlKey(text) {
   const normalized = text.replace(/^\s*-\s+/u, "");
   const match = normalized.match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*:/u);
@@ -779,14 +799,33 @@ function simpleYamlKey(text) {
 }
 
 function flowStyleJobFields(text) {
-  const result = { names: [], uses: [] };
-  const jobsPattern = /(?:^|[,{])\s*(?:"jobs"|'jobs'|jobs)\s*:\s*\{((?:[^{}]|\{[^{}]*\})*)\}/gu;
-  const jobPattern = /(?:^|,)\s*(?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\s*:\s*\{([^{}]*)\}/gu;
-  for (const jobs of text.matchAll(jobsPattern)) {
-    for (const job of jobs[1].matchAll(jobPattern)) {
-      for (const field of fieldsOnLine(job[1])) {
-        if (isNameField(field.key)) result.names.push(field);
-        if (field.key.toLowerCase() === "uses") result.uses.push(field);
+  const result = { names: [], uses: [], steps: [], ambiguous: false };
+  const root = parseFlowMap(text);
+  if (root.ambiguous) {
+    result.ambiguous = /\bjobs\b/iu.test(text);
+    return result;
+  }
+  const jobs = root.entries.find((field) => field.key.toLowerCase() === "jobs");
+  if (!jobs) return result;
+
+  const jobEntries = parseFlowMap(jobs.value);
+  if (jobEntries.ambiguous) {
+    result.ambiguous = true;
+    return result;
+  }
+  for (const job of jobEntries.entries) {
+    const fields = parseFlowMap(job.value);
+    if (fields.ambiguous) {
+      result.ambiguous = true;
+      continue;
+    }
+    for (const field of fields.entries) {
+      if (isNameField(field.key)) result.names.push(field);
+      if (field.key.toLowerCase() === "uses") result.uses.push(field);
+      if (field.key.toLowerCase() === "steps") {
+        const steps = simpleFlowStepUses(field.value);
+        result.steps.push(...steps.uses);
+        result.ambiguous ||= steps.ambiguous;
       }
     }
   }
@@ -794,14 +833,172 @@ function flowStyleJobFields(text) {
 }
 
 function simpleInlineJobFields(value) {
-  const body = value.trim().match(/^\{\s*([^{}]*)\}\s*,?$/u);
-  if (!body) return null;
-  const result = { names: [], uses: [] };
-  for (const field of fieldsOnLine(body[1])) {
+  const result = { names: [], uses: [], steps: [], ambiguous: false };
+  const fields = parseFlowMap(value);
+  if (fields.ambiguous) {
+    result.ambiguous = true;
+    return result;
+  }
+  for (const field of fields.entries) {
     if (isNameField(field.key)) result.names.push(field);
     if (field.key.toLowerCase() === "uses") result.uses.push(field);
+    if (field.key.toLowerCase() === "steps") {
+      const steps = simpleFlowStepUses(field.value);
+      result.steps = steps.uses;
+      result.ambiguous ||= steps.ambiguous;
+    }
   }
   return result;
+}
+
+function simpleFlowStepUses(value) {
+  const collection = unwrapFlowCollection(value, "[");
+  if (!collection.present) return { uses: [], ambiguous: false };
+  if (collection.ambiguous) return { uses: [], ambiguous: true };
+  const items = splitFlowParts(collection.body);
+  if (!items) return { uses: [], ambiguous: true };
+  const uses = [];
+  for (const item of items) {
+    if (!item.trim().startsWith("{")) continue;
+    const fields = parseFlowMap(item);
+    if (fields.ambiguous) return { uses: [], ambiguous: true };
+    for (const field of fields.entries) {
+      if (field.key.toLowerCase() === "uses") uses.push(field);
+    }
+  }
+  return { uses, ambiguous: false };
+}
+
+function parseFlowMap(value) {
+  const source = value.trim();
+  if (source.length > MAX_FLOW_COLLECTION_CHARS) return { entries: [], ambiguous: true };
+  const collection = unwrapFlowCollection(source, "{");
+  if (collection.ambiguous) return { entries: [], ambiguous: true };
+  const body = collection.present ? collection.body : source;
+  const parts = splitFlowParts(body);
+  if (!parts) return { entries: [], ambiguous: true };
+
+  const entries = [];
+  for (const part of parts) {
+    const colon = findFlowColon(part);
+    if (colon <= 0) continue;
+    const key = parseFlowKey(part.slice(0, colon));
+    if (key !== null) entries.push({ key, value: part.slice(colon + 1).trim() });
+  }
+  return { entries, ambiguous: false };
+}
+
+function unwrapFlowCollection(value, opener) {
+  const source = value.trim();
+  if (!source.startsWith(opener)) return { present: false, body: source, ambiguous: false };
+  if (source.length > MAX_FLOW_COLLECTION_CHARS) return { present: true, body: "", ambiguous: true };
+
+  const stack = [];
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote !== null) {
+      if (escaped) escaped = false;
+      else if (quote === '"' && character === "\\") escaped = true;
+      else if (character === quote) {
+        if (quote === "'" && source[index + 1] === "'") index += 1;
+        else quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "{" || character === "[") {
+      stack.push(character);
+      if (stack.length > MAX_FLOW_COLLECTION_DEPTH) return { present: true, body: "", ambiguous: true };
+    } else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (stack.pop() !== expected) return { present: true, body: "", ambiguous: true };
+      if (stack.length === 0) {
+        if (character !== (opener === "{" ? "}" : "]") || source.slice(index + 1).trim()) {
+          return { present: true, body: "", ambiguous: true };
+        }
+        return { present: true, body: source.slice(1, index), ambiguous: false };
+      }
+    }
+  }
+  return { present: true, body: "", ambiguous: true };
+}
+
+function splitFlowParts(value) {
+  const parts = [];
+  const stack = [];
+  let quote = null;
+  let escaped = false;
+  let start = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote !== null) {
+      if (escaped) escaped = false;
+      else if (quote === '"' && character === "\\") escaped = true;
+      else if (character === quote) {
+        if (quote === "'" && value[index + 1] === "'") index += 1;
+        else quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === "{" || character === "[") {
+      stack.push(character);
+      if (stack.length > MAX_FLOW_COLLECTION_DEPTH) return null;
+    } else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (stack.pop() !== expected) return null;
+    } else if (character === "," && stack.length === 0) {
+      parts.push(value.slice(start, index));
+      start = index + 1;
+    }
+  }
+  if (quote !== null || stack.length > 0) return null;
+  parts.push(value.slice(start));
+  return parts;
+}
+
+function findFlowColon(value) {
+  const stack = [];
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote !== null) {
+      if (escaped) escaped = false;
+      else if (quote === '"' && character === "\\") escaped = true;
+      else if (character === quote) {
+        if (quote === "'" && value[index + 1] === "'") index += 1;
+        else quote = null;
+      }
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === "{" || character === "[") {
+      stack.push(character);
+    } else if (character === "}" || character === "]") {
+      stack.pop();
+    } else if (character === ":" && stack.length === 0) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function parseFlowKey(value) {
+  const key = value.trim();
+  if (
+    key.length >= 2 &&
+    ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'")))
+  ) {
+    const inner = key.slice(1, -1);
+    return inner.includes("\\") ? null : inner;
+  }
+  return /^[A-Za-z0-9_.-]+$/u.test(key) ? key : null;
 }
 
 function stripYamlAnchor(value) {
