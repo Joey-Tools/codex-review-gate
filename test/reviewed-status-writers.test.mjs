@@ -83,6 +83,24 @@ const JOB_LEVEL_STATUS_WRITER = [
   "          printf 'Reviewed inline publisher\\n'",
   "",
 ].join("\n");
+const HDR_RUNNER_LABELS_EXPRESSION =
+  "${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '[\"self-hosted\",\"Linux\",\"X64\",\"hdr-streaming-linux\"]') }}";
+const SELF_HOSTED_LABEL_STATUS_WRITER = JOB_LEVEL_STATUS_WRITER.replace(
+  "runs-on: ubuntu-slim",
+  "runs-on: [self-hosted, Linux, X64, hdr-streaming-linux]",
+);
+const BLOCK_LABEL_STATUS_WRITER = JOB_LEVEL_STATUS_WRITER.replace(
+  "    runs-on: ubuntu-slim\n",
+  "    runs-on:\n      - self-hosted\n      - Linux\n      - X64\n      - hdr-streaming-linux\n",
+);
+const HDR_VARIABLE_STATUS_WRITER = JOB_LEVEL_STATUS_WRITER.replace(
+  "runs-on: ubuntu-slim",
+  `runs-on: ${HDR_RUNNER_LABELS_EXPRESSION}`,
+);
+const HDR_WHITESPACE_FALLBACK_STATUS_WRITER = JOB_LEVEL_STATUS_WRITER.replace(
+  "runs-on: ubuntu-slim",
+  "runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '[ \"self-hosted\", \"Linux\", \"X64\", \"hdr-streaming-linux\" ]') }}",
+);
 const RUN_FIRST_STATUS_WRITER = [
   "name: Reviewed run-first status writer",
   "on: push",
@@ -241,6 +259,24 @@ test("reviewed status writers are denied by default and explicitly returned as p
     ]),
     new Set([isolatedFile.path]),
   );
+});
+
+test("reviewed status writers admit only bounded literal and owner-configured runner labels", () => {
+  for (const content of [
+    JOB_LEVEL_STATUS_WRITER,
+    SELF_HOSTED_LABEL_STATUS_WRITER,
+    BLOCK_LABEL_STATUS_WRITER,
+    HDR_VARIABLE_STATUS_WRITER,
+    HDR_WHITESPACE_FALLBACK_STATUS_WRITER,
+  ]) {
+    const file = { path: DEFAULT_REVIEWED_WRITER_PATH, content };
+    assert.deepEqual(
+      validateReviewedStatusWriters([file], [
+        writerRecord(file.path, file.content),
+      ]),
+      new Set([file.path]),
+    );
+  }
 });
 
 test("canonical inventory accepts isolated publishers alongside split read-only jobs", () => {
@@ -437,12 +473,92 @@ test("reviewed status writer entries cannot excuse callers, other violations, or
       ),
     ],
     [
-      "self-hosted privileged runner",
-      JOB_LEVEL_STATUS_WRITER.replace("runs-on: ubuntu-slim", "runs-on: self-hosted"),
+      "empty runner-label array",
+      JOB_LEVEL_STATUS_WRITER.replace("runs-on: ubuntu-slim", "runs-on: []"),
     ],
     [
-      "runner-label array",
-      JOB_LEVEL_STATUS_WRITER.replace("runs-on: ubuntu-slim", "runs-on: [ubuntu-slim]"),
+      "runner object and group mapping",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: { group: trusted, labels: [self-hosted] }",
+      ),
+    ],
+    [
+      "non-string runner label",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: [self-hosted, 42]",
+      ),
+    ],
+    [
+      "nested runner-label sequence",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: [self-hosted, [Linux]]",
+      ),
+    ],
+    [
+      "arbitrary runner expression",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: ${{ github.event.inputs.runner }}",
+      ),
+    ],
+    [
+      "runner expression with nested mapping child",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "    runs-on: ubuntu-slim\n",
+        "    runs-on: ${{ vars.HDR_STREAMING_LINUX_RUNNER_LABELS }}\n      labels: [self-hosted]\n",
+      ),
+    ],
+    [
+      "literal runner with nested mapping child",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "    runs-on: ubuntu-slim\n",
+        "    runs-on: ubuntu-slim\n      labels: [self-hosted]\n",
+      ),
+    ],
+    [
+      "runner variable without literal fallback",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS) }}",
+      ),
+    ],
+    [
+      "runner JSON object fallback",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '{\"group\":\"trusted\"}') }}",
+      ),
+    ],
+    [
+      "empty runner JSON array fallback",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '[]') }}",
+      ),
+    ],
+    [
+      "nested runner JSON array fallback",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '[\"self-hosted\",[\"Linux\"]]') }}",
+      ),
+    ],
+    [
+      "non-string runner JSON entry fallback",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '[\"self-hosted\",42]') }}",
+      ),
+    ],
+    [
+      "malformed runner JSON fallback",
+      JOB_LEVEL_STATUS_WRITER.replace(
+        "runs-on: ubuntu-slim",
+        "runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || 'not-json') }}",
+      ),
     ],
     [
       "privileged job action dependency",

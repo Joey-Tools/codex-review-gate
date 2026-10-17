@@ -88,11 +88,39 @@ request marker and diagnostic snapshot only on a PR. GitHub's issue-comment endp
 accept that permission for a PR, so the controller does not receive `issues:
 write`, contents, checks, statuses, or OIDC write authority.
 
-The default runner is `ubuntu-slim`. Set the repository Actions variable
-`CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` only when the supported
-`ubuntu-latest` fallback is required. Limits are selected only through the
-`default` or `expanded` profile; a repository that regularly needs the latter
-may set `CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`. There are no numeric limit
+Both canonical workflows use the effective organization- or repository-level
+Actions variable `CODEX_REVIEW_GATE_RUNNER_LABELS` when set. Its value must be
+valid JSON that decodes to one runner-label string or a non-empty array of
+literal runner labels. For example, this repository-scoped value selects a
+dedicated HDR Linux runner:
+
+```bash
+gh variable set CODEX_REVIEW_GATE_RUNNER_LABELS \
+  --repo "github.com/$REPO" \
+  --body '["self-hosted","Linux","X64","hdr-streaming-linux"]'
+```
+
+This variable takes precedence over the legacy
+`CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` fallback. If neither is set, both
+workflows use `ubuntu-slim`. Runner labels do not register or discover a runner,
+alter branch protections, grant credentials or permissions, or change workflow
+event filters or permission declarations.
+Organization-variable visibility determines which
+repositories receive the selection. Setting a variable alone does not update
+an already installed consumer: update both workflow files to the new
+`runs-on` expression. This needs no Action runtime release.
+
+The shared runner selection also affects the controller, which has
+`actions: write` and `pull-requests: write`, and may receive the optional
+`CODEX_REVIEW_GATE_REQUEST_TOKEN` secret. Treat the variable and self-hosted
+host as trusted operator-controlled configuration. The exact workflow digest
+does not bind variable values or host state, and separate GitHub jobs do not
+provide host isolation. Any host that can receive the controller token must be
+trusted; use dedicated or ephemeral trusted runners for token-bearing jobs.
+
+Limits are selected only through the `default` or `expanded` profile; a
+repository that regularly needs the latter may set
+`CODEX_REVIEW_GATE_LIMITS_PROFILE=expanded`. There are no numeric limit
 overrides.
 
 Ordinary review-request authors are admitted as candidates at any repository
@@ -124,20 +152,34 @@ It has no bypass actors. Keep it disabled until the live canary succeeds.
 Repositories with an unrelated commit-status producer may explicitly retain
 its `statuses: write` permission using the bootstrap helper's repeatable
 `--reviewed-status-writer .github/workflows/FILE.yml@SHA256` option. The
-workflow must first isolate status writers in literal `ubuntu-slim` jobs with
-explicit job-level `statuses: write` and self-contained inline Bash steps.
-Workflow-level permissions stay read-only. Privileged jobs cannot use actions,
-checkouts, artifacts, repository scripts, containers, services, runner overrides
-or inherited executable defaults. PR-executing test jobs keep read-only tokens.
+workflow must first isolate status writers in explicit job-level
+`statuses: write` jobs with self-contained inline Bash steps. Workflow-level
+permissions stay read-only. The publisher `runs-on` may be a literal
+runner-label string, a literal label array, or the exact
+`fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` form. The variable name
+must match `[A-Z][A-Z0-9_]*_RUNNER_LABELS`, and the fallback must be a non-empty
+JSON array of string labels. When set, the variable value must also be valid
+JSON resolving to a label string or non-empty label array. For example:
+
+```yaml
+runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
+```
+
+Do not use arbitrary runner expressions. Privileged jobs cannot use actions,
+checkouts, artifacts, repository scripts, containers, services, or inherited
+executable defaults. PR-executing test jobs keep read-only tokens.
 Each privileged job contains one literal Bash `run: |` step, `shell: bash`,
 and step-level `env` clearing `BASH_ENV`/`ENV` and passing
 `GH_TOKEN: ${{ github.token }}`. Use step env for metadata; literal `needs`,
 `if`, job outputs and one step ID support the metadata handoff.
-The control-plane owner reviews every publisher's inline code and non-gate
-context: use trusted metadata and GitHub job results, never execute PR-produced
-text or downloaded mutable/unprotected code. Structural admission is not a
-static proof of arbitrary shell behavior; a workflow digest cannot bind future
-changes to an unprotected dependency. Each declared file
+The control-plane owner reviews every publisher's runner selector, inline code
+and non-gate context: use trusted metadata and GitHub job results, never execute
+PR-produced text or downloaded mutable/unprotected code. Structural admission
+is not a static proof of arbitrary shell behavior; a workflow digest does not
+bind variable values or self-hosted host state, and separate jobs do not provide
+host isolation. Use dedicated or ephemeral trusted runners for token-bearing
+publishers. A workflow digest also cannot bind future changes to an unprotected
+dependency. Each declared file
 must match that SHA-256 of its UTF-8 bytes at every inventory read and must
 have exactly `statuses: write` among the policy's relevant write permissions.
 Gate callers, the reserved native job name, and additional `actions`, `checks`,
@@ -145,8 +187,8 @@ Gate callers, the reserved native job name, and additional `actions`, `checks`,
 changed, duplicate, canonical-path, or no-longer-status-writing declarations
 fail closed. Repeat the same declarations through local preview/apply,
 remote staging/activation, and full-profile cleanup verification; no
-declaration is learned or persisted automatically. Existing canonical
-CODEOWNERS coverage and independent owner review still apply. Initial admission
+declaration is learned or persisted automatically. Existing canonical CODEOWNERS
+coverage and independent owner review still apply. Initial admission
 rejects `--legacy-bridge` together with this option because later bridge
 removal keeps a frozen policy. Historical
 organization handoff/bridge-removal and source-only proofs do not accept

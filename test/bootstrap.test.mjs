@@ -173,6 +173,10 @@ const CANONICAL_WORKFLOWS = {
   verifier: CANONICAL_WORKFLOW,
   controller: CANONICAL_CONTROLLER_WORKFLOW,
 };
+const RUNNER_LABELS_EXPRESSION =
+  "${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || (vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && '[\"ubuntu-latest\"]' || '[\"ubuntu-slim\"]')) }}";
+const PREVIOUS_RUNNER_LABELS_EXPRESSION =
+  "${{ vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST == 'true' && 'ubuntu-latest' || 'ubuntu-slim' }}";
 const REVIEWED_INLINE_STATUS_WRITER = [
   "name: Reviewed transport publisher",
   "on: push",
@@ -195,6 +199,14 @@ const REVIEWED_INLINE_STATUS_WRITER = [
   "          printf 'Reviewed inline publisher\\n'",
   "",
 ].join("\n");
+function previousRunnerWorkflow(workflow) {
+  const currentLine = `    runs-on: ${RUNNER_LABELS_EXPRESSION}`;
+  assert.equal(workflow.split(currentLine).length, 2);
+  return workflow.replace(
+    currentLine,
+    `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}`,
+  );
+}
 const CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE = {
   ...CANONICAL_WORKFLOWS,
   legacyBridge: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
@@ -2429,8 +2441,17 @@ test("fixed frozen handoff inventory accepts only the recorded immutable workflo
   );
   assert.throws(
     () => validateCanonicalV2WorkflowContent(FROZEN_HANDOFF_VERIFIER_WORKFLOW),
+    /exact supported runs-on expression/u,
+    "the immutable handoff does not gain the current runner contract",
+  );
+  const frozenVerifierWithCurrentRunner = FROZEN_HANDOFF_VERIFIER_WORKFLOW.replace(
+    `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}`,
+    `    runs-on: ${RUNNER_LABELS_EXPRESSION}`,
+  );
+  assert.throws(
+    () => validateCanonicalV2WorkflowContent(frozenVerifierWithCurrentRunner),
     /unexpected top-level permissions mapping/u,
-    "the immutable handoff remains historical, not current installation policy",
+    "changing only the runner cannot upgrade the historical permissions",
   );
   const changed = structuredClone(inventory);
   changed[0].content = `${changed[0].content}\n# replacement\n`;
@@ -2602,7 +2623,10 @@ test("reviewed status writers survive local preparation only with explicit froze
       for (const { path, content } of writers) assert.equal(readFileSync(join(targetRoot, path), "utf8"), content);
     }
     assert.equal(readFileSync(join(targetRoot, DEFAULT_WORKFLOW_PATH), "utf8"), CANONICAL_WORKFLOW);
-    const unsafeWriter = writers[0].content.replace("runs-on: ubuntu-slim", "runs-on: self-hosted");
+    const unsafeWriter = writers[0].content.replace(
+      "runs-on: ubuntu-slim",
+      "runs-on: ${{ github.event.inputs.runner }}",
+    );
     writeFileSync(join(targetRoot, writers[0].path), unsafeWriter);
     const unsafe = runBootstrap([
       "--prepare-worktree", targetRoot,
@@ -2735,6 +2759,43 @@ test("prepare-worktree upgrades the exact previous canonical controller concurre
       apply.stdout,
       /Applied: replace the drifted controller workflow with canonical v2 bytes/u,
     );
+    assert.equal(readFileSync(controllerPath, "utf8"), CANONICAL_CONTROLLER_WORKFLOW);
+  } finally {
+    rmSync(targetRoot, { recursive: true, force: true });
+  }
+});
+
+test("prepare-worktree upgrades the exact previous verifier and controller runner expressions", () => {
+  const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-runner-upgrade-"));
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
+  const verifierPath = join(targetRoot, ...DEFAULT_WORKFLOW_PATH.split("/"));
+  const controllerPath = join(
+    targetRoot,
+    ...DEFAULT_CONTROLLER_WORKFLOW_PATH.split("/"),
+  );
+  try {
+    initializeGitRepository(targetRoot);
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(verifierPath, previousRunnerWorkflow(CANONICAL_WORKFLOW), "utf8");
+    writeFileSync(
+      controllerPath,
+      previousRunnerWorkflow(CANONICAL_CONTROLLER_WORKFLOW),
+      "utf8",
+    );
+
+    const dryRun = runBootstrap(["--prepare-worktree", targetRoot]);
+    assert.equal(dryRun.status, 0, dryRun.stderr);
+    assert.match(dryRun.stdout, /replace the drifted verifier workflow with canonical v2 bytes/u);
+    assert.match(dryRun.stdout, /replace the drifted controller workflow with canonical v2 bytes/u);
+    assert.equal(readFileSync(verifierPath, "utf8"), previousRunnerWorkflow(CANONICAL_WORKFLOW));
+    assert.equal(
+      readFileSync(controllerPath, "utf8"),
+      previousRunnerWorkflow(CANONICAL_CONTROLLER_WORKFLOW),
+    );
+
+    const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
+    assert.equal(apply.status, 0, apply.stderr);
+    assert.equal(readFileSync(verifierPath, "utf8"), CANONICAL_WORKFLOW);
     assert.equal(readFileSync(controllerPath, "utf8"), CANONICAL_CONTROLLER_WORKFLOW);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
@@ -6852,6 +6913,95 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOWS),
     CANONICAL_WORKFLOWS,
   );
+
+  const previousRunnerVerifier = previousRunnerWorkflow(CANONICAL_WORKFLOW);
+  const previousRunnerController = previousRunnerWorkflow(
+    CANONICAL_CONTROLLER_WORKFLOW,
+  );
+  assert.throws(
+    () => validateCanonicalV2WorkflowContent(previousRunnerVerifier),
+    /exact supported runs-on expression/u,
+    "the previous runner line is accepted only as installed inventory",
+  );
+  assert.throws(
+    () => validateCanonicalV2ControllerWorkflowContent(previousRunnerController),
+    /exact supported runs-on expression/u,
+    "the previous controller runner line is not current canonical input",
+  );
+
+  for (const [name, expression] of [
+    [
+      "runner variable without a fallback",
+      "${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS) }}",
+    ],
+    [
+      "runner variable with dynamic fallback",
+      "${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || github.event.inputs.runner) }}",
+    ],
+    [
+      "runner variable with legacy choice precedence",
+      "${{ fromJSON(vars.CODEX_REVIEW_GATE_USE_UBUNTU_LATEST || vars.CODEX_REVIEW_GATE_RUNNER_LABELS) }}",
+    ],
+  ]) {
+    const invalidCanonical = CANONICAL_WORKFLOW.replace(
+      `    runs-on: ${RUNNER_LABELS_EXPRESSION}`,
+      `    runs-on: ${expression}`,
+    );
+    assert.throws(
+      () => validateCanonicalV2WorkflowContent(invalidCanonical),
+      /exact supported runs-on expression/u,
+      name,
+    );
+  }
+
+  const previousRunnerInventory = cleanInventory.map((file) =>
+    [DEFAULT_WORKFLOW_PATH, DEFAULT_CONTROLLER_WORKFLOW_PATH].includes(file.path)
+      ? { ...file, content: previousRunnerWorkflow(file.content) }
+      : file,
+  );
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      previousRunnerInventory,
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "the exact previous default runner envelope remains an upgrade target",
+  );
+
+  for (const [name, invalidVerifier] of [
+    [
+      "mixed previous and current runner declarations",
+      previousRunnerVerifier.replace(
+        `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}`,
+        `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}\n    runs-on: ${RUNNER_LABELS_EXPRESSION}`,
+      ),
+    ],
+    [
+      "arbitrary expression routing",
+      previousRunnerVerifier.replace(
+        `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}`,
+        "    runs-on: ${{ github.event.inputs.runner }}",
+      ),
+    ],
+    [
+      "incomplete runner-variable fallback",
+      previousRunnerVerifier.replace(
+        `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}`,
+        "    runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '[\"ubuntu-slim\"]') }}",
+      ),
+    ],
+  ]) {
+    const invalidInventory = previousRunnerInventory.map((file) =>
+      file.path === DEFAULT_WORKFLOW_PATH
+        ? { ...file, content: invalidVerifier }
+        : file,
+    );
+    assert.throws(
+      () => validateCanonicalV2WorkflowInventory(invalidInventory, CANONICAL_WORKFLOWS),
+      /runs-on/u,
+      name,
+    );
+  }
 
   const controllerWithoutRequestToken = controllerWithoutReviewRequestToken(
     CANONICAL_CONTROLLER_WORKFLOW,
@@ -14106,7 +14256,7 @@ syncBuiltinESMExports();
 
 assert.equal(
   test.registeredCount,
-  169,
+  170,
   "bootstrap test shard registration inventory drift",
 );
 

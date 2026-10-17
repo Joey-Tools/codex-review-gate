@@ -2778,10 +2778,14 @@ test("frozen organization handoff admission remains distinct from current contro
     }),
     frozenWorkflows,
   );
+  const currentRunnerLine = currentWorkflows.verifier.match(/^    runs-on: .+$/mu)?.[0];
+  const frozenRunnerLine = frozenWorkflows.verifier.match(/^    runs-on: .+$/mu)?.[0];
+  assert.equal(typeof currentRunnerLine, "string");
+  assert.equal(typeof frozenRunnerLine, "string");
   const currentPermissionFrozenVerifier = frozenWorkflows.verifier.replace(
     "permissions:\n  contents: read\n",
     "permissions:\n  actions: read\n  contents: read\n",
-  );
+  ).replace(frozenRunnerLine, currentRunnerLine);
   const currentPermissionFrozenWorkflows = {
     ...frozenWorkflows,
     verifier: currentPermissionFrozenVerifier,
@@ -2801,7 +2805,8 @@ test("frozen organization handoff admission remains distinct from current contro
   );
   const frozenPermissionCurrentWorkflows = {
     ...currentWorkflows,
-    verifier: currentWorkflows.verifier.replace("  actions: read\n", ""),
+    verifier: currentWorkflows.verifier.replace("  actions: read\n", "")
+      .replace(currentRunnerLine, frozenRunnerLine),
   };
   assert.throws(
     () => validateFrozenHandoffV2WorkflowInventory(
