@@ -460,6 +460,19 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   assert.equal(rawField.matches.length, 1);
   assert.equal(rawField.matches[0].kind, "reserved-check-run-name");
 
+  const explicitPost = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs --method POST -f name=codex/github-review-gate",
+  );
+  assert.equal(explicitPost.matches[0].kind, "reserved-check-run-name");
+
+  for (const method of ["--method GET", "--method=GET", "-X GET", "--method HEAD"]) {
+    const reader = inspectWorkflowGateSignals(
+      `run: gh api repos/o/r/check-runs ${method} -f name=codex/github-review-gate`,
+    );
+    assert.deepEqual(reader.matches, [], method);
+    assert.ok(reader.warnings.some(({ kind }) => kind === "reserved-status-context-reference"), method);
+  }
+
   const unrelated = inspectWorkflowGateSignals(
     "run: gh api repos/example/releases -f name=codex/github-review-gate",
   );

@@ -510,6 +510,7 @@ function hasExplicitNonPostGitHubApiMethod(command) {
 function cliCheckRunNameExpression(text) {
   const command = runCommand(text);
   if (!/^gh\s+api(?:\s|$)/iu.test(command) || !/\/check-runs(?:[/?#\s]|$)/iu.test(command)) return null;
+  if (hasExplicitNonPostGitHubApiMethod(command)) return null;
   return cliFieldExpression(command, "name");
 }
 

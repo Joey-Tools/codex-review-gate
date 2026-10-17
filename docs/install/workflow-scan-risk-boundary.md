@@ -27,6 +27,8 @@ The false-negative allowance does not justify treating known data as execution. 
 
 Here, `env` / `with` means environment/input mapping properties, not a job ID with the same spelling. Likewise, CLI-shaped output text such as `echo -f context=...` is not a publishing command.
 
+The supported `gh api` creation matches exclude recognized explicit non-POST method forms for both context and CheckRun-name fields. This avoids treating GET/HEAD readers as creators; it does not prove that every other method or unsupported command form is incapable of modifying a check.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

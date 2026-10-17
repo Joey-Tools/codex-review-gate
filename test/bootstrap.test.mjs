@@ -7237,6 +7237,10 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "echo-cli-context-reference",
       "jobs:\n  build:\n    steps:\n      - run: echo -f context=codex/github-review-gate\n",
     ],
+    [
+      "read-only-gh-check-run-name-reference",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method GET -f name=codex/github-review-gate\n",
+    ],
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
