@@ -74,11 +74,13 @@ Required-check `integration_id: 15368` identifies the entire GitHub Actions App,
 not a particular workflow or unique producer. For ordinary current-v2
 installation, exact-byte verification of both canonical workflows is paired
 with a best-effort scoped keyword scan of workflow source text. It blocks
-explicit additional Codex gate callers and explicit uses of the reserved
-`codex/github-review-gate` signal; fragmented text, literal concatenations and
-simple local-variable forms are scanned where possible. Only potential gate
-collisions the scan cannot resolve are warnings. Unrelated keywords and
-contexts do not block installation. Plain-text references such as `echo`,
+recognized explicit matches for additional Codex gate callers and uses of the
+reserved `codex/github-review-gate` signal; fragmented text, literal
+concatenations and simple local-variable forms are scanned where possible.
+Only detected candidates that cannot be classified warn; unsupported literal
+forms may be missed, so no
+warning does not prove the absence of another producer. Unrelated keywords
+and contexts do not block installation. Plain-text references such as `echo`,
 `jq` or artifact labels may appear as non-blocking reference warnings; they
 are not treated as gate collisions. Unrelated workflow-local write permissions and opaque workflow-local
 permission declarations are operator-trust warnings, not installation
@@ -90,6 +92,9 @@ and canary collision readback remain strict as well. The scan does not execute
 workflows, prove complete data flow, prevent malicious same-name forgery, or
 establish a unique producer. Frozen historical organization handoff,
 bridge-removal and source-only proof contracts remain strict.
+
+See the [workflow scan risk boundary](https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/workflow-scan-risk-boundary.md)
+for accepted coverage limits and examples.
 
 ## Runtime boundary
 

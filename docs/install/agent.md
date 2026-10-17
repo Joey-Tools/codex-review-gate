@@ -1053,15 +1053,17 @@ disable v2 or delete the old organization rule as recovery.
    deactivate the legacy job. Repeat the preview until no v1 caller remains.
 
    The ordinary current-v2 installer uses a scoped keyword scan (a best-effort
-   scan of workflow source text) for explicit additional Codex gate callers
-   and explicit uses of the same reserved gate signal (`codex/github-review-gate`,
-   the required CheckRun context). Those findings remain blocking. The scan
-   also checks fragmented text, literal concatenations,
-   and simple local-variable forms where it can; potential gate collisions
-   that the keyword scan cannot resolve are warnings, while unrelated
-   keywords and contexts are ignored. It does not execute workflows, prove
-   their full data flow, prevent a malicious same-name forgery, or establish
-   a unique producer.
+   scan of workflow source text) for additional Codex gate callers and uses of
+   the same reserved gate signal (`codex/github-review-gate`, the required
+   CheckRun context). Only explicit matches recognized by the scanner remain
+   blocking. The scan also checks fragmented text, literal concatenations, and
+   simple local-variable forms where it can; only detected candidates that
+   cannot be classified warn. Unsupported literal forms may be missed, so no
+   warning does not prove that no other workflow can emit the signal.
+   Unrelated keywords and contexts are ignored. It does not execute workflows,
+   prove their full data flow, prevent a malicious same-name forgery, or
+   establish a unique producer. See the [workflow scan risk boundary](workflow-scan-risk-boundary.md)
+   for the accepted coverage limits and examples.
 
    Unrelated workflow-local write permissions such as `statuses`, `checks`,
    `actions`, or `contents`, and opaque workflow-local declarations, are

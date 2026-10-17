@@ -1057,12 +1057,14 @@ caller，只检查它列出的路径，并在同一个 migration PR 中移除或
 一个 PR 可以同时移除 v1、安装 v2 与 CODEOWNERS 控制面。
 
 普通 current-v2 bootstrap 还会执行 scoped keyword scan（对 workflow 源文本的 best-effort
-扫描），检查显式的额外 Codex gate caller 与显式使用同一 reserved gate signal 的 workflow；
-这些明确命中仍会阻止安装。扫描也会尽力检查被拆分的文本、literal concatenation 和简单
-local-variable 形式；对扫描无法解析且可能构成 gate signal collision 的形式会发出 warning，
-无关的 keyword 或 context 会忽略。它不会执行 workflow、
-证明完整 data flow、防止恶意 workflow 伪造同名 signal，也不能证明只有一个 producer 能发出
+扫描），检查额外 Codex gate caller 与显式使用同一 reserved gate signal 的 workflow；只有扫描器
+识别出的明确命中才会阻止安装。扫描也会尽力检查被拆分的文本、literal concatenation 和简单
+local-variable 形式；只有已检测到但无法分类的候选才会发出 warning。不支持或未识别的 literal
+格式可能漏检；没有 warning 不能证明不存在其他 producer。无关的 keyword 或 context 会忽略。它不会执行
+workflow，也不会证明完整 data flow、防止恶意 workflow 伪造同名 signal，或证明只有一个 producer 能发出
 required signal。
+
+已接受的扫描覆盖边界与例子见[workflow 扫描风险说明](workflow-scan-risk-boundary.md)。
 
 Unrelated workflow-local 的 `statuses`、`checks`、`actions`、`contents` 等 write permission，
 以及 opaque workflow-local permission 声明，只作为 operator review warning，不阻止普通安装。

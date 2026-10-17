@@ -1297,14 +1297,18 @@ deactivate those callers in this same migration PR. One PR may remove v1,
 install v2, and install the CODEOWNERS control plane.
 
 The ordinary current-v2 bootstrap also performs a scoped keyword scan (a
-best-effort scan of workflow source text) for explicit additional Codex gate
-callers and the same reserved gate signal (`codex/github-review-gate`, the
-required CheckRun context). These explicit findings remain blocking. The scan
-also checks fragmented text, literal concatenations, and
-simple local-variable forms where it can; potential gate collisions that the
-keyword scan cannot resolve are warnings, while unrelated keywords and
-contexts are ignored. It does not execute workflows, prove their full data
+best-effort scan of workflow source text) for additional Codex gate callers
+and the same reserved gate signal (`codex/github-review-gate`, the required
+CheckRun context). Only explicit matches recognized by the scanner remain
+blocking. The scan also checks fragmented text, literal concatenations, and
+simple local-variable forms where it can; only detected candidates that cannot
+be classified warn. Unsupported literal forms may be missed, so no warning
+does not prove that no other workflow can emit the signal. Unrelated keywords
+and contexts are ignored. It does not execute workflows, prove their full data
 flow, prevent a malicious same-name forgery, or establish a unique producer.
+
+See the [workflow scan risk boundary](workflow-scan-risk-boundary.md) for the
+accepted coverage limits and examples.
 
 Unrelated workflow-local permissions such as `statuses`, `checks`, `actions`,
 or `contents` writes, as well as opaque workflow-local permission declarations,

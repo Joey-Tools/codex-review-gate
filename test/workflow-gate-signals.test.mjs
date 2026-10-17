@@ -496,6 +496,85 @@ test("joins only bounded backslash continuations inside a run block for curl pub
   assert.deepEqual(followsOtherContinuation.matches, []);
 });
 
+test("keeps accepted ordinary-installer coverage examples warning-only", () => {
+  // These exact examples are accepted warning-only cases, not a blanket guarantee for unsupported syntax.
+  const acceptedGaps = [
+    {
+      issue: "4304322776",
+      content: [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        "      - run: |",
+        `          curl -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
+      ].join("\n"),
+    },
+    {
+      issue: "4304322781",
+      content: [
+        "jobs:",
+        "  build:",
+        "    steps:",
+        "      -",
+        "        uses: JoeyTeng/codex-review-gate-action@v2",
+      ].join("\n"),
+    },
+    {
+      issue: "4304322783",
+      content: [
+        "jobs: {",
+        "  collision: {",
+        "    name: codex/github-review-gate",
+        "  }",
+        "}",
+      ].join("\n"),
+    },
+    {
+      issue: "4304322787",
+      content: `jobs: {publish: {steps: [{run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs}]}}`,
+    },
+    {
+      issue: "4304322790",
+      content: [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        "      - run: >-",
+        "          curl -X POST",
+        `          -d '{"name":"codex/github-review-gate"}'`,
+        "          https://api.github.com/repos/o/r/check-runs",
+      ].join("\n"),
+    },
+    {
+      issue: "4304322791",
+      content: [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        `      - run: gh api repos/o/r/check-runs --method POST --input - <<< '{"name":"codex/github-review-gate"}'`,
+      ].join("\n"),
+    },
+    {
+      issue: "4304322794",
+      content: [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        "      - uses: actions/github-script@v7",
+        "        with:",
+        "          script: |",
+        '            github.rest.checks.create({name: "codex/github-review-gate", owner: "o", repo: "r", head_sha: "abc"})',
+      ].join("\n"),
+    },
+  ];
+
+  for (const { issue, content } of acceptedGaps) {
+    const result = inspectWorkflowGateSignals(content);
+    assert.deepEqual(result.matches, [], issue);
+    assert.ok(result.warnings.length > 0, `${issue} should remain visible as a warning`);
+  }
+});
+
 test("keeps bare references and non-job names as warnings rather than blocking matches", () => {
   const result = inspectWorkflowGateSignals([
     "name: codex/github-review-gate",

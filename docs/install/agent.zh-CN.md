@@ -876,16 +876,19 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
    既有 entries 移动或合并进 `.github/CODEOWNERS`，然后重跑。不得让高优先级新文件
    遮蔽尚未合并的旧 policy。
 
-5. Preview 对 workflow 源文本执行 scoped keyword scan（best-effort 文本扫描）。若报告显式的
-   额外 Codex gate caller，或显式发出同一个 reserved gate signal（即
+5. Preview 对 workflow 源文本执行 scoped keyword scan（best-effort 文本扫描）。若报告显示扫描器
+   已识别到额外 Codex gate caller 的明确命中，或显式发出同一个 reserved gate signal（即
    `codex/github-review-gate` 这个 required CheckRun context），只检查 helper 列出的路径；
-   这些明确命中仍会阻止安装。若 workflow 专用于 legacy caller 才删除整个文件；否则只移除或
+   这些已识别的明确命中仍会阻止安装。若 workflow 专用于 legacy caller 才删除整个文件；否则只移除或
    停用对应 job，然后重复 preview。
 
-   Scan 也会尽力处理被拆分文本、literal concatenation 与简单 local-variable 形式；关键词扫描
-   无法解析且可能造成 gate signal collision 的形式会告警，无关 keyword 或 context 会忽略。
-   它不会执行 workflow、验证完整
-   data flow、防止恶意 workflow 伪造同名 signal，也不证明只有一个 producer。Unrelated
+   Scan 也会尽力处理被拆分文本、literal concatenation 与简单 local-variable 形式；只有已检测到但
+   无法分类的候选会告警。不支持或未识别的 literal 格式可能漏检；没有 warning 不能证明不存在其他
+   workflow producer。无关 keyword 或 context 会忽略。它不会执行 workflow、验证完整
+   data flow、防止恶意 workflow 伪造同名 signal，也不证明只有一个 producer。已接受的扫描覆盖边界与
+   例子见[workflow 扫描风险说明](workflow-scan-risk-boundary.md)。
+
+   Unrelated
    workflow-local 的 `statuses`、`checks`、
    `actions`、`contents` 等 write permission 与 opaque workflow-local permission 声明只是
    operator warnings，不是阻塞条件。不要为了安装删除这些 permissions 或隔离 unrelated

@@ -165,11 +165,13 @@ non-fast-forward default-branch updates and has no bypass actors. â€œAny sourceâ
 is not supported. This integration ID identifies the GitHub Actions App, not a
 unique workflow producer. The ordinary installer exact-byte checks the two
 canonical workflows and uses a scoped keyword scan (a best-effort search of
-workflow source text) to block explicit additional Codex gate callers or
-explicit uses of the same reserved signal. Fragmented text, literal
-concatenations and simple local-variable forms are scanned where possible;
-potential gate collisions the keyword scan cannot resolve are warnings, while
-unrelated keywords and contexts do not block installation. Plain-text
+workflow source text) to block recognized explicit matches for additional
+Codex gate callers or uses of the same reserved signal. Fragmented text,
+literal concatenations and simple local-variable forms are scanned where
+possible; only detected candidates that cannot be classified are warnings.
+Unsupported literal forms may be missed, so no warning does not prove that no
+other workflow can emit the signal. Unrelated keywords and contexts do not
+block installation. Plain-text
 references such as `echo`, `jq` or artifact labels may appear as non-blocking
 reference warnings; they are not treated as gate collisions. Unrelated
 workflow-local write permissions and opaque workflow-local permission
@@ -180,6 +182,9 @@ remains a separate strict requirement. The scan does not execute workflows or
 prove complete data flow, prevent a malicious same-name forgery, or establish
 a unique producer; operators remain responsible for trusting other workflows
 that share the Actions App.
+
+See [the workflow scan risk boundary](docs/install/workflow-scan-risk-boundary.md)
+for accepted coverage limits and examples.
 
 See [the human installation guide](docs/install/human.md) or
 [the agent execution runbook](docs/install/agent.md). Both implement the same

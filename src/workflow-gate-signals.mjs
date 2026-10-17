@@ -16,7 +16,16 @@ const ACTION_CALLERS = [
 ];
 
 /**
- * Best-effort segmented text heuristic, not a workflow parser or security proof.
+ * Best-effort segmented text heuristic covering only a recognized subset of
+ * literal workflow forms; matches does not guarantee detection of every
+ * literal, syntax, or transport mechanism. The seven warning-only examples
+ * listed in docs/install/workflow-scan-risk-boundary.md are intentional
+ * accepted coverage limits. This heuristic is not an installation safety
+ * boundary or proof of a unique producer; ordinary installation relies on
+ * operator trust. Canonical-asset checks, default-permission checks, and strict
+ * legacy-cleanup checks remain separate and unchanged. These scan limits do
+ * not affect execution-time review-finding pass/block policy.
+ *
  * It never executes scripts, and intentionally ignores permissions by itself.
  */
 export function inspectWorkflowGateSignals(

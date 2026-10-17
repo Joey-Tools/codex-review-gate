@@ -117,9 +117,10 @@ resolved、阻止 default-branch non-fast-forward updates，并且没有 bypass 
 
 `integration_id` 标识整个 GitHub Actions App，而不是某个 workflow 或唯一 producer。普通
 current-v2 installer 会 exact-byte 验证两份 canonical workflows，并对 workflow 源文本执行
-best-effort scoped keyword scan，阻止显式的额外 Codex gate caller 和显式使用同一 reserved
-signal。被拆分的文本、literal concatenation 与简单 local-variable 形式会在可识别时扫描；只有
-扫描无法解析且可能构成 gate collision 的结构才会告警。无关 keyword/context 不作为阻塞条件；
+best-effort scoped keyword scan；只有扫描器识别出的明确命中会阻止安装，包括额外 Codex gate
+caller 或对同一 reserved signal 的显式使用。被拆分的文本、literal concatenation 与简单
+local-variable 形式会在可识别时扫描；只有已检测到但无法分类的候选才会告警。不支持或未识别的
+literal 格式可能漏检；没有 warning 不能证明不存在其他 producer。无关 keyword/context 不作为阻塞条件；
 普通文本引用（例如 `echo`、`jq` 或 artifact label）可能显示为 non-blocking reference
 warning，但不会被视为 gate collision 或阻塞安装。Unrelated workflow-local write permission
 与 opaque workflow-local permission 声明是 operator-trust warnings，不要求删除权限或隔离无关
@@ -128,6 +129,8 @@ canonical workflow permissions、CODEOWNERS protection 与 ruleset checks 也保
 不会执行 workflows、证明完整 data flow、防止恶意同名 signal forgery 或建立唯一 producer；
 operator 仍须自行信任共用 GitHub Actions App 的其他 workflows。此普通安装策略不放宽冻结的
 历史 organization handoff、bridge-removal 或 source-only proof 合约。
+
+已接受的扫描覆盖边界与例子见[workflow 扫描风险说明](docs/install/workflow-scan-risk-boundary.md)。
 
 安装请读[人类指南](docs/install/human.zh-CN.md)或
 [Agent 执行手册](docs/install/agent.zh-CN.md)。两者执行同一套 two-PR rollout：一个
