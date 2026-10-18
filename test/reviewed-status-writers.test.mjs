@@ -351,6 +351,40 @@ test("ordinary inventory warns instead of blocking opaque unrelated permissions"
   );
 });
 
+test("remote inventory conflict errors escape workflow path controls", () => {
+  const ordinaryPath = ".github/workflows/legacy-codex-review.yml";
+  const controlPath =
+    ".github/workflows/legacy\u0001\n\u001b[31mcontrol\u007f\u0085\u2028\u2029.yml";
+  const legacyWorkflow =
+    "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n";
+  const inventory = canonicalInventory([
+    { path: ordinaryPath, content: legacyWorkflow },
+    { path: controlPath, content: legacyWorkflow },
+  ]);
+  const inspection = inspectUnrelatedV2Workflows(inventory);
+  assert.ok(inspection.matches.some((match) => match.path === controlPath));
+
+  let error;
+  assert.throws(
+    () => validateCanonicalV2WorkflowInventory(inventory, CANONICAL_WORKFLOWS),
+    (caught) => {
+      error = caught;
+      return /Additional workflows contain Codex gate callers or reserved gate signals/u.test(
+        caught.message,
+      );
+    },
+  );
+  const escapedControlPath =
+    ".github/workflows/legacy\\u0001\\n\\u001b[31mcontrol\\u007f\\u0085\\u2028\\u2029.yml";
+  assert.ok(error.message.includes(`${ordinaryPath}:3`));
+  assert.ok(error.message.includes(`${escapedControlPath}:3`));
+  assert.equal(error.message.includes(controlPath), false);
+  assert.equal(error.message.includes("\n"), false);
+  for (const control of ["\u0001", "\u001b", "\u007f", "\u0085", "\u2028", "\u2029"]) {
+    assert.equal(error.message.includes(control), false);
+  }
+});
+
 test("reviewed status writers admit only bounded literal and owner-configured runner labels", () => {
   for (const content of [
     JOB_LEVEL_STATUS_WRITER,

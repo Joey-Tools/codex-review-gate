@@ -857,7 +857,7 @@ function cliCheckRunNameExpression(text, repositoryFullName, implicitCliHostUnce
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
   if (/^\/?repos\/[^/]+\/[^/]+\/check-runs$/iu.test(endpoint ?? "")) {
     if ((admission.method ?? "POST") !== "POST") return null;
-  } else if (/^\/?repos\/[^/]+\/[^/]+\/check-runs\/[^/?#]+$/iu.test(endpoint ?? "")) {
+  } else if (/^\/?repos\/[^/]+\/[^/]+\/check-runs\/[1-9][0-9]*$/iu.test(endpoint ?? "")) {
     if (admission.method !== "PATCH") return null;
   } else {
     return null;

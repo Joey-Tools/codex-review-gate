@@ -5985,6 +5985,9 @@ test("prepare-worktree blocks additional v1 callers before writing", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bootstrap-"));
   const workflowsDirectory = join(targetRoot, ".github", "workflows");
   const workflowPath = join(workflowsDirectory, "codex-review-gate.yml");
+  const controlWorkflowPath = process.platform === "win32"
+    ? null
+    : ".github/workflows/legacy\u0001\n\u001b[31mcontrol\u007f\u0085\u2028\u2029.yml";
   const legacyWorkflow =
     "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n";
   try {
@@ -5995,6 +5998,9 @@ test("prepare-worktree blocks additional v1 callers before writing", () => {
       legacyWorkflow,
       "utf8",
     );
+    if (controlWorkflowPath !== null) {
+      writeFileSync(join(targetRoot, controlWorkflowPath), legacyWorkflow, "utf8");
+    }
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 1);
@@ -6002,7 +6008,30 @@ test("prepare-worktree blocks additional v1 callers before writing", () => {
       apply.stderr,
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     );
-    assert.match(apply.stderr, /\.github\/workflows\/legacy-codex-review\.yml/u);
+    assert.ok(apply.stderr.includes(".github/workflows/legacy-codex-review.yml:3"));
+    if (controlWorkflowPath !== null) {
+      const escapedControlWorkflowPath =
+        ".github/workflows/legacy\\u0001\\n\\u001b[31mcontrol\\u007f\\u0085\\u2028\\u2029.yml";
+      const controlWorkflowDiagnostic = apply.stderr
+        .split("\n")
+        .find((line) => line.includes(`${escapedControlWorkflowPath}:3`));
+      assert.ok(
+        controlWorkflowDiagnostic,
+        "the escaped path should remain identifiable on one diagnostic line",
+      );
+      assert.equal(apply.stderr.includes(controlWorkflowPath), false);
+      for (const control of [
+        "\u0001",
+        "\n",
+        "\u001b",
+        "\u007f",
+        "\u0085",
+        "\u2028",
+        "\u2029",
+      ]) {
+        assert.equal(controlWorkflowDiagnostic.includes(control), false);
+      }
+    }
     assert.equal(existsSync(workflowPath), false);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });

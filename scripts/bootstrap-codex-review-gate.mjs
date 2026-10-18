@@ -37,6 +37,7 @@ import {
   DEFAULT_STATUS_INTEGRATION_ID,
   DEFAULT_VERIFIER_RUN_NAME_PREFIX,
   DEFAULT_WORKFLOW_PATH,
+  escapeWorkflowPathForDiagnostic,
   LEGACY_STATUS_CONTEXT,
   assertCompleteRulesetApiObject,
   assertPostCutoverAuditOrganizationLegacyRulesetSemantics,
@@ -7792,7 +7793,7 @@ async function loadLocalInstallationSecurityState({
       },
     );
     conflicts.push(...inspection.matches.map((match) =>
-      `${match.path}:${match.line} (${match.kind}: ${match.excerpt})`
+      `${escapeWorkflowPathForDiagnostic(match.path)}:${match.line} (${match.kind}: ${match.excerpt})`
     ));
     reportUnrelatedWorkflowWarnings(inspection);
   }
@@ -7829,13 +7830,6 @@ function reportUnrelatedWorkflowWarnings({ warnings }) {
     REPORTED_INSTALLATION_WARNINGS.add(key);
     console.error(`warning: ${escapeWorkflowPathForDiagnostic(warning.path)}:${warning.line} [${warning.kind}] ${warning.message}`);
   }
-}
-
-function escapeWorkflowPathForDiagnostic(path) {
-  return JSON.stringify(path).slice(1, -1).replace(
-    /[\u007f-\u009f\u2028\u2029]/gu,
-    (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
-  );
 }
 
 function buildExpectedFinalLocalSecurityState({

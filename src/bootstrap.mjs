@@ -4629,6 +4629,13 @@ export function workflowSingleProducerPolicyViolations(
   return violations;
 }
 
+export function escapeWorkflowPathForDiagnostic(path) {
+  return JSON.stringify(path).slice(1, -1).replace(
+    /[\u007f-\u009f\u2028\u2029]/gu,
+    (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
 // Ordinary installation scans for likely gate collisions, not for a proof that
 // every other workflow is incapable of writing a reserved signal. Unrelated
 // write authority and constructions the text scanner cannot resolve are trusted
@@ -5982,7 +5989,7 @@ function validateV2WorkflowInventory(
     });
     if (inspection.matches.length > 0) {
       throw new Error(
-        `Additional workflows contain Codex gate callers or reserved gate signals: ${inspection.matches.map((match) => `${match.path}:${match.line} (${match.kind}: ${match.excerpt})`).join("; ")}`,
+        `Additional workflows contain Codex gate callers or reserved gate signals: ${inspection.matches.map((match) => `${escapeWorkflowPathForDiagnostic(match.path)}:${match.line} (${match.kind}: ${match.excerpt})`).join("; ")}`,
       );
     }
     return canonicalWorkflows;

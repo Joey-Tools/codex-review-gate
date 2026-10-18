@@ -1262,6 +1262,13 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     assert.equal(updater.matches[0].kind, "reserved-check-run-name", method);
   }
 
+  for (const checkRunId of ["abc", "0", "-1", "+1", "01", "1.5"]) {
+    const unsupportedUpdater = inspectWorkflowGateSignals(
+      `run: gh api repos/o/r/check-runs/${checkRunId} --method PATCH -f name=codex/github-review-gate`,
+    );
+    assert.deepEqual(unsupportedUpdater.matches, [], checkRunId);
+  }
+
   for (const method of ["--method GET", "--method=GET", "-X GET", "--method HEAD"]) {
     const reader = inspectWorkflowGateSignals(
       `run: gh api repos/o/r/check-runs ${method} -f name=codex/github-review-gate`,
