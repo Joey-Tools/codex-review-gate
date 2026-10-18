@@ -120,6 +120,8 @@ export function inspectWorkflowGateSignals(
     );
   }
   markYamlJobNameFields(lines);
+  // This source-wide key scan is intentionally role-agnostic: a job ID or
+  // env/with data named `shell` can suppress unrelated command matches.
   const explicitShellConfiguration = lines.find(isYamlShellConfigurationLine);
   if (explicitShellConfiguration) {
     shellPublisherMatchingUncertain = true;
@@ -497,6 +499,9 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
 
 function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName, implicitCliHostUncertain) {
   const literals = new Map();
+  // Shell locals help classify executable fields, but never rewrite YAML
+  // names or context scalars.
+  const yamlLiterals = new Map();
   for (const line of window) {
     if (line.unclassifiedRunBlock) {
       literals.clear();
@@ -524,7 +529,7 @@ function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullNam
           continue;
         }
         if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
-          inspectContext(field.key, field.value, literals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
+          inspectContext(field.key, field.value, yamlLiterals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
         }
       }
     }
@@ -532,7 +537,7 @@ function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullNam
       ...(line.yamlMatrixJobNameUnclassified ? [] : line.flowJobFields?.names ?? []),
       ...(line.yamlMatrixJobNameUnclassified ? [] : line.inlineJobFields?.names ?? []),
     ]) {
-      inspectContext("name", field.value, literals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
+      inspectContext("name", field.value, yamlLiterals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
     }
     for (const field of [
       ...(line.flowJobFields?.uses ?? []),
@@ -884,8 +889,10 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
   for (let index = 1; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     const equals = argument.indexOf("=");
-    const option = equals > 0 ? argument.slice(0, equals) : argument;
-    const inlineValue = equals > 0 ? argument.slice(equals + 1) : null;
+    const hasAttachedLongOptionValue = argument.startsWith("--") && equals > 0;
+    const option = hasAttachedLongOptionValue ? argument.slice(0, equals) : argument;
+    const inlineValue = hasAttachedLongOptionValue ? argument.slice(equals + 1) : null;
+    if (inlineValue !== null && !valueOptions.has(option)) return null;
     if (option === "--data-urlencode") return null;
     if (valueOptions.has(option)) {
       const value = inlineValue ?? arguments_[index + 1];
@@ -893,7 +900,7 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
       if (inlineValue === null) index += 1;
       if (option === "-X" || option === "--request") {
         if (method !== null) return null;
-        method = value.toUpperCase();
+        method = value;
       } else if (dataOptions.has(option)) {
         payloads.push(value);
       } else if (option === "--url") {
@@ -1438,6 +1445,8 @@ function markYamlJobNameFields(lines) {
 }
 
 function hasYamlMatrixKeyMention(line, jobIndent = null) {
+  // Any nested `matrix:` key can reach this guard, including env/with data;
+  // preserve that warning-only coverage loss without interpreting YAML roles.
   if (line.yamlScalarContent || isRunCommandLine(line.text)) return false;
   const mapping = simpleYamlMapping(line.text);
   if (mapping?.key.toLowerCase() === "matrix") {
@@ -2040,8 +2049,10 @@ function resolveSimpleLiteral(expression, literals, stripTerminators = true) {
   return literalAtom(value, literals);
 }
 
-function resolveYamlWindowLiteral(expression, literals) {
-  return resolveSimpleLiteral(expression, literals, false);
+function resolveYamlWindowLiteral(expression) {
+  // Scalar aliases are resolved in the primary bounded YAML pass. This window
+  // pass only decodes a scalar (and optional anchor prefix), never expressions.
+  return resolveYamlLiteral(stripYamlAnchor(expression));
 }
 
 function literalAtom(value, literals, allowBare = true) {

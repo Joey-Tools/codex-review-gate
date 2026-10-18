@@ -2652,6 +2652,9 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
 
 test("ordinary local preparation accepts status writers while explicit declarations remain strict", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-reviewed-writers-"));
+  const controlWarningPath = process.platform === "win32"
+    ? null
+    : ".github/workflows/control\u0001\n\u001b[31mname\u007f\u0085\u2028\u2029.yml";
   const writers = [
     { path: ".github/workflows/transport.yml", content: REVIEWED_INLINE_STATUS_WRITER },
     { path: ".github/workflows/evidence.yaml", content: REVIEWED_INLINE_STATUS_WRITER.replace("publish:", "evidence:") },
@@ -2663,9 +2666,45 @@ test("ordinary local preparation accepts status writers while explicit declarati
     initializeGitRepository(targetRoot);
     mkdirSync(join(targetRoot, ".github/workflows"), { recursive: true });
     for (const { path, content } of writers) writeFileSync(join(targetRoot, path), content);
+    if (controlWarningPath !== null) {
+      writeFileSync(
+        join(targetRoot, controlWarningPath),
+        "name: Control path warning\non: push\npermissions:\n  contents: write\njobs:\n  write:\n    runs-on: ubuntu-latest\n    steps: []\n",
+      );
+    }
     const accepted = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
+    if (controlWarningPath !== null) {
+      rmSync(join(targetRoot, controlWarningPath));
+    }
     assert.equal(accepted.status, 0, accepted.stderr);
     assert.match(accepted.stderr, /unrelated-workflow-write/u);
+    assert.ok(accepted.stderr.includes("warning: .github/workflows/transport.yml:"));
+    if (controlWarningPath !== null) {
+      const escapedControlWarningPath =
+        ".github/workflows/control\\u0001\\n\\u001b[31mname\\u007f\\u0085\\u2028\\u2029.yml";
+      const controlWarningPrefix = `warning: ${escapedControlWarningPath}:`;
+      const controlWarningLine = accepted.stderr
+        .split("\n")
+        .find((line) => line.startsWith(controlWarningPrefix));
+      assert.ok(
+        controlWarningLine,
+        "the escaped path should remain identifiable on one diagnostic line",
+      );
+      assert.match(controlWarningLine, /:\d+ \[unrelated-workflow-write\]/u);
+      assert.equal(accepted.stderr.includes(controlWarningPath), false);
+      assert.equal(accepted.stderr.includes("\u001b[31mname"), false);
+      for (const control of [
+        "\u0001",
+        "\n",
+        "\u001b",
+        "\u007f",
+        "\u0085",
+        "\u2028",
+        "\u2029",
+      ]) {
+        assert.equal(controlWarningLine.includes(control), false);
+      }
+    }
     assert.equal(
       readFileSync(join(targetRoot, DEFAULT_WORKFLOW_PATH), "utf8"),
       CANONICAL_WORKFLOW,

@@ -170,6 +170,32 @@ test("keeps YAML value punctuation and quoted scalar text out of field identity"
   assert.deepEqual(flowName.matches.map(({ kind }) => kind), ["reserved-job-name"]);
 });
 
+test("keeps YAML name and context values as scalars, not executable expressions", () => {
+  const variableReference = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - run: |",
+    "          GATE=codex/github-review-gate",
+    "    name: GATE",
+    "    check-context: GATE",
+  ].join("\n"));
+  assert.deepEqual(variableReference.matches, []);
+  assert.ok(
+    !variableReference.warnings.some(
+      ({ kind, line }) => kind === "ambiguous-reserved-context" && [6, 7].includes(line),
+    ),
+  );
+
+  const concatenation = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    name: 'codex/github-' + 'review-gate'",
+    "    check-context: 'codex/github-' + 'review-gate'",
+  ].join("\n"));
+  assert.deepEqual(concatenation.matches, []);
+});
+
 test("does not resolve a punctuated block YAML anchor as an exact scalar", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -395,6 +421,36 @@ test("leaves matrix job names unknown while retaining non-matrix names and actio
   assert.ok(flowMatrixName.warnings.some(({ kind }) => kind === "matrix-job-name-unclassified"));
 });
 
+test("keeps nested env and reusable-job with matrix keys as warning-only coverage gaps", () => {
+  const cases = [
+    ["env data", [
+      "jobs:",
+      "  build:",
+      "    name: codex/github-review-gate",
+      "    env:",
+      "      matrix: value",
+      "    steps: []",
+    ].join("\n")],
+    ["reusable-job with input", [
+      "jobs:",
+      "  build:",
+      "    name: codex/github-review-gate",
+      "    uses: example/workflows/child.yml@main",
+      "    with:",
+      "      matrix: value",
+    ].join("\n")],
+  ];
+
+  for (const [label, source] of cases) {
+    const result = inspectWorkflowGateSignals(source);
+    assert.deepEqual(result.matches, [], label);
+    assert.ok(
+      result.warnings.some(({ kind }) => kind === "matrix-job-name-unclassified"),
+      label,
+    );
+  }
+});
+
 test("leaves command publishers unknown when YAML explicitly configures a shell", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -437,6 +493,39 @@ test("leaves command publishers unknown when YAML explicitly configures a shell"
     ["codex-review-gate-action-caller"],
   );
   assert.ok(!suppressedPublisherFlood.warnings.some(({ kind }) => kind === "match-limit"));
+});
+
+test("keeps job-ID and env/with shell mentions as warning-only coverage gaps", () => {
+  const publisher = "      - run: gh api repos/o/r/check-runs -f name=codex/github-review-gate";
+  const cases = [
+    ["job ID shell", ["jobs:", "  shell:", "    steps:", publisher].join("\n")],
+    ["env shell data", [
+      "jobs:",
+      "  publish:",
+      "    env:",
+      "      shell: bash",
+      "    steps:",
+      publisher,
+    ].join("\n")],
+    ["step with shell input", [
+      "jobs:",
+      "  publish:",
+      "    steps:",
+      "      - uses: example/action@v1",
+      "        with:",
+      "          shell: bash",
+      publisher,
+    ].join("\n")],
+  ];
+
+  for (const [label, source] of cases) {
+    const result = inspectWorkflowGateSignals(source);
+    assert.deepEqual(result.matches, [], label);
+    assert.ok(
+      result.warnings.some(({ kind }) => kind === "explicit-shell-configuration-unclassified"),
+      label,
+    );
+  }
 });
 
 test("never derives exact values or aliases from incomplete line and window text", () => {
@@ -928,10 +1017,9 @@ test("finds known caller literals on the next line of folded uses scalars", () =
   );
 });
 
-test("finds adjacent literals and simple local literal compositions", () => {
-  const adjacent = inspectWorkflowGateSignals(`context: 'codex/' + 'github-review-gate'`);
-  assert.equal(adjacent.matches.length, 1);
-  assert.equal(adjacent.matches[0].kind, "reserved-status-context");
+test("keeps YAML scalar identity separate from executable literal tracking", () => {
+  const yamlConcatenation = inspectWorkflowGateSignals(`context: 'codex/' + 'github-review-gate'`);
+  assert.deepEqual(yamlConcatenation.matches, []);
 
   const variables = inspectWorkflowGateSignals([
     "jobs:",
@@ -1348,6 +1436,28 @@ test("finds inline JSON CheckRun POST names across common curl data flags", () =
     "run: echo https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.deepEqual(nonPublishers.matches, []);
+});
+
+test("preserves curl request-method case and rejects attached short-option equals rewrites", () => {
+  const payload = `'{"name":"codex/github-review-gate"}'`;
+  const endpoint = "https://api.github.com/repos/o/r/check-runs";
+  for (const command of [
+    `curl -X post -d ${payload} ${endpoint}`,
+    `curl --request post -d ${payload} ${endpoint}`,
+    `curl --request=post --data=${payload} ${endpoint}`,
+    `curl -X=POST -d ${payload} ${endpoint}`,
+    `curl -X POST -d=${payload} ${endpoint}`,
+  ]) {
+    assert.deepEqual(inspectWorkflowGateSignals(`run: ${command}`).matches, [], command);
+  }
+
+  const attachedLongOptions = inspectWorkflowGateSignals(
+    `run: curl --request=POST --data=${payload} ${endpoint}`,
+  );
+  assert.deepEqual(
+    attachedLongOptions.matches.map(({ kind }) => kind),
+    ["reserved-check-run-name"],
+  );
 });
 
 test("uses curl URL operands rather than header or later-command text", () => {

@@ -69,7 +69,18 @@ warning-only, including inline commands, curl commands and variable-derived
 paths. Actual action callers and job-name matches remain eligible. These rules
 intentionally lose coverage even for harmless or data-only matrix text and
 ordinary shell declarations; the scan does not inherit defaults or interpret
-shell configuration with a shell implementation.
+shell configuration with a shell implementation. The accepted matrix loss
+includes a block-form `env:` mapping with a nested `matrix:` key and a reusable
+job's block-form `with:` mapping with a nested `matrix:` input, even though
+neither establishes `strategy.matrix` expansion ([review finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4306626036)).
+The finding's inline-map example is not reproduced by this heuristic; this note
+records only the recognized block-form key mentions.
+The accepted shell loss also includes a job ID named `shell` or an `env`/`with`
+data entry named `shell`, even without an actual run-shell setting
+([review finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4306626032)).
+No YAML role or `strategy.matrix` parser is added to distinguish those cases;
+action-caller and unaffected job-name recognition remain eligible, and strict
+canonical/runtime controls remain unchanged.
 
 The scan does not interpret descriptor redirections such as `2>&1` or `&>`.
 Its bounded first-command prefix can stop at their ampersand and miss a real
