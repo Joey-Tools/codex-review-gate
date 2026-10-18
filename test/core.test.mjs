@@ -2750,6 +2750,17 @@ test("opts inline-parent review grammar into the exact v1 receipt envelope", () 
     codexInlineParentReviewBodyHasClosedGrammar(
       {
         ...unwrappedReview,
+        body: bodyWithoutReviewedCommit,
+      },
+      { allowKnownReceiptEnvelope: true },
+    ),
+    false,
+    "receipt opt-in alone does not authorize an unwrapped body without a commit line",
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar(
+      {
+        ...unwrappedReview,
         body: codexReviewReceiptEnvelope(bodyWithoutReviewedCommit),
       },
       { allowKnownReceiptEnvelope: true },

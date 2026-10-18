@@ -354,6 +354,8 @@ in its body. In the v2 compatibility profile, the full native `commit_id`
 supplies that binding; a missing or short native SHA is not sufficient. If a
 body commit field is present, it must still agree with the native commit.
 Extra finding payload or an unsupported wrapper is not silently discarded.
+Omitting the body commit field is supported only when the known receipt
+envelope was actually removed, not merely when its compatibility option is on.
 
 The single known receipt marker must remain at the start of the body. Harmless
 blank whitespace after it is normalized; unknown or duplicate markers are not

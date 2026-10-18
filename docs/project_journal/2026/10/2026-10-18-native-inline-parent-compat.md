@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-18
 updated: 2026-10-18
 branch: codex/native-parent-review-compat
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/129
 supersedes: []
 superseded_by:
 ---
@@ -36,7 +36,9 @@ superseded_by:
   receipt marker only in the existing opt-in compatibility profile. Do not
   accept unknown or duplicate envelopes or strip arbitrary provider content.
 - Permit the narrow native inline-parent wrapper to omit a duplicate body
-  commit field when the submitted native review already supplies a full SHA.
+  commit field only after an actual known envelope is removed and the submitted
+  native review supplies a full SHA. Enabling the compatibility option alone
+  is not proof of an envelope; an unwrapped review still needs its body SHA.
   Preserve explicit body/native commit agreement, closed wrapper/disclosure,
   trusted provider provenance and global unresolved-thread blocking. Default
   legacy callers and top-level clean issue-comment commit requirements remain
@@ -57,7 +59,9 @@ superseded_by:
 - The exact historical three-newline/no-body-SHA receipt now permits a later
   current-head clean when threads are resolved. The same history with an
   unresolved old thread still blocks. Missing/short native SHA, duplicate
-  envelopes and extra finding payload remain non-success outcomes; unit tests
+  or missing envelopes and extra finding payload remain non-success outcomes;
+  the missing-envelope regression retains the full native SHA and a later
+  current-head clean to verify that opt-in alone supplies no authority. Unit tests
   also retain malformed and conflicting body SHA rejection and default strict
   behavior.
 - `npm run check`, project-journal validation, `git diff --check`, and actionlint

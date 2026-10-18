@@ -7403,6 +7403,10 @@ test("historical native-parent receipt with separator whitespace and no body SHA
   const invalidReceipts = [
     ["missing-native-sha", { ...review, commit_id: "" }],
     ["short-native-sha", { ...review, commit_id: OLD_HEAD.slice(0, 10) }],
+    ["missing-envelope", {
+      ...review,
+      body: review.body.replace(`${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n\n`, ""),
+    }],
     ["extra-finding-payload", {
       ...review,
       body: `${review.body}\n\n- [P1] This is an unclosed finding payload.`,
@@ -7412,6 +7416,13 @@ test("historical native-parent receipt with separator whitespace and no body SHA
       body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${review.body}`,
     }],
   ];
+  const unwrappedWithoutBodySha = invalidReceipts.find(([suffix]) =>
+    suffix === "missing-envelope"
+  )[1];
+  assert.equal(unwrappedWithoutBodySha.state, "COMMENTED");
+  assert.equal(unwrappedWithoutBodySha.commit_id, OLD_HEAD);
+  assert.doesNotMatch(unwrappedWithoutBodySha.body, /codex-review-receipt/u);
+  assert.doesNotMatch(unwrappedWithoutBodySha.body, /Reviewed commit/u);
   const cases = [
     ["resolved", [reviewThread({
       id: "PRRT_native_parent_resolved",

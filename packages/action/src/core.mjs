@@ -660,6 +660,8 @@ export function codexInlineParentReviewBodyHasClosedGrammar(
   const body = allowKnownReceiptEnvelope === true
     ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
     : normalizedBody;
+  const receiptEnvelopeWasUnwrapped =
+    allowKnownReceiptEnvelope === true && body !== normalizedBody;
   if (!body || body.length > 5_000) {
     return false;
   }
@@ -690,7 +692,7 @@ export function codexInlineParentReviewBodyHasClosedGrammar(
     }
     disclosureStart = 3;
   } else if (
-    allowKnownReceiptEnvelope !== true ||
+    !receiptEnvelopeWasUnwrapped ||
     lines.some((line) => /^\*\*Reviewed commit:\*\*/i.test(line))
   ) {
     return false;
