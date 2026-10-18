@@ -1437,6 +1437,36 @@ test("requires one nonempty supported head_sha field for CLI CheckRun creation",
   }
 });
 
+test("records source-only typed head_sha false positives as accepted behavior", () => {
+  const checkRun = "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate";
+  for (const value of ["null", "true", "false", "12", "-12"]) {
+    for (const argument of [
+      `-F head_sha=${value}`,
+      `-F=head_sha=${value}`,
+      `--field head_sha=${value}`,
+      `--field=head_sha=${value}`,
+    ]) {
+      assert.deepEqual(
+        inspectWorkflowGateSignals(`${checkRun} ${argument}`).matches.map(({ kind }) => kind),
+        ["reserved-check-run-name"],
+        `${argument}: source-only accepted typed-field false positive`,
+      );
+    }
+    for (const argument of [
+      `-f head_sha=${value}`,
+      `-f=head_sha=${value}`,
+      `--raw-field head_sha=${value}`,
+      `--raw-field=head_sha=${value}`,
+    ]) {
+      assert.deepEqual(
+        inspectWorkflowGateSignals(`${checkRun} ${argument}`).matches.map(({ kind }) => kind),
+        ["reserved-check-run-name"],
+        `${argument}: raw-field text presence control`,
+      );
+    }
+  }
+});
+
 test("skips known run blocks containing here-document-like text conservatively", () => {
   const heredoc = inspectWorkflowGateSignals([
     "jobs:",

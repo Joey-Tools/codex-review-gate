@@ -37,11 +37,13 @@ Here, `env` / `with` / `outputs` / `secrets` means mapping properties, not a job
 The supported `gh api` publishing matches exclude recognized explicit GET/HEAD method forms for both context and CheckRun-name fields. Other recognized command fields remain candidates, including a PATCH CheckRun-name update; non-POST does not mean read-only. Unsupported command forms remain outside the completeness guarantee.
 
 For a supported CheckRun collection-create POST, the CLI match requires the
-exact `head_sha` field with a nonempty supplied value. A dynamic CLI value is
-presence-only: the scan does not evaluate its expansion or prove that its
-runtime value is nonempty. The supported curl POST JSON form requires a
-nonempty top-level string `head_sha`. This narrow field-presence rule does not
-validate the full API schema or SHA format; the existing name-only PATCH match
+exact `head_sha` field with nonempty supplied CLI text. This is a raw-text
+presence check, not proof that CLI conversion produces a JSON string or that
+the request succeeds. A dynamic CLI value is also presence-only: the scan does
+not evaluate its expansion or prove that its runtime value is nonempty. The
+explicitly accepted typed-nonstring case is recorded below. The supported curl
+POST JSON form requires a nonempty top-level string `head_sha`. This narrow
+field-presence rule does not validate the full API schema or SHA format; the existing name-only PATCH match
 with a canonical positive-decimal run ID is unchanged ([review finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4307496207)).
 No additional API, shell, or value interpreter is added.
 
@@ -194,11 +196,12 @@ These guards intentionally lose coverage rather than adding interpreters.
 
 ## Explicitly approved conservative matches
 
-Joey explicitly accepted these three narrow conservative outcomes to keep the
+Joey explicitly accepted these four narrow conservative outcomes to keep the
 ordinary preflight a bounded source-keyword scan. The first two avoid
 caller/callee name analysis and condition evaluation; the `gh` function case
 avoids function execution or lookup and avoids skipping a whole block that
-could contain a real publisher:
+could contain a real publisher; the typed-field case avoids CLI value/type
+interpretation:
 
 - A reserved job-name string in a `workflow_call`-only reusable workflow may
   still be matched without determining whether a caller references it or how
@@ -211,18 +214,23 @@ could contain a real publisher:
   positive. The scanner does not execute or resolve shell functions, and
   skipping the entire block could miss another real publisher in it ([review
   finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4307496214)).
+- A supported `-F` / `--field` `head_sha` argument with nonempty supplied text
+  may match even when the argument is null, boolean, or integer typed rather
+  than a JSON string. Supplied text does not prove the final JSON type/value or
+  that the request succeeds; the scanner does not interpret CLI field values
+  or types ([review finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4307680786)).
 
 These syntactic matches can block ordinary installation even when a workflow
 is not invoked, a command never executes, or the emitted native name differs.
-Joey's approval is limited to these three named cases, not a general waiver for
+Joey's approval is limited to these four named cases, not a general waiver for
 other false positives. Known-data and exact-literal identity corrections
 remain required. A match is not proof that a workflow is invoked, that a step
 executes, or that GitHub emits the exact native check name. The accepted
 former-slug redirect gap is described above. These dispositions add no broader
-caller/callee, condition, or shell-function interpreter, and no additional
-alias/redirect API query. The separate narrow `head_sha` presence rule above
-does not validate the full API schema or SHA value. This record does not define
-a bypass, override, or recovery path for literal matches.
+caller/callee, condition, shell-function, or CLI field type/value interpreter,
+and no additional alias/redirect API query. The separate narrow `head_sha`
+presence rule above does not validate the full API schema or SHA value. This
+record does not define a bypass, override, or recovery path for literal matches.
 
 ## Safeguards that remain strict
 
