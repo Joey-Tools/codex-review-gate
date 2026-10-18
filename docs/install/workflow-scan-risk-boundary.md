@@ -30,6 +30,22 @@ The following eight PR #128 review examples are intentionally accepted as warnin
 
 These accepted scanner-coverage examples do not by themselves establish a security regression or change runtime evidence. They also do not waive ordinary runtime handling of unresolved review findings.
 
+The examples above are not exhaustive. In particular, on Windows a workflow's
+`GH api ...` command can invoke `gh.exe` while the scanner's exact lowercase
+`gh api` source grammar does not recognize that executable spelling. This concrete
+platform-specific false negative remains warning-only under the existing
+unsupported literal/platform/shell-semantics boundary ([PR #128 review
+finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309246151)).
+It can publish a competing check; this is a real coverage gap, not a claim
+that the request cannot publish. Keep the matcher unchanged: do not add executable
+discovery or shell/platform interpretation, and do not globally case-fold the
+command because `GH` and `gh` can denote different executables on Unix. This
+is not a fifth accepted conservative false-positive match. The original four
+named conservative matches, eight listed warning-only examples, and strict
+installer/runtime controls remain unchanged.
+Microsoft documents that external application discovery follows the underlying
+filesystem's case behavior ([PowerShell case sensitivity](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_case-sensitivity?view=powershell-7.6)); this source-only fixture is not a Windows execution test.
+
 The false-negative allowance does not justify treating known data as execution. Context-like fields inside `env`, `with`, `outputs` or `secrets` data, including nested container environment mappings, and YAML-looking selector text inside block scalars, are not by themselves proof of a publisher or caller. The scanner keeps those references nonblocking while retaining its separate recognition of actual command/API publishing patterns. An environment, input, output or secret value may still flow into a publisher; tracing that data flow remains outside this preflight. This distinction is bounded source classification, not a promise of complete YAML or shell semantics.
 
 Here, `env` / `with` / `outputs` / `secrets` means mapping properties, not a job ID with the same spelling. Likewise, CLI-shaped output text such as `echo -f context=...` is not a publishing command. A bounded folded job name is compared as a complete value, not a single physical line; incomplete or over-budget values warn rather than proving a collision from a prefix. Known YAML step boundaries reset local literal tracking regardless of the first step field; list-looking text inside data or a scalar is not an execution boundary.

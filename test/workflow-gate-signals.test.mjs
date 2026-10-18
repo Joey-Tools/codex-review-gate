@@ -1143,6 +1143,24 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
   );
 });
 
+test("keeps Windows GH executable discovery outside the literal lowercase gh grammar", () => {
+  const body = "repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567";
+  const windows = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publisher:",
+    "    runs-on: windows-latest",
+    "    steps:",
+    `      - run: GH api ${body}`,
+  ].join("\n"));
+  assert.deepEqual(windows.matches, []);
+  assert.ok(
+    windows.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+  );
+
+  const supported = inspectWorkflowGateSignals(`run: gh api ${body}`);
+  assert.deepEqual(supported.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+});
+
 test("filters literal API publishers for a known foreign repository only", () => {
   const cli = "run: gh api repos/other/repo/statuses/$SHA -f context=codex/github-review-gate -f state=success";
   const curl = `run: curl -X POST -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/other/repo/statuses/$SHA`;

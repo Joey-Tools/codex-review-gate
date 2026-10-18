@@ -864,6 +864,9 @@ function cliApiSupportsFieldPublisher(
   implicitCliRepositoryUncertain = false,
 ) {
   const arguments_ = shellWords(command);
+  // The bounded publisher grammar admits literal lowercase `gh api` only; it
+  // does not discover platform-specific executables such as Windows `GH`.
+  // Global case-folding here could create Unix false positives.
   if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return false;
   let hostname = null;
   let methodCount = 0;
