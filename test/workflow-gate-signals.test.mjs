@@ -67,6 +67,67 @@ jobs:
   }
 });
 
+test("keeps indentless step display names out of job-name classification", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  display-only:",
+    "    steps:",
+    "    - name: codex/github-review-gate",
+    "      run: echo ready",
+    "  actual-collision:",
+    "    name: codex/github-review-gate",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    ["reserved-job-name", "codex-review-gate-action-caller"],
+  );
+  assert.equal(result.matches[0].line, 7);
+  assert.equal(result.matches[1].line, 9);
+});
+
+test("keeps multiline quoted YAML content unclassified through its closing line", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  display-only:",
+    "    name: 'safe display name",
+    "        context: codex/github-review-gate",
+    "        uses: JoeyTeng/codex-review-gate-action@v2",
+    "        closing quote'",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  actual-collision:",
+    "    name: codex/github-review-gate",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    ["codex-review-gate-action-caller", "reserved-job-name"],
+  );
+  assert.equal(result.matches[0].line, 9);
+  assert.equal(result.matches[1].line, 11);
+  assert.ok(result.warnings.some(({ kind, line }) => kind === "unclassified-quoted-yaml-scalar" && line === 3));
+});
+
+test("does not scan quoted run scalar continuations as physical shell lines", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: 'echo harmless",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          closing quote'",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches.map(({ kind }) => kind), ["codex-review-gate-action-caller"]);
+  assert.equal(result.matches[0].line, 7);
+  assert.ok(result.warnings.some(({ kind, line }) => kind === "unclassified-quoted-yaml-scalar" && line === 4));
+});
+
 test("preserves YAML slash-slash scalar content when matching reserved job names", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -1400,6 +1461,52 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     `          curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
   ].join("\n"));
   assert.deepEqual(followsOtherContinuation.matches, []);
+});
+
+test("does not classify physical lines inside incomplete run-block shell commands", () => {
+  const continuedEcho = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          echo harmless \\",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "      - run: |",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ].join("\n"));
+  assert.equal(continuedEcho.matches.length, 1);
+  assert.equal(continuedEcho.matches[0].kind, "reserved-check-run-name");
+  assert.equal(continuedEcho.matches[0].line, 8);
+  assert.ok(continuedEcho.warnings.some(({ kind }) => kind === "unclassified-run-block"));
+  assert.ok(continuedEcho.warnings.some(({ kind }) => kind === "reserved-status-context-reference"));
+
+  const openQuote = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    '          echo "harmless',
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ].join("\n"));
+  assert.deepEqual(openQuote.matches, []);
+  assert.ok(openQuote.warnings.some(({ kind }) => kind === "unclassified-run-block"));
+
+  const uncertainCurlBlock = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    "            https://api.github.com/repos/o/r/check-runs",
+    '          echo "unfinished',
+  ].join("\n"));
+  assert.deepEqual(
+    uncertainCurlBlock.matches,
+    [],
+    "a whole unknown run block must not retain provisional curl matches",
+  );
+  assert.ok(uncertainCurlBlock.warnings.some(({ kind }) => kind === "unclassified-run-block"));
 });
 
 test("keeps accepted ordinary-installer coverage examples warning-only", () => {

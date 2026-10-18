@@ -114,6 +114,25 @@ Known folded `run: >` blocks stay unclassified as whole blocks. Physical lines
 cannot establish separate shell commands after YAML folding; no reconstruction
 is attempted. Literal `|` run blocks keep their separate supported matching.
 
+Within a known literal `run` block, an unsupported incomplete shell physical
+line (for example, a backslash-continued `echo` or an unclosed quote) makes the
+entire block unknown to this scan. The bounded curl continuation groups remain
+supported unless another incomplete line makes the block unknown. In that
+case, even an earlier provisional literal curl match is suppressed. This is an
+intentional coverage loss, not evidence that the block cannot execute a
+publisher.
+
+A multiline quoted YAML scalar, including a quoted `run` value, remains
+unclassified through its conservative dedent boundary. The scan does not fold
+or decode that scalar; `context`, `uses` or `gh`-looking text inside it is not
+proof of a job field, action caller or executable command. This is bounded
+classification, not YAML parsing or execution analysis.
+
+An indentless sequence item under `steps:` remains a step even when its
+indentation equals the `steps:` key. Its `name` is a step display name, not the
+enclosing job's name. This role correction avoids a false job-name collision;
+it does not broaden the scanner's syntax coverage.
+
 Mentioning `GH_HOST` anywhere in the bounded workflow source makes implicit-host
 gh API publication unclassified for that scan, with a fixed warning. This is a
 conservative coverage loss even for inactive/data/comment references, not scoped

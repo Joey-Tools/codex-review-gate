@@ -114,7 +114,18 @@ export function inspectWorkflowGateSignals(
   }
   markYamlJobNameFields(lines);
   markUnknownRunBlocks(lines, reserved, addWarning);
-  inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, repositoryFullName);
+  const continuedCurlMatches = [];
+  inspectCurlContinuationBlocks(
+    lines, reserved,
+    (kind, line, raw) => continuedCurlMatches.push({ kind, line, raw }),
+    addWarning, repositoryFullName,
+  );
+  markUnknownRunContinuations(lines, reserved, addWarning);
+  for (const finding of continuedCurlMatches) {
+    if (!lines[finding.line - 1]?.unclassifiedRunBlock) {
+      addMatch(finding.kind, finding.line, finding.raw);
+    }
+  }
 
   if (content.length > clipped.length) {
     addWarning(
@@ -141,6 +152,14 @@ export function inspectWorkflowGateSignals(
       if (foldedJobName) foldedJobName.unclassified = true;
       if (foldedUses) foldedUses = null;
       continue;
+    }
+    if (line.yamlQuotedScalarContinuation) {
+      addWarning(
+        "unclassified-quoted-yaml-scalar",
+        line.line,
+        "A quoted YAML scalar continues across physical lines and was not decoded by the bounded scan.",
+        line.raw,
+      );
     }
     if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
       if (foldedJobName) {
@@ -1299,6 +1318,18 @@ function markYamlJobNameFields(lines) {
       }
       continue;
     }
+    // GitHub Actions accepts indentless sequences under a mapping key. A step
+    // item at the same indentation as `steps:` is not another job property.
+    if (
+      stepsIndent !== null &&
+      indent === stepsIndent &&
+      /^\s*-\s+/u.test(line.text)
+    ) {
+      stepIndent = indent;
+      stepPropertyIndent = null;
+      if (key?.toLowerCase() === "uses") markSelectorUse(line);
+      continue;
+    }
     if (jobPropertyIndent === null) jobPropertyIndent = indent;
     if (indent === jobPropertyIndent) {
       if (key?.toLowerCase() === "name") line.jobNameField = true;
@@ -1383,6 +1414,44 @@ function markUnknownRunBlocks(lines, reserved, addWarning) {
   }
 }
 
+function markUnknownRunContinuations(lines, reserved, addWarning) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index];
+    if (header.truncated || header.yamlDataField || header.yamlScalarContent) continue;
+    const runHeader = header.text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu);
+    if (!runHeader || !isBlockScalarIndicator(stripYamlAnchor(runHeader[1].trim()))) continue;
+
+    const blockLines = [header];
+    let containsUnknownShellContinuation = false;
+    for (let bodyIndex = index + 1; bodyIndex < lines.length; bodyIndex += 1) {
+      const body = lines[bodyIndex];
+      if (!body.yamlScalarContent || body.yamlScalarOwnerKey !== "run") break;
+      blockLines.push(body);
+      if (!body.continuedCurlCommandPart && shellWords(body.text.trim()) === null) {
+        containsUnknownShellContinuation = true;
+      }
+    }
+    if (!containsUnknownShellContinuation) continue;
+
+    for (const line of blockLines) line.unclassifiedRunBlock = true;
+    addWarning(
+      "unclassified-run-block",
+      header.line,
+      "A run block contains an incomplete shell line and was skipped by the bounded shell-text scan.",
+      header.raw,
+    );
+    if (blockLines.some((line) => hasExactToken(line.raw, reserved))) {
+      addWarning(
+        "reserved-status-context-reference",
+        header.line,
+        "The reserved name appears in an unclassified run block; this text scan cannot confirm a status publisher.",
+        header.raw,
+      );
+    }
+    index += blockLines.length - 1;
+  }
+}
+
 function markSelectorUse(line) {
   if (line.yamlDataField || line.yamlScalarContent) return;
   const field = fieldsOnLine(line.text).find(
@@ -1445,6 +1514,16 @@ function markYamlDataAndScalarFields(lines) {
     }
     line.yamlDataField = dataMappingIndents.length > 0;
     const workflowProperty = !line.yamlDataField && isWorkflowYamlProperty(line, mapping, workflow);
+    if (mapping && isUnclosedQuotedYamlScalar(mapping.value)) {
+      line.yamlScalarContent = true;
+      // Do not treat unsupported quoted run continuations as physical shell
+      // lines; their YAML scalar folding and quote decoding are unknown here.
+      line.yamlScalarOwnerKey = "quoted-yaml-scalar";
+      line.yamlQuotedScalarContinuation = true;
+      scalarKeyIndent = mapping.indent;
+      scalarOwnerKey = "quoted-yaml-scalar";
+      continue;
+    }
     const nestedJobProperty =
       workflow.jobsIndent !== null &&
       workflow.jobIndent !== null &&
@@ -1503,6 +1582,18 @@ function isWorkflowYamlProperty(line, mapping, scope) {
     }
     return false;
   }
+  // Indentless step sequences share the `steps:` indentation. Recognize the
+  // sequence item before interpreting its mapping key as a job property.
+  if (
+    scope.stepsIndent !== null &&
+    indent === scope.stepsIndent &&
+    /^\s*-\s+/u.test(line.text)
+  ) {
+    scope.stepIndent = indent;
+    scope.stepPropertyIndent = null;
+    line.yamlStepBoundary = true;
+    return true;
+  }
   if (scope.jobPropertyIndent === null) scope.jobPropertyIndent = indent;
   if (indent === scope.jobPropertyIndent) {
     if (key === "steps") {
@@ -1534,6 +1625,12 @@ function isWorkflowYamlProperty(line, mapping, scope) {
     return indent === scope.stepPropertyIndent;
   }
   return false;
+}
+
+function isUnclosedQuotedYamlScalar(value) {
+  const scalar = stripYamlAnchor(value.trim());
+  if (scalar[0] !== "'" && scalar[0] !== '"') return false;
+  return yamlSyntaxState(scalar, scalar.length).quote !== null;
 }
 
 function resetWorkflowYamlScope(scope) {
