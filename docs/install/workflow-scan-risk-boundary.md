@@ -91,7 +91,10 @@ names, and does not change strict historical/proof paths.
 
 Known flow-style environment/input/output/secret/matrix mappings are data just
 like their block-form equivalents; a nested `context` does not itself prove a
-publisher. Plain YAML scalar text retains a `//` suffix rather than applying
+publisher. Known strategy, container, service and default-run-settings properties
+are likewise configuration data, including a flow container around matrix or
+environment fields; jobs whose IDs have those spellings remain jobs.
+Plain YAML scalar text retains a `//` suffix rather than applying
 JavaScript comment semantics to a job name. These are false-positive scope and
 value-identity corrections, not complete YAML parsing or executable-language
 comment interpretation.

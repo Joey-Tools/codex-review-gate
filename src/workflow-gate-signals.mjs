@@ -1396,7 +1396,7 @@ function markYamlDataAndScalarFields(lines) {
     if (
       !line.yamlDataField &&
       mapping &&
-      (/^(?:env|with|outputs|secrets)$/iu.test(mapping.key) ||
+      (/^(?:env|with|outputs|secrets|strategy|container|services|defaults)$/iu.test(mapping.key) ||
         (mapping.key.toLowerCase() === "matrix" && nestedJobProperty)) &&
       (!mapping.value.trim() || flowDataMapping) &&
       (workflowProperty || nestedJobProperty)

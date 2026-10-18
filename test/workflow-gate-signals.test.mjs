@@ -482,8 +482,23 @@ test("keeps context-like keys inside bounded flow data mappings as data", () => 
     "    with: { context: codex/github-review-gate }",
     "    outputs: { check-name: codex/github-review-gate }",
     "    secrets: { check_name: codex/github-review-gate }",
+    "    strategy: { matrix: { context: codex/github-review-gate, include: { context: codex/github-review-gate } } }",
+    "    container: { env: { context: codex/github-review-gate } }",
+    "    services: { database: { env: { context: codex/github-review-gate } } }",
+    "    defaults: { run: { context: codex/github-review-gate } }",
     "    strategy:",
-    "      matrix: { include: { context: codex/github-review-gate } }",
+    "      matrix:",
+    "        context: codex/github-review-gate",
+    "    container:",
+    "      env:",
+    "        context: codex/github-review-gate",
+    "    services:",
+    "      database:",
+    "        env:",
+    "          context: codex/github-review-gate",
+    "    defaults:",
+    "      run:",
+    "        context: codex/github-review-gate",
     "    steps:",
     "      - run: echo data only",
     "        env: { context: codex/github-review-gate }",
@@ -492,15 +507,40 @@ test("keeps context-like keys inside bounded flow data mappings as data", () => 
     "    name: codex/github-review-gate",
     "    steps:",
     "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  strategy:",
+    "    name: codex/github-review-gate",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  container:",
+    "    name: codex/github-review-gate",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  services:",
+    "    name: codex/github-review-gate",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  defaults:",
+    "    name: codex/github-review-gate",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
     "  publish:",
     "    steps:",
     "      - run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
   ].join("\n"));
 
-  assert.deepEqual(
-    result.matches.map(({ kind }) => kind),
-    ["reserved-job-name", "codex-review-gate-action-caller", "reserved-check-run-name"],
+  assert.equal(
+    result.matches.filter(({ kind }) => kind === "codex-review-gate-action-caller").length,
+    5,
   );
+  assert.equal(
+    result.matches.filter(({ kind }) => kind === "reserved-job-name").length,
+    5,
+  );
+  assert.equal(
+    result.matches.filter(({ kind }) => kind === "reserved-check-run-name").length,
+    1,
+  );
+  assert.equal(result.matches.length, 11, "data containers must not add publisher findings");
 
   const fullyInline = inspectWorkflowGateSignals(
     "jobs: { build: { env: { context: codex/github-review-gate }, name: codex/github-review-gate, steps: [{ uses: JoeyTeng/codex-review-gate-action@v2, with: { status-context: codex/github-review-gate } }] }, env: { name: codex/github-review-gate, uses: JoeyTeng/codex-review-gate-action@v2 } }",
