@@ -1287,6 +1287,85 @@ test("leaves implicit-host CLI publishers unclassified when GH_HOST is mentioned
   );
 });
 
+test("does not treat CLI query or fragment text as GitHub API route segments", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const fakeRoutes = [
+    `run: gh api 'repos/o/r?probe/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    `run: gh api 'repos/o?probe/r/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    `run: gh api 'repos/o/r#fragment/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    `run: gh api 'repos/o/r/check-runs?probe/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    `run: gh api 'repos/o/r/check-runs#fragment/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    "run: gh api 'repos/o?probe/r/statuses/$SHA' -f context=codex/github-review-gate -f state=success",
+    "run: gh api 'repos/o/r#fragment/statuses/$SHA' -f context=codex/github-review-gate -f state=success",
+    "run: gh api 'repos/o/r/statuses/$SHA?probe/statuses/$SHA' -f context=codex/github-review-gate -f state=success",
+    "run: gh api 'repos/o/r/statuses/$SHA#fragment/statuses/$SHA' -f context=codex/github-review-gate -f state=success",
+  ];
+
+  for (const command of fakeRoutes) {
+    const result = inspectWorkflowGateSignals(command);
+    assert.deepEqual(result.matches, [], command);
+    assert.ok(
+      result.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+      command,
+    );
+  }
+
+  for (const endpoint of [
+    "repos/o/r/check-runs?probe=1",
+    "repos/o/r/check-runs#fragment",
+    "repos/o/r/statuses/$SHA?probe=1",
+    "repos/o/r/statuses/$SHA#fragment",
+  ]) {
+    const result = inspectWorkflowGateSignals(
+      `run: gh api '${endpoint}' -f name=codex/github-review-gate -f head_sha=${sha} -f context=codex/github-review-gate -f state=success`,
+    );
+    assert.deepEqual(result.matches, [], endpoint);
+  }
+});
+
+test("leaves gh api repository placeholders unclassified only when GH_REPO is mentioned", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const placeholderPublishers = [
+    `run: gh api 'repos/{owner}/{repo}/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    `run: gh api 'repos/{owner}/repo/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    `run: gh api 'repos/owner/{repo}/check-runs' -f name=codex/github-review-gate -f head_sha=${sha}`,
+    "run: gh api 'repos/{owner}/{repo}/check-runs/123' --method PATCH -f name=codex/github-review-gate",
+    "run: gh api 'repos/{owner}/{repo}/statuses/$SHA' -f context=codex/github-review-gate -f state=success",
+  ];
+
+  const withoutMention = inspectWorkflowGateSignals(placeholderPublishers.join("\n"));
+  assert.deepEqual(
+    withoutMention.matches.map(({ kind }) => kind),
+    ["reserved-check-run-name", "reserved-check-run-name", "reserved-check-run-name", "reserved-check-run-name", "reserved-status-context"],
+  );
+
+  for (const mention of [
+    "env:\n  GH_REPO: other/other",
+    "# GH_REPO may override gh api placeholder routing",
+    "env:\n  GH_REPO: $GH_REPO",
+    "with:\n  note: GH_REPO is supplied by the runner",
+  ]) {
+    const result = inspectWorkflowGateSignals([mention, ...placeholderPublishers].join("\n"));
+    assert.deepEqual(result.matches, [], mention);
+    assert.equal(
+      result.warnings.filter(({ kind }) => kind === "cli-repository-override-unclassified").length,
+      1,
+      mention,
+    );
+  }
+
+  const literalEndpoints = inspectWorkflowGateSignals([
+    "# GH_REPO may affect placeholder endpoints only",
+    `run: gh api repos/example/repo/check-runs -f name=codex/github-review-gate -f head_sha=${sha}`,
+    `run: gh api repos/another/repo/check-runs -f name=codex/github-review-gate -f head_sha=${sha}`,
+    "run: gh api repos/example/repo/statuses/$SHA -f context=codex/github-review-gate -f state=success",
+  ].join("\n"), { repositoryFullName: "example/repo" });
+  assert.deepEqual(
+    literalEndpoints.matches.map(({ kind }) => kind),
+    ["reserved-check-run-name", "reserved-status-context"],
+  );
+});
+
 test("matches a literal publisher in a statically false step without evaluating conditions", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",

@@ -119,6 +119,17 @@ export function inspectWorkflowGateSignals(
       "The bounded source mentions GH_HOST; implicit-host GitHub CLI API requests were left unclassified.",
     );
   }
+  // GH_REPO can redirect gh api's {owner}/{repo} placeholders. This is a
+  // source-wide conservative guard: even an inactive, data, or comment mention
+  // can leave those placeholder endpoints unclassified; values are never evaluated.
+  const implicitCliRepositoryUncertain = lines.some((line) => line.raw.includes("GH_REPO"));
+  if (implicitCliRepositoryUncertain) {
+    addWarning(
+      "cli-repository-override-unclassified",
+      1,
+      "The bounded source mentions GH_REPO; gh api endpoints using {owner}/{repo} placeholders were left unclassified.",
+    );
+  }
   markYamlJobNameFields(lines);
   // This source-wide key scan is intentionally role-agnostic: a job ID or
   // env/with data named `shell` can suppress unrelated command matches.
@@ -256,6 +267,7 @@ export function inspectWorkflowGateSignals(
       addWarning,
       repositoryFullName,
       implicitCliHostUncertain,
+      implicitCliRepositoryUncertain,
     );
     const yamlFields = line.yamlScalarContent || line.yamlDataField ? [] : fieldsOutsideFlowData(line);
     const uses = yamlFields.find((field) => field.key === "uses");
@@ -306,7 +318,15 @@ export function inspectWorkflowGateSignals(
 
   for (const segment of splitScopes(lines)) {
     for (const window of boundedWindows(segment)) {
-      inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName, implicitCliHostUncertain);
+      inspectWindow(
+        window,
+        reserved,
+        addMatch,
+        addWarning,
+        repositoryFullName,
+        implicitCliHostUncertain,
+        implicitCliRepositoryUncertain,
+      );
     }
   }
 
@@ -382,7 +402,17 @@ function finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning, inpu
   }
 }
 
-function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning, repositoryFullName, implicitCliHostUncertain) {
+function inspectLineSignals(
+  line,
+  reserved,
+  yamlAnchors,
+  allowYamlAliases,
+  addMatch,
+  addWarning,
+  repositoryFullName,
+  implicitCliHostUncertain,
+  implicitCliRepositoryUncertain,
+) {
   if (line.truncated) return;
   if (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run") {
     if (hasExactToken(line.text, reserved) || isAmbiguous(line.text, new Map(), reserved)) {
@@ -462,11 +492,11 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
     const value = resolveField(expression);
     warnUnscopedCaller(expression, value, line, addWarning);
   }
-  const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain);
+  const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain, implicitCliRepositoryUncertain);
   if (cliContext && asciiCaseInsensitiveEqual(resolveSimpleLiteral(cliContext, new Map()), reserved)) {
     addMatch("reserved-status-context", line.line, line.raw);
   }
-  const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName, implicitCliHostUncertain);
+  const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName, implicitCliHostUncertain, implicitCliRepositoryUncertain);
   if (cliCheckRunName && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) {
     addMatch("reserved-check-run-name", line.line, line.raw);
   }
@@ -497,7 +527,15 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
   }
 }
 
-function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName, implicitCliHostUncertain) {
+function inspectWindow(
+  window,
+  reserved,
+  addMatch,
+  addWarning,
+  repositoryFullName,
+  implicitCliHostUncertain,
+  implicitCliRepositoryUncertain,
+) {
   const literals = new Map();
   // Shell locals help classify executable fields, but never rewrite YAML
   // names or context scalars.
@@ -546,11 +584,11 @@ function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullNam
     ]) {
       inspectCaller(field.value, literals, line, addMatch, addWarning);
     }
-    const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain);
+    const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain, implicitCliRepositoryUncertain);
     if (cliContext) {
       inspectContext("context", cliContext, literals, line, reserved, addMatch, addWarning);
     }
-    const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName, implicitCliHostUncertain);
+    const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName, implicitCliHostUncertain, implicitCliRepositoryUncertain);
     if (cliCheckRunName) {
       inspectContext("check-run-name", cliCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
@@ -785,12 +823,21 @@ function useFieldExpressions(text) {
   return [...text.matchAll(pattern)].map((match) => match[1].trim());
 }
 
-function cliContextExpression(text, repositoryFullName, implicitCliHostUncertain) {
+function cliContextExpression(
+  text,
+  repositoryFullName,
+  implicitCliHostUncertain,
+  implicitCliRepositoryUncertain,
+) {
   const command = firstShellCommand(runCommand(text));
-  const admission = cliApiSupportsFieldPublisher(command, implicitCliHostUncertain);
+  const admission = cliApiSupportsFieldPublisher(
+    command,
+    implicitCliHostUncertain,
+    implicitCliRepositoryUncertain,
+  );
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
-  if (!/^\/?repos\/[^/]+\/[^/]+\/statuses\/[^/?#]+$/iu.test(endpoint ?? "")) return null;
+  if (!/^\/?repos\/[^/?#]+\/[^/?#]+\/statuses\/[^/?#]+$/iu.test(endpoint ?? "")) return null;
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
   if ((admission.method ?? "POST") !== "POST") return null;
   if (!cliFieldHasNonemptyValue(command, "state")) return null;
@@ -811,7 +858,11 @@ function cliApiEndpoint(command) {
   return endpoint?.startsWith("-") ? null : endpoint;
 }
 
-function cliApiSupportsFieldPublisher(command, implicitCliHostUncertain = false) {
+function cliApiSupportsFieldPublisher(
+  command,
+  implicitCliHostUncertain = false,
+  implicitCliRepositoryUncertain = false,
+) {
   const arguments_ = shellWords(command);
   if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return false;
   let hostname = null;
@@ -858,23 +909,45 @@ function cliApiSupportsFieldPublisher(command, implicitCliHostUncertain = false)
     if (index !== 2) return false;
   }
   if (implicitCliHostUncertain && hostname === null) return false;
+  if (
+    implicitCliRepositoryUncertain &&
+    isCliRepositoryPlaceholderEndpoint(cliApiEndpoint(command))
+  ) {
+    return false;
+  }
   return hostname === null || hostname.toLowerCase() === "github.com" ? { method } : false;
 }
 
-function cliCheckRunNameExpression(text, repositoryFullName, implicitCliHostUncertain) {
+function cliCheckRunNameExpression(
+  text,
+  repositoryFullName,
+  implicitCliHostUncertain,
+  implicitCliRepositoryUncertain,
+) {
   const command = firstShellCommand(runCommand(text));
-  const admission = cliApiSupportsFieldPublisher(command, implicitCliHostUncertain);
+  const admission = cliApiSupportsFieldPublisher(
+    command,
+    implicitCliHostUncertain,
+    implicitCliRepositoryUncertain,
+  );
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
-  if (/^\/?repos\/[^/]+\/[^/]+\/check-runs$/iu.test(endpoint ?? "")) {
+  if (/^\/?repos\/[^/?#]+\/[^/?#]+\/check-runs$/iu.test(endpoint ?? "")) {
     if ((admission.method ?? "POST") !== "POST" || !cliFieldHasNonemptyValue(command, "head_sha")) return null;
-  } else if (/^\/?repos\/[^/]+\/[^/]+\/check-runs\/[1-9][0-9]*$/iu.test(endpoint ?? "")) {
+  } else if (/^\/?repos\/[^/?#]+\/[^/?#]+\/check-runs\/[1-9][0-9]*$/iu.test(endpoint ?? "")) {
     if (admission.method !== "PATCH") return null;
   } else {
     return null;
   }
   return cliFieldExpression(command, "name");
+}
+
+function isCliRepositoryPlaceholderEndpoint(endpoint) {
+  const destination = endpoint?.match(/^\/?repos\/([^/?#]+)\/([^/?#]+)(?:\/|$)/iu);
+  return destination !== undefined &&
+    destination !== null &&
+    destination.slice(1).some((component) => /\{(?:owner|repo)\}/u.test(component));
 }
 
 function curlPublisherSignal(text, reserved, repositoryFullName) {

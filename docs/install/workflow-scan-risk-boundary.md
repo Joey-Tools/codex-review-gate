@@ -187,6 +187,25 @@ conservative coverage loss even for inactive/data/comment references, not scoped
 environment inheritance or evaluation. A supported explicit `--hostname github.com`
 can still establish the host. No host-override value is printed.
 
+Likewise, a bounded-source `GH_REPO` mention leaves only `gh api` endpoints
+containing recognized `{owner}` or `{repo}` placeholders in repository path
+components unclassified; literal
+endpoints remain eligible for the existing repository-text filter, including
+its literal foreign-destination handling. The scan does not interpret scoped
+environment inheritance, overrides, aliases, or the value of `GH_REPO`. This
+deliberately loses placeholder-endpoint coverage even when a mention is
+inactive, data, or comment text. The local `gh api --help` consulted for this
+boundary says endpoint placeholders may be filled from the current directory
+or `GH_REPO`; the relevant current-head review findings are [query/fragment
+route handling](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309084677)
+and [GH_REPO placeholder routing](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309084682).
+Endpoint query/fragment text is not treated as additional route identity:
+endpoints containing `?` or `#` remain unclassified rather than being parsed
+or normalized by this source heuristic. This is an accepted best-effort
+coverage loss, not an additional named conservative false-positive waiver;
+the existing four named waivers and eight warning-only examples are unchanged.
+Strict canonical/runtime controls and curl whitespace handling are unchanged.
+
 Any backslash inside a double-quoted shell word leaves that command
 unclassified instead of interpreting escape rules or erasing characters into a different exact name. A quoted
 gh endpoint must end at a token boundary; quoted/unquoted endpoint concatenation
