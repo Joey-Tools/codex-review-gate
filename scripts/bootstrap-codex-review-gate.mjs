@@ -7756,11 +7756,17 @@ async function loadLocalInstallationSecurityState({
   }
   validateReviewedStatusWriters(workflowContents, reviewedStatusWriters);
   if (!strictUnrelatedWorkflows) {
-    const inspection = inspectUnrelatedV2Workflows(workflowContents, {
-      canonicalPaths: canonicalWorkflowPaths.map((path) =>
-        relative(targetRoot, path).split("\\").join("/")
-      ),
-    });
+    const inspection = inspectUnrelatedV2Workflows(
+      workflowContents.map(({ path, content }) => ({
+        path: path.split("\\").join("/"),
+        content,
+      })),
+      {
+        canonicalPaths: canonicalWorkflowPaths.map((path) =>
+          relative(targetRoot, path).split("\\").join("/")
+        ),
+      },
+    );
     conflicts.push(...inspection.matches.map((match) =>
       `${match.path}:${match.line} (${match.kind}: ${match.excerpt})`
     ));

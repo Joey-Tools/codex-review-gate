@@ -41,7 +41,9 @@ Supported `gh api` field matches use the default GitHub host or an explicit `git
 
 A known block-scalar `run` containing `<<` is conservatively skipped as an entire unclassified run block, with a warning. This deliberately also skips lookalike text and real commands in that block instead of interpreting here-document delimiters or shell expansion. Local literal state is cleared rather than carried through the skipped block. It is an accepted coverage loss, not evidence that no publisher exists there.
 
-Diagnostic excerpts containing an Authorization key are omitted in full. The finding kind and source location remain available; the log does not retain the authentication scheme or any credential tail from that line.
+All raw source-text diagnostic excerpts are omitted, not only known credential-shaped fields. Finding kind, workflow path, line and fixed explanatory messages remain available; operators inspect that source location themselves. This avoids exporting a credential in an unrecognized spelling without requiring the scanner to understand every secret format.
+
+Repeated `gh api` method flags remain unclassified instead of inferring the effective final method. Semicolons inside a quoted string are not standalone assignment boundaries. Ordinary local scanning compares canonical workflow paths using one slash representation, while strict reviewed-writer identities and digest snapshots retain their existing handling.
 
 ## Safeguards that remain strict
 

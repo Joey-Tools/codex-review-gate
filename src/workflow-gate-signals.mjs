@@ -644,7 +644,8 @@ function cliApiSupportsFieldPublisher(command) {
   const arguments_ = shellWords(command);
   if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return false;
   let hostname = null;
-  const valueOptions = new Set(["-f", "--field", "--raw-field", "-X", "--method", "-H", "--header"]);
+  let methodCount = 0;
+  const valueOptions = new Set(["-f", "--field", "--raw-field", "-H", "--header"]);
   for (let index = 2; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--input" || argument.startsWith("--input=")) return false;
@@ -662,6 +663,18 @@ function cliApiSupportsFieldPublisher(command) {
       hostname = value;
       continue;
     }
+    if (argument === "-X" || argument === "--method") {
+      const value = arguments_[index + 1];
+      if (!value || value.startsWith("-") || ++methodCount > 1) return false;
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("-X=") || argument.startsWith("--method=")) {
+      const value = argument.slice(argument.indexOf("=") + 1);
+      if (!value || ++methodCount > 1) return false;
+      continue;
+    }
+    if (argument.startsWith("-X")) return false;
     if (valueOptions.has(argument)) index += 1;
   }
   return hostname === null || hostname.toLowerCase() === "github.com";
@@ -1670,7 +1683,28 @@ function splitStatements(line) {
   const run = text.match(/^(?:-\s*)?run\s*:\s*(.*)$/iu);
   if (run) text = run[1].trim();
   if (!text || /^(?:[>|][+-]?[1-9]?\s*)$/u.test(text)) return [];
-  return text.split(";").map((statement) => statement.trim()).filter(Boolean);
+  const statements = [];
+  let quote = null;
+  let escaped = false;
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (escaped) {
+      escaped = false;
+    } else if (character === "\\" && quote !== "'") {
+      escaped = true;
+    } else if (quote !== null) {
+      if (character === quote) quote = null;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === ";") {
+      statements.push(text.slice(start, index));
+      start = index + 1;
+    }
+  }
+  if (quote !== null || escaped) return [];
+  statements.push(text.slice(start));
+  return statements.map((statement) => statement.trim()).filter(Boolean);
 }
 
 function isAmbiguous(expression, literals, reserved, resolved = null) {
@@ -1768,12 +1802,6 @@ function stripComments(value) {
   return value;
 }
 
-function safeExcerpt(value) {
-  if (/\bauthorization\b/iu.test(value)) return "[redacted authorization-bearing line]";
-  return value
-    .replace(/\b(Bearer\s+)[A-Za-z0-9._~-]+/giu, "$1[redacted]")
-    .replace(/((?:token|secret|password|authorization|api[_-]?key)\s*[:=]\s*)([^\s,}]+)/giu, "$1[redacted]")
-    .trim()
-    .replace(/\s+/gu, " ")
-    .slice(0, 160);
+function safeExcerpt() {
+  return "[source text omitted; inspect the reported workflow line]";
 }

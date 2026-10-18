@@ -8,12 +8,13 @@ const syntheticAuthorizationCredentials = {
   api_key: "codex_synth_v1_api_key_a",
 };
 
-test("redacts complete authorization-bearing excerpts from blocking matches", () => {
+test("omits source text from blocking match excerpts", () => {
   const authorizationLines = [
     `check-context: codex/github-review-gate # Authorization: token ${syntheticAuthorizationCredentials.bearer_token}`,
     `check-context: codex/github-review-gate # AUTHORIZATION: Basic ${syntheticAuthorizationCredentials.api_key}`,
     `check-context: codex/github-review-gate # {\"authorization\": \"token ${syntheticAuthorizationCredentials.bearer_token}\"}`,
     `check-context: codex/github-review-gate # 'Authorization': 'Basic ${syntheticAuthorizationCredentials.api_key}'`,
+    `check-context: codex/github-review-gate # {\"token\":\"${syntheticAuthorizationCredentials.bearer_token}\",\"password\":\"${syntheticAuthorizationCredentials.api_key}\"}`,
   ];
 
   for (const line of authorizationLines) {
@@ -21,20 +22,20 @@ test("redacts complete authorization-bearing excerpts from blocking matches", ()
     assert.equal(result.matches.length, 1);
     assert.equal(result.matches[0].kind, "reserved-status-context");
     assert.equal(result.matches[0].line, 1);
-    assert.equal(result.matches[0].excerpt, "[redacted authorization-bearing line]");
+    assert.equal(result.matches[0].excerpt, "[source text omitted; inspect the reported workflow line]");
     assert.ok(!result.matches[0].excerpt.includes(syntheticAuthorizationCredentials.bearer_token));
     assert.ok(!result.matches[0].excerpt.includes(syntheticAuthorizationCredentials.api_key));
   }
 });
 
-test("redacts complete authorization-bearing excerpts from warning diagnostics", () => {
-  const raw = `Authorization: Basic ${syntheticAuthorizationCredentials.api_key} ${"x".repeat(4096)}`;
+test("omits source text from warning diagnostic excerpts", () => {
+  const raw = `{"token":"${syntheticAuthorizationCredentials.bearer_token}","password":"${syntheticAuthorizationCredentials.api_key}"}${"x".repeat(4096)}`;
   const result = inspectWorkflowGateSignals(raw);
   const warning = result.warnings.find(({ kind }) => kind === "line-truncated");
 
   assert.ok(warning);
   assert.equal(warning.line, 1);
-  assert.equal(warning.excerpt, "[redacted authorization-bearing line]");
+  assert.equal(warning.excerpt, "[source text omitted; inspect the reported workflow line]");
   assert.ok(!warning.excerpt.includes(syntheticAuthorizationCredentials.api_key));
 });
 
@@ -656,6 +657,14 @@ test("finds adjacent literals and simple local literal compositions", () => {
     "const context = prefix + suffix;",
   ].join("\n"));
   assert.equal(jsVariables.matches.length, 1);
+
+  for (const source of [
+    'run: echo "x; context=codex/github-review-gate; y"',
+    "run: echo 'x; context=codex/github-review-gate; y'",
+    "run: echo x\\; context=codex/github-review-gate\\; y",
+  ]) {
+    assert.deepEqual(inspectWorkflowGateSignals(source).matches, [], source);
+  }
 });
 
 test("finds exact CLI payload and inline JavaScript or JSON context literals", () => {
@@ -784,6 +793,23 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     );
     assert.deepEqual(reader.matches, [], method);
     assert.ok(reader.warnings.some(({ kind }) => kind === "reserved-status-context-reference"), method);
+  }
+
+  for (const methods of [
+    "--method POST --method GET",
+    "--method=POST --method=HEAD",
+    "-X POST --method PATCH",
+    "--method POST -XGET",
+    "-XPOST -XGET",
+  ]) {
+    const ambiguous = inspectWorkflowGateSignals(
+      `run: gh api repos/o/r/check-runs ${methods} -f name=codex/github-review-gate`,
+    );
+    assert.deepEqual(ambiguous.matches, [], methods);
+    assert.ok(
+      ambiguous.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+      methods,
+    );
   }
 
   const unrelated = inspectWorkflowGateSignals(

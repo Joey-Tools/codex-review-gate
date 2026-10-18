@@ -83,6 +83,7 @@ import {
   findEffectiveRulesetWithProfilePolicy,
   findEffectiveRulesetWithStatusOnlyPolicy,
   findEffectiveRulesetWithStatusContext,
+  inspectUnrelatedV2Workflows,
   installedWorkflowMatchesCanonical,
   isLegacyStatusContext,
   normalizeControlPlaneOwner,
@@ -127,6 +128,7 @@ import {
 const BOOTSTRAP_SCRIPT = fileURLToPath(
   new URL("../scripts/bootstrap-codex-review-gate.mjs", import.meta.url),
 );
+const BOOTSTRAP_SCRIPT_SOURCE = readFileSync(BOOTSTRAP_SCRIPT, "utf8");
 const CANONICAL_WORKFLOW = readFileSync(
   new URL(
     "../templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
@@ -2479,6 +2481,23 @@ test("normalizes workflow paths to repository workflow files", () => {
     /Workflow path/,
   );
   assert.throws(() => normalizeWorkflowPath("codex-review-gate.yml"), /Workflow path/);
+  assert.ok(
+    BOOTSTRAP_SCRIPT_SOURCE.includes('path: path.split("\\\\").join("/")'),
+    "the local scanner input converts native path separators without changing the original inventory",
+  );
+
+  const canonicalWindowsPath = ".github\\workflows\\codex-review-gate.yml";
+  const scannerPath = canonicalWindowsPath.split("\\").join("/");
+  const inspection = inspectUnrelatedV2Workflows(
+    [
+      {
+        path: scannerPath,
+        content: "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+      },
+    ],
+    { canonicalPaths: [".github/workflows/codex-review-gate.yml"] },
+  );
+  assert.deepEqual(inspection, { matches: [], warnings: [] });
 });
 
 test("builds a final idempotent CODEOWNERS control-plane block without losing other entries", () => {
@@ -7312,6 +7331,14 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "gh-api-other-host",
       "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --hostname ghe.example.com -f name=codex/github-review-gate\n",
+    ],
+    [
+      "gh-api-repeated-method-is-unclassified",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method POST --method GET -f name=codex/github-review-gate\n",
+    ],
+    [
+      "quoted-semicolon-is-not-an-assignment",
+      'jobs:\n  build:\n    steps:\n      - run: echo "x; context=codex/github-review-gate; y"\n',
     ],
     [
       "gh-api-input-body-with-query-field",
