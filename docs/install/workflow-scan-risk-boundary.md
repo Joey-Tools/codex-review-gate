@@ -8,6 +8,13 @@ The scoped keyword scan is a best-effort heuristic over workflow source text. It
 
 This preflight is neither security isolation nor proof of a unique producer. Required-check `integration_id: 15368` identifies the shared GitHub Actions App, not an individual workflow. The ordinary install accepts that other workflows and their runners remain an operator-trust boundary; it does not require unrelated publishers to be isolated.
 
+A local assignment to a context-like variable is not itself publication. Its
+literal may support a later recognized publishing sink (the command or API
+field that actually emits the signal), but the assignment alone stays
+nonblocking. Likewise, the legacy reusable caller identity is the exact
+`Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml` path,
+not every reusable workflow hosted in that repository.
+
 ## Accepted warning-only coverage gaps
 
 The following eight PR #128 review examples are intentionally accepted as warning-only coverage gaps in this change. No new recognition logic is added for them, and the scanner does not promise to warn for every instance:

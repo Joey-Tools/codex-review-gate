@@ -499,7 +499,7 @@ test("finds literal action and legacy reusable-workflow callers", () => {
     "    steps:",
     "      - uses: JoeyTeng/codex-review-gate-action@v2",
     "      - uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
-    "      - uses: Joey-Tools/codex-review-gate/.github/workflows/reusable.yml@0123456789abcdef",
+    "      - uses: Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@0123456789abcdef",
   ].join("\n"));
 
   assert.deepEqual(
@@ -519,6 +519,19 @@ test("finds literal action and legacy reusable-workflow callers", () => {
   ].join("\n"));
   assert.equal(segmented.matches.length, 1);
   assert.equal(segmented.matches[0].kind, "codex-review-gate-action-caller");
+
+  const unrelatedSourceWorkflows = inspectWorkflowGateSignals([
+    "jobs:",
+    "  ci:",
+    "    uses: Joey-Tools/codex-review-gate/.github/workflows/required-ci.yml@master",
+    "  other:",
+    "    uses: Joey-Tools/codex-review-gate/.github/workflows/reusable.yml@0123456789abcdef",
+    "  action:",
+    "    steps:",
+    "      - uses: Joey-Tools/codex-review-gate@master",
+  ].join("\n"));
+  assert.deepEqual(unrelatedSourceWorkflows.matches, []);
+  assert.ok(unrelatedSourceWorkflows.warnings.length > 0);
 });
 
 test("blocks only job and step uses selectors, warning on unrelated uses data", () => {
@@ -926,15 +939,31 @@ test("finds adjacent literals and simple local literal compositions", () => {
     "    steps:",
     "      - run: prefix='codex/'; suffix='github-review-gate'; context=\"$prefix$suffix\"",
   ].join("\r\n"));
-  assert.equal(variables.matches.length, 1);
-  assert.equal(variables.matches[0].kind, "reserved-status-context");
+  assert.deepEqual(variables.matches, []);
 
   const jsVariables = inspectWorkflowGateSignals([
     "const prefix = 'codex/';",
     "const suffix = 'github-review-gate';",
     "const context = prefix + suffix;",
   ].join("\n"));
-  assert.equal(jsVariables.matches.length, 1);
+  assert.deepEqual(jsVariables.matches, []);
+  assert.deepEqual(
+    inspectWorkflowGateSignals("run: context=codex/github-review-gate").matches,
+    [],
+  );
+
+  const assignedPublisher = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          context=codex/github-review-gate",
+    "          gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate",
+  ].join("\n"));
+  assert.deepEqual(
+    assignedPublisher.matches.map(({ kind }) => kind),
+    ["reserved-status-context"],
+  );
 
   for (const source of [
     'run: echo "x; context=codex/github-review-gate; y"',

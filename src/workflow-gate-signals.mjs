@@ -13,7 +13,7 @@ const MAX_FOLDED_JOB_NAME_LINES = 4;
 
 const ACTION_CALLERS = [
   /^JoeyTeng\/codex-review-gate-action(?:\/\.github\/workflows\/codex-review-gate\.ya?ml)?@[^\s,}"']+$/iu,
-  /^Joey-Tools\/codex-review-gate(?:\/\.github\/workflows\/[^@\s,}"']+)?@[^\s,}"']+$/iu,
+  /^Joey-Tools\/codex-review-gate\/\.github\/workflows\/codex-review-gate\.yml@[^\s,}"']+$/iu,
 ];
 
 /**
@@ -576,17 +576,13 @@ function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullNam
         continue;
       }
       literals.set(name, value);
-      if (isContextField(name)) {
-        if (value === reserved) {
-          addMatch("reserved-status-context", line.line, line.raw);
-        } else if (isAmbiguous(expression, literals, reserved, value)) {
-          addWarning(
-            "ambiguous-reserved-context",
-            line.line,
-            "A context-like variable contains reserved-name fragments, but does not confirm the full literal name.",
-            line.raw,
-          );
-        }
+      if (isContextField(name) && value !== reserved && isAmbiguous(expression, literals, reserved, value)) {
+        addWarning(
+          "ambiguous-reserved-context",
+          line.line,
+          "A context-like variable contains reserved-name fragments, but does not confirm the full literal name.",
+          line.raw,
+        );
       }
     }
   }
