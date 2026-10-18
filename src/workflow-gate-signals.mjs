@@ -1020,6 +1020,18 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
     }
 
     const initialCommand = line.text.trim();
+    if (/^curl(?:\s|$)/iu.test(initialCommand) && hasSingleQuotedTrailingBackslash(initialCommand)) {
+      line.continuedCurlCommandPart = true;
+      addWarning(
+        "continued-curl-command-unclosed",
+        line.line,
+        "A curl command ends with a backslash inside a single-quoted argument and was not joined as a shell continuation.",
+        line.raw,
+      );
+      previousContinues = false;
+      index += 1;
+      continue;
+    }
     if (previousContinues) line.continuedCurlCommandPart = true;
     if (
       previousContinues ||
@@ -1101,8 +1113,40 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
 }
 
 function hasShellLineContinuation(value) {
-  const trailingSlashes = value.match(/\\+\s*$/u)?.[0].trimEnd().length ?? 0;
-  return trailingSlashes % 2 === 1;
+  const trailingSlashes = value.match(/\\+\s*$/u);
+  if (!trailingSlashes || trailingSlashes[0].trimEnd().length % 2 !== 1) return false;
+  return !isInsideSingleQuote(value, trailingSlashes.index);
+}
+
+function hasSingleQuotedTrailingBackslash(value) {
+  const trailingSlashes = value.match(/\\+\s*$/u);
+  return Boolean(
+    trailingSlashes &&
+    trailingSlashes[0].trimEnd().length % 2 === 1 &&
+    isInsideSingleQuote(value, trailingSlashes.index),
+  );
+}
+
+function isInsideSingleQuote(value, end) {
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < end; index += 1) {
+    const character = value[index];
+    if (quote === "'") {
+      if (character === "'") quote = null;
+    } else if (escaped) {
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (quote === '"') {
+      if (character === '"') quote = null;
+    } else if (character === "'") {
+      quote = "'";
+    } else if (character === '"') {
+      quote = '"';
+    }
+  }
+  return quote === "'";
 }
 
 // Quoted YAML run scalars remain unclassified; this scan does not decode YAML.
@@ -1389,16 +1433,19 @@ function markYamlDataAndScalarFields(lines) {
       workflow.jobIndent !== null &&
       fieldIndent > workflow.jobIndent;
 
+    const dataMappingValue = mapping
+      ? stripYamlAnchor(`${mapping.value.trim()} `).trim()
+      : "";
     const flowDataMapping =
       mapping &&
-      mapping.value.trim().startsWith("{") &&
-      !parseFlowMap(mapping.value).ambiguous;
+      dataMappingValue.startsWith("{") &&
+      !parseFlowMap(dataMappingValue).ambiguous;
     if (
       !line.yamlDataField &&
       mapping &&
       (/^(?:env|with|outputs|secrets|strategy|container|services|defaults)$/iu.test(mapping.key) ||
         (mapping.key.toLowerCase() === "matrix" && nestedJobProperty)) &&
-      (!mapping.value.trim() || flowDataMapping) &&
+      (!dataMappingValue || flowDataMapping) &&
       (workflowProperty || nestedJobProperty)
     ) {
       if (flowDataMapping) line.yamlDataField = true;

@@ -99,6 +99,17 @@ JavaScript comment semantics to a job name. These are false-positive scope and
 value-identity corrections, not complete YAML parsing or executable-language
 comment interpretation.
 
+Existing simple anchor prefixes are removed before classifying an otherwise
+supported empty or flow data mapping; aliases and arbitrary YAML semantics are
+not evaluated. A trailing backslash inside an open single-quoted curl argument
+does not establish a shell line continuation; that unsupported body remains
+unclassified rather than reconstructing a different JSON payload.
+
+Ordinary permission warnings use fixed messages as well as omitted excerpts.
+Neither permission-parser exceptions nor arbitrary parsed permission names are
+copied into diagnostics; both can contain raw workflow text. Operators inspect
+the reported workflow path instead. Strict validation decisions are unchanged.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

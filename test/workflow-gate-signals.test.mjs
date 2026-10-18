@@ -478,8 +478,10 @@ test("keeps context-like keys inside bounded flow data mappings as data", () => 
     "with: { context: codex/github-review-gate, check_name: codex/github-review-gate }",
     "jobs:",
     "  build:",
-    "    env: { status-context: codex/github-review-gate }",
-    "    with: { context: codex/github-review-gate }",
+    "    env: &shared",
+    "      status-context: codex/github-review-gate",
+    "      context: codex/github-review-gate",
+    "    with: &inputs { context: codex/github-review-gate, status-context: codex/github-review-gate }",
     "    outputs: { check-name: codex/github-review-gate }",
     "    secrets: { check_name: codex/github-review-gate }",
     "    strategy: { matrix: { context: codex/github-review-gate, include: { context: codex/github-review-gate } } }",
@@ -1252,6 +1254,29 @@ test("joins only bounded backslash continuations inside a run block for curl pub
   ].join("\n"));
   assert.deepEqual(unclosed.matches, []);
   assert.ok(unclosed.warnings.some(({ kind }) => kind === "continued-curl-command-unclosed"));
+
+  const singleQuotedBackslash = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST https://api.github.com/repos/o/r/check-runs -d '{\"name\":\"codex/github-review-gate\"}\\",
+    "          ' ",
+  ].join("\n"));
+  assert.deepEqual(singleQuotedBackslash.matches, []);
+  assert.ok(singleQuotedBackslash.warnings.some(({ kind }) => kind === "continued-curl-command-unclosed"));
+
+  const doubleQuotedApostrophe = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\",
+    `            -d '{"name":"codex/github-review-gate"}' --header "X-Label: Joey's" \\`,
+    "            https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.equal(doubleQuotedApostrophe.matches.length, 1);
+  assert.equal(doubleQuotedApostrophe.matches[0].kind, "reserved-check-run-name");
 
   const overBudget = inspectWorkflowGateSignals([
     "jobs:",

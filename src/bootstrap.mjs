@@ -4667,15 +4667,15 @@ export function inspectUnrelatedV2Workflows(
           path: file.path,
           kind: "unrelated-workflow-write",
           line: 1,
-          message: `Operator-trusted unrelated write permissions: ${permissions.map((permission) => permission === "write-all" ? permission : `${permission}: write`).join(", ")}. This is not proof of an isolated or unique gate producer.`,
+          message: "Operator-trusted unrelated workflow has write permissions. Inspect the workflow source; this is not proof of an isolated or unique gate producer.",
         });
       }
-    } catch (error) {
+    } catch {
       warnings.push({
         path: file.path,
         kind: "unrelated-workflow-permissions-unclassified",
         line: 1,
-        message: `Unrelated permissions were not classified: ${error.message} The workflow remains operator-trusted.`,
+        message: "Unrelated permissions were not classified. Inspect the workflow source; it remains operator-trusted.",
       });
     }
   }

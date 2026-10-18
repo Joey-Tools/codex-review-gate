@@ -7014,6 +7014,41 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     "a literal publisher targeting the known repository remains a collision",
   );
 
+  // Approved synthetic catalog joey-private-v3, record api-key-a; same credential in both fixtures.
+  const permissionFixture = { api_key: "codex_synth_v1_api_key_a" };
+  for (const content of [
+    `name: Permissions\npermissions: ${permissionFixture.api_key}\njobs: {}\n`,
+    `name: Permissions\npermissions:\n  contents: ${permissionFixture.api_key}\njobs: {}\n`,
+  ]) {
+    const inspection = inspectUnrelatedV2Workflows([
+      { path: ".github/workflows/opaque-permissions.yml", content },
+    ]);
+    const warning = inspection.warnings.find(
+      ({ kind }) => kind === "unrelated-workflow-permissions-unclassified",
+    );
+    assert.ok(warning, "opaque permissions must retain a nonblocking warning");
+    assert.equal(
+      warning.message,
+      "Unrelated permissions were not classified. Inspect the workflow source; it remains operator-trusted.",
+    );
+    assert.equal(JSON.stringify(inspection).includes(permissionFixture.api_key), false);
+  }
+  const writableInspection = inspectUnrelatedV2Workflows([
+    {
+      path: ".github/workflows/writable-permissions.yml",
+      content: "permissions:\n  opaquepermission: write\njobs: {}\n",
+    },
+  ]);
+  const writableWarning = writableInspection.warnings.find(
+    ({ kind }) => kind === "unrelated-workflow-write",
+  );
+  assert.ok(writableWarning);
+  assert.equal(
+    writableWarning.message,
+    "Operator-trusted unrelated workflow has write permissions. Inspect the workflow source; this is not proof of an isolated or unique gate producer.",
+  );
+  assert.equal(JSON.stringify(writableInspection).includes("opaquepermission"), false);
+
   const previousRunnerVerifier = previousRunnerWorkflow(CANONICAL_WORKFLOW);
   const previousRunnerController = previousRunnerWorkflow(
     CANONICAL_CONTROLLER_WORKFLOW,

@@ -320,15 +320,17 @@ test("ordinary inventory accepts transport-like workflows with unrelated write p
   assert.ok(
     transportWarning,
   );
-  assert.match(transportWarning.message, /contents: write/u);
-  assert.match(transportWarning.message, /packages: write/u);
+  assert.equal(
+    transportWarning.message,
+    "Operator-trusted unrelated workflow has write permissions. Inspect the workflow source; this is not proof of an isolated or unique gate producer.",
+  );
   const writeAllWarning = signals.warnings.find(
     (warning) =>
       warning.path === writeAllPath &&
       warning.kind === "unrelated-workflow-write",
   );
   assert.ok(writeAllWarning);
-  assert.match(writeAllWarning.message, /write-all/u);
+  assert.equal(writeAllWarning.message, transportWarning.message);
 });
 
 test("ordinary inventory warns instead of blocking opaque unrelated permissions", () => {
