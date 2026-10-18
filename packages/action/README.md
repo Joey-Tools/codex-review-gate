@@ -355,8 +355,8 @@ and link forms and harmless whitespace changes do not require a whole-footer
 byte match. Unknown prose, nested or unclosed blocks, duplicate summaries,
 or extra trailing payload remain inconclusive. Finding-formatted content is
 checked across the original body, including the disclosure. This profile is
-specific to top-level clean issue comments; it does not broaden the shared
-inline-parent review receipt grammar.
+specific to top-level clean issue comments. Native inline-parent reviews use
+their separate closed receipt grammar and native commit binding below.
 
 The verifier's bounded CLI diagnostics and Actions Summary identify the
 relevant carrier and parser stage/reason code, with available head-resolution
@@ -364,6 +364,24 @@ and request-selection context. They do not print raw comment bodies or tokens,
 and diagnostic metadata never supplies pass authority. Unsupported provider
 formatting is distinct from an actual unresolved finding; both remain
 non-success outcomes until their respective recovery conditions are met.
+
+### Native inline-parent review compatibility
+
+A submitted official `COMMENTED` review can carry the known inline-parent
+heading, introduction and closed disclosure without repeating `Reviewed commit`
+in its body. In the v2 compatibility profile, the full native `commit_id`
+supplies that binding; a missing or short native SHA is not sufficient. If a
+body commit field is present, it must still agree with the native commit.
+Extra finding payload or an unsupported wrapper is not silently discarded.
+Omitting the body commit field is supported only when the known receipt
+envelope was actually removed, not merely when its compatibility option is on.
+
+The single known receipt marker must remain at the start of the body. Harmless
+blank whitespace after it is normalized; unknown or duplicate markers are not
+accepted. Top-level clean issue comments still need their explicit body commit
+marker, and provider identity, request/snapshot admission and unresolved-thread
+checks remain unchanged. Recognizing a parent receipt is not permission to
+ignore its unresolved inline findings.
 
 ### Diagnostic Codex activity summaries
 
