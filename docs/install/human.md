@@ -1296,9 +1296,39 @@ still calls v1, inspect the paths reported by the helper and remove or
 deactivate those callers in this same migration PR. One PR may remove v1,
 install v2, and install the CODEOWNERS control plane.
 
-An unrelated CI workflow may legitimately need `statuses: write` for its own
-commit-status context. Do not remove that permission merely to install this
-gate. An explicit, reviewed exception is available:
+The ordinary current-v2 bootstrap also performs a scoped keyword scan (a
+best-effort scan of workflow source text) for additional Codex gate callers
+and the same reserved gate signal (`codex/github-review-gate`, the required
+CheckRun context). Only explicit matches recognized by the scanner remain
+blocking. The scan also checks fragmented text, literal concatenations, and
+simple local-variable forms where it can; only detected candidates that cannot
+be classified warn. Unsupported literal forms may be missed, so no warning
+does not prove that no other workflow can emit the signal. Unrelated keywords
+and contexts are ignored. It does not execute workflows, prove their full data
+flow, prevent a malicious same-name forgery, or establish a unique producer.
+
+See the [workflow scan risk boundary](workflow-scan-risk-boundary.md) for the
+accepted coverage limits and examples.
+
+Unrelated workflow-local permissions such as `statuses`, `checks`, `actions`,
+or `contents` writes, as well as opaque workflow-local permission declarations,
+are warnings for operator review rather than installation blockers. Keep
+unrelated workflows as they are; the ordinary installation does not require
+removing those permissions or isolating their publishers. Review whether those
+workflows and their runners are trusted before relying on the shared GitHub
+Actions source. The canonical verifier/controller permission declarations,
+CODEOWNERS protection, and ruleset checks remain strict. The repository-wide
+default-permissions preflight above remains a separate strict requirement.
+
+### Optional compatibility: reviewed status writer
+
+Ordinary current-v2 installation does not need `--reviewed-status-writer`.
+Only pass it when intentionally using the older exact-digest and isolated-
+publisher compatibility check for a particular workflow; the stricter
+requirements below then apply to each declared file. They do not change how
+unrelated workflows are handled when this option is omitted.
+
+For that compatibility path, an operator may compute a digest:
 
 ```bash
 shasum -a 256 "$TARGET_ROOT/.github/workflows/transport.yml"
@@ -1342,16 +1372,17 @@ Then add the declaration to local preview and
 apply, remote staging and activation, and later full-profile cleanup commands.
 Repeat the option for each file (at most 32). Keep the same reviewed paths and
 digests; do not regenerate a digest after a change without reviewing it again.
-Every inventory read requires the exact UTF-8 content hash. Missing or changed
-files, duplicate/canonical paths, read-only no-op declarations, additional
-gate callers, the reserved gate job name, and any other relevant write
-permission are still rejected. The helper checks the isolated writer
-structure; script behavior and non-gate contexts still require explicit owner
-review. A workflow-only digest does not protect later changes to scripts it
-invokes. This does not replace CODEOWNERS or independent exact-head approval.
-Without declarations the original deny policy is unchanged. Do not combine
-the option with `--legacy-bridge`; initial admission rejects that combination
-because the later bridge cleanup has a frozen policy. Historical
+Every inventory read in this compatibility path requires the exact UTF-8
+content hash. Missing or changed files, duplicate/canonical paths, read-only
+no-op declarations, additional gate callers, the reserved gate job name, and
+any other relevant write permission in a declared file are rejected. The
+helper checks the isolated writer structure; script behavior and non-gate
+contexts still require explicit owner review. A workflow-only digest does not
+protect later changes to scripts it invokes. This does not replace
+CODEOWNERS or independent exact-head approval. When the option is omitted,
+the ordinary scoped scan and permission warnings described above apply. Do
+not combine the option with `--legacy-bridge`; initial admission rejects that
+combination because the later bridge cleanup has a frozen policy. Historical
 organization handoff/bridge-removal and source-only proofs do not accept this
 exception. Full inventory fingerprints and cleanup-plan digests already bind
 the retained workflows, so this does not add a stored receipt or runtime input.

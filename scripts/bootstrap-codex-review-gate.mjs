@@ -56,6 +56,7 @@ import {
   ensureControlPlaneCodeownersContent,
   findEffectiveRulesetWithProfilePolicy,
   installedWorkflowMatchesCanonical,
+  inspectUnrelatedV2Workflows,
   isLegacyStatusContext,
   normalizeControlPlaneOwner,
   normalizeRulesetProfile,
@@ -100,6 +101,8 @@ const CANONICAL_LEGACY_BRIDGE_WORKFLOW_SOURCE = join(
   "templates/codex-gated-repo/.github/workflows/codex-review-gate-legacy-bridge.yml",
 );
 const GH_NOT_FOUND = Symbol("GitHub API not found");
+const REPORTED_INSTALLATION_WARNINGS = new Set();
+const MAX_REPORTED_INSTALLATION_WARNINGS = 32;
 const GITHUB_PULL_REQUEST_FILES_LIMIT = 3_000;
 const GITHUB_PULL_REQUEST_FILES_PAGE_SIZE = 100;
 const MAX_APPROVED_POST_CLEANUP_PLAN_BYTES = 1_048_576;
@@ -1256,7 +1259,7 @@ Options:
   --repo OWNER/REPO       Inspect or stage the merged repository ruleset.
   --apply                 Apply the local copy or ruleset change. Defaults to dry-run.
   --legacy-bridge         Explicitly require/install the exact temporary v1 producer at ${DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH}. Keep this flag through legacy cleanup verification.
-  --reviewed-status-writer PATH@SHA256  Repeat for owner-reviewed isolated inline status publishers: read-only workflow permissions, explicit job-level statuses:write and literal runner labels, a literal label sequence, or fromJSON(vars.NAME || '<JSON label array>'). A digest does not prove self-hosted runner host trust; the owner must review that assumption. No action, checkout, repository script or executable dependency in privileged jobs. Exact raw UTF-8 bytes are required on every read; inline behavior/context still requires owner review. Use only without --legacy-bridge; frozen proof modes do not accept declarations. Other writes, gate callers and reserved job names remain forbidden.
+  --reviewed-status-writer PATH@SHA256  Optional compatibility profile for owner-reviewed isolated inline status publishers. Not required for ordinary installation: unrelated workflow writes are warnings, definite extra Codex gate callers or reserved gate signals block, and unresolved dynamic constructions are warnings. The profile still requires read-only workflow permissions, explicit job-level statuses:write, supported literal or fromJSON runner labels, exact raw UTF-8 bytes, and no action, checkout, repository script or executable dependency in privileged jobs. A digest does not prove runner host trust or inline behavior; the owner must review those assumptions. Use only without --legacy-bridge; frozen proof modes retain their strict inventory policy and do not accept declarations.
   --remove-legacy-bridge  Freeze-bound, local-only post-cutover removal of an exact canonical bridge. By default it uses no GitHub API reads.
   --live-revalidate-final-closure
                           Explicitly repeat the expensive live organization/canary closure audit for one diagnostic cleanup. Do not use for batch consumer cleanup during a freeze.
@@ -2389,6 +2392,7 @@ async function loadConsumerSecuritySnapshot({
   canonicalWorkflows,
   controlPlaneOwner,
   reviewedStatusWriters = [],
+  strictUnrelatedWorkflows,
   expectedDefaultBranch = null,
 }) {
   const repoInfo = await ghJson(`repos/${repoSlug}`);
@@ -2421,7 +2425,7 @@ async function loadConsumerSecuritySnapshot({
     typeof workflowPermissions?.can_approve_pull_request_reviews !== "boolean"
   ) {
     throw new Error(
-      `${repoSlug} must expose a complete Actions workflow-permission policy with default permissions set to read before the GitHub Actions source can be uniquely trusted.`,
+      `${repoSlug} must expose a complete Actions workflow-permission policy with default permissions set to read. This default does not prove that the canonical verifier is the only gate producer.`,
     );
   }
   const controlPlaneOwnerAccess = await loadControlPlaneOwnerPermission({
@@ -2451,8 +2455,12 @@ async function loadConsumerSecuritySnapshot({
       {
         legacyBridge: canonicalWorkflows.legacyBridge !== undefined,
         reviewedStatusWriters,
+        strictUnrelatedWorkflows,
       },
     );
+    if (canonicalWorkflows.legacyBridge === undefined) {
+      reportUnrelatedWorkflowWarnings(inspectUnrelatedV2Workflows(workflowFiles));
+    }
     validateControlPlaneCodeownersContent(
       codeownersContent,
       controlPlaneOwner,
@@ -3950,6 +3958,7 @@ async function loadCleanupSecurityClosure({
     canonicalWorkflows,
     controlPlaneOwner: options.controlPlaneOwner,
     reviewedStatusWriters: options.reviewedStatusWriters,
+    strictUnrelatedWorkflows: true,
   });
   const rulesets = await loadRulesets(options.repo.slug);
   const selectedV2 = selectUniqueNamedRepositoryRuleset(
@@ -5645,6 +5654,7 @@ function assertPostCutoverAuditCanonicalWorkflowInventory(
       "current canonical inventory",
       () => validateCanonicalV2WorkflowInventory(workflowFiles, canonicalWorkflows, {
         legacyBridge,
+        strictUnrelatedWorkflows: true,
       }),
     ],
     [
@@ -6329,6 +6339,7 @@ async function prepareConsumerWorktree({
   const initialLocalSecurityState = await loadLocalInstallationSecurityState({
     targetRoot,
     reviewedStatusWriters,
+    strictUnrelatedWorkflows: managesLegacyBridge,
     canonicalWorkflowPaths: [
       verifierWorkflowPath,
       controllerWorkflowPath,
@@ -6399,6 +6410,7 @@ async function prepareConsumerWorktree({
     const finalNoopState = await loadLocalInstallationSecurityState({
       targetRoot,
       reviewedStatusWriters,
+      strictUnrelatedWorkflows: managesLegacyBridge,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -6520,6 +6532,7 @@ async function prepareConsumerWorktree({
       const preMutationState = await loadLocalInstallationSecurityState({
         targetRoot,
         reviewedStatusWriters,
+        strictUnrelatedWorkflows: managesLegacyBridge,
         canonicalWorkflowPaths: [
           verifierWorkflowPath,
           controllerWorkflowPath,
@@ -6582,6 +6595,7 @@ async function prepareConsumerWorktree({
     const finalLocalSecurityState = await loadLocalInstallationSecurityState({
       targetRoot,
       reviewedStatusWriters,
+      strictUnrelatedWorkflows: managesLegacyBridge,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -6649,6 +6663,7 @@ async function prepareConsumerWorktree({
     const successBoundaryState = await loadLocalInstallationSecurityState({
       targetRoot,
       reviewedStatusWriters,
+      strictUnrelatedWorkflows: managesLegacyBridge,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -7679,6 +7694,7 @@ async function loadLocalInstallationSecurityState({
   targetRoot,
   canonicalWorkflowPaths,
   reviewedStatusWriters = [],
+  strictUnrelatedWorkflows = false,
 }) {
   const lowerPrecedenceCodeowners = await findLowerPrecedenceCodeowners(targetRoot);
   if (lowerPrecedenceCodeowners !== null) {
@@ -7722,6 +7738,7 @@ async function loadLocalInstallationSecurityState({
     if (canonicalPaths.has(absolutePath)) {
       continue;
     }
+    if (!strictUnrelatedWorkflows) continue;
     const violations = [];
     if (workflowContainsCodexReviewGateCaller(content)) {
       violations.push("gate caller");
@@ -7738,9 +7755,28 @@ async function loadLocalInstallationSecurityState({
     }
   }
   validateReviewedStatusWriters(workflowContents, reviewedStatusWriters);
+  if (!strictUnrelatedWorkflows) {
+    const inspection = inspectUnrelatedV2Workflows(
+      workflowContents.map(({ path, content }) => ({
+        path: path.split("\\").join("/"),
+        content,
+      })),
+      {
+        canonicalPaths: canonicalWorkflowPaths.map((path) =>
+          relative(targetRoot, path).split("\\").join("/")
+        ),
+      },
+    );
+    conflicts.push(...inspection.matches.map((match) =>
+      `${match.path}:${match.line} (${match.kind}: ${match.excerpt})`
+    ));
+    reportUnrelatedWorkflowWarnings(inspection);
+  }
   if (conflicts.length > 0) {
     throw new Error(
-      `Additional workflows have a v1/v2 gate caller, reserved CheckRun name, or relevant write authority and require explicit removal or review in the same installation PR: ${conflicts.sort().join(", ")}`,
+      strictUnrelatedWorkflows
+        ? `Additional workflows have a v1/v2 gate caller, reserved CheckRun name, or relevant write authority and require explicit removal or review in the same installation PR: ${conflicts.sort().join(", ")}`
+        : `Additional workflows contain Codex gate callers or reserved gate signals and require review: ${conflicts.sort().join(", ")}`,
     );
   }
   const codeownersContent = await readOptionalRegularFile(
@@ -7753,6 +7789,22 @@ async function loadLocalInstallationSecurityState({
       : fingerprintText(codeownersContent),
     workflows: workflowFiles.sort((left, right) => left.path.localeCompare(right.path)),
   };
+}
+
+function reportUnrelatedWorkflowWarnings({ warnings }) {
+  for (const warning of warnings) {
+    const key = JSON.stringify(warning);
+    if (REPORTED_INSTALLATION_WARNINGS.has(key)) continue;
+    if (REPORTED_INSTALLATION_WARNINGS.size >= MAX_REPORTED_INSTALLATION_WARNINGS) {
+      if (!REPORTED_INSTALLATION_WARNINGS.has("warning-limit")) {
+        console.error("warning: additional unrelated-workflow diagnostics omitted; keyword scanning is best-effort, not a unique-producer guarantee.");
+        REPORTED_INSTALLATION_WARNINGS.add("warning-limit");
+      }
+      continue;
+    }
+    REPORTED_INSTALLATION_WARNINGS.add(key);
+    console.error(`warning: ${warning.path}:${warning.line} [${warning.kind}] ${warning.message}`);
+  }
 }
 
 function buildExpectedFinalLocalSecurityState({

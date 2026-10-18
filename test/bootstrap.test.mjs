@@ -83,6 +83,7 @@ import {
   findEffectiveRulesetWithProfilePolicy,
   findEffectiveRulesetWithStatusOnlyPolicy,
   findEffectiveRulesetWithStatusContext,
+  inspectUnrelatedV2Workflows,
   installedWorkflowMatchesCanonical,
   isLegacyStatusContext,
   normalizeControlPlaneOwner,
@@ -127,6 +128,7 @@ import {
 const BOOTSTRAP_SCRIPT = fileURLToPath(
   new URL("../scripts/bootstrap-codex-review-gate.mjs", import.meta.url),
 );
+const BOOTSTRAP_SCRIPT_SOURCE = readFileSync(BOOTSTRAP_SCRIPT, "utf8");
 const CANONICAL_WORKFLOW = readFileSync(
   new URL(
     "../templates/codex-gated-repo/.github/workflows/codex-review-gate.yml",
@@ -2479,6 +2481,23 @@ test("normalizes workflow paths to repository workflow files", () => {
     /Workflow path/,
   );
   assert.throws(() => normalizeWorkflowPath("codex-review-gate.yml"), /Workflow path/);
+  assert.ok(
+    BOOTSTRAP_SCRIPT_SOURCE.includes('path: path.split("\\\\").join("/")'),
+    "the local scanner input converts native path separators without changing the original inventory",
+  );
+
+  const canonicalWindowsPath = ".github\\workflows\\codex-review-gate.yml";
+  const scannerPath = canonicalWindowsPath.split("\\").join("/");
+  const inspection = inspectUnrelatedV2Workflows(
+    [
+      {
+        path: scannerPath,
+        content: "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+      },
+    ],
+    { canonicalPaths: [".github/workflows/codex-review-gate.yml"] },
+  );
+  assert.deepEqual(inspection, { matches: [], warnings: [] });
 });
 
 test("builds a final idempotent CODEOWNERS control-plane block without losing other entries", () => {
@@ -2599,7 +2618,7 @@ test("prepare-worktree dry-runs and then replaces a canonical-path v1 caller", (
   }
 });
 
-test("reviewed status writers survive local preparation only with explicit frozen declarations", () => {
+test("ordinary local preparation accepts status writers while explicit declarations remain strict", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-reviewed-writers-"));
   const writers = [
     { path: ".github/workflows/transport.yml", content: REVIEWED_INLINE_STATUS_WRITER },
@@ -2612,10 +2631,13 @@ test("reviewed status writers survive local preparation only with explicit froze
     initializeGitRepository(targetRoot);
     mkdirSync(join(targetRoot, ".github/workflows"), { recursive: true });
     for (const { path, content } of writers) writeFileSync(join(targetRoot, path), content);
-    const denied = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
-    assert.equal(denied.status, 1);
-    assert.match(denied.stderr, /relevant write authority/u);
-    assert.equal(existsSync(join(targetRoot, DEFAULT_WORKFLOW_PATH)), false);
+    const accepted = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.stderr, /unrelated-workflow-write/u);
+    assert.equal(
+      readFileSync(join(targetRoot, DEFAULT_WORKFLOW_PATH), "utf8"),
+      CANONICAL_WORKFLOW,
+    );
     for (const suffix of [[], ["--apply"], ["--apply"]]) {
       const result = runBootstrap(["--prepare-worktree", targetRoot, ...declarations, ...suffix]);
       assert.equal(result.status, 0, result.stderr);
@@ -2866,7 +2888,10 @@ test("prepare-worktree explicitly installs, retains, and removes the exact legac
 
     const strict = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(strict.status, 1);
-    assert.match(strict.stderr, /Additional workflows have a v1\/v2 gate caller/u);
+    assert.match(
+      strict.stderr,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    );
     assert.equal(readFileSync(bridgePath, "utf8"), CANONICAL_LEGACY_BRIDGE_WORKFLOW);
 
     const removalDryRun = runBootstrap([
@@ -5902,7 +5927,10 @@ test("prepare-worktree blocks additional v1 callers before writing", () => {
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 1);
-    assert.match(apply.stderr, /Additional workflows have a v1\/v2 gate caller/u);
+    assert.match(
+      apply.stderr,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    );
     assert.match(apply.stderr, /\.github\/workflows\/legacy-codex-review\.yml/u);
     assert.equal(existsSync(workflowPath), false);
   } finally {
@@ -5925,7 +5953,10 @@ test("prepare-worktree blocks an additional direct v2 caller before writing", ()
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 1);
-    assert.match(apply.stderr, /Additional workflows have a v1\/v2 gate caller/u);
+    assert.match(
+      apply.stderr,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    );
     assert.match(apply.stderr, /\.github\/workflows\/duplicate-v2\.yml/u);
     assert.equal(existsSync(workflowPath), false);
   } finally {
@@ -7093,7 +7124,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   ];
   assert.throws(
     () => validateCanonicalV2WorkflowInventory(legacyInventory, CANONICAL_WORKFLOWS),
-    /Additional v1\/v2 gate callers remain on the default branch: \.github\/workflows\/legacy-codex-review\.yml/u,
+    /Additional workflows contain Codex gate callers or reserved gate signals.*legacy-codex-review\.yml/u,
   );
 
   const additionalV2Caller = [
@@ -7105,7 +7136,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   ];
   assert.throws(
     () => validateCanonicalV2WorkflowInventory(additionalV2Caller, CANONICAL_WORKFLOWS),
-    /Additional v1\/v2 gate callers.*extra-v2\.yml/u,
+    /Additional workflows contain Codex gate callers or reserved gate signals.*extra-v2\.yml/u,
   );
   for (const blockCaller of [
     "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
@@ -7123,7 +7154,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
           ],
           CANONICAL_WORKFLOWS,
         ),
-      /opaque, escaped, flow-style, or multiline uses scalar/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     );
   }
 
@@ -7134,80 +7165,363 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       content: "permissions:\n  statuses: write\njobs: {}\n",
     },
   ];
-  assert.throws(
-    () => validateCanonicalV2WorkflowInventory(additionalStatusWriter, CANONICAL_WORKFLOWS),
-    /single-producer policy.*status-writer\.yml.*statuses: write/u,
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      additionalStatusWriter,
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "unrelated status writers do not block ordinary v2 inventory",
   );
   for (const quotedStatusWriter of [
     "permissions:\n  \"statuses\": write\njobs: {}\n",
     "permissions:\n  'statuses': write\njobs: {}\n",
   ]) {
-    assert.throws(
-      () =>
-        validateCanonicalV2WorkflowInventory(
-          [
-            ...cleanInventory,
-            {
-              path: ".github/workflows/quoted-status-writer.yml",
-              content: quotedStatusWriter,
-            },
-          ],
-          CANONICAL_WORKFLOWS,
-        ),
-      /quoted protected permissions key|opaque permissions entry/u,
+    assert.equal(
+      validateCanonicalV2WorkflowInventory(
+        [
+          ...cleanInventory,
+          {
+            path: ".github/workflows/quoted-status-writer.yml",
+            content: quotedStatusWriter,
+          },
+        ],
+        CANONICAL_WORKFLOWS,
+      ),
+      CANONICAL_WORKFLOWS,
+      "quoted unrelated write permissions do not block ordinary v2 inventory",
+    );
+  }
+
+  for (const [name, content] of [
+    [
+      "actions-writer",
+      "permissions:\n  actions: write\njobs: {}\n",
+    ],
+    [
+      "checks-writer",
+      "permissions:\n  checks: write\njobs: {}\n",
+    ],
+    [
+      "issues-writer",
+      "permissions:\n  issues: write\njobs: {}\n",
+    ],
+    [
+      "pull-requests-writer",
+      "permissions:\n  pull-requests: write\njobs: {}\n",
+    ],
+    [
+      "line-broken-top-flow",
+      "permissions:\n  {statuses: write}\njobs: {}\n",
+    ],
+    [
+      "line-broken-job-flow",
+      "jobs:\n  test:\n    permissions:\n      {checks: write}\n    runs-on: ubuntu-slim\n",
+    ],
+    ["inline-flow-read", "permissions: {contents: read}\njobs: {}\n"],
+    [
+      "unrelated-scalar-alias",
+      "env: { ACTION: &checkout actions/checkout@v4 }\njobs:\n  build:\n    steps:\n      - uses: *checkout\n",
+    ],
+    [
+      "plain-check-name-reference",
+      "jobs:\n  build:\n    steps:\n      - run: echo codex/github-review-gate\n",
+    ],
+    [
+      "with-uses-input",
+      "jobs:\n  build:\n    steps:\n      - uses: actions/github-script@v7\n        with:\n          uses: JoeyTeng/codex-review-gate-action@v2\n          script: core.info('ordinary input')\n",
+    ],
+    [
+      "nested-flow-with-uses-data-only",
+      'jobs: {test: {steps: [{name: metadata, uses: actions/github-script@v7, with: {uses: JoeyTeng/codex-review-gate-action@v2}}]}}\n',
+    ],
+    [
+      "context-like-env-data",
+      "env:\n  context: codex/github-review-gate\njobs:\n  build:\n    env:\n      check-name: codex/github-review-gate\n    steps:\n      - run: echo ready\n        env:\n          custom_context: codex/github-review-gate\n",
+    ],
+    [
+      "anchored-context-input",
+      "jobs:\n  build:\n    steps:\n      - uses: custom/action@v1\n        with:\n          context: &gate codex/github-review-gate\n          check-name: codex/github-review-gate\n",
+    ],
+    [
+      "workflow-example-inside-run-scalar",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          cat <<'YAML'\n          uses: JoeyTeng/codex-review-gate-action@v2\n          YAML\n",
+    ],
+    [
+      "accepted-block-sequence-flow-map-gap",
+      // Ordinary preflight accepts this documented heuristic false negative.
+      "jobs:\n  build:\n    steps:\n      - { uses: JoeyTeng/codex-review-gate-action@v2 }\n",
+    ],
+    [
+      "echo-cli-context-reference",
+      "jobs:\n  build:\n    steps:\n      - run: echo -f context=codex/github-review-gate\n",
+    ],
+    [
+      "read-only-gh-check-run-name-reference",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method GET -f name=codex/github-review-gate\n",
+    ],
+    [
+      "context-like-job-output-data",
+      "jobs:\n  build:\n    outputs:\n      context: codex/github-review-gate\n      check-name: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "folded-job-name-with-suffix",
+      "jobs:\n  build:\n    name: >-\n      codex/github-review-gate\n      (Linux)\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "folded-job-name-with-prefix-at-eof",
+      "jobs:\n  build:\n    name: >-\n      Build\n      codex/github-review-gate\n",
+    ],
+    [
+      "folded-job-name-with-leading-body-space",
+      "jobs:\n  build:\n    name: >-2\n       codex/github-review-gate\n",
+    ],
+    [
+      "folded-job-name-with-quoted-body",
+      "jobs:\n  build:\n    name: >-\n      'codex/github-review-gate'\n",
+    ],
+    [
+      "graphql-variable-with-check-run-marker",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          gh api graphql -f 'query=query { viewer { login } } # /check-runs marker' -f name=codex/github-review-gate\n",
+    ],
+    [
+      "graphql-variable-with-status-marker",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          gh api graphql -f 'query=query { viewer { login } } # /statuses/HEAD marker' -f context=codex/github-review-gate\n",
+    ],
+    [
+      "unrelated-rest-endpoint-with-check-run-marker",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/issues --method POST -f body=/check-runs -f name=codex/github-review-gate\n",
+    ],
+    [
+      "nested-container-env-data",
+      "jobs:\n  build:\n    container:\n      image: ubuntu:24.04\n      env:\n        context: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "reusable-caller-secret-data",
+      "jobs:\n  build:\n    uses: example/reusable/.github/workflows/build.yml@v1\n    secrets:\n      context: codex/github-review-gate\n",
+    ],
+    [
+      "echo-flags-after-gh-command",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method POST && echo -f name=codex/github-review-gate\n",
+    ],
+    [
+      "isolated-shell-first-step-literals",
+      'jobs:\n  build:\n    steps:\n      - shell: bash\n        run: NAME=codex/github-review-gate\n      - shell: bash\n        run: context="$NAME"\n',
+    ],
+    [
+      "non-executable-env-scalar",
+      "env:\n  NOTE: |\n    context=codex/github-review-gate\n    gh api repos/example/repo/check-runs -f name=codex/github-review-gate\njobs:\n  build:\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "non-executable-input-scalar",
+      "jobs:\n  build:\n    steps:\n      - uses: example/action@v1\n        with:\n          note: |\n            context=codex/github-review-gate\n",
+    ],
+    [
+      "non-executable-scalar-run-lookalike",
+      "env:\n  NOTE: |\n    run: |\n      curl -X POST https://api.github.com/repos/example/repo/check-runs -d '{\"name\":\"codex/github-review-gate\"}'\n    NAME=codex/github-review-gate\njobs:\n  build:\n    steps:\n      - run: context=ordinary\n",
+    ],
+    [
+      "matrix-include-context-data",
+      "jobs:\n  build:\n    strategy:\n      matrix:\n        include:\n          - context: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "curl-header-url-is-not-target",
+      `jobs:\n  build:\n    steps:\n      - run: |\n          curl -X POST -H 'Link: https://api.github.com/repos/example/repo/check-runs' -d '{"name":"codex/github-review-gate"}' https://example.com/audit\n`,
+    ],
+    [
+      "gh-api-other-host",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --hostname ghe.example.com -f name=codex/github-review-gate\n",
+    ],
+    [
+      "gh-api-repeated-method-is-unclassified",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method POST --method GET -f name=codex/github-review-gate\n",
+    ],
+    [
+      "quoted-semicolon-is-not-an-assignment",
+      'jobs:\n  build:\n    steps:\n      - run: echo "x; context=codex/github-review-gate; y"\n',
+    ],
+    [
+      "quoted-display-name-is-not-extra-yaml-fields",
+      `jobs:\n  build:\n    steps:\n      - name: 'metadata, context: "codex/github-review-gate", end'\n        run: echo ready\n`,
+    ],
+    [
+      "curl-nested-name-is-not-check-run-name",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST --json '{"output":{"name":"codex/github-review-gate"},"name":"other","head_sha":"HEAD"}' https://api.github.com/repos/example/repo/check-runs\n`,
+    ],
+    [
+      "curl-post-is-not-check-run-update",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST --json '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs/123\n`,
+    ],
+    ...[",", ";"].map((punctuation) => [
+      `job-name-with-trailing-${punctuation === "," ? "comma" : "semicolon"}`,
+      `jobs:\n  build:\n    name: codex/github-review-gate${punctuation}\n    steps:\n      - run: echo ready\n`,
+    ]),
+    [
+      "gh-api-input-body-with-query-field",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --input body.json -f name=codex/github-review-gate\n",
+    ],
+    [
+      "curl-other-host-with-api-shaped-path",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://example.com/repos/example/repo/check-runs\n`,
+    ],
+    [
+      "curl-multiple-body-options",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' -d '{"status":"completed"}' https://api.github.com/repos/example/repo/check-runs\n`,
+    ],
+    [
+      "here-document-text-is-not-execution-proof",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          cat >config <<'EOF'\n          context=codex/github-review-gate\n          gh api repos/example/repo/check-runs -f name=codex/github-review-gate\n          EOF\n",
+    ],
+    [
+      "truncated-job-name-is-not-an-exact-scalar",
+      "jobs:\n  build:\n    name: codex/github-review-gate" + " ".repeat(4096) + "(Linux)\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "truncated-assignment-does-not-seed-later-literal",
+      "jobs:\n  build:\n    steps:\n      - run: NAME=codex/github-review-gate" + " ".repeat(4096) + "(Linux)\n      - run: context=\"$NAME\"\n",
+    ],
+    ...["|", ">", "|+", ">+"].map((indicator) => [
+      `non-strip-job-name-${indicator}`,
+      `jobs:\n  build:\n    name: ${indicator}\n      codex/github-review-gate\n    steps:\n      - run: echo ready\n`,
+    ]),
+  ]) {
+    assert.equal(
+      validateCanonicalV2WorkflowInventory(
+        [...cleanInventory, { path: `.github/workflows/${name}.yml`, content }],
+        CANONICAL_WORKFLOWS,
+      ),
+      CANONICAL_WORKFLOWS,
+      `${name} is unrelated to ordinary v2 installer inventory`,
     );
   }
 
   for (const [name, content, expected] of [
     [
-      "actions-writer",
-      "permissions:\n  actions: write\njobs: {}\n",
-      /actions: write/u,
-    ],
-    [
-      "checks-writer",
-      "permissions:\n  checks: write\njobs: {}\n",
-      /checks: write/u,
-    ],
-    [
-      "issues-writer",
-      "permissions:\n  issues: write\njobs: {}\n",
-      /issues: write/u,
-    ],
-    [
-      "pull-requests-writer",
-      "permissions:\n  pull-requests: write\njobs: {}\n",
-      /pull-requests: write/u,
-    ],
-    [
       "reserved-job-name",
       "permissions:\n  contents: read\njobs:\n  collision:\n    name: 'codex/github-review-gate'\n    runs-on: ubuntu-slim\n",
-      /job name: codex\/github-review-gate/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
       "block-scalar-job-name",
       "permissions: {}\njobs:\n  collision:\n    name: >-\n      codex/github-review-gate\n    runs-on: ubuntu-slim\n",
-      /job name: codex\/github-review-gate/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
       "flow-root-jobs",
       "{name: Test, on: push, jobs: {collision: {name: codex/github-review-gate}}}\n",
-      /flow-style root mapping/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
-      "line-broken-top-flow",
-      "permissions:\n  {statuses: write}\njobs: {}\n",
-      /line-broken flow-style permissions mapping/u,
+      "flow-step-gate-caller",
+      "jobs: {test: {steps: [{name: gate, uses: JoeyTeng/codex-review-gate-action@v2}]}}\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
-      "line-broken-job-flow",
-      "jobs:\n  test:\n    permissions:\n      {checks: write}\n    runs-on: ubuntu-slim\n",
-      /line-broken flow-style permissions mapping/u,
+      "nested-flow-reserved-job-name",
+      "jobs: {test: {name: codex/github-review-gate, permissions: {contents: read}}}\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
-      "inline-flow-read",
-      "permissions: {contents: read}\njobs: {}\n",
-      /flow-style permissions mapping/u,
+      "scalar-alias-caller",
+      "env: { ACTION: &gate JoeyTeng/codex-review-gate-action@v2 }\njobs:\n  build:\n    steps:\n      - uses: *gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gate-step-under-env-job-id",
+      "jobs:\n  env:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gate-step-under-with-job-id",
+      "jobs:\n  with:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gate-step-under-outputs-job-id",
+      "jobs:\n  outputs:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "reserved-name-under-outputs-job-id",
+      "jobs:\n  outputs:\n    name: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gate-step-under-secrets-job-id",
+      "jobs:\n  secrets:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-status-context-publisher",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/statuses/$SHA --raw-field context=codex/github-review-gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "anchored-job-name",
+      "jobs:\n  collision:\n    name: &gate codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "literal-json-check-run",
+      `jobs:\n  publish:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs\n`,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "continued-curl-post-json-check-run",
+      [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        "      - run: |",
+        "          curl -X POST " + "\\",
+        "            -H 'Accept: application/vnd.github+json' " + "\\",
+        "            -d '{\"name\":\"codex/github-review-gate\"}' " + "\\",
+        "            https://api.github.com/repos/example/repo/check-runs",
+      ].join("\n"),
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "curl-post-json-status-context",
+      [
+        "jobs:",
+        "  publish:",
+        "    steps:",
+        "      - run: |",
+        "          curl -X POST https://api.github.com/repos/example/repo/statuses/$SHA " + "\\",
+        "            -H 'Accept: application/vnd.github+json' " + "\\",
+        "            -d '{\"context\":\"codex/github-review-gate\",\"state\":\"success\"}'",
+      ].join("\n"),
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-api-implicit-post-reserved-check-run",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs --raw-field name=codex/github-review-gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-api-patch-reserved-check-run",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs/123 --method PATCH -f name=codex/github-review-gate -f conclusion=success\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-header-method-prose-does-not-hide-publisher",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs -H 'X-Note: --method GET' -f name=codex/github-review-gate\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-api-quoted-check-run-endpoint",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api 'repos/example/repo/check-runs/123' --method PATCH -f name=codex/github-review-gate -f conclusion=success\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "publisher-before-compound-boundary",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs --method POST -f name=codex/github-review-gate -f head_sha=$SHA && echo ready\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "quoted-flow-job-id",
+      'jobs: {"collision": {name: codex/github-review-gate, runs-on: ubuntu-slim}}\n',
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
   ]) {
     assert.throws(
@@ -7242,7 +7556,7 @@ test("legacy bridge inventory requires explicit profile, fixed path, and exact b
         bridgeInventory,
         CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
       ),
-    /Additional v1\/v2 gate callers.*codex-review-gate-legacy-bridge\.yml/u,
+    /Additional workflows contain Codex gate callers or reserved gate signals.*codex-review-gate-legacy-bridge\.yml/u,
   );
   assert.throws(
     () =>
@@ -7457,7 +7771,7 @@ test("remote staging and activation reject a post-merge extra v1 caller", () => 
       assert.equal(result.status, 1);
       assert.match(
         result.stderr,
-        /Additional v1\/v2 gate callers remain on the default branch: \.github\/workflows\/legacy-codex-review\.yml/u,
+        /Additional workflows contain Codex gate callers or reserved gate signals.*legacy-codex-review\.yml/u,
       );
     }
   } finally {
@@ -7465,7 +7779,7 @@ test("remote staging and activation reject a post-merge extra v1 caller", () => 
   }
 });
 
-test("remote inventory rejects an extra v2 caller and an extra status writer", () => {
+test("remote inventory blocks gate signals but accepts unrelated workflow writes", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-fake-gh-"));
   const repoSlug = "Joey-Tools/consumer";
   try {
@@ -7473,33 +7787,31 @@ test("remote inventory rejects an extra v2 caller and an extra status writer", (
       [
         "extra-v2",
         "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
-        /Additional v1\/v2 gate callers.*extra\.yml/u,
+        /Additional workflows contain Codex gate callers or reserved gate signals.*extra\.yml/u,
       ],
       [
         "status-writer",
         "permissions: write-all\njobs: {}\n",
-        /single-producer policy.*extra\.yml.*checks: write.*issues: write.*pull-requests: write.*statuses: write/u,
       ],
       [
         "issues-writer",
         "permissions:\n  issues: write\njobs: {}\n",
-        /single-producer policy.*extra\.yml.*issues: write/u,
-      ],
-      [
-        "reserved-job-name",
-        "permissions: {}\njobs:\n  collision:\n    name: codex/github-review-gate\n    runs-on: ubuntu-slim\n",
-        /single-producer policy.*extra\.yml.*job name: codex\/github-review-gate/u,
       ],
       [
         "line-broken-flow",
         "permissions:\n  {statuses: write}\njobs: {}\n",
-        /line-broken flow-style permissions mapping/u,
+      ],
+      [
+        "reserved-job-name",
+        "permissions: {}\njobs:\n  collision:\n    name: codex/github-review-gate\n    runs-on: ubuntu-slim\n",
+        /Additional workflows contain Codex gate callers or reserved gate signals.*extra\.yml/u,
       ],
     ]) {
       const fakeBin = join(fixtureRoot, name);
       createFakeGhExecutable(fakeBin);
       const responses = {
         ...canonicalRemoteWorkflowResponses(repoSlug),
+        [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`]: [[]],
         [`repos/${repoSlug}/git/trees/workflows-tree`]: {
           truncated: false,
           tree: [
@@ -7535,8 +7847,13 @@ test("remote inventory rejects an extra v2 caller and an extra status writer", (
           FAKE_GH_RESPONSES: JSON.stringify(responses),
         },
       });
-      assert.equal(result.status, 1, name);
-      assert.match(result.stderr, expected, name);
+      if (expected) {
+        assert.equal(result.status, 1, name);
+        assert.match(result.stderr, expected, name);
+      } else {
+        assert.equal(result.status, 0, `${name}: ${result.stderr}`);
+        assert.match(result.stdout, /Dry run: would create repository ruleset/u);
+      }
     }
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
@@ -10293,7 +10610,7 @@ test("remote bridge admission rejects missing, drifted, displaced, unflagged, or
         responses: canonicalRemoteWorkflowResponses(repoSlug, {
           legacyBridge: true,
         }),
-        expected: /Additional v1\/v2 gate callers/u,
+        expected: /Additional workflows contain Codex gate callers or reserved gate signals/u,
       },
       {
         name: "additional-v2",
@@ -10644,6 +10961,66 @@ test("post-cleanup verification accepts empty legacy surfaces and unrelated clas
       ],
       [`repos/${repoSlug}/rulesets/7`]: activeV2,
     };
+    const workflowsTreeKey = `repos/${repoSlug}/git/trees/workflows-tree`;
+    const unrelatedWriterContent = [
+      "name: unrelated status writer",
+      "on:",
+      "  workflow_dispatch:",
+      "permissions:",
+      "  statuses: write",
+      "jobs:",
+      "  status:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - run: echo unrelated",
+      "",
+    ].join("\n");
+    const responsesWithUnrelatedWriter = {
+      ...responses,
+      [workflowsTreeKey]: {
+        ...responses[workflowsTreeKey],
+        tree: [
+          ...responses[workflowsTreeKey].tree,
+          {
+            path: "unrelated-status-writer.yml",
+            sha: "unrelated-status-writer-blob",
+            type: "blob",
+            mode: "100644",
+          },
+        ],
+      },
+      [`repos/${repoSlug}/git/blobs/unrelated-status-writer-blob`]: {
+        encoding: "base64",
+        content: Buffer.from(unrelatedWriterContent, "utf8").toString("base64"),
+      },
+    };
+    const blockedDeriveLog = join(fixtureRoot, "blocked-derive-calls.log");
+    const blockedDerive = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--derive-post-cleanup-plan",
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responsesWithUnrelatedWriter),
+        FAKE_GH_CALL_LOG: blockedDeriveLog,
+      },
+    });
+    assert.equal(blockedDerive.status, 1, blockedDerive.stderr);
+    assert.match(
+      blockedDerive.stderr,
+      /Additional workflows violate the codex\/github-review-gate single-producer policy: .*unrelated-status-writer\.yml \(statuses: write\)/u,
+    );
+    assert.doesNotMatch(
+      blockedDerive.stdout,
+      /schema_version|expected_post_cleanup_security_sha256/u,
+    );
+    assert.doesNotMatch(
+      readFileSync(blockedDeriveLog, "utf8"),
+      /^(?:POST|PUT) /mu,
+    );
+
     const derive = runBootstrap([
       "--repo",
       repoSlug,
@@ -10659,6 +11036,33 @@ test("post-cleanup verification accepts empty legacy surfaces and unrelated clas
     assert.equal(derive.status, 0, derive.stderr);
     const plan = JSON.parse(derive.stdout);
     assert.match(plan.expected_post_cleanup_security_sha256, /^[0-9a-f]{64}$/u);
+
+    const blockedVerifyLog = join(fixtureRoot, "blocked-verify-calls.log");
+    const blockedVerify = runBootstrap([
+      "--repo",
+      repoSlug,
+      "--verify-post-cleanup",
+      "--expected-post-cleanup-security-sha256",
+      plan.expected_post_cleanup_security_sha256,
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+        FAKE_GH_RESPONSES: JSON.stringify(responsesWithUnrelatedWriter),
+        FAKE_GH_CALL_LOG: blockedVerifyLog,
+      },
+    });
+    assert.equal(blockedVerify.status, 1, blockedVerify.stderr);
+    assert.match(
+      blockedVerify.stderr,
+      /Additional workflows violate the codex\/github-review-gate single-producer policy: .*unrelated-status-writer\.yml \(statuses: write\)/u,
+    );
+    assert.doesNotMatch(blockedVerify.stdout, /Post-cleanup verified/u);
+    assert.doesNotMatch(
+      readFileSync(blockedVerifyLog, "utf8"),
+      /^(?:POST|PUT) /mu,
+    );
+
     const result = runBootstrap([
       "--repo",
       repoSlug,

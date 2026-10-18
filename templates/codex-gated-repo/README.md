@@ -140,19 +140,35 @@ workflow. Qualifying Codex findings remain blocking in either mode.
 The ruleset template requires `codex/github-review-gate` from expected source
 GitHub Actions (`integration_id: 15368`), a branch that is up to date, and all
 review conversations resolved. Integration ID 15368 identifies the whole
-GitHub Actions App, not this workflow or a unique producer. The compound
-control plane therefore exact-byte verifies both default-branch workflows,
-rejects noncanonical reserved-name producers and unreviewed relevant write authority,
-requires Code Owner review for `.github/workflows/` and
-`.github/CODEOWNERS`, and dismisses stale approvals. The template's ordinary
-approval count is zero, so ordinary business-code PRs do not require a human
-approval; the bootstrap helper preserves an existing higher approval count.
-It has no bypass actors. Keep it disabled until the live canary succeeds.
+GitHub Actions App, not this workflow or a unique producer. The ordinary
+installer exact-byte verifies both default-branch workflows and uses a scoped
+keyword scan (a best-effort search of workflow source text) to block explicit
+additional Codex gate callers or explicit uses of the same reserved signal.
+It also checks fragmented text, literal concatenations, and simple local
+variables where possible. Potential gate collisions that the keyword scan
+cannot resolve are warnings; unrelated keywords and contexts are ignored.
+Unrelated workflow-local write permissions and opaque workflow-local
+permission declarations are warnings for operator review, not installation
+blockers, and do not require publisher isolation. The repository-wide
+default-workflow-permissions read-only preflight remains a separate strict
+requirement. This scan does not execute workflows, prove complete data flow,
+prevent a malicious same-name forgery, or establish a unique producer;
+operators remain responsible for trusting other workflows that share the
+Actions App. Exact canonical workflow permissions,
+CODEOWNERS protection for `.github/workflows/` and `.github/CODEOWNERS`,
+stale-approval dismissal, and the required ruleset conditions remain strict.
+The template's ordinary approval count is zero, so
+ordinary business-code PRs do not require a human approval; the bootstrap
+helper preserves an existing higher approval count. It has no bypass actors.
+Keep it disabled until the live canary succeeds.
 
-Repositories with an unrelated commit-status producer may explicitly retain
-its `statuses: write` permission using the bootstrap helper's repeatable
-`--reviewed-status-writer .github/workflows/FILE.yml@SHA256` option. The
-workflow must first isolate status writers in explicit job-level
+### Optional compatibility: reviewed status writer
+
+The ordinary current-v2 install does not need
+`--reviewed-status-writer .github/workflows/FILE.yml@SHA256`. Use the option
+only when explicitly choosing the older exact-digest and isolated-publisher
+compatibility check for a particular workflow. When supplied, the workflow
+must first isolate status writers in explicit job-level
 `statuses: write` jobs with self-contained inline Bash steps. Workflow-level
 permissions stay read-only. The publisher `runs-on` may be a literal
 runner-label string, a literal label array, or the exact
@@ -179,20 +195,20 @@ is not a static proof of arbitrary shell behavior; a workflow digest does not
 bind variable values or self-hosted host state, and separate jobs do not provide
 host isolation. Use dedicated or ephemeral trusted runners for token-bearing
 publishers. A workflow digest also cannot bind future changes to an unprotected
-dependency. Each declared file
-must match that SHA-256 of its UTF-8 bytes at every inventory read and must
-have exactly `statuses: write` among the policy's relevant write permissions.
-Gate callers, the reserved native job name, and additional `actions`, `checks`,
-`issues`, or `pull-requests` write authority remain forbidden. Missing,
-changed, duplicate, canonical-path, or no-longer-status-writing declarations
-fail closed. Repeat the same declarations through local preview/apply,
-remote staging/activation, and full-profile cleanup verification; no
-declaration is learned or persisted automatically. Existing canonical CODEOWNERS
-coverage and independent owner review still apply. Initial admission
-rejects `--legacy-bridge` together with this option because later bridge
-removal keeps a frozen policy. Historical
-organization handoff/bridge-removal and source-only proofs do not accept
-this exception.
+dependency. Each explicitly declared file must match that SHA-256 of its UTF-8
+bytes at every inventory read and have exactly `statuses: write` among the
+policy's relevant write permissions. Missing, changed, duplicate,
+canonical-path, or no-longer-status-writing declarations fail closed. Repeat
+the same declarations through local preview/apply, remote staging/activation,
+and full-profile cleanup verification; no declaration is learned or persisted
+automatically. The ordinary scoped scan still blocks explicit additional gate
+callers and explicit uses of the reserved signal; unrelated workflow-local
+write permissions on other workflows remain warnings. The repository-wide
+default-workflow-permissions read-only preflight remains separate. Existing
+canonical CODEOWNERS coverage and independent owner review still apply.
+Initial admission rejects `--legacy-bridge` together with this option because
+later bridge removal keeps a frozen policy. Historical organization
+handoff/bridge-removal and source-only proofs do not accept this exception.
 
 Activation also stops if it would silently make unrelated existing CODEOWNERS
 patterns newly approval-gated. Explicitly review that policy expansion, split

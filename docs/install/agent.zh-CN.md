@@ -876,30 +876,30 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
    既有 entries 移动或合并进 `.github/CODEOWNERS`，然后重跑。不得让高优先级新文件
    遮蔽尚未合并的旧 policy。
 
-5. Helper 若报告其他 v1 caller，只检查它列出的 paths。整个文件专用于 v1 时才删除；
-   否则只移除或停用 legacy job。重复 preview，直到无 v1 caller。
+5. Preview 对 workflow 源文本执行 scoped keyword scan（best-effort 文本扫描）。若报告显示扫描器
+   已识别到额外 Codex gate caller 的明确命中，或显式发出同一个 reserved gate signal（即
+   `codex/github-review-gate` 这个 required CheckRun context），只检查 helper 列出的路径；
+   这些已识别的明确命中仍会阻止安装。若 workflow 专用于 legacy caller 才删除整个文件；否则只移除或
+   停用对应 job，然后重复 preview。
 
-   若 helper 报告 unrelated `statuses: write` workflow，不要删除正常 CI producer 的 permission。
-   先取得显式 control-plane-owner review；publisher 必须与 PR execution 隔离，只在 job-level
-   声明 `statuses: write`，workflow-level permissions 保持 read-only。Publisher 的 `runs-on` 可以是
-   literal runner-label string、literal label array，或精确的
-   `fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` fallback 形式。变量名必须匹配
-   `[A-Z][A-Z0-9_]*_RUNNER_LABELS`，fallback 必须是非空的 JSON 字符串数组；变量值若已设置，
-   也必须是有效 JSON，解析后为 label string 或非空 label array。示例如下：
+   Scan 也会尽力处理被拆分文本、literal concatenation 与简单 local-variable 形式；只有已检测到但
+   无法分类的候选会告警。不支持或未识别的 literal 格式可能漏检；没有 warning 不能证明不存在其他
+   workflow producer。无关 keyword 或 context 会忽略。它不会执行 workflow、验证完整
+   data flow、防止恶意 workflow 伪造同名 signal，也不证明只有一个 producer。已接受的扫描覆盖边界与
+   例子见[workflow 扫描风险说明](workflow-scan-risk-boundary.md)。
 
-   ```yaml
-   runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
-   ```
+   Unrelated
+   workflow-local 的 `statuses`、`checks`、
+   `actions`、`contents` 等 write permission 与 opaque workflow-local permission 声明只是
+   operator warnings，不是阻塞条件。不要为了安装删除这些 permissions 或隔离 unrelated
+   publishers；由 operator 决定是否信任相关 workflow 与 runner。安装器不会修改它们。步骤 2
+   的 repository-wide default-permissions preflight 仍是独立的严格要求。
 
-   不得使用任意 runner expression。
-   每个 publisher 仍必须只有一个 `shell: bash` 的 literal inline Bash `run: |` step，清除
-   `BASH_ENV`/`ENV`，只在 step env 传入 `GH_TOKEN` 并放置 metadata；不得使用 actions、checkout、
-   artifacts、repository scripts、containers、services 或 inherited executable defaults。执行 PR
-   代码的 jobs 不得获得 status-write authority。Owner 必须 review runner selector、inline code
-   与数据流，再计算 exact UTF-8 workflow digest 并在每个 bootstrap command 重复
-   `--reviewed-status-writer .github/workflows/FILE.yml@SHA256`；helper 仅允许 relevant writes 中
-   恰有 `statuses: write` 的 workflow。Digest 不绑定 variable 值或 self-hosted host state，独立
-   jobs 也不提供 host isolation；token-bearing publisher 应使用专用或 ephemeral trusted runner。
+   `--reviewed-status-writer` 是旧 exact-digest / isolated-publisher check 的 optional
+   compatibility 路径，普通 current install 不要传入。若显式使用，遵守
+   [human guide 的兼容章节](human.md#optional-compatibility-reviewed-status-writer)，并在
+   适用的每个阶段重复同一 digest。不得与 `--legacy-bridge` 合用；历史 organization
+   handoff/bridge-removal 与 source-only proof 合约继续冻结且严格。
 
 6. 证明两份 workflow bytes 等于各自 canonical template，并读取最终有效的 CODEOWNERS
    rules：

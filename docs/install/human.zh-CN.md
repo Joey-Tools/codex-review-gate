@@ -1056,25 +1056,29 @@ control-plane block 合并到 `.github/CODEOWNERS` 的最终有效位置。若 h
 caller，只检查它列出的路径，并在同一个 migration PR 中移除或停用精确 legacy job。
 一个 PR 可以同时移除 v1、安装 v2 与 CODEOWNERS 控制面。
 
-若 unrelated CI workflow 需要自己的 `statuses: write`，不要为了安装 gate 删除该 permission。
-先取得显式 control-plane-owner review，并把 publisher 与 PR execution 隔离到显式 job-level
-`statuses: write` job；workflow-level permissions 仍保持 read-only。其 `runs-on` 仅使用 literal
-runner-label string、literal label array，或精确的
-`fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` fallback 形式。变量名必须匹配
-`[A-Z][A-Z0-9_]*_RUNNER_LABELS`，fallback 必须是非空 JSON 字符串数组；变量值若已设置，
-也必须是有效 JSON，解析后为 label string 或非空 label array。示例如下：
+普通 current-v2 bootstrap 还会执行 scoped keyword scan（对 workflow 源文本的 best-effort
+扫描），检查额外 Codex gate caller 与显式使用同一 reserved gate signal 的 workflow；只有扫描器
+识别出的明确命中才会阻止安装。扫描也会尽力检查被拆分的文本、literal concatenation 和简单
+local-variable 形式；只有已检测到但无法分类的候选才会发出 warning。不支持或未识别的 literal
+格式可能漏检；没有 warning 不能证明不存在其他 producer。无关的 keyword 或 context 会忽略。它不会执行
+workflow，也不会证明完整 data flow、防止恶意 workflow 伪造同名 signal，或证明只有一个 producer 能发出
+required signal。
 
-```yaml
-runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
-```
+已接受的扫描覆盖边界与例子见[workflow 扫描风险说明](workflow-scan-risk-boundary.md)。
 
-不得使用任意 runner expression。Publisher 仍须是 self-contained inline Bash，不得使用 actions、checkout、artifacts、repository scripts、
-containers、services 或 inherited executable defaults；必须清除 `BASH_ENV`/`ENV` 并只在 step env
-传入 `GH_TOKEN`，且不得给 PR-executing jobs status-write authority。
+Unrelated workflow-local 的 `statuses`、`checks`、`actions`、`contents` 等 write permission，
+以及 opaque workflow-local permission 声明，只作为 operator review warning，不阻止普通安装。
+不要为了安装 gate 删除这些 permission，也无需隔离 unrelated publisher；安装器不会修改这些
+workflow。依赖 GitHub Actions 作为共享 source 前，operator 应自行判断相关 workflow 与 runner
+是否可信。Canonical verifier/controller 的 permission 声明、CODEOWNERS protection 与
+ruleset checks 仍保持严格；上面的 repository-wide default-permissions preflight 也是独立的
+严格要求。
 
-Owner review 还要覆盖 runner selector 与数据流。Workflow digest 不绑定引用的 variable 值或
-self-hosted host state；独立 jobs 不提供 host isolation。使用 operator-controlled runner
-configuration，并为带 token 的 publisher 配置专用或 ephemeral trusted runner。
+普通 current-v2 安装不需要 `--reviewed-status-writer`。只有显式选择旧版 exact-digest 和
+isolated-publisher compatibility check 时才使用；其约束见
+[英文安装指南的兼容章节](human.md#optional-compatibility-reviewed-status-writer)。不得将该
+选项与 `--legacy-bridge` 合用；历史 organization handoff/bridge-removal 与 source-only
+proof 合约仍保持冻结且严格。
 
 如果仓库当前使用根目录 `CODEOWNERS` 或 `docs/CODEOWNERS`，helper 会停止，避免新建
 `.github/CODEOWNERS` 后静默遮蔽旧 policy。请在同一个 migration PR 中把原有 entries
