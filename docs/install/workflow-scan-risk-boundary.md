@@ -71,6 +71,24 @@ values remain unclassified; tokenization alone does not prove whether a dollar
 expression was quoted literally or expanded. No shell expansion or arbitrary
 option-value interpretation is added to recover those matches.
 
+The scanner also deliberately does not decode a quoted inline YAML `run` value
+or escaped YAML job-name scalars. Those can contain real publishers or decode
+to the reserved name; the [quoted-run](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4305333685)
+and [escaped-name](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4305333692)
+examples remain warning-only rather than introducing YAML decoding semantics.
+The ordinary `-F` alias is supported alongside `--field`; adding that existing
+literal option alias does not add typed-value/file or stdin interpretation.
+
+When the ordinary installer already knows its target repository, supported CLI
+and curl API requests that literally name a different owner/repository do not
+prove a publisher in that target. Repository-name comparison is case-insensitive;
+dynamic or encoded destinations are not proven foreign. Remote installation
+reuses its existing repository identity. Offline preparation optionally reads
+the local origin once, without a network lookup; absent, invalid or unreadable
+origin data produces a generic warning and retains the conservative scan.
+This scope correction does not suppress additional gate callers or matching job
+names, and does not change strict historical/proof paths.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

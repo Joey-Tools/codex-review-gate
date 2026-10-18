@@ -31,7 +31,7 @@ const ACTION_CALLERS = [
  */
 export function inspectWorkflowGateSignals(
   content,
-  { reservedCheckName = DEFAULT_RESERVED_CHECK_NAME } = {},
+  { reservedCheckName = DEFAULT_RESERVED_CHECK_NAME, repositoryFullName } = {},
 ) {
   const matches = [];
   const warnings = [];
@@ -105,7 +105,7 @@ export function inspectWorkflowGateSignals(
   });
   markYamlJobNameFields(lines);
   markUnknownRunBlocks(lines, reserved, addWarning);
-  inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning);
+  inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, repositoryFullName);
 
   if (content.length > clipped.length) {
     addWarning(
@@ -199,6 +199,7 @@ export function inspectWorkflowGateSignals(
       !isRunCommandLine(line.text),
       addMatch,
       addWarning,
+      repositoryFullName,
     );
     const yamlFields = line.yamlScalarContent || line.yamlDataField ? [] : fieldsOnLine(line.text);
     const uses = yamlFields.find((field) => field.key === "uses");
@@ -249,7 +250,7 @@ export function inspectWorkflowGateSignals(
 
   for (const segment of splitScopes(lines)) {
     for (const window of boundedWindows(segment)) {
-      inspectWindow(window, reserved, addMatch, addWarning);
+      inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName);
     }
   }
 
@@ -325,7 +326,7 @@ function finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning, inpu
   }
 }
 
-function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning) {
+function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning, repositoryFullName) {
   if (line.truncated) return;
   if (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run") {
     if (hasExactToken(line.text, reserved) || isAmbiguous(line.text, new Map(), reserved)) {
@@ -405,17 +406,17 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
     const value = resolveField(expression);
     warnUnscopedCaller(expression, value, line, addWarning);
   }
-  const cliContext = cliContextExpression(line.text);
+  const cliContext = cliContextExpression(line.text, repositoryFullName);
   if (cliContext && resolveSimpleLiteral(cliContext, new Map()) === reserved) {
     addMatch("reserved-status-context", line.line, line.raw);
   }
-  const cliCheckRunName = cliCheckRunNameExpression(line.text);
+  const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName);
   if (cliCheckRunName && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) {
     addMatch("reserved-check-run-name", line.line, line.raw);
   }
   const curlSignal = line.continuedCurlCommandPart
     ? null
-    : curlPublisherSignal(line.text, reserved);
+    : curlPublisherSignal(line.text, reserved, repositoryFullName);
   if (curlSignal) addMatch(curlSignal.kind, line.line, line.raw);
   const exactFieldHandled = fields.some(
     (field) =>
@@ -440,7 +441,7 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
   }
 }
 
-function inspectWindow(window, reserved, addMatch, addWarning) {
+function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName) {
   const literals = new Map();
   for (const line of window) {
     if (line.unclassifiedRunBlock) {
@@ -486,17 +487,17 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
     ]) {
       inspectCaller(field.value, literals, line, addMatch, addWarning);
     }
-    const cliContext = cliContextExpression(line.text);
+    const cliContext = cliContextExpression(line.text, repositoryFullName);
     if (cliContext) {
       inspectContext("context", cliContext, literals, line, reserved, addMatch, addWarning);
     }
-    const cliCheckRunName = cliCheckRunNameExpression(line.text);
+    const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName);
     if (cliCheckRunName) {
       inspectContext("check-run-name", cliCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
     const curlSignal = line.continuedCurlCommandPart
       ? null
-      : curlPublisherSignal(line.text, reserved);
+      : curlPublisherSignal(line.text, reserved, repositoryFullName);
     if (curlSignal) {
       inspectContext(curlSignal.field, curlSignal.expression, literals, line, reserved, addMatch, addWarning);
     }
@@ -715,12 +716,13 @@ function useFieldExpressions(text) {
   return [...text.matchAll(pattern)].map((match) => match[1].trim());
 }
 
-function cliContextExpression(text) {
+function cliContextExpression(text, repositoryFullName) {
   const command = firstShellCommand(runCommand(text));
   const admission = cliApiSupportsFieldPublisher(command);
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
   if (!/^\/?repos\/[^/]+\/[^/]+\/statuses\/[^/?#]+$/iu.test(endpoint ?? "")) return null;
+  if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
   if ((admission.method ?? "POST") !== "POST") return null;
   return cliFieldExpression(command, "context");
 }
@@ -737,7 +739,7 @@ function cliApiSupportsFieldPublisher(command) {
   let hostname = null;
   let methodCount = 0;
   let method = null;
-  const valueOptions = new Set(["-f", "--field", "--raw-field", "-H", "--header"]);
+  const valueOptions = new Set(["-f", "-F", "--field", "--raw-field", "-H", "--header"]);
   for (let index = 2; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--input" || argument.startsWith("--input=")) return false;
@@ -774,17 +776,18 @@ function cliApiSupportsFieldPublisher(command) {
       index += 1;
       continue;
     }
-    if (["-f=", "--field=", "--raw-field=", "-H=", "--header="].some((prefix) => argument.startsWith(prefix))) continue;
+    if (["-f=", "-F=", "--field=", "--raw-field=", "-H=", "--header="].some((prefix) => argument.startsWith(prefix))) continue;
     if (index !== 2) return false;
   }
   return hostname === null || hostname.toLowerCase() === "github.com" ? { method } : false;
 }
 
-function cliCheckRunNameExpression(text) {
+function cliCheckRunNameExpression(text, repositoryFullName) {
   const command = firstShellCommand(runCommand(text));
   const admission = cliApiSupportsFieldPublisher(command);
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
+  if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
   if (/^\/?repos\/[^/]+\/[^/]+\/check-runs$/iu.test(endpoint ?? "")) {
     if ((admission.method ?? "POST") !== "POST") return null;
   } else if (/^\/?repos\/[^/]+\/[^/]+\/check-runs\/[^/?#]+$/iu.test(endpoint ?? "")) {
@@ -795,7 +798,7 @@ function cliCheckRunNameExpression(text) {
   return cliFieldExpression(command, "name");
 }
 
-function curlPublisherSignal(text, reserved) {
+function curlPublisherSignal(text, reserved, repositoryFullName) {
   const command = firstShellCommand(runCommand(text));
   if (!/^curl(?:\s|$)/iu.test(command)) return null;
   if (hasShellLineContinuation(command)) return null;
@@ -849,6 +852,7 @@ function curlPublisherSignal(text, reserved) {
 
   const apiPath = supportedGitHubApiPath(target);
   if (apiPath === null) return null;
+  if (isKnownForeignRepositoryEndpoint(apiPath, repositoryFullName)) return null;
   const checkRunsEndpoint = /^\/repos\/[^/]+\/[^/]+\/check-runs$/iu.test(apiPath);
   const statusesEndpoint = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/iu.test(apiPath);
   if (!checkRunsEndpoint && !statusesEndpoint) return null;
@@ -868,6 +872,15 @@ function curlPublisherSignal(text, reserved) {
     }
   }
   return null;
+}
+
+function isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName) {
+  if (typeof repositoryFullName !== "string") return false;
+  const target = repositoryFullName.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/u);
+  const destination = endpoint?.match(/^\/?repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\//iu);
+  if (!target || !destination) return false;
+  return `${destination[1]}/${destination[2]}`.toLowerCase() !==
+    `${target[1]}/${target[2]}`.toLowerCase();
 }
 
 function supportedGitHubApiPath(target) {
@@ -945,7 +958,7 @@ function jsonStringField(payload, key) {
   return parsed[key];
 }
 
-function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
+function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, repositoryFullName) {
   let runBlockIndent = null;
   let runBlockHeaderChars = 0;
   let previousContinues = false;
@@ -1069,7 +1082,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
       continue;
     }
 
-    const signal = curlPublisherSignal(chunks.join(" "), reserved);
+    const signal = curlPublisherSignal(chunks.join(" "), reserved, repositoryFullName);
     if (signal) addMatch(signal.kind, firstLine.line, firstLine.raw);
     previousContinues = false;
     index = current;
@@ -1081,6 +1094,7 @@ function hasShellLineContinuation(value) {
   return trailingSlashes % 2 === 1;
 }
 
+// Quoted YAML run scalars remain unclassified; this scan does not decode YAML.
 function runCommand(text) {
   return text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu)?.[1]?.trim() ?? text.trim();
 }
@@ -1127,10 +1141,10 @@ function cliFieldExpression(text, field) {
       continue;
     }
     let value = null;
-    if (["-f", "--field", "--raw-field"].includes(argument)) {
+    if (["-f", "-F", "--field", "--raw-field"].includes(argument)) {
       value = arguments_[index + 1];
       index += 1;
-    } else if (["-f=", "--field=", "--raw-field="].some((prefix) => argument.startsWith(prefix))) {
+    } else if (["-f=", "-F=", "--field=", "--raw-field="].some((prefix) => argument.startsWith(prefix))) {
       value = argument.slice(argument.indexOf("=") + 1);
     }
     if (typeof value === "string" && value.startsWith(`${field}=`)) {
@@ -1775,6 +1789,7 @@ function literalAtom(value, literals, allowBare = true) {
   if (literals.has(token)) return literals.get(token);
   if (token.length >= 2 && token[0] === token.at(-1) && (token[0] === "'" || token[0] === '"')) {
     const inner = token.slice(1, -1);
+    // Escaped scalar decoding is an accepted coverage gap, not literal proof.
     if (inner.includes("\\")) return null;
     return token[0] === '"' ? expandShellVariables(inner, literals) : inner;
   }

@@ -2568,6 +2568,7 @@ test("detects effective non-managed CODEOWNERS patterns without counting comment
 
 test("prepare-worktree creates and revalidates a missing workflow parent chain", () => {
   const targetRoot = mkdtempSync(join(tmpdir(), "codex-review-gate-bootstrap-"));
+  const workflowsDirectory = join(targetRoot, ".github", "workflows");
   const workflowPath = join(
     targetRoot,
     ".github",
@@ -2579,9 +2580,40 @@ test("prepare-worktree creates and revalidates a missing workflow parent chain",
 
     const apply = runBootstrap(["--prepare-worktree", targetRoot, "--apply"]);
     assert.equal(apply.status, 0, apply.stderr);
+    assert.match(
+      apply.stderr,
+      /target repository identity is unavailable; foreign API publisher filtering is disabled and the conservative workflow scan remains in effect/u,
+    );
     assert.match(apply.stdout, /Applied: install the canonical v2 verifier workflow/u);
     assert.match(apply.stdout, /Applied: install the canonical v2 controller workflow/u);
     assert.equal(readFileSync(workflowPath, "utf8"), CANONICAL_WORKFLOW);
+
+    mkdirSync(workflowsDirectory, { recursive: true });
+    writeFileSync(
+      join(workflowsDirectory, "publisher.yml"),
+      [
+        "name: Publisher",
+        "on: [push]",
+        "jobs:",
+        "  publish:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: gh api repos/foreign/project/statuses/$SHA -f context=codex/github-review-gate",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const noOrigin = runBootstrap(["--prepare-worktree", targetRoot]);
+    assert.notEqual(noOrigin.status, 0);
+    assert.match(noOrigin.stderr, /target repository identity is unavailable/u);
+    assert.match(noOrigin.stderr, /Additional workflows contain Codex gate callers or reserved gate signals/u);
+
+    runGit(["-C", targetRoot, "remote", "add", "origin", "https://github.com/target/project.git"]);
+    const withOrigin = runBootstrap(["--prepare-worktree", targetRoot]);
+    assert.equal(withOrigin.status, 0, withOrigin.stderr);
+    assert.doesNotMatch(withOrigin.stderr, /target repository identity is unavailable/u);
+    assert.match(withOrigin.stdout, /local verifier already matches the canonical v2 bytes/u);
   } finally {
     rmSync(targetRoot, { recursive: true, force: true });
   }
@@ -6943,6 +6975,43 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   assert.equal(
     validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOWS),
     CANONICAL_WORKFLOWS,
+  );
+  const foreignApiPublisher = {
+    path: ".github/workflows/publisher.yml",
+    content: [
+      "name: Publisher",
+      "on: [push]",
+      "jobs:",
+      "  publish:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - run: gh api repos/foreign/project/statuses/$SHA -f context=codex/github-review-gate",
+      "",
+    ].join("\n"),
+  };
+  const withForeignPublisher = [...cleanInventory, foreignApiPublisher];
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(withForeignPublisher, CANONICAL_WORKFLOWS, {
+      repositoryFullName: "target/project",
+    }),
+    CANONICAL_WORKFLOWS,
+  );
+  assert.throws(
+    () => validateCanonicalV2WorkflowInventory(withForeignPublisher, CANONICAL_WORKFLOWS),
+    /reserved gate signals/u,
+    "without a target identity the existing conservative scan remains in force",
+  );
+  assert.throws(
+    () => validateCanonicalV2WorkflowInventory(
+      [
+        ...cleanInventory,
+        { ...foreignApiPublisher, content: foreignApiPublisher.content.replace("foreign/project", "target/project") },
+      ],
+      CANONICAL_WORKFLOWS,
+      { repositoryFullName: "target/project" },
+    ),
+    /reserved gate signals/u,
+    "a literal publisher targeting the known repository remains a collision",
   );
 
   const previousRunnerVerifier = previousRunnerWorkflow(CANONICAL_WORKFLOW);

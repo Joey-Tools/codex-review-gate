@@ -755,6 +755,45 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
   );
 });
 
+test("filters literal API publishers for a known foreign repository only", () => {
+  const cli = "run: gh api repos/other/repo/statuses/$SHA -f context=codex/github-review-gate";
+  const curl = `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/other/repo/statuses/$SHA`;
+  const sameTarget = [
+    "run: gh api repos/target/repo/statuses/$SHA -f context=codex/github-review-gate",
+    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/TARGET/REPO/statuses/$SHA`,
+  ].join("\n");
+  assert.equal(
+    inspectWorkflowGateSignals(sameTarget, { repositoryFullName: "target/repo" }).matches.length,
+    2,
+  );
+
+  for (const source of [
+    cli,
+    curl,
+    'run: gh api repos/other-owner/other-repo/check-runs -f name=codex/github-review-gate -f head_sha="$SHA"',
+    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/other/repo/check-runs`,
+  ]) {
+    assert.equal(
+      inspectWorkflowGateSignals(source, { repositoryFullName: "target/repo" }).matches.length,
+      0,
+      source,
+    );
+    assert.equal(inspectWorkflowGateSignals(source).matches.length, 1, source);
+  }
+
+  for (const endpoint of [
+    "repos/$OWNER/repo/statuses/$SHA",
+    "repos/other%2Fowner/repo/statuses/$SHA",
+  ]) {
+    const unknownTarget = `run: gh api ${endpoint} -f context=codex/github-review-gate`;
+    assert.equal(
+      inspectWorkflowGateSignals(unknownTarget, { repositoryFullName: "target/repo" }).matches.length,
+      1,
+      endpoint,
+    );
+  }
+});
+
 test("keeps quoted JSON.parse text inside a YAML step name warning-only", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -830,6 +869,10 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   );
   assert.equal(rawField.matches.length, 1);
   assert.equal(rawField.matches[0].kind, "reserved-check-run-name");
+  const typedShortField = inspectWorkflowGateSignals(
+    'run: gh api repos/o/r/check-runs -F name=codex/github-review-gate -F head_sha="$GITHUB_SHA"',
+  );
+  assert.deepEqual(typedShortField.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
 
   const quotedEndpoint = inspectWorkflowGateSignals(
     "run: gh api '/repos/o/r/check-runs/123' --method PATCH -f name=codex/github-review-gate",
@@ -1245,6 +1288,17 @@ test("keeps accepted ordinary-installer coverage examples warning-only", () => {
     const result = inspectWorkflowGateSignals(content);
     assert.deepEqual(result.matches, [], issue);
     assert.ok(result.warnings.length > 0, `${issue} should remain visible as a warning`);
+  }
+});
+
+test("keeps accepted quoted run and escaped name examples warning-only", () => {
+  for (const source of [
+    "run: 'gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=$GITHUB_SHA'",
+    'jobs:\n  collision:\n    name: "codex/github-review-\\u0067ate"\n',
+  ]) {
+    const result = inspectWorkflowGateSignals(source);
+    assert.deepEqual(result.matches, [], source);
+    assert.ok(result.warnings.length > 0, source);
   }
 });
 

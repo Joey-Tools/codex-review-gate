@@ -4637,6 +4637,7 @@ export function inspectUnrelatedV2Workflows(
   workflowFiles,
   {
     canonicalPaths = [DEFAULT_WORKFLOW_PATH, DEFAULT_CONTROLLER_WORKFLOW_PATH],
+    repositoryFullName,
   } = {},
 ) {
   if (!Array.isArray(workflowFiles) || !Array.isArray(canonicalPaths)) {
@@ -4655,6 +4656,7 @@ export function inspectUnrelatedV2Workflows(
     if (excludedPaths.has(file.path)) continue;
     const inspection = inspectWorkflowGateSignals(file.content, {
       reservedCheckName: DEFAULT_STATUS_CONTEXT,
+      repositoryFullName,
     });
     matches.push(...inspection.matches.map((match) => ({ path: file.path, ...match })));
     warnings.push(...inspection.warnings.map((warning) => ({ path: file.path, ...warning })));
@@ -5808,6 +5810,7 @@ export function validateCanonicalV2WorkflowInventory(
     legacyBridge = false,
     reviewedStatusWriters = [],
     strictUnrelatedWorkflows = legacyBridge,
+    repositoryFullName,
   } = {},
 ) {
   return validateV2WorkflowInventory(
@@ -5817,6 +5820,7 @@ export function validateCanonicalV2WorkflowInventory(
       legacyBridge,
       reviewedStatusWriters,
       strictUnrelatedWorkflows,
+      repositoryFullName,
       validateVerifier: validateCanonicalV2VerifierWorkflowContent,
       validateController: validateCanonicalV2ControllerWorkflowContent,
       validateInstalledVerifier: validateInstalledCanonicalV2VerifierWorkflowContent,
@@ -5909,6 +5913,7 @@ function validateV2WorkflowInventory(
     legacyBridge,
     reviewedStatusWriters = [],
     strictUnrelatedWorkflows = true,
+    repositoryFullName,
     validateVerifier,
     validateController,
     validateInstalledVerifier = validateVerifier,
@@ -5973,6 +5978,7 @@ function validateV2WorkflowInventory(
   if (!strictUnrelatedWorkflows) {
     const inspection = inspectUnrelatedV2Workflows(workflowFiles, {
       canonicalPaths: [...canonicalPaths],
+      repositoryFullName,
     });
     if (inspection.matches.length > 0) {
       throw new Error(

@@ -2456,10 +2456,13 @@ async function loadConsumerSecuritySnapshot({
         legacyBridge: canonicalWorkflows.legacyBridge !== undefined,
         reviewedStatusWriters,
         strictUnrelatedWorkflows,
+        ...(strictUnrelatedWorkflows ? {} : { repositoryFullName: repoSlug }),
       },
     );
     if (canonicalWorkflows.legacyBridge === undefined) {
-      reportUnrelatedWorkflowWarnings(inspectUnrelatedV2Workflows(workflowFiles));
+      reportUnrelatedWorkflowWarnings(inspectUnrelatedV2Workflows(workflowFiles, {
+        ...(strictUnrelatedWorkflows ? {} : { repositoryFullName: repoSlug }),
+      }));
     }
     validateControlPlaneCodeownersContent(
       codeownersContent,
@@ -4611,6 +4614,17 @@ async function loadGitHubOriginRepository(targetRoot) {
   return { raw: value, repository: parseGitHubRepositoryRemote(value) };
 }
 
+async function loadOptionalGitHubOriginFullName(targetRoot) {
+  try {
+    return (await loadGitHubOriginRepository(targetRoot)).repository.slug;
+  } catch {
+    console.error(
+      "warning: target repository identity is unavailable; foreign API publisher filtering is disabled and the conservative workflow scan remains in effect.",
+    );
+    return undefined;
+  }
+}
+
 function githubRepositoryEndpoint(repository) {
   return `repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`;
 }
@@ -6320,6 +6334,9 @@ async function prepareConsumerWorktree({
   if (managesLegacyBridge && canonicalWorkflows.legacyBridge === undefined) {
     throw new Error("Internal error: the selected bridge lifecycle lacks canonical bytes.");
   }
+  const repositoryFullName = managesLegacyBridge
+    ? undefined
+    : await loadOptionalGitHubOriginFullName(targetRoot);
   const currentLegacyBridgeWorkflow = managesLegacyBridge
     ? await readOptionalRegularFile(legacyBridgeWorkflowPath)
     : null;
@@ -6340,6 +6357,7 @@ async function prepareConsumerWorktree({
     targetRoot,
     reviewedStatusWriters,
     strictUnrelatedWorkflows: managesLegacyBridge,
+    repositoryFullName,
     canonicalWorkflowPaths: [
       verifierWorkflowPath,
       controllerWorkflowPath,
@@ -6411,6 +6429,7 @@ async function prepareConsumerWorktree({
       targetRoot,
       reviewedStatusWriters,
       strictUnrelatedWorkflows: managesLegacyBridge,
+      repositoryFullName,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -6533,6 +6552,7 @@ async function prepareConsumerWorktree({
         targetRoot,
         reviewedStatusWriters,
         strictUnrelatedWorkflows: managesLegacyBridge,
+        repositoryFullName,
         canonicalWorkflowPaths: [
           verifierWorkflowPath,
           controllerWorkflowPath,
@@ -6596,6 +6616,7 @@ async function prepareConsumerWorktree({
       targetRoot,
       reviewedStatusWriters,
       strictUnrelatedWorkflows: managesLegacyBridge,
+      repositoryFullName,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -6664,6 +6685,7 @@ async function prepareConsumerWorktree({
       targetRoot,
       reviewedStatusWriters,
       strictUnrelatedWorkflows: managesLegacyBridge,
+      repositoryFullName,
       canonicalWorkflowPaths: [
         verifierWorkflowPath,
         controllerWorkflowPath,
@@ -7695,6 +7717,7 @@ async function loadLocalInstallationSecurityState({
   canonicalWorkflowPaths,
   reviewedStatusWriters = [],
   strictUnrelatedWorkflows = false,
+  repositoryFullName,
 }) {
   const lowerPrecedenceCodeowners = await findLowerPrecedenceCodeowners(targetRoot);
   if (lowerPrecedenceCodeowners !== null) {
@@ -7765,6 +7788,7 @@ async function loadLocalInstallationSecurityState({
         canonicalPaths: canonicalWorkflowPaths.map((path) =>
           relative(targetRoot, path).split("\\").join("/")
         ),
+        repositoryFullName,
       },
     );
     conflicts.push(...inspection.matches.map((match) =>
