@@ -7682,7 +7682,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     ],
     [
       "literal-json-check-run",
-      `jobs:\n  publish:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs\n`,
+      `jobs:\n  publish:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/example/repo/check-runs\n`,
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
@@ -7694,7 +7694,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
         "      - run: |",
         "          curl -X POST " + "\\",
         "            -H 'Accept: application/vnd.github+json' " + "\\",
-        "            -d '{\"name\":\"codex/github-review-gate\"}' " + "\\",
+        "            -d '{\"name\":\"codex/github-review-gate\",\"head_sha\":\"0123456789abcdef0123456789abcdef01234567\"}' " + "\\",
         "            https://api.github.com/repos/example/repo/check-runs",
       ].join("\n"),
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
@@ -7714,7 +7714,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     ],
     [
       "gh-api-implicit-post-reserved-check-run",
-      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs --raw-field name=codex/github-review-gate\n",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs --raw-field name=codex/github-review-gate --raw-field head_sha=$SHA\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
@@ -7724,7 +7724,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     ],
     [
       "gh-header-method-prose-does-not-hide-publisher",
-      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs -H 'X-Note: --method GET' -f name=codex/github-review-gate\n",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs -H 'X-Note: --method GET' -f name=codex/github-review-gate -f head_sha=$SHA\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

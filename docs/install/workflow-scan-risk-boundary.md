@@ -36,6 +36,15 @@ Here, `env` / `with` / `outputs` / `secrets` means mapping properties, not a job
 
 The supported `gh api` publishing matches exclude recognized explicit GET/HEAD method forms for both context and CheckRun-name fields. Other recognized command fields remain candidates, including a PATCH CheckRun-name update; non-POST does not mean read-only. Unsupported command forms remain outside the completeness guarantee.
 
+For a supported CheckRun collection-create POST, the CLI match requires the
+exact `head_sha` field with a nonempty supplied value. A dynamic CLI value is
+presence-only: the scan does not evaluate its expansion or prove that its
+runtime value is nonempty. The supported curl POST JSON form requires a
+nonempty top-level string `head_sha`. This narrow field-presence rule does not
+validate the full API schema or SHA format; the existing name-only PATCH match
+with a canonical positive-decimal run ID is unchanged ([review finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4307496207)).
+No additional API, shell, or value interpreter is added.
+
 Endpoint classification uses the leading literal endpoint directly after `gh api`, allowing simple surrounding quotes. Endpoint-like text inside a GraphQL query, header or other payload is not an endpoint. This deliberately does not interpret arbitrary argument ordering, option arity or shell expansion; option-before-endpoint and other unsupported forms can remain warning-only coverage limits.
 
 The supported CLI match is confined to the first command before an unquoted shell separator. Flags belonging to a later command are not request parameters of the first one. This bounded prefix scan is not a full shell parser or a guarantee of detecting writers in later commands or complex substitutions.
@@ -97,10 +106,11 @@ These additions do not change the eight earlier fixed warning-only examples or
 relax the runtime unresolved-finding gate.
 
 CLI payload fields use literal case-sensitive field keys and a closed set of
-supported argument positions. Unknown option layouts and shell-expanded field
-values remain unclassified; tokenization alone does not prove whether a dollar
-expression was quoted literally or expanded. No shell expansion or arbitrary
-option-value interpretation is added to recover those matches.
+supported argument positions. Unknown option layouts and shell-expanded gate
+name/context values remain unclassified; tokenization alone does not prove
+whether a dollar expression was quoted literally or expanded. The separate
+`head_sha` presence check does not resolve that value. No shell expansion or
+arbitrary option-value interpretation is added to recover those matches.
 
 The scanner also deliberately does not decode a quoted inline YAML `run` value
 or escaped YAML job-name scalars. Those can contain real publishers or decode
@@ -120,7 +130,8 @@ Dynamic or encoded destinations are not proven foreign. Remote installation
 reuses its existing target identity. Offline preparation optionally reads the
 local origin once, without a network lookup; absent, invalid or unreadable
 origin data produces a generic warning and retains the conservative scan. No
-alias/redirect network lookup is performed. This scope correction does not
+alias/redirect network lookup is performed; Joey explicitly accepted this
+bounded gap rather than adding that lookup. This scope correction does not
 suppress additional gate callers or matching job names, and does not change
 strict historical/proof paths.
 
@@ -183,9 +194,11 @@ These guards intentionally lose coverage rather than adding interpreters.
 
 ## Explicitly approved conservative matches
 
-Joey explicitly accepted these conservative outcomes to keep the ordinary
-preflight a bounded source-keyword scan, without adding caller/callee name
-analysis or condition evaluation:
+Joey explicitly accepted these three narrow conservative outcomes to keep the
+ordinary preflight a bounded source-keyword scan. The first two avoid
+caller/callee name analysis and condition evaluation; the `gh` function case
+avoids function execution or lookup and avoids skipping a whole block that
+could contain a real publisher:
 
 - A reserved job-name string in a `workflow_call`-only reusable workflow may
   still be matched without determining whether a caller references it or how
@@ -193,16 +206,23 @@ analysis or condition evaluation:
 - A publisher-shaped command in a step with literal `if: false` may still be
   matched because the scanner does not evaluate workflow conditions ([review
   finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4306800100)).
+- A local shell function named `gh` may shadow the CLI while a publisher-shaped
+  textual `gh api` command is still matched, causing a conservative false
+  positive. The scanner does not execute or resolve shell functions, and
+  skipping the entire block could miss another real publisher in it ([review
+  finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4307496214)).
 
-These syntactic matches can block ordinary installation even when the command
-never executes or the emitted native name differs; that conservative
-false-positive outcome is explicitly accepted for these two cases only.
-Known-data and exact-literal identity corrections remain required. A match is
-not proof that a workflow is invoked, that a step executes, or that GitHub emits
-the exact native check name. The accepted
-former-slug redirect gap is described above. No broader interpreter, runtime
-change, or additional alias/redirect API query is introduced. This record does
-not define a bypass, override, or recovery path for literal matches.
+These syntactic matches can block ordinary installation even when a workflow
+is not invoked, a command never executes, or the emitted native name differs.
+Joey's approval is limited to these three named cases, not a general waiver for
+other false positives. Known-data and exact-literal identity corrections
+remain required. A match is not proof that a workflow is invoked, that a step
+executes, or that GitHub emits the exact native check name. The accepted
+former-slug redirect gap is described above. These dispositions add no broader
+caller/callee, condition, or shell-function interpreter, and no additional
+alias/redirect API query. The separate narrow `head_sha` presence rule above
+does not validate the full API schema or SHA value. This record does not define
+a bypass, override, or recovery path for literal matches.
 
 ## Safeguards that remain strict
 

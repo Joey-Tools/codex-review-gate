@@ -856,7 +856,7 @@ function cliCheckRunNameExpression(text, repositoryFullName, implicitCliHostUnce
   const endpoint = cliApiEndpoint(command);
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
   if (/^\/?repos\/[^/]+\/[^/]+\/check-runs$/iu.test(endpoint ?? "")) {
-    if ((admission.method ?? "POST") !== "POST") return null;
+    if ((admission.method ?? "POST") !== "POST" || !cliFieldHasNonemptyValue(command, "head_sha")) return null;
   } else if (/^\/?repos\/[^/]+\/[^/]+\/check-runs\/[1-9][0-9]*$/iu.test(endpoint ?? "")) {
     if (admission.method !== "PATCH") return null;
   } else {
@@ -931,7 +931,8 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
   for (const payload of payloads) {
     if (checkRunsEndpoint) {
       const name = jsonStringField(payload, "name");
-      if (name === reserved) {
+      const headSha = jsonStringField(payload, "head_sha");
+      if (name === reserved && headSha !== null && headSha.length > 0) {
         return { kind: "reserved-check-run-name", field: "check-run-name", expression: JSON.stringify(name) };
       }
     }
@@ -1247,7 +1248,7 @@ function firstShellCommand(command) {
   return command.trim();
 }
 
-function cliFieldExpression(text, field) {
+function cliFieldValues(text, field) {
   const arguments_ = shellWords(text);
   if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return null;
   const values = [];
@@ -1268,7 +1269,19 @@ function cliFieldExpression(text, field) {
       values.push(value.slice(value.indexOf("=") + 1));
     }
   }
-  return values.length === 1 && !values[0].includes("$") ? JSON.stringify(values[0]) : null;
+  return values;
+}
+
+function cliFieldExpression(text, field) {
+  const values = cliFieldValues(text, field);
+  return values !== null && values.length === 1 && !values[0].includes("$")
+    ? JSON.stringify(values[0])
+    : null;
+}
+
+function cliFieldHasNonemptyValue(text, field) {
+  const values = cliFieldValues(text, field);
+  return values !== null && values.length === 1 && values[0].length > 0;
 }
 
 function isContextField(key) {

@@ -488,7 +488,7 @@ test("leaves command publishers unknown when YAML explicitly configures a shell"
   assert.ok(result.warnings.some(({ kind, line }) => kind === "explicit-shell-configuration-unclassified" && line === 5));
 
   const implicitDefault = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.deepEqual(implicitDefault.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
 
@@ -777,7 +777,7 @@ test("keeps context-like keys inside bounded flow data mappings as data", () => 
     "      - uses: JoeyTeng/codex-review-gate-action@v2",
     "  publish:",
     "    steps:",
-    "      - run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "      - run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n"));
 
   assert.equal(
@@ -920,7 +920,7 @@ test("ignores YAML-looking block scalar contents while retaining selectors and r
 
   const publishers = [
     [
-      "gh api repos/example/repo/check-runs --method POST -f name=codex/github-review-gate",
+      "gh api repos/example/repo/check-runs --method POST -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
       "reserved-check-run-name",
     ],
     [
@@ -1136,7 +1136,7 @@ test("filters literal API publishers for a known foreign repository only", () =>
     cli,
     curl,
     'run: gh api repos/other-owner/other-repo/check-runs -f name=codex/github-review-gate -f head_sha="$SHA"',
-    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/other/repo/check-runs`,
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/other/repo/check-runs`,
   ]) {
     assert.equal(
       inspectWorkflowGateSignals(source, { repositoryFullName: "target/repo" }).matches.length,
@@ -1161,16 +1161,30 @@ test("filters literal API publishers for a known foreign repository only", () =>
 
 test("does not follow repository rename redirects when filtering known targets", () => {
   const currentSlug = inspectWorkflowGateSignals(
-    `run: curl -L -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/acme/new-name/check-runs`,
+    `run: curl -L -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/acme/new-name/check-runs`,
     { repositoryFullName: "acme/new-name" },
   );
   assert.deepEqual(currentSlug.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
 
   const oldSlug = inspectWorkflowGateSignals(
-    `run: curl -L -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/acme/old-name/check-runs`,
+    `run: curl -L -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/acme/old-name/check-runs`,
     { repositoryFullName: "acme/new-name" },
   );
   assert.deepEqual(oldSlug.matches, []);
+});
+
+test("keeps shell-function-shadowed literal CheckRun publishers blocking", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: |",
+    "          gh() { :; }",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
 });
 
 test("keeps quoted JSON.parse text inside a YAML step name warning-only", () => {
@@ -1188,7 +1202,7 @@ test("keeps quoted JSON.parse text inside a YAML step name warning-only", () => 
 
 test("limits CLI publisher fields and methods to the first shell command", () => {
   const firstCommandWriter = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate && echo --method GET -f name=other",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567 && echo --method GET -f name=other",
   );
   assert.deepEqual(
     firstCommandWriter.matches.map(({ kind }) => kind),
@@ -1196,7 +1210,7 @@ test("limits CLI publisher fields and methods to the first shell command", () =>
   );
 
   for (const command of [
-    "run: gh api repos/o/r/check-runs && echo -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -f head_sha=0123456789abcdef0123456789abcdef01234567 && echo -f name=codex/github-review-gate",
     "run: gh api repos/o/r/check-runs -f context=ordinary; echo -f context=codex/github-review-gate",
     "run: gh api repos/o/r/releases; gh api repos/o/r/check-runs -f name=codex/github-review-gate",
   ]) {
@@ -1219,18 +1233,18 @@ test("limits CLI publisher fields and methods to the first shell command", () =>
 
 test("keeps CLI publisher fields on the supported GitHub host and inline body", () => {
   const explicitGitHub = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs --hostname github.com -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs --hostname github.com -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.equal(explicitGitHub.matches.length, 1);
   assert.equal(explicitGitHub.matches[0].kind, "reserved-check-run-name");
 
   const unsupportedHost = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs --hostname ghe.example.com -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs --hostname ghe.example.com -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.deepEqual(unsupportedHost.matches, []);
 
   const inputBodies = inspectWorkflowGateSignals([
-    "run: gh api repos/o/r/check-runs --input body.json -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs --input body.json -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
     "run: gh api repos/o/r/statuses/$SHA --input=- --raw-field context=codex/github-review-gate",
   ].join("\n"));
   assert.deepEqual(inputBodies.matches, []);
@@ -1239,8 +1253,8 @@ test("keeps CLI publisher fields on the supported GitHub host and inline body", 
 test("leaves implicit-host CLI publishers unclassified when GH_HOST is mentioned", () => {
   const source = [
     "# GH_HOST can redirect the API host",
-    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
-    "run: gh api repos/o/r/check-runs --hostname github.com -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
+    "run: gh api repos/o/r/check-runs --hostname github.com -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n");
   const result = inspectWorkflowGateSignals(source);
   assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
@@ -1257,7 +1271,7 @@ test("matches a literal publisher in a statically false step without evaluating 
     "    runs-on: ubuntu-latest",
     "    steps:",
     "      - if: ${{ false }}",
-    "        run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "        run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n"));
 
   assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
@@ -1265,13 +1279,13 @@ test("matches a literal publisher in a statically false step without evaluating 
 
 test("finds a reserved CheckRun name only beside the explicit check-runs API", () => {
   const publisher = inspectWorkflowGateSignals(
-    "run: gh api repos/example/repo/check-runs -f name=codex/github-review-gate",
+    "run: gh api repos/example/repo/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.equal(publisher.matches.length, 1);
   assert.equal(publisher.matches[0].kind, "reserved-check-run-name");
 
   const rawField = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs --raw-field name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs --raw-field name=codex/github-review-gate --raw-field head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.equal(rawField.matches.length, 1);
   assert.equal(rawField.matches[0].kind, "reserved-check-run-name");
@@ -1292,7 +1306,7 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   assert.deepEqual(quotedEndpointPrefix.matches, []);
 
   const explicitPost = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs --method POST -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs --method POST -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.equal(explicitPost.matches[0].kind, "reserved-check-run-name");
 
@@ -1313,7 +1327,7 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
 
   for (const method of ["--method GET", "--method=GET", "-X GET", "--method HEAD"]) {
     const reader = inspectWorkflowGateSignals(
-      `run: gh api repos/o/r/check-runs ${method} -f name=codex/github-review-gate`,
+      `run: gh api repos/o/r/check-runs ${method} -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567`,
     );
     assert.deepEqual(reader.matches, [], method);
     assert.ok(reader.warnings.some(({ kind }) => kind === "reserved-status-context-reference"), method);
@@ -1327,7 +1341,7 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     "-XPOST -XGET",
   ]) {
     const ambiguous = inspectWorkflowGateSignals(
-      `run: gh api repos/o/r/check-runs ${methods} -f name=codex/github-review-gate`,
+      `run: gh api repos/o/r/check-runs ${methods} -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567`,
     );
     assert.deepEqual(ambiguous.matches, [], methods);
     assert.ok(
@@ -1337,8 +1351,8 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   }
 
   for (const methodLikeValue of [
-    "run: gh api repos/o/r/check-runs -H 'X-Note: --method GET' -f name=codex/github-review-gate",
-    "run: gh api repos/o/r/check-runs -f note=' --method GET' -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -H 'X-Note: --method GET' -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
+    "run: gh api repos/o/r/check-runs -f note=' --method GET' -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
     "run: gh api repos/o/r/check-runs/123 --method=PATCH -H 'X-Note: --method HEAD' -f name=codex/github-review-gate",
   ]) {
     const publisher = inspectWorkflowGateSignals(methodLikeValue);
@@ -1354,27 +1368,27 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   );
   assert.deepEqual(implicitItemPost.matches, []);
   const headerFieldText = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs -H 'X-Note: -f name=codex/github-review-gate' -f other=value",
+    "run: gh api repos/o/r/check-runs -H 'X-Note: -f name=codex/github-review-gate' -f other=value -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.deepEqual(headerFieldText.matches, []);
   const repeatedName = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f name=ordinary",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f name=ordinary -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.deepEqual(repeatedName.matches, []);
   for (const source of [
-    "run: gh api repos/o/r/check-runs -H '-f=name=codex/github-review-gate' -f other=value",
-    "run: gh api repos/o/r/check-runs --jq '-f=name=codex/github-review-gate' -f other=value",
-    "run: gh api repos/o/r/check-runs -f Name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -H '-f=name=codex/github-review-gate' -f other=value -f head_sha=0123456789abcdef0123456789abcdef01234567",
+    "run: gh api repos/o/r/check-runs --jq '-f=name=codex/github-review-gate' -f other=value -f head_sha=0123456789abcdef0123456789abcdef01234567",
+    "run: gh api repos/o/r/check-runs -f Name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
     "run: gh api repos/o/r/check-runs -f",
-    "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name='$NAME'",
-    "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name=$NAME",
-    `run: gh api repos/o/r/check-runs -f "name=codex\\/github-review-gate"`,
+    "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name='$NAME' -f head_sha=0123456789abcdef0123456789abcdef01234567",
+    "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name=$NAME -f head_sha=0123456789abcdef0123456789abcdef01234567",
+    `run: gh api repos/o/r/check-runs -f "name=codex\\/github-review-gate" -f head_sha=0123456789abcdef0123456789abcdef01234567`,
   ]) {
     assert.deepEqual(inspectWorkflowGateSignals(source).matches, [], source);
   }
 
   const unrelated = inspectWorkflowGateSignals(
-    "run: gh api repos/example/releases -f name=codex/github-review-gate",
+    "run: gh api repos/example/releases -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   );
   assert.deepEqual(unrelated.matches, []);
   assert.ok(unrelated.warnings.some(({ kind }) => kind === "reserved-status-context-reference"));
@@ -1384,10 +1398,43 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     "  publish:",
     "    steps:",
     "      - run: |",
-    "          gh api repos/example/repo/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/example/repo/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n"));
   assert.equal(blockScalar.matches.length, 1);
   assert.equal(blockScalar.matches[0].kind, "reserved-check-run-name");
+});
+
+test("requires one nonempty supported head_sha field for CLI CheckRun creation", () => {
+  const missingHeadSha = "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate";
+  for (const [label, source] of [
+    ["missing", missingHeadSha],
+    ["empty", `${missingHeadSha} -f head_sha=`],
+    ["missing value", `${missingHeadSha} -f head_sha`],
+    ["quoted empty", `${missingHeadSha} --raw-field 'head_sha='`],
+    ["wrong key", `${missingHeadSha} -f sha=abc`],
+    ["case-sensitive key", `${missingHeadSha} -f HEAD_SHA=0123456789abcdef0123456789abcdef01234567`],
+    ["non-field prose", `${missingHeadSha} -H 'X-Note: head_sha=0123456789abcdef0123456789abcdef01234567'`],
+    ["duplicate", `${missingHeadSha} -f head_sha=0123456789abcdef0123456789abcdef01234567 -F head_sha=def`],
+  ]) {
+    assert.deepEqual(inspectWorkflowGateSignals(source).matches, [], label);
+  }
+  for (const argument of [
+    '-f head_sha="$GITHUB_SHA"',
+    '-F head_sha="$GITHUB_SHA"',
+    '--field head_sha="$GITHUB_SHA"',
+    '--raw-field head_sha="$GITHUB_SHA"',
+    '-f=head_sha="$GITHUB_SHA"',
+    '-F=head_sha="$GITHUB_SHA"',
+    '--field=head_sha="$GITHUB_SHA"',
+    '--raw-field=head_sha="$GITHUB_SHA"',
+    '-f head_sha=not-a-sha',
+  ]) {
+    assert.deepEqual(
+      inspectWorkflowGateSignals(`${missingHeadSha} ${argument}`).matches.map(({ kind }) => kind),
+      ["reserved-check-run-name"],
+      `${argument}: presence only, not shell expansion or SHA validation`,
+    );
+  }
 });
 
 test("skips known run blocks containing here-document-like text conservatively", () => {
@@ -1398,7 +1445,7 @@ test("skips known run blocks containing here-document-like text conservatively",
     "      - run: |",
     "          cat >config <<'EOF'",
     "          context=codex/github-review-gate",
-    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
     "          EOF",
   ].join("\n"));
   assert.deepEqual(heredoc.matches, []);
@@ -1424,7 +1471,7 @@ test("skips known run blocks containing here-document-like text conservatively",
     "  publish:",
     "    steps:",
     "      - run: |",
-    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n"));
   assert.equal(ordinaryRunBlock.matches.length, 1);
   assert.equal(ordinaryRunBlock.matches[0].kind, "reserved-check-run-name");
@@ -1438,7 +1485,7 @@ test("keeps folded run blocks unclassified instead of scanning physical shell li
       "    steps:",
       `      - run: ${indicator}`,
       "          echo harmless",
-      "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+      "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
     ].join("\n"));
     assert.deepEqual(folded.matches, [], indicator);
     assert.ok(folded.warnings.some(({ kind }) => kind === "unclassified-run-block"), indicator);
@@ -1453,7 +1500,7 @@ test("keeps folded run blocks unclassified instead of scanning physical shell li
     "  publish:",
     "    steps:",
     "      - run: |",
-    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n"));
   assert.equal(literal.matches.length, 1);
   assert.equal(literal.matches[0].kind, "reserved-check-run-name");
@@ -1463,32 +1510,57 @@ test("finds inline JSON CheckRun POST names across common curl data flags", () =
   const options = ["-d", "--data", "--data-raw", "--data-binary", "--json"];
   for (const option of options) {
     const result = inspectWorkflowGateSignals(
-      `run: curl -X POST ${option} '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
+      `run: curl -X POST ${option} '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/example/repo/check-runs`,
     );
     assert.equal(result.matches.length, 1, option);
     assert.equal(result.matches[0].kind, "reserved-check-run-name", option);
   }
 
   const nestedName = inspectWorkflowGateSignals(
-    `run: curl -X POST -d '{"output":{"name":"codex/github-review-gate"}}' https://api.github.com/repos/o/r/check-runs`,
+    `run: curl -X POST -d '{"head_sha":"0123456789abcdef0123456789abcdef01234567","output":{"name":"codex/github-review-gate"}}' https://api.github.com/repos/o/r/check-runs`,
   );
   assert.deepEqual(nestedName.matches, []);
 
   const nonPublishers = inspectWorkflowGateSignals([
-    `run: curl -X POST --data-urlencode '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
+    `run: curl -X POST --data-urlencode '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/example/repo/check-runs`,
     `run: echo "curl -X POST -d '{\"name\":\"codex/github-review-gate\"}' https://api.github.com/repos/example/repo/check-runs"`,
-    `run: curl -X GET -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
-    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/releases`,
-    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/releases; echo https://api.github.com/repos/example/repo/check-runs`,
+    `run: curl -X GET -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/example/repo/check-runs`,
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/example/repo/releases`,
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/example/repo/releases; echo https://api.github.com/repos/example/repo/check-runs`,
     "run: jq '.name == \"codex/github-review-gate\"' payload.json",
-    `run: curl -X POST -d '{"name":"codex/github-review-gate"}'`,
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}'`,
     "run: echo https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.deepEqual(nonPublishers.matches, []);
 });
 
+test("requires a nonempty top-level string head_sha for curl CheckRun creation", () => {
+  for (const [label, fields] of [
+    ["missing", {}],
+    ["empty", { head_sha: "" }],
+    ["null", { head_sha: null }],
+    ["number", { head_sha: 12 }],
+    ["boolean", { head_sha: true }],
+    ["array", { head_sha: ["0123456789abcdef0123456789abcdef01234567"] }],
+    ["object", { head_sha: { value: "0123456789abcdef0123456789abcdef01234567" } }],
+    ["nested", { output: { head_sha: "0123456789abcdef0123456789abcdef01234567" } }],
+    ["wrong key", { HEAD_SHA: "0123456789abcdef0123456789abcdef01234567" }],
+  ]) {
+    const payload = JSON.stringify({ name: "codex/github-review-gate", ...fields });
+    const result = inspectWorkflowGateSignals(
+      `run: curl -X POST -d '${payload}' https://api.github.com/repos/o/r/check-runs`,
+    );
+    assert.deepEqual(result.matches, [], label);
+    assert.ok(result.warnings.some(({ kind }) => kind === "reserved-status-context-reference"), label);
+  }
+  const presenceOnly = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"not-a-sha"}' https://api.github.com/repos/o/r/check-runs`,
+  );
+  assert.deepEqual(presenceOnly.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+});
+
 test("preserves curl request-method case and rejects attached short-option equals rewrites", () => {
-  const payload = `'{"name":"codex/github-review-gate"}'`;
+  const payload = `'{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}'`;
   const endpoint = "https://api.github.com/repos/o/r/check-runs";
   for (const command of [
     `curl -X post -d ${payload} ${endpoint}`,
@@ -1511,28 +1583,28 @@ test("preserves curl request-method case and rejects attached short-option equal
 
 test("uses curl URL operands rather than header or later-command text", () => {
   const headerUrl = inspectWorkflowGateSignals(
-    `run: curl -X POST -H 'Link: https://api.github.com/repos/o/r/check-runs' -d '{"name":"codex/github-review-gate"}' https://example.com/audit`,
+    `run: curl -X POST -H 'Link: https://api.github.com/repos/o/r/check-runs' -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://example.com/audit`,
   );
   assert.deepEqual(headerUrl.matches, []);
 
   const headerAccept = inspectWorkflowGateSignals(
-    `run: curl -H 'Accept: application/vnd.github+json' -X POST -d '{"name":"codex/github-review-gate"}' --url https://api.github.com/repos/o/r/check-runs`,
+    `run: curl -H 'Accept: application/vnd.github+json' -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' --url https://api.github.com/repos/o/r/check-runs`,
   );
   assert.equal(headerAccept.matches.length, 1);
   assert.equal(headerAccept.matches[0].kind, "reserved-check-run-name");
 
   const laterCommand = inspectWorkflowGateSignals(
-    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/releases && echo -H 'Link: https://api.github.com/repos/o/r/check-runs'`,
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/o/r/releases && echo -H 'Link: https://api.github.com/repos/o/r/check-runs'`,
   );
   assert.deepEqual(laterCommand.matches, []);
 
   const unsupportedOption = inspectWorkflowGateSignals(
-    `run: curl --config request.conf -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
+    `run: curl --config request.conf -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/o/r/check-runs`,
   );
   assert.deepEqual(unsupportedOption.matches, []);
 
   const defaultPort = inspectWorkflowGateSignals(
-    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com:443/repos/o/r/check-runs`,
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com:443/repos/o/r/check-runs`,
   );
   assert.equal(defaultPort.matches.length, 1);
 
@@ -1543,13 +1615,13 @@ test("uses curl URL operands rather than header or later-command text", () => {
     "https://api.github.com:8443/repos/o/r/check-runs",
   ]) {
     const unsupportedTarget = inspectWorkflowGateSignals(
-      `run: curl -X POST -d '{"name":"codex/github-review-gate"}' ${target}`,
+      `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' ${target}`,
     );
     assert.deepEqual(unsupportedTarget.matches, [], target);
   }
 
   const multipleBodies = inspectWorkflowGateSignals(
-    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' -d '{"status":"completed"}' https://api.github.com/repos/o/r/check-runs`,
+    `run: curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' -d '{"status":"completed"}' https://api.github.com/repos/o/r/check-runs`,
   );
   assert.deepEqual(multipleBodies.matches, []);
 
@@ -1558,7 +1630,7 @@ test("uses curl URL operands rather than header or later-command text", () => {
     "https://api.github.com/repos/o/r/statuses/$SHA/extra",
   ]) {
     const unsupportedRoute = inspectWorkflowGateSignals(
-      `run: curl -X POST -d '{"name":"codex/github-review-gate","context":"codex/github-review-gate"}' ${target}`,
+      `run: curl -X POST -d '{"name":"codex/github-review-gate","context":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' ${target}`,
     );
     assert.deepEqual(unsupportedRoute.matches, [], target);
   }
@@ -1575,7 +1647,7 @@ test("does not classify curl publishers with a literal Host header override", ()
   ];
   for (const header of headers) {
     const result = inspectWorkflowGateSignals(
-      `run: curl --http1.1 -X POST ${header} -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
+      `run: curl --http1.1 -X POST ${header} -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/o/r/check-runs`,
     );
     assert.deepEqual(result.matches, [], header);
     assert.ok(
@@ -1585,7 +1657,7 @@ test("does not classify curl publishers with a literal Host header override", ()
   }
 
   const ordinaryHeader = inspectWorkflowGateSignals(
-    `run: curl --http1.1 -X POST --header 'Accept: application/vnd.github+json' -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
+    `run: curl --http1.1 -X POST --header 'Accept: application/vnd.github+json' -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/o/r/check-runs`,
   );
   assert.equal(ordinaryHeader.matches.length, 1);
   assert.equal(ordinaryHeader.matches[0].kind, "reserved-check-run-name");
@@ -1625,7 +1697,7 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     "    steps:",
     "      - run: |",
     "          curl -X POST \\",
-    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    `            -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
     "            https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.equal(publisher.matches.length, 1);
@@ -1637,7 +1709,7 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     "    steps:",
     "      - run: |",
     "          curl -X POST \\",
-    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    `            -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
     "            https://api.github.com/repos/example/repo/releases; echo https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.deepEqual(chained.matches, []);
@@ -1669,7 +1741,7 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     "    steps:",
     "      - run: |",
     "          curl -X POST \\",
-    `            -d '{"name":"codex/github-review-gate"}' --header "X-Label: Joey's" \\`,
+    `            -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' --header "X-Label: Joey's" \\`,
     "            https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.equal(doubleQuotedApostrophe.matches.length, 1);
@@ -1682,7 +1754,7 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     "      - run: |",
     "          curl -X POST \\",
     ...Array.from({ length: 16 }, (_, index) => `            --header X-Test-${index}: value \\`),
-    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    `            -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
     "            https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.deepEqual(overBudget.matches, []);
@@ -1695,7 +1767,7 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     "      - run: |",
     "          curl -X POST \\",
     "      - run: |",
-    `          -d '{"name":"codex/github-review-gate"}' \\`,
+    `          -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
     "          https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.deepEqual(splitAtStep.matches, []);
@@ -1707,7 +1779,7 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     "      - run: |",
     "          curl -X POST \\",
     "---",
-    `-d '{"name":"codex/github-review-gate"}' \\`,
+    `-d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
     "https://api.github.com/repos/example/repo/check-runs",
   ].join("\n"));
   assert.deepEqual(splitAtDocument.matches, []);
@@ -1718,7 +1790,7 @@ test("joins only bounded backslash continuations inside a run block for curl pub
     "    steps:",
     "      - run: |",
     "          echo placeholder \\",
-    `          curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
+    `          curl -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/example/repo/check-runs`,
   ].join("\n"));
   assert.deepEqual(followsOtherContinuation.matches, []);
 });
@@ -1730,9 +1802,9 @@ test("does not classify physical lines inside incomplete run-block shell command
     "    steps:",
     "      - run: |",
     "          echo harmless \\",
-    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
     "      - run: |",
-    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n"));
   assert.equal(continuedEcho.matches.length, 1);
   assert.equal(continuedEcho.matches[0].kind, "reserved-check-run-name");
@@ -1746,7 +1818,7 @@ test("does not classify physical lines inside incomplete run-block shell command
     "    steps:",
     "      - run: |",
     '          echo "harmless',
-    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567",
   ].join("\n"));
   assert.deepEqual(openQuote.matches, []);
   assert.ok(openQuote.warnings.some(({ kind }) => kind === "unclassified-run-block"));
@@ -1757,7 +1829,7 @@ test("does not classify physical lines inside incomplete run-block shell command
     "    steps:",
     "      - run: |",
     "          curl -X POST \\",
-    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    `            -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
     "            https://api.github.com/repos/o/r/check-runs",
     '          echo "unfinished',
   ].join("\n"));
