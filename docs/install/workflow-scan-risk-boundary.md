@@ -110,6 +110,23 @@ Neither permission-parser exceptions nor arbitrary parsed permission names are
 copied into diagnostics; both can contain raw workflow text. Operators inspect
 the reported workflow path instead. Strict validation decisions are unchanged.
 
+Known folded `run: >` blocks stay unclassified as whole blocks. Physical lines
+cannot establish separate shell commands after YAML folding; no reconstruction
+is attempted. Literal `|` run blocks keep their separate supported matching.
+
+Mentioning `GH_HOST` anywhere in the bounded workflow source makes implicit-host
+gh API publication unclassified for that scan, with a fixed warning. This is a
+conservative coverage loss even for inactive/data/comment references, not scoped
+environment inheritance or evaluation. A supported explicit `--hostname github.com`
+can still establish the host. No host-override value is printed.
+
+Any backslash inside a double-quoted shell word leaves that command
+unclassified instead of interpreting escape rules or erasing characters into a different exact name. A quoted
+gh endpoint must end at a token boundary; quoted/unquoted endpoint concatenation
+does not prove the quoted prefix is the route. Literal curl `Host` header
+overrides are unclassified rather than simulating HTTP virtual-host behavior.
+These guards intentionally lose coverage rather than adding interpreters.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

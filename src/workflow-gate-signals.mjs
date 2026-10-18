@@ -103,6 +103,15 @@ export function inspectWorkflowGateSignals(
         (content.length > clipped.length && index === rawLines.length - 1),
     };
   });
+  // GH_HOST can redirect implicit-host gh api commands; do not infer its value or shell data flow.
+  const implicitCliHostUncertain = lines.some((line) => line.raw.includes("GH_HOST"));
+  if (implicitCliHostUncertain) {
+    addWarning(
+      "cli-host-override-unclassified",
+      1,
+      "The bounded source mentions GH_HOST; implicit-host GitHub CLI API requests were left unclassified.",
+    );
+  }
   markYamlJobNameFields(lines);
   markUnknownRunBlocks(lines, reserved, addWarning);
   inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, repositoryFullName);
@@ -200,6 +209,7 @@ export function inspectWorkflowGateSignals(
       addMatch,
       addWarning,
       repositoryFullName,
+      implicitCliHostUncertain,
     );
     const yamlFields = line.yamlScalarContent || line.yamlDataField ? [] : fieldsOutsideFlowData(line);
     const uses = yamlFields.find((field) => field.key === "uses");
@@ -250,7 +260,7 @@ export function inspectWorkflowGateSignals(
 
   for (const segment of splitScopes(lines)) {
     for (const window of boundedWindows(segment)) {
-      inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName);
+      inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName, implicitCliHostUncertain);
     }
   }
 
@@ -326,7 +336,7 @@ function finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning, inpu
   }
 }
 
-function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning, repositoryFullName) {
+function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning, repositoryFullName, implicitCliHostUncertain) {
   if (line.truncated) return;
   if (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run") {
     if (hasExactToken(line.text, reserved) || isAmbiguous(line.text, new Map(), reserved)) {
@@ -406,11 +416,11 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
     const value = resolveField(expression);
     warnUnscopedCaller(expression, value, line, addWarning);
   }
-  const cliContext = cliContextExpression(line.text, repositoryFullName);
+  const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain);
   if (cliContext && resolveSimpleLiteral(cliContext, new Map()) === reserved) {
     addMatch("reserved-status-context", line.line, line.raw);
   }
-  const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName);
+  const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName, implicitCliHostUncertain);
   if (cliCheckRunName && resolveSimpleLiteral(cliCheckRunName, new Map()) === reserved) {
     addMatch("reserved-check-run-name", line.line, line.raw);
   }
@@ -441,7 +451,7 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
   }
 }
 
-function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName) {
+function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullName, implicitCliHostUncertain) {
   const literals = new Map();
   for (const line of window) {
     if (line.unclassifiedRunBlock) {
@@ -487,11 +497,11 @@ function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullNam
     ]) {
       inspectCaller(field.value, literals, line, addMatch, addWarning);
     }
-    const cliContext = cliContextExpression(line.text, repositoryFullName);
+    const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain);
     if (cliContext) {
       inspectContext("context", cliContext, literals, line, reserved, addMatch, addWarning);
     }
-    const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName);
+    const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName, implicitCliHostUncertain);
     if (cliCheckRunName) {
       inspectContext("check-run-name", cliCheckRunName, literals, line, reserved, addMatch, addWarning);
     }
@@ -727,9 +737,9 @@ function useFieldExpressions(text) {
   return [...text.matchAll(pattern)].map((match) => match[1].trim());
 }
 
-function cliContextExpression(text, repositoryFullName) {
+function cliContextExpression(text, repositoryFullName, implicitCliHostUncertain) {
   const command = firstShellCommand(runCommand(text));
-  const admission = cliApiSupportsFieldPublisher(command);
+  const admission = cliApiSupportsFieldPublisher(command, implicitCliHostUncertain);
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
   if (!/^\/?repos\/[^/]+\/[^/]+\/statuses\/[^/?#]+$/iu.test(endpoint ?? "")) return null;
@@ -739,12 +749,12 @@ function cliContextExpression(text, repositoryFullName) {
 }
 
 function cliApiEndpoint(command) {
-  const match = command.match(/^gh\s+api\s+(?:"([^"]*)"|'([^']*)'|([^\s]+))/iu);
+  const match = command.match(/^gh\s+api\s+(?:"([^"]*)"|'([^']*)'|([^\s]+))(?:\s|$)/iu);
   const endpoint = match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
   return endpoint?.startsWith("-") ? null : endpoint;
 }
 
-function cliApiSupportsFieldPublisher(command) {
+function cliApiSupportsFieldPublisher(command, implicitCliHostUncertain = false) {
   const arguments_ = shellWords(command);
   if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return false;
   let hostname = null;
@@ -790,12 +800,13 @@ function cliApiSupportsFieldPublisher(command) {
     if (["-f=", "-F=", "--field=", "--raw-field=", "-H=", "--header="].some((prefix) => argument.startsWith(prefix))) continue;
     if (index !== 2) return false;
   }
+  if (implicitCliHostUncertain && hostname === null) return false;
   return hostname === null || hostname.toLowerCase() === "github.com" ? { method } : false;
 }
 
-function cliCheckRunNameExpression(text, repositoryFullName) {
+function cliCheckRunNameExpression(text, repositoryFullName, implicitCliHostUncertain) {
   const command = firstShellCommand(runCommand(text));
-  const admission = cliApiSupportsFieldPublisher(command);
+  const admission = cliApiSupportsFieldPublisher(command, implicitCliHostUncertain);
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
@@ -848,6 +859,8 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
       } else if (option === "--url") {
         if (target !== null) return null;
         target = value;
+      } else if ((option === "-H" || option === "--header") && /^\s*host\s*[:;]/iu.test(value)) {
+        return null;
       }
       continue;
     }
@@ -926,6 +939,8 @@ function shellWords(command) {
       word += character;
       escaped = false;
       started = true;
+    } else if (character === "\\" && quote === '"') {
+      return null;
     } else if (character === "\\" && quote !== "'") {
       escaped = true;
       started = true;
@@ -1339,19 +1354,21 @@ function markUnknownRunBlocks(lines, reserved, addWarning) {
 
     const blockLines = [header];
     let containsHereDocLikeText = false;
+    const scalarIndicator = stripYamlAnchor(runHeader[1].trim());
+    const isFoldedScalar = scalarIndicator.startsWith(">");
     for (let bodyIndex = index + 1; bodyIndex < lines.length; bodyIndex += 1) {
       const body = lines[bodyIndex];
       if (!body.yamlScalarContent || body.yamlScalarOwnerKey !== "run") break;
       blockLines.push(body);
       if (body.raw.includes("<<")) containsHereDocLikeText = true;
     }
-    if (!containsHereDocLikeText) continue;
+    if (!containsHereDocLikeText && !isFoldedScalar) continue;
 
     for (const line of blockLines) line.unclassifiedRunBlock = true;
     addWarning(
       "unclassified-run-block",
       header.line,
-      "A run block contains here-document-like text and was skipped by the bounded shell-text scan.",
+      "A run block contains here-document-like text or uses folded YAML style and was skipped by the bounded shell-text scan.",
       header.raw,
     );
     if (blockLines.some((line) => hasExactToken(line.raw, reserved))) {

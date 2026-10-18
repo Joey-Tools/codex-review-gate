@@ -957,6 +957,20 @@ test("keeps CLI publisher fields on the supported GitHub host and inline body", 
   assert.deepEqual(inputBodies.matches, []);
 });
 
+test("leaves implicit-host CLI publishers unclassified when GH_HOST is mentioned", () => {
+  const source = [
+    "# GH_HOST can redirect the API host",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs --hostname github.com -f name=codex/github-review-gate",
+  ].join("\n");
+  const result = inspectWorkflowGateSignals(source);
+  assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+  assert.equal(
+    result.warnings.filter(({ kind }) => kind === "cli-host-override-unclassified").length,
+    1,
+  );
+});
+
 test("finds a reserved CheckRun name only beside the explicit check-runs API", () => {
   const publisher = inspectWorkflowGateSignals(
     "run: gh api repos/example/repo/check-runs -f name=codex/github-review-gate",
@@ -979,6 +993,11 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   );
   assert.equal(quotedEndpoint.matches.length, 1);
   assert.equal(quotedEndpoint.matches[0].kind, "reserved-check-run-name");
+
+  const quotedEndpointPrefix = inspectWorkflowGateSignals(
+    "run: gh api 'repos/o/r/check-runs'/123 -f name=codex/github-review-gate",
+  );
+  assert.deepEqual(quotedEndpointPrefix.matches, []);
 
   const explicitPost = inspectWorkflowGateSignals(
     "run: gh api repos/o/r/check-runs --method POST -f name=codex/github-review-gate",
@@ -1050,6 +1069,7 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     "run: gh api repos/o/r/check-runs -f",
     "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name='$NAME'",
     "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name=$NAME",
+    `run: gh api repos/o/r/check-runs -f "name=codex\\/github-review-gate"`,
   ]) {
     assert.deepEqual(inspectWorkflowGateSignals(source).matches, [], source);
   }
@@ -1109,6 +1129,35 @@ test("skips known run blocks containing here-document-like text conservatively",
   ].join("\n"));
   assert.equal(ordinaryRunBlock.matches.length, 1);
   assert.equal(ordinaryRunBlock.matches[0].kind, "reserved-check-run-name");
+});
+
+test("keeps folded run blocks unclassified instead of scanning physical shell lines", () => {
+  for (const indicator of [">", ">-", ">+"]) {
+    const folded = inspectWorkflowGateSignals([
+      "jobs:",
+      "  publish:",
+      "    steps:",
+      `      - run: ${indicator}`,
+      "          echo harmless",
+      "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    ].join("\n"));
+    assert.deepEqual(folded.matches, [], indicator);
+    assert.ok(folded.warnings.some(({ kind }) => kind === "unclassified-run-block"), indicator);
+    assert.ok(
+      folded.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+      indicator,
+    );
+  }
+
+  const literal = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ].join("\n"));
+  assert.equal(literal.matches.length, 1);
+  assert.equal(literal.matches[0].kind, "reserved-check-run-name");
 });
 
 test("finds inline JSON CheckRun POST names across common curl data flags", () => {
@@ -1192,6 +1241,33 @@ test("uses curl URL operands rather than header or later-command text", () => {
     );
     assert.deepEqual(unsupportedRoute.matches, [], target);
   }
+});
+
+test("does not classify curl publishers with a literal Host header override", () => {
+  const headers = [
+    "-H 'Host: forged.example'",
+    "--header 'hOsT: api.github.com'",
+    "-H 'Host:'",
+    "--header 'HOST;'",
+    "-H='Host: forged.example'",
+    "--header='host: api.github.com'",
+  ];
+  for (const header of headers) {
+    const result = inspectWorkflowGateSignals(
+      `run: curl --http1.1 -X POST ${header} -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
+    );
+    assert.deepEqual(result.matches, [], header);
+    assert.ok(
+      result.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+      header,
+    );
+  }
+
+  const ordinaryHeader = inspectWorkflowGateSignals(
+    `run: curl --http1.1 -X POST --header 'Accept: application/vnd.github+json' -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
+  );
+  assert.equal(ordinaryHeader.matches.length, 1);
+  assert.equal(ordinaryHeader.matches[0].kind, "reserved-check-run-name");
 });
 
 test("finds only explicit commit-status POST publishers in bounded curl commands", () => {
