@@ -2598,7 +2598,7 @@ test("prepare-worktree creates and revalidates a missing workflow parent chain",
         "  publish:",
         "    runs-on: ubuntu-latest",
         "    steps:",
-        "      - run: gh api repos/foreign/project/statuses/$SHA -f context=codex/github-review-gate",
+        "      - run: gh api repos/foreign/project/statuses/$SHA -f context=codex/github-review-gate -f state=success",
         "",
       ].join("\n"),
       "utf8",
@@ -7062,7 +7062,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "  publish:",
       "    runs-on: ubuntu-latest",
       "    steps:",
-      "      - run: gh api repos/foreign/project/statuses/$SHA -f context=codex/github-review-gate",
+      "      - run: gh api repos/foreign/project/statuses/$SHA -f context=codex/github-review-gate -f state=success",
       "",
     ].join("\n"),
   };
@@ -7672,7 +7672,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     ],
     [
       "gh-status-context-publisher",
-      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/statuses/$SHA --raw-field context=codex/github-review-gate\n",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/statuses/$SHA --raw-field context=codex/github-review-gate --raw-field state=success\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

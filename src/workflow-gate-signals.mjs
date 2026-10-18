@@ -463,7 +463,7 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
     warnUnscopedCaller(expression, value, line, addWarning);
   }
   const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain);
-  if (cliContext && resolveSimpleLiteral(cliContext, new Map()) === reserved) {
+  if (cliContext && asciiCaseInsensitiveEqual(resolveSimpleLiteral(cliContext, new Map()), reserved)) {
     addMatch("reserved-status-context", line.line, line.raw);
   }
   const cliCheckRunName = cliCheckRunNameExpression(line.text, repositoryFullName, implicitCliHostUncertain);
@@ -604,8 +604,11 @@ function inspectContext(
   resolveLiteral = resolveSimpleLiteral,
 ) {
   const value = resolveLiteral(expression, literals);
-  if (value === reserved) {
-    const normalized = key.toLowerCase();
+  const normalized = key.toLowerCase();
+  const matchesReserved = normalized === "name" || normalized === "check-run-name"
+    ? value === reserved
+    : asciiCaseInsensitiveEqual(value, reserved);
+  if (matchesReserved) {
     addMatch(
       normalized === "name"
         ? "reserved-job-name"
@@ -790,7 +793,16 @@ function cliContextExpression(text, repositoryFullName, implicitCliHostUncertain
   if (!/^\/?repos\/[^/]+\/[^/]+\/statuses\/[^/?#]+$/iu.test(endpoint ?? "")) return null;
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
   if ((admission.method ?? "POST") !== "POST") return null;
+  if (!cliFieldHasNonemptyValue(command, "state")) return null;
   return cliFieldExpression(command, "context");
+}
+
+function asciiCaseInsensitiveEqual(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  const foldAscii = (value) => value.replace(/[A-Z]/gu, (character) =>
+    String.fromCharCode(character.charCodeAt(0) + 32),
+  );
+  return foldAscii(left) === foldAscii(right);
 }
 
 function cliApiEndpoint(command) {
@@ -938,7 +950,8 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
     }
     if (statusesEndpoint) {
       const context = jsonStringField(payload, "context");
-      if (context === reserved) {
+      const state = jsonStringField(payload, "state");
+      if (asciiCaseInsensitiveEqual(context, reserved) && state !== null && state.length > 0) {
         return { kind: "reserved-status-context", field: "context", expression: JSON.stringify(context) };
       }
     }
@@ -1035,6 +1048,7 @@ function jsonStringField(payload, key) {
 function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, repositoryFullName) {
   let runBlockIndent = null;
   let runBlockHeaderChars = 0;
+  let runBlockScalarIndent = null;
   let previousContinues = false;
   let index = 0;
   while (index < lines.length) {
@@ -1042,6 +1056,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
     if (line.unclassifiedRunBlock || line.truncated || line.yamlDataField || (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run")) {
       runBlockIndent = null;
       runBlockHeaderChars = 0;
+      runBlockScalarIndent = null;
       previousContinues = false;
       index += 1;
       continue;
@@ -1049,6 +1064,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
     if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
       runBlockIndent = null;
       runBlockHeaderChars = 0;
+      runBlockScalarIndent = null;
       previousContinues = false;
       index += 1;
       continue;
@@ -1061,6 +1077,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
         ? indentationOf(line.text)
         : null;
       runBlockHeaderChars = runBlockIndent === null ? 0 : line.text.length + 1;
+      runBlockScalarIndent = null;
       previousContinues = false;
       index += 1;
       continue;
@@ -1077,10 +1094,13 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
     if (indentationOf(line.text) <= runBlockIndent) {
       runBlockIndent = null;
       runBlockHeaderChars = 0;
+      runBlockScalarIndent = null;
       previousContinues = false;
       index += 1;
       continue;
     }
+
+    if (runBlockScalarIndent === null) runBlockScalarIndent = indentationOf(line.raw);
 
     const initialCommand = line.text.trim();
     if (/^curl(?:\s|$)/iu.test(initialCommand) && hasSingleQuotedTrailingBackslash(initialCommand)) {
@@ -1126,12 +1146,18 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
       ) {
         break;
       }
-      const part = physical.text.trim();
+      if (indentationOf(physical.raw) < runBlockScalarIndent) {
+        break;
+      }
+      const part = physical.text.slice(runBlockScalarIndent);
       physical.continuedCurlCommandPart = true;
       const continuation = hasShellLineContinuation(part);
-      const chunk = continuation ? part.replace(/\\\s*$/u, "").trimEnd() : part;
+      if (continuation && /\\[ \t]+$/u.test(physical.raw.slice(runBlockScalarIndent))) {
+        break;
+      }
+      const chunk = continuation ? part.replace(/\\\s*$/u, "") : part;
       consumed += 1;
-      totalChars += chunk.length + (chunks.length ? 1 : 0);
+      totalChars += chunk.length;
       if (consumed > MAX_WINDOW_LINES || totalChars > MAX_WINDOW_CHARS) {
         exceeded = true;
         break;
@@ -1168,7 +1194,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning, re
       continue;
     }
 
-    const signal = curlPublisherSignal(chunks.join(" "), reserved, repositoryFullName);
+    const signal = curlPublisherSignal(chunks.join(""), reserved, repositoryFullName);
     if (signal) addMatch(signal.kind, firstLine.line, firstLine.raw);
     previousContinues = false;
     index = current;

@@ -194,6 +194,23 @@ does not prove the quoted prefix is the route. Literal curl `Host` header
 overrides are unclassified rather than simulating HTTP virtual-host behavior.
 These guards intentionally lose coverage rather than adding interpreters.
 
+Three additional source-classification corrections keep supported publisher
+matching bounded ([curl continuation](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4308992826),
+[status context comparison](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4308992831),
+[status POST fields](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4308992834)).
+Supported curl continuations preserve the original scalar content, whitespace
+and token adjacency; joining physical lines must not invent a separating
+space. If indentation makes the continuation relationship unprovable, leave
+the candidate unclassified rather than guessing. This adds no general YAML
+or shell interpreter. Status API context comparisons use ASCII case-insensitive
+comparison only, consistent with GitHub's documented case-insensitive context
+comparison; CheckRun names and job names retain exact, case-sensitive equality.
+For a supported status-creation POST, the `state` field must be present with
+nonempty supported text: `gh api` uses raw supplied-text
+presence, while curl requires a nonempty top-level JSON string. This is not
+enum, full-schema, SHA, or typed CLI-value validation, and adds no YAML/shell
+interpreter or runtime-policy change ([GitHub status API](https://docs.github.com/en/rest/commits/statuses#create-a-commit-status)).
+
 ## Explicitly approved conservative matches
 
 Joey explicitly accepted these four narrow conservative outcomes to keep the

@@ -924,7 +924,7 @@ test("ignores YAML-looking block scalar contents while retaining selectors and r
       "reserved-check-run-name",
     ],
     [
-      `curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+      `curl -X POST -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/o/r/statuses/$SHA`,
       "reserved-status-context",
     ],
   ];
@@ -1061,7 +1061,7 @@ test("keeps YAML scalar identity separate from executable literal tracking", () 
     "    steps:",
     "      - run: |",
     "          context=codex/github-review-gate",
-    "          gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate",
+    "          gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=success",
   ].join("\n"));
   assert.deepEqual(
     assignedPublisher.matches.map(({ kind }) => kind),
@@ -1079,24 +1079,47 @@ test("keeps YAML scalar identity separate from executable literal tracking", () 
 
 test("finds exact CLI payload and inline JavaScript or JSON context literals", () => {
   const cli = inspectWorkflowGateSignals([
-    "run: gh api repos/example/repo/statuses/$SHA -f context=codex/github-review-gate",
-    "run: gh api repos/example/repo/statuses/$SHA --field 'context=codex/github-review-gate'",
-    "run: gh api repos/o/r/statuses/$SHA --raw-field context=codex/github-review-gate",
-    "run: gh api repos/example/repo/statuses/$SHA -f context=codex/github-review-gate-extra",
+    "run: gh api repos/example/repo/statuses/$SHA -f context=CoDeX/GitHub-Review-Gate -f state=success",
+    "run: gh api repos/example/repo/statuses/$SHA --field 'context=codex/github-review-gate' -f state=success",
+    "run: gh api repos/o/r/statuses/$SHA --raw-field context=codex/github-review-gate -f state=success",
+    "run: gh api repos/example/repo/statuses/$SHA -f context=codex/github-review-gate-extra -f state=success",
   ].join("\n"));
   assert.equal(cli.matches.length, 3);
   assert.ok(cli.matches.every(({ kind }) => kind === "reserved-status-context"));
+
+  const dynamicState = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=$STATE",
+  );
+  assert.deepEqual(dynamicState.matches.map(({ kind }) => kind), ["reserved-status-context"]);
+
+  const checkRunCase = inspectWorkflowGateSignals([
+    "run: gh api repos/o/r/check-runs -f name=CoDeX/GitHub-Review-Gate -f head_sha=abc",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=abc",
+  ].join("\n"));
+  assert.deepEqual(checkRunCase.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+  assert.equal(checkRunCase.matches[0].line, 2);
+
+  const nonAsciiContext = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/statuses/$SHA -f context=code\u212a/github-review-gate -f state=success",
+    { reservedCheckName: "codek/github-review-gate" },
+  );
+  assert.deepEqual(nonAsciiContext.matches, [], "status identity does not use Unicode case folds");
+  assert.deepEqual(inspectWorkflowGateSignals("jobs:\n  gate:\n    name: CoDeX/GitHub-Review-Gate").matches, []);
 
   const nonPublishers = inspectWorkflowGateSignals([
     "run: echo -f context=codex/github-review-gate",
     "run: jq -f context=codex/github-review-gate",
     "run: gh api repos/o/r/statuses/$SHA --method GET --raw-field context=codex/github-review-gate",
     "run: gh api repos/o/r/releases --raw-field context=codex/github-review-gate",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f State=success",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=success -f state=failure",
   ].join("\n"));
   assert.deepEqual(nonPublishers.matches, []);
   assert.equal(
     nonPublishers.warnings.filter(({ kind }) => kind === "reserved-status-context-reference").length,
-    4,
+    8,
   );
 
   const endpointMarkersInData = inspectWorkflowGateSignals([
@@ -1121,11 +1144,11 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
 });
 
 test("filters literal API publishers for a known foreign repository only", () => {
-  const cli = "run: gh api repos/other/repo/statuses/$SHA -f context=codex/github-review-gate";
-  const curl = `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/other/repo/statuses/$SHA`;
+  const cli = "run: gh api repos/other/repo/statuses/$SHA -f context=codex/github-review-gate -f state=success";
+  const curl = `run: curl -X POST -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/other/repo/statuses/$SHA`;
   const sameTarget = [
-    "run: gh api repos/target/repo/statuses/$SHA -f context=codex/github-review-gate",
-    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/TARGET/REPO/statuses/$SHA`,
+    "run: gh api repos/target/repo/statuses/$SHA -f context=codex/github-review-gate -f state=success",
+    `run: curl -X POST -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/TARGET/REPO/statuses/$SHA`,
   ].join("\n");
   assert.equal(
     inspectWorkflowGateSignals(sameTarget, { repositoryFullName: "target/repo" }).matches.length,
@@ -1150,7 +1173,7 @@ test("filters literal API publishers for a known foreign repository only", () =>
     "repos/$OWNER/repo/statuses/$SHA",
     "repos/other%2Fowner/repo/statuses/$SHA",
   ]) {
-    const unknownTarget = `run: gh api ${endpoint} -f context=codex/github-review-gate`;
+    const unknownTarget = `run: gh api ${endpoint} -f context=codex/github-review-gate -f state=success`;
     assert.equal(
       inspectWorkflowGateSignals(unknownTarget, { repositoryFullName: "target/repo" }).matches.length,
       1,
@@ -1223,7 +1246,7 @@ test("limits CLI publisher fields and methods to the first shell command", () =>
   assert.deepEqual(quotedSeparators.matches, []);
 
   const quotedPayloadWriter = inspectWorkflowGateSignals(
-    "run: gh api repos/o/r/statuses/$SHA -f note='first; second | third' --raw-field context=codex/github-review-gate",
+    "run: gh api repos/o/r/statuses/$SHA -f note='first; second | third' --raw-field context=codex/github-review-gate -f state=success",
   );
   assert.deepEqual(
     quotedPayloadWriter.matches.map(({ kind }) => kind),
@@ -1695,7 +1718,7 @@ test("does not classify curl publishers with a literal Host header override", ()
 
 test("finds only explicit commit-status POST publishers in bounded curl commands", () => {
   const publisher = inspectWorkflowGateSignals(
-    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+    `run: curl -X POST -d '{"context":"CoDeX/GitHub-Review-Gate","state":"success"}' https://api.github.com/repos/o/r/statuses/$SHA`,
   );
   assert.equal(publisher.matches.length, 1);
   assert.equal(publisher.matches[0].kind, "reserved-status-context");
@@ -1706,12 +1729,28 @@ test("finds only explicit commit-status POST publishers in bounded curl commands
     "    steps:",
     "      - run: |",
     "          curl -X POST \\",
-    `            -d '{"context":"codex/github-review-gate"}' \\`,
+    `            -d '{"context":"codex/github-review-gate","state":"success"}' \\`,
     "            https://api.github.com/repos/o/r/statuses/$SHA",
   ].join("\n"));
   assert.equal(continued.matches.length, 1);
   assert.equal(continued.matches[0].kind, "reserved-status-context");
 
+  const missingState = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+  );
+  assert.deepEqual(missingState.matches, []);
+
+  for (const payload of [
+    { context: "codex/github-review-gate", state: "" },
+    { context: "codex/github-review-gate", state: 1 },
+    { context: "codex/github-review-gate", output: { state: "success" } },
+    { context: "codex/github-review-gate", State: "success" },
+  ]) {
+    const invalidState = inspectWorkflowGateSignals(
+      `run: curl -X POST -d '${JSON.stringify(payload)}' https://api.github.com/repos/o/r/statuses/$SHA`,
+    );
+    assert.deepEqual(invalidState.matches, [], JSON.stringify(payload));
+  }
   const nonPublishers = inspectWorkflowGateSignals([
     `run: curl -X GET -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
     `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/releases`,
@@ -1732,6 +1771,41 @@ test("joins only bounded backslash continuations inside a run block for curl pub
   ].join("\n"));
   assert.equal(publisher.matches.length, 1);
   assert.equal(publisher.matches[0].kind, "reserved-check-run-name");
+
+  const adjacentToken = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST\\",
+    `          -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
+    "          https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(adjacentToken.matches, [], "scalar indentation does not invent whitespace after POST");
+
+  const preservedRelativeIndent = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          echo ready",
+    "            curl -X POST\\",
+    `            -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
+    "            https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(preservedRelativeIndent.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+
+  const postBackslashSpace = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          curl -X POST \\ ",
+    `            -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' \\`,
+    "            https://api.github.com/repos/example/repo/check-runs",
+  ].join("\n"));
+  assert.deepEqual(postBackslashSpace.matches, [], "spaces after a backslash are not removed as a shell newline");
+  assert.ok(postBackslashSpace.warnings.some(({ kind }) => kind === "continued-curl-command-unclosed"));
 
   const chained = inspectWorkflowGateSignals([
     "jobs:",
