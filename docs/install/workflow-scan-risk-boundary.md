@@ -89,6 +89,13 @@ origin data produces a generic warning and retains the conservative scan.
 This scope correction does not suppress additional gate callers or matching job
 names, and does not change strict historical/proof paths.
 
+Known flow-style environment/input/output/secret/matrix mappings are data just
+like their block-form equivalents; a nested `context` does not itself prove a
+publisher. Plain YAML scalar text retains a `//` suffix rather than applying
+JavaScript comment semantics to a job name. These are false-positive scope and
+value-identity corrections, not complete YAML parsing or executable-language
+comment interpretation.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

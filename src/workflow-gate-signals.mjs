@@ -201,7 +201,7 @@ export function inspectWorkflowGateSignals(
       addWarning,
       repositoryFullName,
     );
-    const yamlFields = line.yamlScalarContent || line.yamlDataField ? [] : fieldsOnLine(line.text);
+    const yamlFields = line.yamlScalarContent || line.yamlDataField ? [] : fieldsOutsideFlowData(line);
     const uses = yamlFields.find((field) => field.key === "uses");
     if (uses && isBlockScalarIndicator(stripYamlAnchor(uses.value))) {
       foldedUses = {
@@ -353,7 +353,7 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
     isRunCommandLine(line.text) ||
     line.continuedCurlCommandPart
       ? []
-      : fieldsOnLine(line.text);
+      : fieldsOutsideFlowData(line);
   const recognizedUses = [];
   const resolveField = (expression) =>
     allowYamlAliases
@@ -462,7 +462,7 @@ function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullNam
       !isRunCommandLine(line.text) &&
       !line.continuedCurlCommandPart
     ) {
-      for (const field of fieldsOnLine(line.text)) {
+      for (const field of fieldsOutsideFlowData(line)) {
         if (field.key === "uses") {
           if (line.selectorUseStarts?.has(field.start)) {
             inspectCaller(field.value, literals, line, addMatch, addWarning);
@@ -620,6 +620,17 @@ function fieldsOnLine(text) {
   return yamlFieldsOnLine(text).filter(
     ({ key }) => key.toLowerCase() === "uses" || isContextField(key) || isNameField(key),
   );
+}
+
+function fieldsOutsideFlowData(line) {
+  // Known flow jobs/steps use their role-aware fields, not a nested text rescan.
+  return line.workflowFlowCollection
+    ? [
+      ...(line.flowJobFields?.contexts ?? []),
+      ...(line.inlineJobFields?.contexts ?? []),
+      ...(line.flowStepContexts ?? []),
+    ]
+    : fieldsOnLine(line.text);
 }
 
 function yamlFieldsOnLine(text) {
@@ -1188,8 +1199,9 @@ function markYamlJobNameFields(lines) {
     if (!line.text.trim()) continue;
     if (line.yamlScalarContent) continue;
     line.flowJobFields = line.yamlDataField
-      ? { names: [], uses: [], steps: [], ambiguous: false }
+      ? { names: [], uses: [], steps: [], contexts: [], flowCollection: false, ambiguous: false }
       : flowStyleJobFields(line.text);
+    line.workflowFlowCollection = line.flowJobFields.flowCollection;
     line.flowStepUses = line.flowJobFields.steps;
     line.flowScanAmbiguous = line.flowJobFields.ambiguous;
     const indent = indentationOf(line.text);
@@ -1222,6 +1234,7 @@ function markYamlJobNameFields(lines) {
         stepIndent = null;
         stepPropertyIndent = null;
         line.inlineJobFields = simpleInlineJobFields(text.slice(text.indexOf(":") + 1));
+        line.workflowFlowCollection ||= line.inlineJobFields.flowCollection;
         line.flowScanAmbiguous ||= line.inlineJobFields.ambiguous;
         line.flowStepUses = [...line.flowStepUses, ...line.inlineJobFields.steps];
       }
@@ -1236,6 +1249,8 @@ function markYamlJobNameFields(lines) {
       if (key?.toLowerCase() === "steps") {
         const flowSteps = simpleFlowStepUses(text.slice(text.indexOf(":") + 1));
         line.flowStepUses = flowSteps.uses;
+        line.flowStepContexts = flowSteps.contexts;
+        line.workflowFlowCollection ||= flowSteps.flowCollection;
         line.flowScanAmbiguous ||= flowSteps.ambiguous;
         stepsIndent = indent;
         stepIndent = null;
@@ -1374,15 +1389,20 @@ function markYamlDataAndScalarFields(lines) {
       workflow.jobIndent !== null &&
       fieldIndent > workflow.jobIndent;
 
+    const flowDataMapping =
+      mapping &&
+      mapping.value.trim().startsWith("{") &&
+      !parseFlowMap(mapping.value).ambiguous;
     if (
       !line.yamlDataField &&
       mapping &&
       (/^(?:env|with|outputs|secrets)$/iu.test(mapping.key) ||
         (mapping.key.toLowerCase() === "matrix" && nestedJobProperty)) &&
-      !mapping.value.trim() &&
+      (!mapping.value.trim() || flowDataMapping) &&
       (workflowProperty || nestedJobProperty)
     ) {
-      dataMappingIndents.push(mapping.indent);
+      if (flowDataMapping) line.yamlDataField = true;
+      else dataMappingIndents.push(mapping.indent);
     }
     if (mapping && isBlockScalarIndicator(stripYamlAnchor(mapping.value))) {
       scalarKeyIndent = mapping.indent;
@@ -1477,7 +1497,7 @@ function simpleYamlKey(text) {
 }
 
 function flowStyleJobFields(text) {
-  const result = { names: [], uses: [], steps: [], ambiguous: false };
+  const result = { names: [], uses: [], steps: [], contexts: [], flowCollection: false, ambiguous: false };
   const root = parseFlowMap(text);
   if (root.ambiguous) {
     result.ambiguous = /\bjobs\b/iu.test(text);
@@ -1485,12 +1505,14 @@ function flowStyleJobFields(text) {
   }
   const jobs = root.entries.find((field) => field.key.toLowerCase() === "jobs");
   if (!jobs) return result;
+  result.contexts.push(...root.entries.filter((field) => isContextField(field.key)));
 
   const jobEntries = parseFlowMap(jobs.value);
   if (jobEntries.ambiguous) {
     result.ambiguous = true;
     return result;
   }
+  result.flowCollection = jobs.value.trim().startsWith("{");
   for (const job of jobEntries.entries) {
     const fields = parseFlowMap(job.value);
     if (fields.ambiguous) {
@@ -1500,9 +1522,11 @@ function flowStyleJobFields(text) {
     for (const field of fields.entries) {
       if (isNameField(field.key)) result.names.push(field);
       if (field.key.toLowerCase() === "uses") result.uses.push(field);
+      if (isContextField(field.key)) result.contexts.push(field);
       if (field.key.toLowerCase() === "steps") {
         const steps = simpleFlowStepUses(field.value);
         result.steps.push(...steps.uses);
+        result.contexts.push(...steps.contexts);
         result.ambiguous ||= steps.ambiguous;
       }
     }
@@ -1511,18 +1535,21 @@ function flowStyleJobFields(text) {
 }
 
 function simpleInlineJobFields(value) {
-  const result = { names: [], uses: [], steps: [], ambiguous: false };
+  const result = { names: [], uses: [], steps: [], contexts: [], flowCollection: false, ambiguous: false };
   const fields = parseFlowMap(value);
   if (fields.ambiguous) {
     result.ambiguous = true;
     return result;
   }
+  result.flowCollection = value.trim().startsWith("{");
   for (const field of fields.entries) {
     if (isNameField(field.key)) result.names.push(field);
     if (field.key.toLowerCase() === "uses") result.uses.push(field);
+    if (isContextField(field.key)) result.contexts.push(field);
     if (field.key.toLowerCase() === "steps") {
       const steps = simpleFlowStepUses(field.value);
       result.steps = steps.uses;
+      result.contexts.push(...steps.contexts);
       result.ambiguous ||= steps.ambiguous;
     }
   }
@@ -1531,20 +1558,22 @@ function simpleInlineJobFields(value) {
 
 function simpleFlowStepUses(value) {
   const collection = unwrapFlowCollection(value, "[");
-  if (!collection.present) return { uses: [], ambiguous: false };
-  if (collection.ambiguous) return { uses: [], ambiguous: true };
+  if (!collection.present) return { uses: [], contexts: [], flowCollection: false, ambiguous: false };
+  if (collection.ambiguous) return { uses: [], contexts: [], flowCollection: false, ambiguous: true };
   const items = splitFlowParts(collection.body);
-  if (!items) return { uses: [], ambiguous: true };
+  if (!items) return { uses: [], contexts: [], flowCollection: false, ambiguous: true };
   const uses = [];
+  const contexts = [];
   for (const item of items) {
     if (!item.trim().startsWith("{")) continue;
     const fields = parseFlowMap(item);
-    if (fields.ambiguous) return { uses: [], ambiguous: true };
+    if (fields.ambiguous) return { uses: [], contexts: [], flowCollection: false, ambiguous: true };
     for (const field of fields.entries) {
       if (field.key.toLowerCase() === "uses") uses.push(field);
+      if (isContextField(field.key)) contexts.push(field);
     }
   }
-  return { uses, ambiguous: false };
+  return { uses, contexts, flowCollection: true, ambiguous: false };
 }
 
 function parseFlowMap(value) {
@@ -1944,10 +1973,7 @@ function stripComments(value) {
       if (character === quote) quote = null;
     } else if (character === "'" || character === '"' || character === "`") {
       quote = character;
-    } else if (
-      (character === "#" || (character === "/" && value[index + 1] === "/")) &&
-      (index === 0 || /\s/u.test(value[index - 1]))
-    ) {
+    } else if (character === "#" && (index === 0 || /\s/u.test(value[index - 1]))) {
       return value.slice(0, index);
     }
   }

@@ -67,6 +67,17 @@ jobs:
   }
 });
 
+test("preserves YAML slash-slash scalar content when matching reserved job names", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    name: codex/github-review-gate // Linux",
+    "    runs-on: ubuntu-latest",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches, []);
+});
+
 test("keeps YAML value punctuation and quoted scalar text out of field identity", () => {
   const quotedStepName = inspectWorkflowGateSignals([
     "jobs:",
@@ -459,6 +470,53 @@ test("keeps context-like keys inside block env, with, and outputs mappings as da
   ].join("\n"));
 
   assert.deepEqual(result.matches, []);
+});
+
+test("keeps context-like keys inside bounded flow data mappings as data", () => {
+  const result = inspectWorkflowGateSignals([
+    "env: { REVIEW_CONTEXT: codex/github-review-gate, check-name: codex/github-review-gate }",
+    "with: { context: codex/github-review-gate, check_name: codex/github-review-gate }",
+    "jobs:",
+    "  build:",
+    "    env: { status-context: codex/github-review-gate }",
+    "    with: { context: codex/github-review-gate }",
+    "    outputs: { check-name: codex/github-review-gate }",
+    "    secrets: { check_name: codex/github-review-gate }",
+    "    strategy:",
+    "      matrix: { include: { context: codex/github-review-gate } }",
+    "    steps:",
+    "      - run: echo data only",
+    "        env: { context: codex/github-review-gate }",
+    "        with: { status-context: codex/github-review-gate }",
+    "  env:",
+    "    name: codex/github-review-gate",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  publish:",
+    "    steps:",
+    "      - run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    ["reserved-job-name", "codex-review-gate-action-caller", "reserved-check-run-name"],
+  );
+
+  const fullyInline = inspectWorkflowGateSignals(
+    "jobs: { build: { env: { context: codex/github-review-gate }, name: codex/github-review-gate, steps: [{ uses: JoeyTeng/codex-review-gate-action@v2, with: { status-context: codex/github-review-gate } }] }, env: { name: codex/github-review-gate, uses: JoeyTeng/codex-review-gate-action@v2 } }",
+  );
+  assert.deepEqual(
+    fullyInline.matches.map(({ kind }) => kind),
+    ["codex-review-gate-action-caller", "reserved-job-name"],
+  );
+  const inlineDataOnly = inspectWorkflowGateSignals(
+    "jobs: { build: { env: { context: codex/github-review-gate }, steps: [{ uses: actions/checkout@v4, with: { status-context: codex/github-review-gate } }] } }",
+  );
+  assert.deepEqual(inlineDataOnly.matches, []);
+  const directField = inspectWorkflowGateSignals(
+    "jobs: { build: { context: codex/github-review-gate, env: { context: codex/github-review-gate } } }",
+  );
+  assert.deepEqual(directField.matches.map(({ kind }) => kind), ["reserved-status-context"]);
 });
 
 test("keeps nested container env and reusable caller secrets values as data", () => {
