@@ -67,6 +67,51 @@ jobs:
   }
 });
 
+test("keeps YAML value punctuation and quoted scalar text out of field identity", () => {
+  const quotedStepName = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    steps:",
+    `      - name: 'metadata, context: "codex/github-review-gate", end'`,
+    "        run: echo ready",
+  ].join("\n"));
+  assert.deepEqual(quotedStepName.matches, []);
+  assert.ok(quotedStepName.warnings.some(({ kind }) => kind === "reserved-status-context-reference"));
+
+  for (const punctuation of [",", ";"]) {
+    const punctuatedName = inspectWorkflowGateSignals([
+      "jobs:",
+      "  collision:",
+      `    name: codex/github-review-gate${punctuation}`,
+      "    runs-on: ubuntu-latest",
+    ].join("\n"));
+    assert.deepEqual(punctuatedName.matches, [], punctuation);
+    assert.ok(
+      punctuatedName.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+      punctuation,
+    );
+  }
+
+  const flowName = inspectWorkflowGateSignals(
+    "jobs: {build: {name: codex/github-review-gate, runs-on: ubuntu-latest}}",
+  );
+  assert.deepEqual(flowName.matches.map(({ kind }) => kind), ["reserved-job-name"]);
+});
+
+test("does not resolve a punctuated block YAML anchor as an exact scalar", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  first:",
+    "    name: &gate codex/github-review-gate,",
+    "  second:",
+    "    name: *gate",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches, []);
+  assert.ok(result.warnings.some(({ kind }) => kind === "complex-yaml-scalar-anchor"));
+  assert.ok(result.warnings.some(({ kind }) => kind === "unknown-yaml-scalar-alias"));
+});
+
 test("finds a reserved job name nested under a flow-style root mapping", () => {
   for (const content of [
     "{name: Other, jobs: {collision: {name: codex/github-review-gate}}}",
@@ -812,6 +857,19 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     );
   }
 
+  for (const methodLikeValue of [
+    "run: gh api repos/o/r/check-runs -H 'X-Note: --method GET' -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -f note=' --method GET' -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs/123 --method=PATCH -H 'X-Note: --method HEAD' -f name=codex/github-review-gate",
+  ]) {
+    const publisher = inspectWorkflowGateSignals(methodLikeValue);
+    assert.deepEqual(
+      publisher.matches.map(({ kind }) => kind),
+      ["reserved-check-run-name"],
+      methodLikeValue,
+    );
+  }
+
   const unrelated = inspectWorkflowGateSignals(
     "run: gh api repos/example/releases -f name=codex/github-review-gate",
   );
@@ -870,7 +928,7 @@ test("skips known run blocks containing here-document-like text conservatively",
 });
 
 test("finds inline JSON CheckRun POST names across common curl data flags", () => {
-  const options = ["-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json"];
+  const options = ["-d", "--data", "--data-raw", "--data-binary", "--json"];
   for (const option of options) {
     const result = inspectWorkflowGateSignals(
       `run: curl -X POST ${option} '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
@@ -879,7 +937,13 @@ test("finds inline JSON CheckRun POST names across common curl data flags", () =
     assert.equal(result.matches[0].kind, "reserved-check-run-name", option);
   }
 
+  const nestedName = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"output":{"name":"codex/github-review-gate"}}' https://api.github.com/repos/o/r/check-runs`,
+  );
+  assert.deepEqual(nestedName.matches, []);
+
   const nonPublishers = inspectWorkflowGateSignals([
+    `run: curl -X POST --data-urlencode '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
     `run: echo "curl -X POST -d '{\"name\":\"codex/github-review-gate\"}' https://api.github.com/repos/example/repo/check-runs"`,
     `run: curl -X GET -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs`,
     `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/releases`,
@@ -934,6 +998,16 @@ test("uses curl URL operands rather than header or later-command text", () => {
     `run: curl -X POST -d '{"name":"codex/github-review-gate"}' -d '{"status":"completed"}' https://api.github.com/repos/o/r/check-runs`,
   );
   assert.deepEqual(multipleBodies.matches, []);
+
+  for (const target of [
+    "https://api.github.com/repos/o/r/check-runs/123",
+    "https://api.github.com/repos/o/r/statuses/$SHA/extra",
+  ]) {
+    const unsupportedRoute = inspectWorkflowGateSignals(
+      `run: curl -X POST -d '{"name":"codex/github-review-gate","context":"codex/github-review-gate"}' ${target}`,
+    );
+    assert.deepEqual(unsupportedRoute.matches, [], target);
+  }
 });
 
 test("finds only explicit commit-status POST publishers in bounded curl commands", () => {

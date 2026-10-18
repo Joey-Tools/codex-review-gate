@@ -7341,6 +7341,22 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       'jobs:\n  build:\n    steps:\n      - run: echo "x; context=codex/github-review-gate; y"\n',
     ],
     [
+      "quoted-display-name-is-not-extra-yaml-fields",
+      `jobs:\n  build:\n    steps:\n      - name: 'metadata, context: "codex/github-review-gate", end'\n        run: echo ready\n`,
+    ],
+    [
+      "curl-nested-name-is-not-check-run-name",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST --json '{"output":{"name":"codex/github-review-gate"},"name":"other","head_sha":"HEAD"}' https://api.github.com/repos/example/repo/check-runs\n`,
+    ],
+    [
+      "curl-post-is-not-check-run-update",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST --json '{"name":"codex/github-review-gate"}' https://api.github.com/repos/example/repo/check-runs/123\n`,
+    ],
+    ...[",", ";"].map((punctuation) => [
+      `job-name-with-trailing-${punctuation === "," ? "comma" : "semicolon"}`,
+      `jobs:\n  build:\n    name: codex/github-review-gate${punctuation}\n    steps:\n      - run: echo ready\n`,
+    ]),
+    [
       "gh-api-input-body-with-query-field",
       "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --input body.json -f name=codex/github-review-gate\n",
     ],
@@ -7485,6 +7501,11 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     [
       "gh-api-patch-reserved-check-run",
       "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs/123 --method PATCH -f name=codex/github-review-gate -f conclusion=success\n",
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
+    ],
+    [
+      "gh-header-method-prose-does-not-hide-publisher",
+      "jobs:\n  publish:\n    steps:\n      - run: gh api repos/example/repo/check-runs -H 'X-Note: --method GET' -f name=codex/github-review-gate\n",
       /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [

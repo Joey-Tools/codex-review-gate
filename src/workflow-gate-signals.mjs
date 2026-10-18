@@ -469,7 +469,7 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
           continue;
         }
         if (isContextField(field.key) || (isNameField(field.key) && line.jobNameField)) {
-          inspectContext(field.key, field.value, literals, line, reserved, addMatch, addWarning);
+          inspectContext(field.key, field.value, literals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
         }
       }
     }
@@ -477,7 +477,7 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
       ...(line.flowJobFields?.names ?? []),
       ...(line.inlineJobFields?.names ?? []),
     ]) {
-      inspectContext("name", field.value, literals, line, reserved, addMatch, addWarning);
+      inspectContext("name", field.value, literals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
     }
     for (const field of [
       ...(line.flowJobFields?.uses ?? []),
@@ -537,8 +537,17 @@ function inspectWindow(window, reserved, addMatch, addWarning) {
   }
 }
 
-function inspectContext(key, expression, literals, line, reserved, addMatch, addWarning) {
-  const value = resolveSimpleLiteral(expression, literals);
+function inspectContext(
+  key,
+  expression,
+  literals,
+  line,
+  reserved,
+  addMatch,
+  addWarning,
+  resolveLiteral = resolveSimpleLiteral,
+) {
+  const value = resolveLiteral(expression, literals);
   if (value === reserved) {
     const normalized = key.toLowerCase();
     addMatch(
@@ -607,17 +616,107 @@ function indentationOf(text) {
 }
 
 function fieldsOnLine(text) {
+  return yamlFieldsOnLine(text).filter(
+    ({ key }) => key.toLowerCase() === "uses" || isContextField(key) || isNameField(key),
+  );
+}
+
+function yamlFieldsOnLine(text) {
   const fields = [];
-  const pattern = /(?:^|[,{])\s*(?:-\s*)?["']?([A-Za-z_][A-Za-z0-9_-]*)["']?\s*:\s*([^,}\n]*)/gu;
+  const pattern = /(?:^|[,{])\s*(?:-\s*)?(?:"([^"]+)"|'([^']+)'|([A-Za-z_][A-Za-z0-9_-]*))\s*:\s*/gu;
   for (const match of text.matchAll(pattern)) {
-    const key = match[1];
-    const value = match[2].trim();
-    const start = match.index + match[0].indexOf(key);
-    if (key.toLowerCase() === "uses" || isContextField(key) || isNameField(key)) {
-      fields.push({ key, value, start });
+    const boundary = text[match.index];
+    const state = yamlSyntaxState(text, match.index);
+    if (state.quote !== null && !isJsonParseQuotedPayload(text, state.quoteStart)) continue;
+
+    let containerStack = state.stack;
+    if (boundary === "{") {
+      containerStack = [...containerStack, "{"];
+    } else if (boundary === ",") {
+      if (containerStack.at(-1) !== "{") continue;
+    } else if (containerStack.length > 0) {
+      continue;
     }
+
+    const key = match[1] ?? match[2] ?? match[3];
+    const valueStart = match.index + match[0].length;
+    const valueEnd = yamlFieldValueEnd(text, valueStart, containerStack);
+    fields.push({
+      key,
+      value: text.slice(valueStart, valueEnd).trim(),
+      start: match.index + match[0].lastIndexOf(key),
+    });
   }
   return fields;
+}
+
+function yamlSyntaxState(text, end) {
+  const stack = [];
+  let quote = null;
+  let quoteStart = null;
+  let escaped = false;
+  for (let index = 0; index < end; index += 1) {
+    const character = text[index];
+    if (quote !== null) {
+      if (escaped) escaped = false;
+      else if (quote === '"' && character === "\\") escaped = true;
+      else if (character === quote) {
+        if (quote === "'" && text[index + 1] === "'") index += 1;
+        else {
+          quote = null;
+          quoteStart = null;
+        }
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      quoteStart = index;
+    } else if (character === "{" || character === "[") {
+      stack.push(character);
+    } else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (stack.at(-1) === expected) stack.pop();
+    }
+  }
+  return { quote, quoteStart, stack };
+}
+
+function isJsonParseQuotedPayload(text, quoteStart) {
+  return quoteStart !== null && /\bJSON\.parse\s*\(\s*$/u.test(text.slice(0, quoteStart));
+}
+
+function yamlFieldValueEnd(text, start, containerStack) {
+  if (containerStack.length === 0) return text.length;
+
+  const stack = [...containerStack];
+  const containerDepth = stack.length;
+  let quote = null;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (quote !== null) {
+      if (escaped) escaped = false;
+      else if (quote === '"' && character === "\\") escaped = true;
+      else if (character === quote) {
+        if (quote === "'" && text[index + 1] === "'") index += 1;
+        else quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === "{" || character === "[") {
+      stack.push(character);
+    } else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (stack.length === containerDepth && stack.at(-1) === expected) return index;
+      if (stack.at(-1) === expected) stack.pop();
+    } else if (character === "," && stack.length === containerDepth && stack.at(-1) === "{") {
+      return index;
+    }
+  }
+  return text.length;
 }
 
 function useFieldExpressions(text) {
@@ -627,10 +726,11 @@ function useFieldExpressions(text) {
 
 function cliContextExpression(text) {
   const command = firstShellCommand(runCommand(text));
-  if (!cliApiSupportsFieldPublisher(command)) return null;
+  const admission = cliApiSupportsFieldPublisher(command);
+  if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
   if (endpoint === null || !/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(endpoint)) return null;
-  if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
+  if (["GET", "HEAD"].includes(admission.method)) return null;
   return cliFieldExpression(command, "context");
 }
 
@@ -645,6 +745,7 @@ function cliApiSupportsFieldPublisher(command) {
   if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return false;
   let hostname = null;
   let methodCount = 0;
+  let method = null;
   const valueOptions = new Set(["-f", "--field", "--raw-field", "-H", "--header"]);
   for (let index = 2; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -666,31 +767,29 @@ function cliApiSupportsFieldPublisher(command) {
     if (argument === "-X" || argument === "--method") {
       const value = arguments_[index + 1];
       if (!value || value.startsWith("-") || ++methodCount > 1) return false;
+      method = value.toUpperCase();
       index += 1;
       continue;
     }
     if (argument.startsWith("-X=") || argument.startsWith("--method=")) {
       const value = argument.slice(argument.indexOf("=") + 1);
       if (!value || ++methodCount > 1) return false;
+      method = value.toUpperCase();
       continue;
     }
-    if (argument.startsWith("-X")) return false;
+    if (argument.startsWith("-X") || argument.startsWith("--method")) return false;
     if (valueOptions.has(argument)) index += 1;
   }
-  return hostname === null || hostname.toLowerCase() === "github.com";
-}
-
-function hasExplicitReadOnlyGitHubApiMethod(command) {
-  const method = command.match(/(?:^|\s)(?:-X|--method)(?:=|\s+)([A-Za-z]+)/iu);
-  return method !== null && ["GET", "HEAD"].includes(method[1].toUpperCase());
+  return hostname === null || hostname.toLowerCase() === "github.com" ? { method } : false;
 }
 
 function cliCheckRunNameExpression(text) {
   const command = firstShellCommand(runCommand(text));
-  if (!cliApiSupportsFieldPublisher(command)) return null;
+  const admission = cliApiSupportsFieldPublisher(command);
+  if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
   if (endpoint === null || !/\/check-runs(?:[/?#\s]|$)/iu.test(endpoint)) return null;
-  if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
+  if (["GET", "HEAD"].includes(admission.method)) return null;
   return cliFieldExpression(command, "name");
 }
 
@@ -720,6 +819,7 @@ function curlPublisherSignal(text, reserved) {
     const equals = argument.indexOf("=");
     const option = equals > 0 ? argument.slice(0, equals) : argument;
     const inlineValue = equals > 0 ? argument.slice(equals + 1) : null;
+    if (option === "--data-urlencode") return null;
     if (valueOptions.has(option)) {
       const value = inlineValue ?? arguments_[index + 1];
       if (value === undefined || (inlineValue === null && value.startsWith("-"))) return null;
@@ -747,8 +847,8 @@ function curlPublisherSignal(text, reserved) {
 
   const apiPath = supportedGitHubApiPath(target);
   if (apiPath === null) return null;
-  const checkRunsEndpoint = /^\/repos\/[^/]+\/[^/]+\/check-runs(?:\/|$)/iu.test(apiPath);
-  const statusesEndpoint = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+(?:\/|$)/iu.test(apiPath);
+  const checkRunsEndpoint = /^\/repos\/[^/]+\/[^/]+\/check-runs$/iu.test(apiPath);
+  const statusesEndpoint = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/iu.test(apiPath);
   if (!checkRunsEndpoint && !statusesEndpoint) return null;
 
   for (const payload of payloads) {
@@ -825,8 +925,22 @@ function shellWords(command) {
 }
 
 function jsonStringField(payload, key) {
-  const field = payload.match(new RegExp(`(?:^|[,{])\\s*["']${key}["']\\s*:\\s*(?:"([^"\\\\]*)"|'([^'\\\\]*)')`, "iu"));
-  return field ? field[1] ?? field[2] : null;
+  let parsed;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    !Object.hasOwn(parsed, key) ||
+    typeof parsed[key] !== "string"
+  ) {
+    return null;
+  }
+  return parsed[key];
 }
 
 function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
@@ -1552,8 +1666,9 @@ function isRunCommandLine(text) {
 }
 
 function registerYamlScalarAnchors(line, anchors, addWarning) {
-  const pattern = /(?:^|[,{])\s*(?:-\s*)?(?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\s*:\s*&([A-Za-z_][A-Za-z0-9_-]*)\s+("[^"]*"|'[^']*'|[^,}\]\n]+)/gu;
-  for (const match of line.text.matchAll(pattern)) {
+  for (const { value: fieldValue } of yamlFieldsOnLine(line.text)) {
+    const match = fieldValue.match(/^&([A-Za-z_][A-Za-z0-9_-]*)\s+(.+)$/u);
+    if (!match) continue;
     const [, name, rawValue] = match;
     const expression = rawValue.trim();
     if (isBlockScalarIndicator(expression)) {
@@ -1592,7 +1707,7 @@ function registerYamlScalarAnchors(line, anchors, addWarning) {
 
 function resolveYamlScalar(expression, anchors, line, addWarning) {
   const value = stripYamlAnchor(expression).trim();
-  if (!value.startsWith("*")) return resolveSimpleLiteral(value, new Map());
+  if (!value.startsWith("*")) return resolveYamlLiteral(value);
 
   const alias = value.match(/^\*([A-Za-z_][A-Za-z0-9_-]*)$/u);
   if (alias && anchors.has(alias[1])) return anchors.get(alias[1]);
@@ -1607,6 +1722,12 @@ function resolveYamlScalar(expression, anchors, line, addWarning) {
   return null;
 }
 
+function resolveYamlLiteral(expression) {
+  const value = expression.trim();
+  if (!value || value.length > MAX_WINDOW_CHARS) return null;
+  return literalAtom(value, new Map());
+}
+
 function isBlockScalarIndicator(value) {
   return /^[>|](?:[+-]?[1-9]?|[1-9]?[+-]?)\s*$/u.test(value);
 }
@@ -1615,8 +1736,8 @@ function isStripChompBlockScalar(value) {
   return /^[>|](?:-[1-9]?|[1-9]-)\s*$/u.test(value);
 }
 
-function resolveSimpleLiteral(expression, literals) {
-  const value = expression.trim().replace(/[;,]\s*$/u, "").trim();
+function resolveSimpleLiteral(expression, literals, stripTerminators = true) {
+  const value = stripTerminators ? expression.trim().replace(/[;,]\s*$/u, "").trim() : expression.trim();
   if (!value || value.length > MAX_WINDOW_CHARS) return null;
 
   const concatenation = splitPlusExpression(value);
@@ -1631,6 +1752,10 @@ function resolveSimpleLiteral(expression, literals) {
     return result;
   }
   return literalAtom(value, literals);
+}
+
+function resolveYamlWindowLiteral(expression, literals) {
+  return resolveSimpleLiteral(expression, literals, false);
 }
 
 function literalAtom(value, literals, allowBare = true) {

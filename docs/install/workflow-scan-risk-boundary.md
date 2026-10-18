@@ -45,6 +45,10 @@ All raw source-text diagnostic excerpts are omitted, not only known credential-s
 
 Repeated `gh api` method flags remain unclassified instead of inferring the effective final method. Semicolons inside a quoted string are not standalone assignment boundaries. Ordinary local scanning compares canonical workflow paths using one slash representation, while strict reviewed-writer identities and digest snapshots retain their existing handling.
 
+Quoted scalar display text is not an additional YAML field, and punctuation in a YAML job name remains part of its identity. The supported literal curl JSON body is read only for a top-level string field on the exact supported POST route; a nested name or an update-route suffix does not prove a create request. CLI method evidence comes from supported argument positions, not method-like prose in a quoted header or payload value. These are identity and scope corrections within the existing bounded forms, not new coverage guarantees.
+
+Encoded body forms such as curl `--data-urlencode` remain unclassified: their raw argument is not the JSON emitted on the wire, and this scanner does not decode or simulate that transport.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.
