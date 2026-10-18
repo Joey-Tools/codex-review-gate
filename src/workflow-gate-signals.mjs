@@ -104,6 +104,7 @@ export function inspectWorkflowGateSignals(
     };
   });
   markYamlJobNameFields(lines);
+  markUnknownRunBlocks(lines, reserved, addWarning);
   inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning);
 
   if (content.length > clipped.length) {
@@ -125,6 +126,7 @@ export function inspectWorkflowGateSignals(
   let foldedJobName = null;
   const yamlAnchors = new Map();
   for (const line of lines) {
+    if (line.unclassifiedRunBlock) continue;
     if (line.truncated) {
       yamlAnchors.clear();
       if (foldedJobName) foldedJobName.unclassified = true;
@@ -441,6 +443,10 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
 function inspectWindow(window, reserved, addMatch, addWarning) {
   const literals = new Map();
   for (const line of window) {
+    if (line.unclassifiedRunBlock) {
+      literals.clear();
+      continue;
+    }
     if (line.truncated) {
       literals.clear();
       continue;
@@ -621,6 +627,7 @@ function useFieldExpressions(text) {
 
 function cliContextExpression(text) {
   const command = firstShellCommand(runCommand(text));
+  if (!cliApiSupportsFieldPublisher(command)) return null;
   const endpoint = cliApiEndpoint(command);
   if (endpoint === null || !/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(endpoint)) return null;
   if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
@@ -633,6 +640,33 @@ function cliApiEndpoint(command) {
   return endpoint?.startsWith("-") ? null : endpoint;
 }
 
+function cliApiSupportsFieldPublisher(command) {
+  const arguments_ = shellWords(command);
+  if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return false;
+  let hostname = null;
+  const valueOptions = new Set(["-f", "--field", "--raw-field", "-X", "--method", "-H", "--header"]);
+  for (let index = 2; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (argument === "--input" || argument.startsWith("--input=")) return false;
+    if (argument === "--hostname") {
+      const value = arguments_[index + 1];
+      if (!value || value.startsWith("-")) return false;
+      if (hostname !== null && hostname.toLowerCase() !== value.toLowerCase()) return false;
+      hostname = value;
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--hostname=")) {
+      const value = argument.slice("--hostname=".length);
+      if (!value || (hostname !== null && hostname.toLowerCase() !== value.toLowerCase())) return false;
+      hostname = value;
+      continue;
+    }
+    if (valueOptions.has(argument)) index += 1;
+  }
+  return hostname === null || hostname.toLowerCase() === "github.com";
+}
+
 function hasExplicitReadOnlyGitHubApiMethod(command) {
   const method = command.match(/(?:^|\s)(?:-X|--method)(?:=|\s+)([A-Za-z]+)/iu);
   return method !== null && ["GET", "HEAD"].includes(method[1].toUpperCase());
@@ -640,6 +674,7 @@ function hasExplicitReadOnlyGitHubApiMethod(command) {
 
 function cliCheckRunNameExpression(text) {
   const command = firstShellCommand(runCommand(text));
+  if (!cliApiSupportsFieldPublisher(command)) return null;
   const endpoint = cliApiEndpoint(command);
   if (endpoint === null || !/\/check-runs(?:[/?#\s]|$)/iu.test(endpoint)) return null;
   if (hasExplicitReadOnlyGitHubApiMethod(command)) return null;
@@ -695,10 +730,12 @@ function curlPublisherSignal(text, reserved) {
     if (target !== null) return null;
     target = argument;
   }
-  if (reject || method !== "POST" || target === null || payloads.length === 0) return null;
+  if (reject || method !== "POST" || target === null || payloads.length !== 1) return null;
 
-  const checkRunsEndpoint = /^https?:\/\/[^/?#]+\/repos\/[^/?#]+\/[^/?#]+\/check-runs(?:[/?#]|$)/iu.test(target);
-  const statusesEndpoint = /^https?:\/\/[^/?#]+\/repos\/[^/?#]+\/[^/?#]+\/statuses\/[^/?#]+(?:[/?#]|$)/iu.test(target);
+  const apiPath = supportedGitHubApiPath(target);
+  if (apiPath === null) return null;
+  const checkRunsEndpoint = /^\/repos\/[^/]+\/[^/]+\/check-runs(?:\/|$)/iu.test(apiPath);
+  const statusesEndpoint = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+(?:\/|$)/iu.test(apiPath);
   if (!checkRunsEndpoint && !statusesEndpoint) return null;
 
   for (const payload of payloads) {
@@ -716,6 +753,27 @@ function curlPublisherSignal(text, reserved) {
     }
   }
   return null;
+}
+
+function supportedGitHubApiPath(target) {
+  let url;
+  try {
+    url = new URL(target);
+  } catch {
+    return null;
+  }
+  const authority = target.match(/^https:\/\/([^/?#]+)/iu)?.[1] ?? "";
+  if (
+    url.protocol !== "https:" ||
+    url.hostname.toLowerCase() !== "api.github.com" ||
+    authority.includes("@") ||
+    url.username !== "" ||
+    url.password !== "" ||
+    (url.port !== "" && url.port !== "443")
+  ) {
+    return null;
+  }
+  return url.pathname;
 }
 
 function shellWords(command) {
@@ -765,7 +823,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
   let index = 0;
   while (index < lines.length) {
     const line = lines[index];
-    if (line.truncated || line.yamlDataField || (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run")) {
+    if (line.unclassifiedRunBlock || line.truncated || line.yamlDataField || (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run")) {
       runBlockIndent = null;
       runBlockHeaderChars = 0;
       previousContinues = false;
@@ -830,6 +888,7 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
     while (current < lines.length) {
       const physical = lines[current];
       if (
+        physical.unclassifiedRunBlock ||
         physical.truncated ||
         physical.yamlDataField ||
         (physical.yamlScalarContent && physical.yamlScalarOwnerKey !== "run") ||
@@ -1056,6 +1115,42 @@ function markYamlJobNameFields(lines) {
         markSelectorUse(line);
       }
     }
+  }
+}
+
+function markUnknownRunBlocks(lines, reserved, addWarning) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index];
+    if (header.truncated || header.yamlDataField || header.yamlScalarContent) continue;
+    const runHeader = header.text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu);
+    if (!runHeader || !isBlockScalarIndicator(stripYamlAnchor(runHeader[1].trim()))) continue;
+
+    const blockLines = [header];
+    let containsHereDocLikeText = false;
+    for (let bodyIndex = index + 1; bodyIndex < lines.length; bodyIndex += 1) {
+      const body = lines[bodyIndex];
+      if (!body.yamlScalarContent || body.yamlScalarOwnerKey !== "run") break;
+      blockLines.push(body);
+      if (body.raw.includes("<<")) containsHereDocLikeText = true;
+    }
+    if (!containsHereDocLikeText) continue;
+
+    for (const line of blockLines) line.unclassifiedRunBlock = true;
+    addWarning(
+      "unclassified-run-block",
+      header.line,
+      "A run block contains here-document-like text and was skipped by the bounded shell-text scan.",
+      header.raw,
+    );
+    if (blockLines.some((line) => hasExactToken(line.raw, reserved))) {
+      addWarning(
+        "reserved-status-context-reference",
+        header.line,
+        "The reserved name appears in an unclassified run block; this text scan cannot confirm a status publisher.",
+        header.raw,
+      );
+    }
+    index += blockLines.length - 1;
   }
 }
 
@@ -1674,6 +1769,7 @@ function stripComments(value) {
 }
 
 function safeExcerpt(value) {
+  if (/\bauthorization\b/iu.test(value)) return "[redacted authorization-bearing line]";
   return value
     .replace(/\b(Bearer\s+)[A-Za-z0-9._~-]+/giu, "$1[redacted]")
     .replace(/((?:token|secret|password|authorization|api[_-]?key)\s*[:=]\s*)([^\s,}]+)/giu, "$1[redacted]")

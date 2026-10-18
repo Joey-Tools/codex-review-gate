@@ -37,6 +37,12 @@ Non-run block-scalar bodies and matrix contents are data for this heuristic; act
 
 Definite block-scalar job-name recognition is restricted to complete supported explicit strip-chomp forms (`|-` / `>-`). Default/keep chomping and other unsupported scalar details can remain warning-only; the scanner does not trim away meaningful body spaces or implement full YAML scalar semantics. Supported curl recognition binds a literal payload and explicit POST to the actual unambiguous URL operand; header text is not a request target. Unknown option layouts or ambiguous targets remain coverage limits, not proof of a publisher.
 
+Supported `gh api` field matches use the default GitHub host or an explicit `github.com` hostname, without `--input`. An explicit different or ambiguous host, or any file/stdin input body, is not classified as a publisher by this heuristic; files are not opened to infer request content. Supported curl publication uses HTTPS on `api.github.com`, no URL user-info, the default/443 port, and exactly one literal body option. Other hosts and multiple body options stay nonblocking; the scanner does not compose HTTP bodies.
+
+A known block-scalar `run` containing `<<` is conservatively skipped as an entire unclassified run block, with a warning. This deliberately also skips lookalike text and real commands in that block instead of interpreting here-document delimiters or shell expansion. Local literal state is cleared rather than carried through the skipped block. It is an accepted coverage loss, not evidence that no publisher exists there.
+
+Diagnostic excerpts containing an Authorization key are omitted in full. The finding kind and source location remain available; the log does not retain the authentication scheme or any credential tail from that line.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

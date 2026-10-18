@@ -2,6 +2,42 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { inspectWorkflowGateSignals } from "../src/workflow-gate-signals.mjs";
 
+// Synthetic token pool joey-private-v3; records bearer-a and api-key-a.
+const syntheticAuthorizationCredentials = {
+  bearer_token: "codex_synth_v1_bearer_a",
+  api_key: "codex_synth_v1_api_key_a",
+};
+
+test("redacts complete authorization-bearing excerpts from blocking matches", () => {
+  const authorizationLines = [
+    `check-context: codex/github-review-gate # Authorization: token ${syntheticAuthorizationCredentials.bearer_token}`,
+    `check-context: codex/github-review-gate # AUTHORIZATION: Basic ${syntheticAuthorizationCredentials.api_key}`,
+    `check-context: codex/github-review-gate # {\"authorization\": \"token ${syntheticAuthorizationCredentials.bearer_token}\"}`,
+    `check-context: codex/github-review-gate # 'Authorization': 'Basic ${syntheticAuthorizationCredentials.api_key}'`,
+  ];
+
+  for (const line of authorizationLines) {
+    const result = inspectWorkflowGateSignals(line);
+    assert.equal(result.matches.length, 1);
+    assert.equal(result.matches[0].kind, "reserved-status-context");
+    assert.equal(result.matches[0].line, 1);
+    assert.equal(result.matches[0].excerpt, "[redacted authorization-bearing line]");
+    assert.ok(!result.matches[0].excerpt.includes(syntheticAuthorizationCredentials.bearer_token));
+    assert.ok(!result.matches[0].excerpt.includes(syntheticAuthorizationCredentials.api_key));
+  }
+});
+
+test("redacts complete authorization-bearing excerpts from warning diagnostics", () => {
+  const raw = `Authorization: Basic ${syntheticAuthorizationCredentials.api_key} ${"x".repeat(4096)}`;
+  const result = inspectWorkflowGateSignals(raw);
+  const warning = result.warnings.find(({ kind }) => kind === "line-truncated");
+
+  assert.ok(warning);
+  assert.equal(warning.line, 1);
+  assert.equal(warning.excerpt, "[redacted authorization-bearing line]");
+  assert.ok(!warning.excerpt.includes(syntheticAuthorizationCredentials.api_key));
+});
+
 test("finds literal reserved names and same-name status contexts", () => {
   const result = inspectWorkflowGateSignals(`
 name: Maintenance workflow
@@ -691,6 +727,25 @@ test("limits CLI publisher fields and methods to the first shell command", () =>
   );
 });
 
+test("keeps CLI publisher fields on the supported GitHub host and inline body", () => {
+  const explicitGitHub = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs --hostname github.com -f name=codex/github-review-gate",
+  );
+  assert.equal(explicitGitHub.matches.length, 1);
+  assert.equal(explicitGitHub.matches[0].kind, "reserved-check-run-name");
+
+  const unsupportedHost = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs --hostname ghe.example.com -f name=codex/github-review-gate",
+  );
+  assert.deepEqual(unsupportedHost.matches, []);
+
+  const inputBodies = inspectWorkflowGateSignals([
+    "run: gh api repos/o/r/check-runs --input body.json -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/statuses/$SHA --input=- --raw-field context=codex/github-review-gate",
+  ].join("\n"));
+  assert.deepEqual(inputBodies.matches, []);
+});
+
 test("finds a reserved CheckRun name only beside the explicit check-runs API", () => {
   const publisher = inspectWorkflowGateSignals(
     "run: gh api repos/example/check-runs -f name=codex/github-review-gate",
@@ -748,6 +803,46 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   assert.equal(blockScalar.matches[0].kind, "reserved-check-run-name");
 });
 
+test("skips known run blocks containing here-document-like text conservatively", () => {
+  const heredoc = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          cat >config <<'EOF'",
+    "          context=codex/github-review-gate",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "          EOF",
+  ].join("\n"));
+  assert.deepEqual(heredoc.matches, []);
+  assert.ok(heredoc.warnings.some(({ kind }) => kind === "unclassified-run-block"));
+  assert.ok(heredoc.warnings.some(({ kind }) => kind === "reserved-status-context-reference"));
+
+  const isolated = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: NAME=codex/github-review-gate",
+    "      - run: |",
+    "          cat <<EOF",
+    "          ordinary data",
+    "          EOF",
+    '      - run: context="$NAME"',
+  ].join("\n"));
+  assert.deepEqual(isolated.matches, []);
+  assert.ok(isolated.warnings.some(({ kind }) => kind === "unclassified-run-block"));
+
+  const ordinaryRunBlock = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - run: |",
+    "          gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ].join("\n"));
+  assert.equal(ordinaryRunBlock.matches.length, 1);
+  assert.equal(ordinaryRunBlock.matches[0].kind, "reserved-check-run-name");
+});
+
 test("finds inline JSON CheckRun POST names across common curl data flags", () => {
   const options = ["-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json"];
   for (const option of options) {
@@ -791,6 +886,28 @@ test("uses curl URL operands rather than header or later-command text", () => {
     `run: curl --config request.conf -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
   );
   assert.deepEqual(unsupportedOption.matches, []);
+
+  const defaultPort = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com:443/repos/o/r/check-runs`,
+  );
+  assert.equal(defaultPort.matches.length, 1);
+
+  for (const target of [
+    "http://api.github.com/repos/o/r/check-runs",
+    "https://example.com/repos/o/r/check-runs",
+    "https://user@api.github.com/repos/o/r/check-runs",
+    "https://api.github.com:8443/repos/o/r/check-runs",
+  ]) {
+    const unsupportedTarget = inspectWorkflowGateSignals(
+      `run: curl -X POST -d '{"name":"codex/github-review-gate"}' ${target}`,
+    );
+    assert.deepEqual(unsupportedTarget.matches, [], target);
+  }
+
+  const multipleBodies = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' -d '{"status":"completed"}' https://api.github.com/repos/o/r/check-runs`,
+  );
+  assert.deepEqual(multipleBodies.matches, []);
 });
 
 test("finds only explicit commit-status POST publishers in bounded curl commands", () => {

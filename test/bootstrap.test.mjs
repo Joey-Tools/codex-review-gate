@@ -7310,6 +7310,26 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       `jobs:\n  build:\n    steps:\n      - run: |\n          curl -X POST -H 'Link: https://api.github.com/repos/example/repo/check-runs' -d '{"name":"codex/github-review-gate"}' https://example.com/audit\n`,
     ],
     [
+      "gh-api-other-host",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --hostname ghe.example.com -f name=codex/github-review-gate\n",
+    ],
+    [
+      "gh-api-input-body-with-query-field",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs --input body.json -f name=codex/github-review-gate\n",
+    ],
+    [
+      "curl-other-host-with-api-shaped-path",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://example.com/repos/example/repo/check-runs\n`,
+    ],
+    [
+      "curl-multiple-body-options",
+      `jobs:\n  build:\n    steps:\n      - run: curl -X POST -d '{"name":"codex/github-review-gate"}' -d '{"status":"completed"}' https://api.github.com/repos/example/repo/check-runs\n`,
+    ],
+    [
+      "here-document-text-is-not-execution-proof",
+      "jobs:\n  build:\n    steps:\n      - run: |\n          cat >config <<'EOF'\n          context=codex/github-review-gate\n          gh api repos/example/repo/check-runs -f name=codex/github-review-gate\n          EOF\n",
+    ],
+    [
       "truncated-job-name-is-not-an-exact-scalar",
       "jobs:\n  build:\n    name: codex/github-review-gate" + " ".repeat(4096) + "(Linux)\n    steps:\n      - run: echo ready\n",
     ],
