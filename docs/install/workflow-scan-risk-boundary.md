@@ -110,15 +110,19 @@ examples remain warning-only rather than introducing YAML decoding semantics.
 The ordinary `-F` alias is supported alongside `--field`; adding that existing
 literal option alias does not add typed-value/file or stdin interpretation.
 
-When the ordinary installer already knows its target repository, supported CLI
-and curl API requests that literally name a different owner/repository do not
-prove a publisher in that target. Repository-name comparison is case-insensitive;
-dynamic or encoded destinations are not proven foreign. Remote installation
-reuses its existing repository identity. Offline preparation optionally reads
-the local origin once, without a network lookup; absent, invalid or unreadable
-origin data produces a generic warning and retains the conservative scan.
-This scope correction does not suppress additional gate callers or matching job
-names, and does not change strict historical/proof paths.
+When the ordinary installer already knows its target repository, the scan's
+owner/repository filter uses only literal CLI/curl destination text. The
+case-insensitive text comparison does not establish an immutable repository
+identity or account for redirects. A literal former-slug destination that
+redirects to the configured repository may therefore be missed as a publisher
+([review finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4306800104)).
+Dynamic or encoded destinations are not proven foreign. Remote installation
+reuses its existing target identity. Offline preparation optionally reads the
+local origin once, without a network lookup; absent, invalid or unreadable
+origin data produces a generic warning and retains the conservative scan. No
+alias/redirect network lookup is performed. This scope correction does not
+suppress additional gate callers or matching job names, and does not change
+strict historical/proof paths.
 
 Known flow-style environment/input/output/secret/matrix mappings are data just
 like their block-form equivalents; a nested `context` does not itself prove a
@@ -176,6 +180,29 @@ gh endpoint must end at a token boundary; quoted/unquoted endpoint concatenation
 does not prove the quoted prefix is the route. Literal curl `Host` header
 overrides are unclassified rather than simulating HTTP virtual-host behavior.
 These guards intentionally lose coverage rather than adding interpreters.
+
+## Explicitly approved conservative matches
+
+Joey explicitly accepted these conservative outcomes to keep the ordinary
+preflight a bounded source-keyword scan, without adding caller/callee name
+analysis or condition evaluation:
+
+- A reserved job-name string in a `workflow_call`-only reusable workflow may
+  still be matched without determining whether a caller references it or how
+  GitHub names the resulting native check ([review finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4306800092)).
+- A publisher-shaped command in a step with literal `if: false` may still be
+  matched because the scanner does not evaluate workflow conditions ([review
+  finding](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4306800100)).
+
+These syntactic matches can block ordinary installation even when the command
+never executes or the emitted native name differs; that conservative
+false-positive outcome is explicitly accepted for these two cases only.
+Known-data and exact-literal identity corrections remain required. A match is
+not proof that a workflow is invoked, that a step executes, or that GitHub emits
+the exact native check name. The accepted
+former-slug redirect gap is described above. No broader interpreter, runtime
+change, or additional alias/redirect API query is introduced. This record does
+not define a bypass, override, or recovery path for literal matches.
 
 ## Safeguards that remain strict
 

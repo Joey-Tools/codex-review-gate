@@ -67,6 +67,21 @@ jobs:
   }
 });
 
+test("classifies reserved job names in reusable-only workflows", () => {
+  const result = inspectWorkflowGateSignals([
+    "on:",
+    "  workflow_call:",
+    "jobs:",
+    "  internal:",
+    "    name: codex/github-review-gate",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: echo reusable",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-job-name"]);
+});
+
 test("keeps indentless step display names out of job-name classification", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -1144,6 +1159,20 @@ test("filters literal API publishers for a known foreign repository only", () =>
   }
 });
 
+test("does not follow repository rename redirects when filtering known targets", () => {
+  const currentSlug = inspectWorkflowGateSignals(
+    `run: curl -L -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/acme/new-name/check-runs`,
+    { repositoryFullName: "acme/new-name" },
+  );
+  assert.deepEqual(currentSlug.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+
+  const oldSlug = inspectWorkflowGateSignals(
+    `run: curl -L -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/acme/old-name/check-runs`,
+    { repositoryFullName: "acme/new-name" },
+  );
+  assert.deepEqual(oldSlug.matches, []);
+});
+
 test("keeps quoted JSON.parse text inside a YAML step name warning-only", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
@@ -1219,6 +1248,19 @@ test("leaves implicit-host CLI publishers unclassified when GH_HOST is mentioned
     result.warnings.filter(({ kind }) => kind === "cli-host-override-unclassified").length,
     1,
   );
+});
+
+test("matches a literal publisher in a statically false step without evaluating conditions", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - if: ${{ false }}",
+    "        run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
 });
 
 test("finds a reserved CheckRun name only beside the explicit check-runs API", () => {
