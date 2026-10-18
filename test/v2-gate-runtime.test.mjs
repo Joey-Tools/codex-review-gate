@@ -7396,6 +7396,103 @@ test("receipt envelope: historical wrapped and unwrapped inline parents allow a 
   }
 });
 
+test("historical native-parent receipt with separator whitespace and no body SHA allows a later clean without waiving unresolved threads", async (context) => {
+  const review = historicalNativeParentReviewWithoutBodySha(OLD_HEAD, {
+    submitted_at: "2026-08-25T08:02:00Z",
+  });
+  const invalidReceipts = [
+    ["missing-native-sha", { ...review, commit_id: "" }],
+    ["short-native-sha", { ...review, commit_id: OLD_HEAD.slice(0, 10) }],
+    ["extra-finding-payload", {
+      ...review,
+      body: `${review.body}\n\n- [P1] This is an unclosed finding payload.`,
+    }],
+    ["duplicate-envelope", {
+      ...review,
+      body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${review.body}`,
+    }],
+  ];
+  const cases = [
+    ["resolved", [reviewThread({
+      id: "PRRT_native_parent_resolved",
+      isResolved: true,
+      isOutdated: true,
+    })]],
+    ["unresolved", [reviewThread({
+      id: "PRRT_native_parent_unresolved",
+      isResolved: false,
+      isOutdated: true,
+    })]],
+  ];
+
+  for (const [suffix, reviewThreads] of cases) {
+    const github = createGitHubMock({
+      issueComments: [
+        workflowRequest({
+          created_at: "2026-08-25T08:00:00Z",
+          updated_at: "2026-08-25T08:00:00Z",
+        }),
+        cleanIssueComment(HEAD, {
+          created_at: "2026-08-25T08:10:00Z",
+          updated_at: "2026-08-25T08:10:00Z",
+        }),
+      ],
+      reviews: [review],
+      reviewThreads,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `historical-native-parent-no-body-sha-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.executionHealth, "healthy", suffix);
+    assert.equal(result.report.counts.indeterminate, 0, suffix);
+    if (suffix === "resolved") {
+      assert.equal(result.exitCode, 0, result.report.reason);
+      assert.equal(result.report.gateOutcome, "success");
+      assert.deepEqual(result.report.reviewThreads, {
+        status: "complete",
+        unresolved: 0,
+        resolved: 1,
+        total: 1,
+        diagnostics: [],
+      });
+    } else {
+      assert.equal(result.exitCode, 1);
+      assert.notEqual(result.report.gateOutcome, "success");
+      assert.equal(result.report.reviewThreads.unresolved, 1);
+      assert.match(result.report.reason, /unresolved pull-request review thread/iu);
+      assert.equal(
+        github.statusWrites.some(({ state }) => state === "success"),
+        false,
+      );
+    }
+  }
+
+  for (const [suffix, invalidReview] of invalidReceipts) {
+    const github = createGitHubMock({
+      issueComments: [
+        workflowRequest({
+          created_at: "2026-08-25T08:00:00Z",
+          updated_at: "2026-08-25T08:00:00Z",
+        }),
+        cleanIssueComment(HEAD, {
+          created_at: "2026-08-25T08:10:00Z",
+          updated_at: "2026-08-25T08:10:00Z",
+        }),
+      ],
+      reviews: [invalidReview],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `historical-native-parent-invalid-no-body-sha-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
 test("receipt envelope: a historical wrapped inline parent cannot waive an unresolved thread", async (context) => {
   const review = receiptWrappedInlineParentReview(OLD_HEAD, {
     submitted_at: "2026-08-25T08:02:00Z",
@@ -15173,6 +15270,29 @@ function receiptWrappedInlineParentReview(commitRef = HEAD, overrides = {}) {
   return {
     ...review,
     body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${review.body}`,
+  };
+}
+
+function historicalNativeParentReviewWithoutBodySha(commitRef = HEAD, overrides = {}) {
+  const review = inlineParentReview(commitRef, overrides);
+  return {
+    ...review,
+    body: [
+      CODEX_REVIEW_RECEIPT_ENVELOPE_V1,
+      "",
+      "",
+      "### 💡 Codex Review",
+      "",
+      "Here are some automated review suggestions for this pull request.",
+      "",
+      ...officialCodexAboutFooter().slice(0, 7),
+      "",
+      "",
+      "",
+      'Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".',
+      "            ",
+      "</details>",
+    ].join("\n"),
   };
 }
 

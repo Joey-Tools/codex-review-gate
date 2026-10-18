@@ -2690,6 +2690,10 @@ test("opts inline-parent review grammar into the exact v1 receipt envelope", () 
     state: "COMMENTED",
     body: officialInlineParentReviewBody(),
   });
+  const bodyWithoutReviewedCommit = officialInlineParentReviewBody().replace(
+    /^\*\*Reviewed commit:\*\* `[^`]+`\n/m,
+    "",
+  );
   const wrappedReview = {
     ...unwrappedReview,
     body: codexReviewReceiptEnvelope(unwrappedReview.body),
@@ -2734,6 +2738,58 @@ test("opts inline-parent review grammar into the exact v1 receipt envelope", () 
     }
   }
 
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar({
+      ...unwrappedReview,
+      body: bodyWithoutReviewedCommit,
+    }),
+    false,
+    "the default legacy grammar still requires the body commit line",
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar(
+      {
+        ...unwrappedReview,
+        body: codexReviewReceiptEnvelope(bodyWithoutReviewedCommit),
+      },
+      { allowKnownReceiptEnvelope: true },
+    ),
+    true,
+    "the opted-in native parent may bind through its full commit_id",
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar(
+      {
+        ...unwrappedReview,
+        commit_id: FULL_SHA_A.slice(0, 10),
+        body: codexReviewReceiptEnvelope(bodyWithoutReviewedCommit),
+      },
+      { allowKnownReceiptEnvelope: true },
+    ),
+    false,
+    "omitting the body commit line requires a full native commit_id",
+  );
+
+  for (const [name, separator] of [
+    ["one blank separator", "\n\n"],
+    ["two blank separators", "\n\n\n"],
+    ["three blank separators", "\n\n\n\n"],
+    ["whitespace-only separator", "\n \t\n"],
+    ["CRLF separators", "\r\n\r\n\r\n"],
+  ]) {
+    assert.equal(
+      codexInlineParentReviewBodyHasClosedGrammar(
+        {
+          ...unwrappedReview,
+          body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}${separator}${bodyWithoutReviewedCommit}`,
+        },
+        { allowKnownReceiptEnvelope: true },
+      ),
+      true,
+      name,
+    );
+  }
+
   for (const commitRef of [FULL_SHA_B.slice(0, 10), FULL_SHA_B]) {
     assert.equal(
       codexInlineParentReviewBodyHasClosedGrammar(
@@ -2757,6 +2813,15 @@ test("opts inline-parent review grammar into the exact v1 receipt envelope", () 
     ["unknown version", `<!-- codex-review-receipt:v2 -->\n\n${unwrappedReview.body}`],
     ["malformed marker", `<!-- codex-review-receipt:v1-->\n\n${unwrappedReview.body}`],
     ["missing blank-line boundary", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n${unwrappedReview.body}`],
+    [
+      "malformed body commit line",
+      codexReviewReceiptEnvelope(
+        bodyWithoutReviewedCommit.replace(
+          "Here are some automated review suggestions for this pull request.",
+          "Here are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `abc`",
+        ),
+      ),
+    ],
     [
       "duplicate envelope",
       `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${unwrappedReview.body}`,
