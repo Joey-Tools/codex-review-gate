@@ -320,14 +320,27 @@ function normalizeCodexCommentBody(body) {
 }
 
 function unwrapKnownCodexReviewReceiptEnvelope(body) {
-  const boundary = `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n`;
+  const markerLine = `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n`;
   if (
-    !body.startsWith(boundary) ||
+    !body.startsWith(markerLine) ||
     body.split(CODEX_REVIEW_RECEIPT_ENVELOPE_V1).length !== 2
   ) {
     return body;
   }
-  return body.slice(boundary.length);
+
+  const lines = body.slice(markerLine.length).split("\n");
+  let blankSeparatorLines = 0;
+  while (
+    blankSeparatorLines < lines.length &&
+    /^[ \t]*$/u.test(lines[blankSeparatorLines])
+  ) {
+    blankSeparatorLines += 1;
+  }
+  if (blankSeparatorLines === 0) {
+    return body;
+  }
+
+  return lines.slice(blankSeparatorLines).join("\n");
 }
 
 function stripLeadingEmojiGraphemes(value) {
@@ -647,6 +660,8 @@ export function codexInlineParentReviewBodyHasClosedGrammar(
   const body = allowKnownReceiptEnvelope === true
     ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
     : normalizedBody;
+  const receiptEnvelopeWasUnwrapped =
+    allowKnownReceiptEnvelope === true && body !== normalizedBody;
   if (!body || body.length > 5_000) {
     return false;
   }
@@ -664,19 +679,27 @@ export function codexInlineParentReviewBodyHasClosedGrammar(
   const commitPattern = allowShortCommitRefs
     ? /^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`$/i
     : /^\*\*Reviewed commit:\*\* `([0-9a-f]{10}|[0-9a-f]{40})`$/i;
-  const reviewedCommit = commitPattern.exec(lines[2] || "")?.[1]?.toLowerCase();
   const parentCommit = review.commit_id.toLowerCase();
-  if (
-    !reviewedCommit ||
-    (reviewedCommit.length === 40
-      ? reviewedCommit !== parentCommit
-      : !parentCommit.startsWith(reviewedCommit))
+  const reviewedCommit = commitPattern.exec(lines[2] || "")?.[1]?.toLowerCase();
+  let disclosureStart = 2;
+  if (reviewedCommit) {
+    if (
+      reviewedCommit.length === 40
+        ? reviewedCommit !== parentCommit
+        : !parentCommit.startsWith(reviewedCommit)
+    ) {
+      return false;
+    }
+    disclosureStart = 3;
+  } else if (
+    !receiptEnvelopeWasUnwrapped ||
+    lines.some((line) => /^\*\*Reviewed commit:\*\*/i.test(line))
   ) {
     return false;
   }
 
   return officialIssueCommentCleanDisclosureHasClosedGrammar(
-    lines.slice(3).join("\n"),
+    lines.slice(disclosureStart).join("\n"),
   );
 }
 
