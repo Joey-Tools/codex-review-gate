@@ -180,6 +180,62 @@ test("closes folded job-name state at dedent and document boundaries", () => {
   assert.equal(trailingBlank.matches.length, 1);
 });
 
+test("keeps default chomping and meaningful block-name spaces unclassified", () => {
+  for (const indicator of ["|", ">", "|+", ">+"]) {
+    const result = inspectWorkflowGateSignals(`jobs:\n  build:\n    name: ${indicator}\n      codex/github-review-gate\n    steps: []\n`);
+    assert.deepEqual(result.matches, [], indicator);
+    assert.ok(result.warnings.some(({ kind }) => kind === "folded-job-name-unclassified"));
+  }
+  for (const body of ["\n      codex/github-review-gate", "      codex/github-review-gate "]) {
+    assert.deepEqual(inspectWorkflowGateSignals(`jobs:\n  build:\n    name: >-\n${body}\n    steps: []\n`).matches, []);
+  }
+  assert.equal(inspectWorkflowGateSignals("jobs:\n  build:\n    name: |-\n      codex/github-review-gate\n    steps: []\n").matches.length, 1);
+});
+
+test("does not execute non-run scalar values or inputs named run", () => {
+  const scalarData = inspectWorkflowGateSignals([
+    "jobs:", "  build:", "    steps:", "      - run: |", "          echo ready",
+    "        env:", "          NOTE: |", "            context=codex/github-review-gate",
+    "            curl -X POST " + "\\", "              -d '{\"name\":\"codex/github-review-gate\"}' " + "\\",
+    "              https://api.github.com/repos/o/r/check-runs",
+    "      - uses: example/action@v1", "        with:", "          run: |",
+    "            gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  ].join("\n"));
+  assert.deepEqual(scalarData.matches, []);
+});
+
+test("keeps matrix expansion values as data without hiding a job named matrix", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:", "  build:", "    strategy:", "      matrix:", "        include:",
+    "          - context: codex/github-review-gate", "    steps: []", "  matrix:",
+    "    name: codex/github-review-gate", "    steps: []",
+  ].join("\n"));
+  assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-job-name"]);
+});
+
+test("never derives exact values or aliases from incomplete line and window text", () => {
+  const longName = "jobs:\n  build:\n    name: codex/github-review-gate" + " ".repeat(4096) + "(Linux)\n";
+  assert.deepEqual(inspectWorkflowGateSignals(longName).matches, []);
+  const windowName = "jobs:\n  build:\n    name: codex/github-review-gate" + " ".repeat(2100) + "(Linux)\n";
+  assert.deepEqual(inspectWorkflowGateSignals(windowName).matches, []);
+  const unknownAssignment = [
+    "jobs:", "  build:", "    steps:", "      - run: |", "          NAME=codex/github-review-gate",
+    "          NAME=ordinary" + " ".repeat(4096), '          context="$NAME"',
+  ].join("\n");
+  assert.deepEqual(inspectWorkflowGateSignals(unknownAssignment).matches, []);
+  const unknownAnchor = [
+    "env: { ACTION: &gate JoeyTeng/codex-review-gate-action@v2 }",
+    "env: { ACTION: &gate actions/checkout@v4 }" + " ".repeat(4096),
+    "jobs:", "  build:", "    steps:", "      - uses: *gate",
+  ].join("\n");
+  assert.deepEqual(inspectWorkflowGateSignals(unknownAnchor).matches, []);
+  const candidate = "context=codex/github-review-gate";
+  const padding = "#" + "x".repeat(256 * 1024 - candidate.length - 2) + "\n";
+  const clippedTail = inspectWorkflowGateSignals(padding + candidate + " (Linux)\n");
+  assert.deepEqual(clippedTail.matches, []);
+  assert.ok(clippedTail.warnings.some(({ kind }) => kind === "input-truncated"));
+});
+
 test("handles simple scalar anchors consistently on job names and context fields", () => {
   const anchored = inspectWorkflowGateSignals([
     "jobs:",
@@ -714,6 +770,29 @@ test("finds inline JSON CheckRun POST names across common curl data flags", () =
   assert.deepEqual(nonPublishers.matches, []);
 });
 
+test("uses curl URL operands rather than header or later-command text", () => {
+  const headerUrl = inspectWorkflowGateSignals(
+    `run: curl -X POST -H 'Link: https://api.github.com/repos/o/r/check-runs' -d '{"name":"codex/github-review-gate"}' https://example.com/audit`,
+  );
+  assert.deepEqual(headerUrl.matches, []);
+
+  const headerAccept = inspectWorkflowGateSignals(
+    `run: curl -H 'Accept: application/vnd.github+json' -X POST -d '{"name":"codex/github-review-gate"}' --url https://api.github.com/repos/o/r/check-runs`,
+  );
+  assert.equal(headerAccept.matches.length, 1);
+  assert.equal(headerAccept.matches[0].kind, "reserved-check-run-name");
+
+  const laterCommand = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/releases && echo -H 'Link: https://api.github.com/repos/o/r/check-runs'`,
+  );
+  assert.deepEqual(laterCommand.matches, []);
+
+  const unsupportedOption = inspectWorkflowGateSignals(
+    `run: curl --config request.conf -X POST -d '{"name":"codex/github-review-gate"}' https://api.github.com/repos/o/r/check-runs`,
+  );
+  assert.deepEqual(unsupportedOption.matches, []);
+});
+
 test("finds only explicit commit-status POST publishers in bounded curl commands", () => {
   const publisher = inspectWorkflowGateSignals(
     `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
@@ -736,7 +815,7 @@ test("finds only explicit commit-status POST publishers in bounded curl commands
   const nonPublishers = inspectWorkflowGateSignals([
     `run: curl -X GET -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA`,
     `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/releases`,
-    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/statuses/$SHA; echo done`,
+    `run: curl -X POST -d '{"context":"codex/github-review-gate"}' https://api.github.com/repos/o/r/releases; echo https://api.github.com/repos/o/r/statuses/$SHA`,
   ].join("\n"));
   assert.deepEqual(nonPublishers.matches, []);
 });

@@ -33,6 +33,10 @@ Endpoint classification uses the leading literal endpoint directly after `gh api
 
 The supported CLI match is confined to the first command before an unquoted shell separator. Flags belonging to a later command are not request parameters of the first one. This bounded prefix scan is not a full shell parser or a guarantee of detecting writers in later commands or complex substitutions.
 
+Non-run block-scalar bodies and matrix contents are data for this heuristic; action-input data flow is not interpreted. Truncated physical lines, clipped input tails and incomplete window values must not establish an exact collision or supply a prefix literal to later matching. Existing limit warnings remain visible.
+
+Definite block-scalar job-name recognition is restricted to complete supported explicit strip-chomp forms (`|-` / `>-`). Default/keep chomping and other unsupported scalar details can remain warning-only; the scanner does not trim away meaningful body spaces or implement full YAML scalar semantics. Supported curl recognition binds a literal payload and explicit POST to the actual unambiguous URL operand; header text is not a request target. Unknown option layouts or ambiguous targets remain coverage limits, not proof of a publisher.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

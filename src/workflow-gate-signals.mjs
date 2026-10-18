@@ -83,6 +83,7 @@ export function inspectWorkflowGateSignals(
 
   const clipped = content.slice(0, MAX_INPUT_CHARS);
   const rawLines = clipped.split(/\r\n|\n|\r/u, MAX_LINES + 1);
+  const inputTruncated = content.length > clipped.length || rawLines.length > MAX_LINES;
   const lines = rawLines.slice(0, MAX_LINES).map((raw, index) => {
     if (raw.length > MAX_LINE_CHARS) {
       addWarning(
@@ -97,7 +98,9 @@ export function inspectWorkflowGateSignals(
       line: index + 1,
       raw: limited,
       text: stripComments(limited),
-      truncated: raw.length > MAX_LINE_CHARS,
+      truncated:
+        raw.length > MAX_LINE_CHARS ||
+        (content.length > clipped.length && index === rawLines.length - 1),
     };
   });
   markYamlJobNameFields(lines);
@@ -122,6 +125,12 @@ export function inspectWorkflowGateSignals(
   let foldedJobName = null;
   const yamlAnchors = new Map();
   for (const line of lines) {
+    if (line.truncated) {
+      yamlAnchors.clear();
+      if (foldedJobName) foldedJobName.unclassified = true;
+      if (foldedUses) foldedUses = null;
+      continue;
+    }
     if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
       if (foldedJobName) {
         finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning);
@@ -137,6 +146,7 @@ export function inspectWorkflowGateSignals(
       if (!line.raw.trim()) {
         if (foldedJobName.lines < MAX_FOLDED_JOB_NAME_LINES) foldedJobName.lines += 1;
         else foldedJobName.unclassified = true;
+        if (foldedJobName.firstContentLine === null) foldedJobName.leadingBlank = true;
       } else if (indent > foldedJobName.indent) {
         if (foldedJobName.lines >= MAX_FOLDED_JOB_NAME_LINES) {
           foldedJobName.unclassified = true;
@@ -200,6 +210,15 @@ export function inspectWorkflowGateSignals(
     const name = yamlFields.find((field) => isNameField(field.key));
     if (line.jobNameField && name && isBlockScalarIndicator(stripYamlAnchor(name.value))) {
       const indicator = stripYamlAnchor(name.value);
+      if (!isStripChompBlockScalar(indicator)) {
+        addWarning(
+          "folded-job-name-unclassified",
+          line.line,
+          "A job name uses a block scalar without explicit strip chomping and was not classified by the bounded text scan.",
+          line.raw,
+        );
+        continue;
+      }
       const explicitIndent = indicator.match(/[1-9]/u)?.[0];
       foldedJobName = {
         indent: indentationOf(line.text),
@@ -211,6 +230,7 @@ export function inspectWorkflowGateSignals(
         headerLine: line.line,
         headerRaw: line.raw,
         unclassified: line.truncated,
+        leadingBlank: false,
       };
     }
   }
@@ -221,7 +241,7 @@ export function inspectWorkflowGateSignals(
       reserved,
       addMatch,
       addWarning,
-      content.length > clipped.length || rawLines.length > MAX_LINES,
+      inputTruncated,
     );
   }
 
@@ -267,8 +287,28 @@ function finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning, inpu
     return;
   }
 
-  const expression = foldedJobName.fragments.join(" ").trim();
-  if (!expression) return;
+  if (foldedJobName.leadingBlank) {
+    addWarning(
+      "folded-job-name-unclassified",
+      foldedJobName.headerLine,
+      "A folded job name has leading blank content and was not classified by the bounded text scan.",
+      foldedJobName.headerRaw,
+    );
+    return;
+  }
+
+  const expression = foldedJobName.fragments.length === 1 ? foldedJobName.fragments[0] : null;
+  if (expression === null) {
+    if (foldedJobName.fragments.length > 1) {
+      addWarning(
+        "folded-job-name-unclassified",
+        foldedJobName.headerLine,
+        "A folded job name uses multiple body lines and was not classified by the bounded text scan.",
+        foldedJobName.headerRaw,
+      );
+    }
+    return;
+  }
   const line = foldedJobName.firstContentLine ?? foldedJobName.headerLine;
   const raw = foldedJobName.firstContentRaw ?? foldedJobName.headerRaw;
   if (expression === reserved) {
@@ -284,6 +324,18 @@ function finishFoldedJobName(foldedJobName, reserved, addMatch, addWarning, inpu
 }
 
 function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMatch, addWarning) {
+  if (line.truncated) return;
+  if (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run") {
+    if (hasExactToken(line.text, reserved) || isAmbiguous(line.text, new Map(), reserved)) {
+      addWarning(
+        "non-executable-gate-reference",
+        line.line,
+        "Non-run scalar data refers to gate-like text; input data flow is not classified by this scan.",
+        line.raw,
+      );
+    }
+    return;
+  }
   if (line.flowScanAmbiguous) {
     addWarning(
       "ambiguous-flow-structure",
@@ -389,6 +441,14 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
 function inspectWindow(window, reserved, addMatch, addWarning) {
   const literals = new Map();
   for (const line of window) {
+    if (line.truncated) {
+      literals.clear();
+      continue;
+    }
+    if (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run") {
+      literals.clear();
+      continue;
+    }
     if (
       !line.yamlScalarContent &&
       !line.yamlDataField &&
@@ -587,26 +647,61 @@ function cliCheckRunNameExpression(text) {
 }
 
 function curlPublisherSignal(text, reserved) {
-  const command = runCommand(text);
+  const command = firstShellCommand(runCommand(text));
   if (!/^curl(?:\s|$)/iu.test(command)) return null;
   if (hasShellLineContinuation(command)) return null;
 
-  const dataOption = /(?:^|\s)(?:-d|--data(?:-raw|-binary|-urlencode)?|--json)(?:\s+|=)(?:"([^"]*)"|'([^']*)'|([^\s]+))/giu;
-  const dataMatches = [...command.matchAll(dataOption)];
-  if (!dataMatches.length) return null;
-  const withoutData = command.replace(dataOption, " ");
-  const checkRunsEndpoint = /https?:\/\/[^/\s"']+\/repos\/[^/\s"']+\/[^/\s"']+\/check-runs(?:[/?#\s"']|$)/iu.test(withoutData);
-  const statusesEndpoint = /https?:\/\/[^/\s"']+\/repos\/[^/\s"']+\/[^/\s"']+\/statuses\/[^/?#\s"']+(?:[/?#\s"']|$)/iu.test(withoutData);
-  if (
-    /[;&|]/u.test(withoutData) ||
-    !/(?:^|\s)(?:-X\s*|--request(?:=|\s+))POST(?:\s|$)/iu.test(withoutData) ||
-    (!checkRunsEndpoint && !statusesEndpoint)
-  ) {
-    return null;
+  const arguments_ = shellWords(command);
+  if (!arguments_ || arguments_[0] !== "curl") return null;
+  let method = null;
+  let target = null;
+  const payloads = [];
+  let reject = false;
+  const valueOptions = new Set([
+    "-X", "--request", "-H", "--header", "--data", "-d", "--data-raw",
+    "--data-binary", "--data-urlencode", "--json", "--url",
+  ]);
+  const flagOptions = new Set([
+    "-L", "--location", "-f", "--fail", "-s", "--silent", "-S", "--show-error",
+    "--compressed", "-i", "--include", "-v", "--verbose", "--http1.1", "--http2",
+    "-g", "--globoff", "-I", "--head", "--get",
+  ]);
+  const dataOptions = new Set(["-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json"]);
+  for (let index = 1; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    const equals = argument.indexOf("=");
+    const option = equals > 0 ? argument.slice(0, equals) : argument;
+    const inlineValue = equals > 0 ? argument.slice(equals + 1) : null;
+    if (valueOptions.has(option)) {
+      const value = inlineValue ?? arguments_[index + 1];
+      if (value === undefined || (inlineValue === null && value.startsWith("-"))) return null;
+      if (inlineValue === null) index += 1;
+      if (option === "-X" || option === "--request") {
+        if (method !== null) return null;
+        method = value.toUpperCase();
+      } else if (dataOptions.has(option)) {
+        payloads.push(value);
+      } else if (option === "--url") {
+        if (target !== null) return null;
+        target = value;
+      }
+      continue;
+    }
+    if (flagOptions.has(argument)) {
+      if (argument === "-I" || argument === "--head" || argument === "--get") reject = true;
+      continue;
+    }
+    if (argument.startsWith("-")) return null;
+    if (target !== null) return null;
+    target = argument;
   }
+  if (reject || method !== "POST" || target === null || payloads.length === 0) return null;
 
-  for (const match of dataMatches) {
-    const payload = match[1] ?? match[2] ?? match[3] ?? "";
+  const checkRunsEndpoint = /^https?:\/\/[^/?#]+\/repos\/[^/?#]+\/[^/?#]+\/check-runs(?:[/?#]|$)/iu.test(target);
+  const statusesEndpoint = /^https?:\/\/[^/?#]+\/repos\/[^/?#]+\/[^/?#]+\/statuses\/[^/?#]+(?:[/?#]|$)/iu.test(target);
+  if (!checkRunsEndpoint && !statusesEndpoint) return null;
+
+  for (const payload of payloads) {
     if (checkRunsEndpoint) {
       const name = jsonStringField(payload, "name");
       if (name === reserved) {
@@ -623,6 +718,41 @@ function curlPublisherSignal(text, reserved) {
   return null;
 }
 
+function shellWords(command) {
+  const words = [];
+  let word = "";
+  let quote = null;
+  let escaped = false;
+  let started = false;
+  for (const character of command) {
+    if (escaped) {
+      word += character;
+      escaped = false;
+      started = true;
+    } else if (character === "\\" && quote !== "'") {
+      escaped = true;
+      started = true;
+    } else if (quote !== null) {
+      if (character === quote) quote = null;
+      else word += character;
+      started = true;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+    } else if (/\s/u.test(character)) {
+      if (started) words.push(word);
+      word = "";
+      started = false;
+    } else {
+      word += character;
+      started = true;
+    }
+  }
+  if (quote !== null || escaped) return null;
+  if (started) words.push(word);
+  return words;
+}
+
 function jsonStringField(payload, key) {
   const field = payload.match(new RegExp(`(?:^|[,{])\\s*["']${key}["']\\s*:\\s*(?:"([^"\\\\]*)"|'([^'\\\\]*)')`, "iu"));
   return field ? field[1] ?? field[2] : null;
@@ -635,6 +765,13 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
   let index = 0;
   while (index < lines.length) {
     const line = lines[index];
+    if (line.truncated || line.yamlDataField || (line.yamlScalarContent && line.yamlScalarOwnerKey !== "run")) {
+      runBlockIndent = null;
+      runBlockHeaderChars = 0;
+      previousContinues = false;
+      index += 1;
+      continue;
+    }
     if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
       runBlockIndent = null;
       runBlockHeaderChars = 0;
@@ -642,7 +779,9 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
       index += 1;
       continue;
     }
-    const runHeader = line.text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu);
+    const runHeader = line.yamlScalarContent || line.yamlDataField
+      ? null
+      : line.text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu);
     if (runHeader) {
       runBlockIndent = isBlockScalarIndicator(stripYamlAnchor(runHeader[1].trim()))
         ? indentationOf(line.text)
@@ -691,6 +830,9 @@ function inspectCurlContinuationBlocks(lines, reserved, addMatch, addWarning) {
     while (current < lines.length) {
       const physical = lines[current];
       if (
+        physical.truncated ||
+        physical.yamlDataField ||
+        (physical.yamlScalarContent && physical.yamlScalarOwnerKey !== "run") ||
         isYamlDocumentBoundary(physical.text) ||
         !physical.text.trim() ||
         indentationOf(physical.text) <= runBlockIndent
@@ -931,6 +1073,7 @@ function markSelectorUse(line) {
 
 function markYamlDataAndScalarFields(lines) {
   let scalarKeyIndent = null;
+  let scalarOwnerKey = null;
   const dataMappingIndents = [];
   const workflow = {
     jobsIndent: null,
@@ -941,11 +1084,19 @@ function markYamlDataAndScalarFields(lines) {
     stepPropertyIndent: null,
   };
   for (const line of lines) {
+    if (line.truncated) {
+      scalarKeyIndent = null;
+      scalarOwnerKey = null;
+      dataMappingIndents.length = 0;
+      resetWorkflowYamlScope(workflow);
+      continue;
+    }
     if (
       isYamlDocumentBoundary(line.text) &&
       (scalarKeyIndent === null || indentationOf(line.text) <= scalarKeyIndent)
     ) {
       scalarKeyIndent = null;
+      scalarOwnerKey = null;
       dataMappingIndents.length = 0;
       resetWorkflowYamlScope(workflow);
       continue;
@@ -956,8 +1107,10 @@ function markYamlDataAndScalarFields(lines) {
     if (scalarKeyIndent !== null) {
       if (mapping && mapping.indent <= scalarKeyIndent) {
         scalarKeyIndent = null;
+        scalarOwnerKey = null;
       } else {
         line.yamlScalarContent = true;
+        line.yamlScalarOwnerKey = scalarOwnerKey;
         continue;
       }
     }
@@ -976,7 +1129,8 @@ function markYamlDataAndScalarFields(lines) {
     if (
       !line.yamlDataField &&
       mapping &&
-      /^(?:env|with|outputs|secrets)$/iu.test(mapping.key) &&
+      (/^(?:env|with|outputs|secrets)$/iu.test(mapping.key) ||
+        (mapping.key.toLowerCase() === "matrix" && nestedJobProperty)) &&
       !mapping.value.trim() &&
       (workflowProperty || nestedJobProperty)
     ) {
@@ -984,6 +1138,8 @@ function markYamlDataAndScalarFields(lines) {
     }
     if (mapping && isBlockScalarIndicator(stripYamlAnchor(mapping.value))) {
       scalarKeyIndent = mapping.indent;
+      scalarOwnerKey = mapping.key.toLowerCase();
+      if (scalarOwnerKey === "run" && (line.yamlDataField || !workflowProperty)) scalarOwnerKey = null;
     }
   }
 }
@@ -1347,6 +1503,10 @@ function isBlockScalarIndicator(value) {
   return /^[>|](?:[+-]?[1-9]?|[1-9]?[+-]?)\s*$/u.test(value);
 }
 
+function isStripChompBlockScalar(value) {
+  return /^[>|](?:-[1-9]?|[1-9]-)\s*$/u.test(value);
+}
+
 function resolveSimpleLiteral(expression, literals) {
   const value = expression.trim().replace(/[;,]\s*$/u, "").trim();
   if (!value || value.length > MAX_WINDOW_CHARS) return null;
@@ -1476,7 +1636,11 @@ function boundedWindows(scope) {
       const line = scope[index];
       const remaining = MAX_WINDOW_CHARS - length;
       if (remaining <= 0) break;
-      window.push(line.text.length > remaining ? { ...line, text: line.text.slice(0, remaining) } : line);
+      window.push(
+        line.text.length > remaining
+          ? { ...line, text: line.text.slice(0, remaining), truncated: true }
+          : line,
+      );
       length += Math.min(line.text.length, remaining) + 1;
       if (line.text.length > remaining) break;
     }

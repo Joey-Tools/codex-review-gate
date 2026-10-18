@@ -7254,6 +7254,14 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "jobs:\n  build:\n    name: >-\n      Build\n      codex/github-review-gate\n",
     ],
     [
+      "folded-job-name-with-leading-body-space",
+      "jobs:\n  build:\n    name: >-2\n       codex/github-review-gate\n",
+    ],
+    [
+      "folded-job-name-with-quoted-body",
+      "jobs:\n  build:\n    name: >-\n      'codex/github-review-gate'\n",
+    ],
+    [
       "graphql-variable-with-check-run-marker",
       "jobs:\n  build:\n    steps:\n      - run: |\n          gh api graphql -f 'query=query { viewer { login } } # /check-runs marker' -f name=codex/github-review-gate\n",
     ],
@@ -7281,6 +7289,38 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       "isolated-shell-first-step-literals",
       'jobs:\n  build:\n    steps:\n      - shell: bash\n        run: NAME=codex/github-review-gate\n      - shell: bash\n        run: context="$NAME"\n',
     ],
+    [
+      "non-executable-env-scalar",
+      "env:\n  NOTE: |\n    context=codex/github-review-gate\n    gh api repos/example/repo/check-runs -f name=codex/github-review-gate\njobs:\n  build:\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "non-executable-input-scalar",
+      "jobs:\n  build:\n    steps:\n      - uses: example/action@v1\n        with:\n          note: |\n            context=codex/github-review-gate\n",
+    ],
+    [
+      "non-executable-scalar-run-lookalike",
+      "env:\n  NOTE: |\n    run: |\n      curl -X POST https://api.github.com/repos/example/repo/check-runs -d '{\"name\":\"codex/github-review-gate\"}'\n    NAME=codex/github-review-gate\njobs:\n  build:\n    steps:\n      - run: context=ordinary\n",
+    ],
+    [
+      "matrix-include-context-data",
+      "jobs:\n  build:\n    strategy:\n      matrix:\n        include:\n          - context: codex/github-review-gate\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "curl-header-url-is-not-target",
+      `jobs:\n  build:\n    steps:\n      - run: |\n          curl -X POST -H 'Link: https://api.github.com/repos/example/repo/check-runs' -d '{"name":"codex/github-review-gate"}' https://example.com/audit\n`,
+    ],
+    [
+      "truncated-job-name-is-not-an-exact-scalar",
+      "jobs:\n  build:\n    name: codex/github-review-gate" + " ".repeat(4096) + "(Linux)\n    steps:\n      - run: echo ready\n",
+    ],
+    [
+      "truncated-assignment-does-not-seed-later-literal",
+      "jobs:\n  build:\n    steps:\n      - run: NAME=codex/github-review-gate" + " ".repeat(4096) + "(Linux)\n      - run: context=\"$NAME\"\n",
+    ],
+    ...["|", ">", "|+", ">+"].map((indicator) => [
+      `non-strip-job-name-${indicator}`,
+      `jobs:\n  build:\n    name: ${indicator}\n      codex/github-review-gate\n    steps:\n      - run: echo ready\n`,
+    ]),
   ]) {
     assert.equal(
       validateCanonicalV2WorkflowInventory(
