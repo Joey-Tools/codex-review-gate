@@ -6976,6 +6976,15 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOWS),
     CANONICAL_WORKFLOWS,
   );
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      cleanInventory,
+      CANONICAL_WORKFLOWS,
+      { strictUnrelatedWorkflows: undefined },
+    ),
+    CANONICAL_WORKFLOWS,
+    "an explicit undefined keeps the ordinary scan default false",
+  );
   const foreignApiPublisher = {
     path: ".github/workflows/publisher.yml",
     content: [
@@ -7276,6 +7285,32 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     ),
     CANONICAL_WORKFLOWS,
     "unrelated status writers do not block ordinary v2 inventory",
+  );
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      additionalStatusWriter,
+      CANONICAL_WORKFLOWS,
+      { strictUnrelatedWorkflows: undefined },
+    ),
+    CANONICAL_WORKFLOWS,
+    "an explicit undefined does not enable strict unrelated-writer checks for ordinary v2",
+  );
+  const legacyBridgeWithAdditionalStatusWriter = [
+    ...cleanInventory,
+    {
+      path: DEFAULT_LEGACY_BRIDGE_WORKFLOW_PATH,
+      content: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
+    },
+    additionalStatusWriter.at(-1),
+  ];
+  assert.throws(
+    () => validateCanonicalV2WorkflowInventory(
+      legacyBridgeWithAdditionalStatusWriter,
+      CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE,
+      { legacyBridge: true, strictUnrelatedWorkflows: undefined },
+    ),
+    /Additional workflows violate the codex\/github-review-gate single-producer policy: .*status-writer\.yml \(statuses: write\)/u,
+    "an explicit undefined preserves the legacy-bridge strict policy default",
   );
   for (const quotedStatusWriter of [
     "permissions:\n  \"statuses\": write\njobs: {}\n",

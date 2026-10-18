@@ -51,6 +51,19 @@ Encoded body forms such as curl `--data-urlencode` remain unclassified: their ra
 
 ## Additional intentionally unclassified forms
 
+Within a known job span, a recognized `matrix:` key or supported flow mention makes that
+job's exact reserved-name candidates unknown and warning-only; the scan does
+not interpret matrix structure or expansion. A shared flow-style physical line
+can conservatively lose all its name candidates when one matrix mention is
+recognized; this is not per-job expansion proof. Other separately classified
+non-matrix jobs and control matches remain visible. Likewise, a recognized explicit YAML `shell:`
+configuration makes command-publisher matches source-wide unknown and
+warning-only, including inline commands, curl commands and variable-derived
+paths. Actual action callers and job-name matches remain eligible. These rules
+intentionally lose coverage even for harmless or data-only matrix text and
+ordinary shell declarations; the scan does not inherit defaults or interpret
+shell configuration with a shell implementation.
+
 The scan does not interpret descriptor redirections such as `2>&1` or `&>`.
 Its bounded first-command prefix can stop at their ampersand and miss a real
 publisher later in that same command ([review example](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4305246320)).

@@ -39,8 +39,15 @@ export function inspectWorkflowGateSignals(
   const warningKeys = new Set();
   let matchLimitReached = false;
   let warningLimitReached = false;
+  let shellPublisherMatchingUncertain = false;
 
   const addMatch = (kind, line, raw) => {
+    if (
+      shellPublisherMatchingUncertain &&
+      (kind === "reserved-status-context" || kind === "reserved-check-run-name")
+    ) {
+      return;
+    }
     const finding = { kind, line, excerpt: safeExcerpt(raw) };
     const key = `${kind}:${line}:${finding.excerpt}`;
     if (matchKeys.has(key)) return;
@@ -113,6 +120,16 @@ export function inspectWorkflowGateSignals(
     );
   }
   markYamlJobNameFields(lines);
+  const explicitShellConfiguration = lines.find(isYamlShellConfigurationLine);
+  if (explicitShellConfiguration) {
+    shellPublisherMatchingUncertain = true;
+    addWarning(
+      "explicit-shell-configuration-unclassified",
+      explicitShellConfiguration.line,
+      "An explicit shell configuration appears in this source; command-publisher matches are left unclassified because shell execution configuration is not interpreted.",
+      explicitShellConfiguration.raw,
+    );
+  }
   markUnknownRunBlocks(lines, reserved, addWarning);
   const continuedCurlMatches = [];
   inspectCurlContinuationBlocks(
@@ -158,6 +175,14 @@ export function inspectWorkflowGateSignals(
         "unclassified-quoted-yaml-scalar",
         line.line,
         "A quoted YAML scalar continues across physical lines and was not decoded by the bounded scan.",
+        line.raw,
+      );
+    }
+    if (line.yamlMatrixJobNameUnclassified) {
+      addWarning(
+        "matrix-job-name-unclassified",
+        line.line,
+        "A matrix key appears in this job, so its exact emitted job-name identity is not classified by this bounded scan.",
         line.raw,
       );
     }
@@ -403,7 +428,7 @@ function inspectLineSignals(line, reserved, yamlAnchors, allowYamlAliases, addMa
       }
     }
   }
-  const flowJobNames = [
+  const flowJobNames = line.yamlMatrixJobNameUnclassified ? [] : [
     ...(line.flowJobFields?.names ?? []),
     ...(line.inlineJobFields?.names ?? []),
   ];
@@ -504,8 +529,8 @@ function inspectWindow(window, reserved, addMatch, addWarning, repositoryFullNam
       }
     }
     for (const field of [
-      ...(line.flowJobFields?.names ?? []),
-      ...(line.inlineJobFields?.names ?? []),
+      ...(line.yamlMatrixJobNameUnclassified ? [] : line.flowJobFields?.names ?? []),
+      ...(line.yamlMatrixJobNameUnclassified ? [] : line.inlineJobFields?.names ?? []),
     ]) {
       inspectContext("name", field.value, literals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
     }
@@ -1256,6 +1281,15 @@ function isNameField(key) {
   return key.toLowerCase() === "name";
 }
 
+function isYamlShellConfigurationLine(line) {
+  if (line.truncated || line.yamlScalarContent || isRunCommandLine(line.text)) return false;
+  const mapping = simpleYamlMapping(line.text);
+  return (
+    mapping?.key.toLowerCase() === "shell" ||
+    yamlFieldsOnLine(line.text).some(({ key }) => key.toLowerCase() === "shell")
+  );
+}
+
 function markYamlJobNameFields(lines) {
   markYamlDataAndScalarFields(lines);
   let jobsIndent = null;
@@ -1264,8 +1298,19 @@ function markYamlJobNameFields(lines) {
   let stepsIndent = null;
   let stepIndent = null;
   let stepPropertyIndent = null;
+  let activeJob = null;
+  const finishActiveJob = () => {
+    if (activeJob?.hasMatrix) {
+      for (const line of activeJob.nameLines) {
+        line.jobNameField = false;
+        line.yamlMatrixJobNameUnclassified = true;
+      }
+    }
+    activeJob = null;
+  };
   for (const line of lines) {
     if (!line.yamlScalarContent && isYamlDocumentBoundary(line.text)) {
+      finishActiveJob();
       jobsIndent = null;
       jobIndent = null;
       jobPropertyIndent = null;
@@ -1282,10 +1327,17 @@ function markYamlJobNameFields(lines) {
     line.workflowFlowCollection = line.flowJobFields.flowCollection;
     line.flowStepUses = line.flowJobFields.steps;
     line.flowScanAmbiguous = line.flowJobFields.ambiguous;
+    if (
+      hasYamlMatrixKeyMention(line) &&
+      (line.flowJobFields.names.length > 0 || line.inlineJobFields?.names.length > 0)
+    ) {
+      line.yamlMatrixJobNameUnclassified = true;
+    }
     const indent = indentationOf(line.text);
     const text = line.text.trim();
     const key = line.yamlDataField ? null : simpleYamlKey(text);
     if (key?.toLowerCase() === "jobs" && /^\s*$/u.test(text.slice(text.indexOf(":") + 1))) {
+      finishActiveJob();
       jobsIndent = indent;
       jobIndent = null;
       jobPropertyIndent = null;
@@ -1296,6 +1348,7 @@ function markYamlJobNameFields(lines) {
     }
     if (jobsIndent === null) continue;
     if (indent <= jobsIndent) {
+      finishActiveJob();
       jobsIndent = null;
       jobIndent = null;
       jobPropertyIndent = null;
@@ -1306,6 +1359,7 @@ function markYamlJobNameFields(lines) {
     }
     if (jobIndent === null || indent === jobIndent) {
       if (key !== null) {
+        finishActiveJob();
         jobIndent = indent;
         jobPropertyIndent = null;
         stepsIndent = null;
@@ -1315,8 +1369,15 @@ function markYamlJobNameFields(lines) {
         line.workflowFlowCollection ||= line.inlineJobFields.flowCollection;
         line.flowScanAmbiguous ||= line.inlineJobFields.ambiguous;
         line.flowStepUses = [...line.flowStepUses, ...line.inlineJobFields.steps];
+        activeJob = {
+          hasMatrix: hasYamlMatrixKeyMention(line, indent),
+          nameLines: line.inlineJobFields.names.length ? [line] : [],
+        };
       }
       continue;
+    }
+    if (activeJob && indent > jobIndent && hasYamlMatrixKeyMention(line, jobIndent)) {
+      activeJob.hasMatrix = true;
     }
     // GitHub Actions accepts indentless sequences under a mapping key. A step
     // item at the same indentation as `steps:` is not another job property.
@@ -1332,7 +1393,10 @@ function markYamlJobNameFields(lines) {
     }
     if (jobPropertyIndent === null) jobPropertyIndent = indent;
     if (indent === jobPropertyIndent) {
-      if (key?.toLowerCase() === "name") line.jobNameField = true;
+      if (key?.toLowerCase() === "name") {
+        line.jobNameField = true;
+        activeJob?.nameLines.push(line);
+      }
       if (key?.toLowerCase() === "uses") {
         markSelectorUse(line);
       }
@@ -1374,6 +1438,16 @@ function markYamlJobNameFields(lines) {
       }
     }
   }
+  finishActiveJob();
+}
+
+function hasYamlMatrixKeyMention(line, jobIndent = null) {
+  if (line.yamlScalarContent || isRunCommandLine(line.text)) return false;
+  const mapping = simpleYamlMapping(line.text);
+  if (mapping?.key.toLowerCase() === "matrix") {
+    return jobIndent === null || mapping.indent > jobIndent;
+  }
+  return /\bstrategy\s*:\s*\{[^}]*\bmatrix\s*:/iu.test(line.text);
 }
 
 function markUnknownRunBlocks(lines, reserved, addWarning) {

@@ -367,6 +367,78 @@ test("keeps matrix expansion values as data without hiding a job named matrix", 
   assert.deepEqual(result.matches.map(({ kind }) => kind), ["reserved-job-name"]);
 });
 
+test("leaves matrix job names unknown while retaining non-matrix names and action callers", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  matrixed:",
+    "    name: codex/github-review-gate",
+    "    strategy:",
+    "      matrix:",
+    "        os: [ubuntu-latest, windows-latest]",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  control:",
+    "    name: codex/github-review-gate",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    ["codex-review-gate-action-caller", "reserved-job-name"],
+  );
+  assert.equal(result.matches[1].line, 10);
+  assert.ok(result.warnings.some(({ kind, line }) => kind === "matrix-job-name-unclassified" && line === 3));
+
+  const flowMatrixName = inspectWorkflowGateSignals(
+    "jobs: {matrixed: {name: codex/github-review-gate, strategy: {matrix: {os: [linux, windows]}}}}",
+  );
+  assert.deepEqual(flowMatrixName.matches, []);
+  assert.ok(flowMatrixName.warnings.some(({ kind }) => kind === "matrix-job-name-unclassified"));
+});
+
+test("leaves command publishers unknown when YAML explicitly configures a shell", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    name: codex/github-review-gate",
+    "    steps:",
+    "      - shell: echo {0}",
+    "        run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    "      - run: |",
+    "          curl -X POST \\",
+    `            -d '{"name":"codex/github-review-gate"}' \\`,
+    "            https://api.github.com/repos/o/r/check-runs",
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+
+  assert.deepEqual(
+    result.matches.map(({ kind }) => kind),
+    ["reserved-job-name", "codex-review-gate-action-caller"],
+  );
+  assert.ok(result.warnings.some(({ kind, line }) => kind === "explicit-shell-configuration-unclassified" && line === 5));
+
+  const implicitDefault = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+  );
+  assert.deepEqual(implicitDefault.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+
+  const suppressedPublisherFlood = inspectWorkflowGateSignals([
+    "jobs:",
+    "  publish:",
+    "    steps:",
+    "      - shell: echo {0}",
+    ...Array.from(
+      { length: 40 },
+      () => "      - run: gh api repos/o/r/check-runs -f name=codex/github-review-gate",
+    ),
+    "      - uses: JoeyTeng/codex-review-gate-action@v2",
+  ].join("\n"));
+  assert.deepEqual(
+    suppressedPublisherFlood.matches.map(({ kind }) => kind),
+    ["codex-review-gate-action-caller"],
+  );
+  assert.ok(!suppressedPublisherFlood.warnings.some(({ kind }) => kind === "match-limit"));
+});
+
 test("never derives exact values or aliases from incomplete line and window text", () => {
   const longName = "jobs:\n  build:\n    name: codex/github-review-gate" + " ".repeat(4096) + "(Linux)\n";
   assert.deepEqual(inspectWorkflowGateSignals(longName).matches, []);
