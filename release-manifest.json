@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:4",
   "schema_version": 4,
-  "version": "2.2.5",
+  "version": "2.2.6",
   "contract_versions": {
     "toolchain": "node24",
     "release_schema": 4,
@@ -12,13 +12,13 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "fc5dda0eea8511cf8b1a26c0844519e997c7d697"
+    "tree": "136704975a48f5b3f498034b8998d82d5d1229dd"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "f8405eb64d923a386969dd36fe0e637e698378af",
-    "previous_version": "2.2.4"
+    "expected_head": "be15152cf66c38f15129a899de25fbc4faf46c0e",
+    "previous_version": "2.2.5"
   },
   "files": [
     {
@@ -67,8 +67,8 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 51259,
-      "sha256": "5c8dddc0b5a0aa4c67b7c863d79eaa447c27fb567818b13ef0b94ca06cbee860"
+      "size": 52378,
+      "sha256": "4398a77c29e5ad6a3678e003d361194e366f3b7ba4c388f1f12d079e1917a26b"
     },
     {
       "path": "README.zh-CN.md",
@@ -110,7 +110,7 @@
       "type": "file",
       "mode": "100644",
       "size": 481,
-      "sha256": "011f3628974f4a1a5100214473ee2c44b37c6e7bf7c349308bd3d524d4ff0c3b"
+      "sha256": "bd5c973496d3cafdef8cb05dbb8d3a78d0b1d440c7f1c3a88db8f77d3a10f506"
     },
     {
       "path": "producer-receipt.schema.json",
@@ -123,8 +123,8 @@
       "path": "src/core.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 72566,
-      "sha256": "24df48f7f00c72c2e2fd214c4fab7933537a2512443ef9ac0f25f106aaba5bae"
+      "size": 73201,
+      "sha256": "d831b8d3de1e386d6267d2dedca54ce6e0c5ba17d6547e38a6bde76898a35673"
     },
     {
       "path": "src/evidence-budget.mjs",
