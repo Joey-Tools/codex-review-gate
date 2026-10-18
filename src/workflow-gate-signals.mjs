@@ -837,7 +837,7 @@ function cliContextExpression(
   );
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
-  if (!/^\/?repos\/[^/?#]+\/[^/?#]+\/statuses\/[^/?#]+$/iu.test(endpoint ?? "")) return null;
+  if (!/^\/?repos\/[^/?#]+\/[^/?#]+\/statuses\/[^/?#]+$/u.test(endpoint ?? "")) return null;
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
   if ((admission.method ?? "POST") !== "POST") return null;
   if (!cliFieldHasNonemptyValue(command, "state")) return null;
@@ -933,9 +933,9 @@ function cliCheckRunNameExpression(
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
   if (isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName)) return null;
-  if (/^\/?repos\/[^/?#]+\/[^/?#]+\/check-runs$/iu.test(endpoint ?? "")) {
+  if (/^\/?repos\/[^/?#]+\/[^/?#]+\/check-runs$/u.test(endpoint ?? "")) {
     if ((admission.method ?? "POST") !== "POST" || !cliFieldHasNonemptyValue(command, "head_sha")) return null;
-  } else if (/^\/?repos\/[^/?#]+\/[^/?#]+\/check-runs\/[1-9][0-9]*$/iu.test(endpoint ?? "")) {
+  } else if (/^\/?repos\/[^/?#]+\/[^/?#]+\/check-runs\/[1-9][0-9]*$/u.test(endpoint ?? "")) {
     if (admission.method !== "PATCH") return null;
   } else {
     return null;
@@ -991,8 +991,10 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
       } else if (option === "--url") {
         if (target !== null) return null;
         target = value;
-      } else if ((option === "-H" || option === "--header") && /^\s*host\s*[:;]/iu.test(value)) {
-        return null;
+      } else if (option === "-H" || option === "--header") {
+        // Host and Content-Length overrides alter request routing/framing; do
+        // not interpret or recompute curl's effective headers.
+        if (/^\s*(?:host|content-length)\s*[:;]/iu.test(value)) return null;
       }
       continue;
     }
@@ -1009,8 +1011,8 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
   const apiPath = supportedGitHubApiPath(target);
   if (apiPath === null) return null;
   if (isKnownForeignRepositoryEndpoint(apiPath, repositoryFullName)) return null;
-  const checkRunsEndpoint = /^\/repos\/[^/]+\/[^/]+\/check-runs$/iu.test(apiPath);
-  const statusesEndpoint = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/iu.test(apiPath);
+  const checkRunsEndpoint = /^\/repos\/[^/]+\/[^/]+\/check-runs$/u.test(apiPath);
+  const statusesEndpoint = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/u.test(apiPath);
   if (!checkRunsEndpoint && !statusesEndpoint) return null;
 
   for (const payload of payloads) {
@@ -1035,13 +1037,17 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
 function isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName) {
   if (typeof repositoryFullName !== "string") return false;
   const target = repositoryFullName.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/u);
-  const destination = endpoint?.match(/^\/?repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\//iu);
+  const destination = endpoint?.match(/^\/?repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\//u);
   if (!target || !destination) return false;
   return `${destination[1]}/${destination[2]}`.toLowerCase() !==
     `${target[1]}/${target[2]}`.toLowerCase();
 }
 
 function supportedGitHubApiPath(target) {
+  // WHATWG URL treats backslashes as slashes for special schemes. Reject the
+  // source literal first so that this bounded check never treats backslashes
+  // as route separators.
+  if (target.includes("\\")) return null;
   let url;
   try {
     url = new URL(target);

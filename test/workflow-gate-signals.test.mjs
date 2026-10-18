@@ -1182,6 +1182,36 @@ test("filters literal API publishers for a known foreign repository only", () =>
   }
 });
 
+test("matches fixed gh API route segments case-sensitively but repository identity case-insensitively", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const commands = [
+    `run: gh api repos/target/repo/check-runs -f name=codex/github-review-gate -f head_sha=${sha}`,
+    "run: gh api repos/target/repo/check-runs/123 --method PATCH -f name=codex/github-review-gate",
+    "run: gh api repos/target/repo/statuses/$SHA -f context=codex/github-review-gate -f state=success",
+  ];
+  for (const command of commands) {
+    assert.equal(
+      inspectWorkflowGateSignals(command, { repositoryFullName: "TARGET/REPO" }).matches.length,
+      1,
+      command,
+    );
+  }
+
+  for (const endpoint of [
+    `REPOS/target/repo/check-runs`,
+    `repos/target/repo/CHECK-RUNS`,
+    "repos/target/repo/check-Runs/123",
+    "repos/target/repo/STATUSES/$SHA",
+  ]) {
+    const command = endpoint.endsWith("123")
+      ? `run: gh api ${endpoint} --method PATCH -f name=codex/github-review-gate`
+      : endpoint.includes("STATUSES")
+        ? `run: gh api ${endpoint} -f context=codex/github-review-gate -f state=success`
+        : `run: gh api ${endpoint} -f name=codex/github-review-gate -f head_sha=${sha}`;
+    assert.deepEqual(inspectWorkflowGateSignals(command).matches, [], endpoint);
+  }
+});
+
 test("does not follow repository rename redirects when filtering known targets", () => {
   const currentSlug = inspectWorkflowGateSignals(
     `run: curl -L -X POST -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/acme/new-name/check-runs`,
@@ -1793,6 +1823,66 @@ test("does not classify curl publishers with a literal Host header override", ()
   );
   assert.equal(ordinaryHeader.matches.length, 1);
   assert.equal(ordinaryHeader.matches[0].kind, "reserved-check-run-name");
+});
+
+test("does not classify curl publishers with a literal Content-Length override", () => {
+  const headers = [
+    "-H 'Content-Length: 0'",
+    "--header 'content-length: 999'",
+    "-H 'CONTENT-LENGTH;'",
+    "--header 'Content-Length:'",
+    "--header='Content-Length: 0'",
+    "--header=content-length:999",
+  ];
+  for (const header of headers) {
+    const result = inspectWorkflowGateSignals(
+      `run: curl --http1.1 -X POST ${header} -d '{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}' https://api.github.com/repos/o/r/check-runs`,
+    );
+    assert.deepEqual(result.matches, [], header);
+    assert.ok(
+      result.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+      header,
+    );
+  }
+});
+
+test("matches fixed curl API route segments case-sensitively and rejects literal backslashes", () => {
+  const payload = `'{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}'`;
+  const endpoint = "https://api.github.com/repos/target/repo/check-runs";
+  assert.equal(
+    inspectWorkflowGateSignals(`run: curl -X POST -d ${payload} ${endpoint}`, {
+      repositoryFullName: "TARGET/REPO",
+    }).matches.length,
+    1,
+  );
+  assert.equal(
+    inspectWorkflowGateSignals(
+      `run: curl -X POST -d ${payload} https://API.GITHUB.COM/repos/TARGET/REPO/check-runs`,
+      { repositoryFullName: "target/repo" },
+    ).matches.length,
+    1,
+  );
+
+  for (const target of [
+    "https://api.github.com/REPOS/target/repo/check-runs",
+    "https://api.github.com/repos/target/repo/CHECK-RUNS",
+    "https://api.github.com/repos/target/repo/STATUSES/$SHA",
+    "https://api.github.com/repos\\o\\r\\check-runs",
+    "https:\\api.github.com/repos/o/r/check-runs",
+    "https://api.github.com\\@example.com/repos/o/r/check-runs",
+  ]) {
+    const content = target.includes("STATUSES")
+      ? `run: curl -X POST -d '{"context":"codex/github-review-gate","state":"success"}' '${target}'`
+      : `run: curl -X POST -d ${payload} '${target}'`;
+    assert.deepEqual(inspectWorkflowGateSignals(content).matches, [], target);
+  }
+
+  const statusControl = inspectWorkflowGateSignals(
+    `run: curl -X POST -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/TARGET/REPO/statuses/$SHA`,
+    { repositoryFullName: "target/repo" },
+  );
+  assert.equal(statusControl.matches.length, 1);
+  assert.equal(statusControl.matches[0].kind, "reserved-status-context");
 });
 
 test("finds only explicit commit-status POST publishers in bounded curl commands", () => {

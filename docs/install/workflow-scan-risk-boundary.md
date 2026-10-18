@@ -206,6 +206,26 @@ coverage loss, not an additional named conservative false-positive waiver;
 the existing four named waivers and eight warning-only examples are unchanged.
 Strict canonical/runtime controls and curl whitespace handling are unchanged.
 
+Three narrow CLI/curl corrections keep supported matching tied to literal,
+unambiguous request evidence ([Content-Length override/removal](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309174015),
+[fixed route-segment case](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309174019),
+[backslash-bearing URL](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309174026)). A literal curl `Content-Length` header override or
+removal makes that request unclassified: do not calculate or infer the
+effective wire length. Curl documents that custom headers replace its internal
+header, so the source text alone cannot establish the transmitted request
+shape ([curl `-H` documentation](https://curl.se/docs/manpage.html#-H)). For
+supported API routes, fixed path segments such as `repos`, `check-runs` and
+`statuses` compare case-sensitively; host, owner and repository identity retain
+their intended case-insensitive comparison. A read-only probe observed the
+existing check-run GET route succeed in lowercase and return HTTP 404 when the
+fixed segment was uppercased under the same identity. This is GET evidence,
+not a POST experiment. Finally, a literal URL containing a backslash is
+unclassified before URL parsing: do not normalize it through WHATWG or curl
+URL rules, which are not interchangeable ([curl URL syntax](https://curl.se/docs/url-syntax.html)).
+These are conservative classification limits, not new interpreters or
+additional false-positive waivers; the four accepted conservative matches
+and eight warning-only cases remain unchanged.
+
 Any backslash inside a double-quoted shell word leaves that command
 unclassified instead of interpreting escape rules or erasing characters into a different exact name. A quoted
 gh endpoint must end at a token boundary; quoted/unquoted endpoint concatenation
