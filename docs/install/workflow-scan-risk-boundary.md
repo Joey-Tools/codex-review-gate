@@ -49,6 +49,28 @@ Quoted scalar display text is not an additional YAML field, and punctuation in a
 
 Encoded body forms such as curl `--data-urlencode` remain unclassified: their raw argument is not the JSON emitted on the wire, and this scanner does not decode or simulate that transport.
 
+## Additional intentionally unclassified forms
+
+The scan does not interpret descriptor redirections such as `2>&1` or `&>`.
+Its bounded first-command prefix can stop at their ampersand and miss a real
+publisher later in that same command ([review example](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4305246320)).
+This is an accepted warning-only transport gap under the ordinary operator-trust
+contract, not a claim that those commands cannot publish the reserved signal.
+The exact reported gh/curl examples are retained as warning-only regressions;
+no shell-redirection recognizer is added.
+
+Quoted strings remain data even when preceded by `JSON.parse`. Programmatic
+JSON parsing and JavaScript data flow stay outside this heuristic, avoiding a
+special case that also misclassified YAML display text ([review example](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4305246314)).
+These additions do not change the eight earlier fixed warning-only examples or
+relax the runtime unresolved-finding gate.
+
+CLI payload fields use literal case-sensitive field keys and a closed set of
+supported argument positions. Unknown option layouts and shell-expanded field
+values remain unclassified; tokenization alone does not prove whether a dollar
+expression was quoted literally or expanded. No shell expansion or arbitrary
+option-value interpretation is added to recover those matches.
+
 ## Safeguards that remain strict
 
 This accepted preflight risk does not relax exact-byte verification of the canonical verifier and controller workflows, the repository-wide `default_workflow_permissions=read` preflight, canonical workflow permissions, CODEOWNERS and ruleset protections, or canary verification. Frozen historical organization handoff, bridge-removal, and source-only proof contracts remain unchanged.

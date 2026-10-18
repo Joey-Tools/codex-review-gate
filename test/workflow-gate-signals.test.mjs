@@ -570,7 +570,7 @@ test("ignores YAML-looking block scalar contents while retaining selectors and r
 
   const publishers = [
     [
-      "gh api repos/example/check-runs --method POST -f name=codex/github-review-gate",
+      "gh api repos/example/repo/check-runs --method POST -f name=codex/github-review-gate",
       "reserved-check-run-name",
     ],
     [
@@ -714,10 +714,10 @@ test("finds adjacent literals and simple local literal compositions", () => {
 
 test("finds exact CLI payload and inline JavaScript or JSON context literals", () => {
   const cli = inspectWorkflowGateSignals([
-    "run: gh api repos/example/check-runs -f context=codex/github-review-gate",
-    "run: gh api repos/example/check-runs --field 'context=codex/github-review-gate'",
+    "run: gh api repos/example/repo/statuses/$SHA -f context=codex/github-review-gate",
+    "run: gh api repos/example/repo/statuses/$SHA --field 'context=codex/github-review-gate'",
     "run: gh api repos/o/r/statuses/$SHA --raw-field context=codex/github-review-gate",
-    "run: gh api repos/example/check-runs -f context=codex/github-review-gate-extra",
+    "run: gh api repos/example/repo/statuses/$SHA -f context=codex/github-review-gate-extra",
   ].join("\n"));
   assert.equal(cli.matches.length, 3);
   assert.ok(cli.matches.every(({ kind }) => kind === "reserved-status-context"));
@@ -747,7 +747,25 @@ test("finds exact CLI payload and inline JavaScript or JSON context literals", (
     `const payload = { context: "codex/github-review-gate" };`,
     `const payload = JSON.parse('{"context":"codex/github-review-gate"}');`,
   ].join("\n"));
-  assert.equal(inline.matches.length, 3);
+  assert.equal(inline.matches.length, 2);
+  assert.ok(
+    inline.warnings.some(
+      ({ kind, line }) => kind === "reserved-status-context-reference" && line === 3,
+    ),
+  );
+});
+
+test("keeps quoted JSON.parse text inside a YAML step name warning-only", () => {
+  const result = inspectWorkflowGateSignals([
+    "jobs:",
+    "  build:",
+    "    steps:",
+    `      - name: JSON.parse('{"context":"codex/github-review-gate"}')`,
+    "        run: echo ready",
+  ].join("\n"));
+
+  assert.deepEqual(result.matches, []);
+  assert.ok(result.warnings.some(({ kind }) => kind === "reserved-status-context-reference"));
 });
 
 test("limits CLI publisher fields and methods to the first shell command", () => {
@@ -802,7 +820,7 @@ test("keeps CLI publisher fields on the supported GitHub host and inline body", 
 
 test("finds a reserved CheckRun name only beside the explicit check-runs API", () => {
   const publisher = inspectWorkflowGateSignals(
-    "run: gh api repos/example/check-runs -f name=codex/github-review-gate",
+    "run: gh api repos/example/repo/check-runs -f name=codex/github-review-gate",
   );
   assert.equal(publisher.matches.length, 1);
   assert.equal(publisher.matches[0].kind, "reserved-check-run-name");
@@ -814,7 +832,7 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
   assert.equal(rawField.matches[0].kind, "reserved-check-run-name");
 
   const quotedEndpoint = inspectWorkflowGateSignals(
-    "run: gh api '/repos/o/r/check-runs' --method PATCH -f name=codex/github-review-gate",
+    "run: gh api '/repos/o/r/check-runs/123' --method PATCH -f name=codex/github-review-gate",
   );
   assert.equal(quotedEndpoint.matches.length, 1);
   assert.equal(quotedEndpoint.matches[0].kind, "reserved-check-run-name");
@@ -826,7 +844,7 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
 
   for (const method of ["--method PATCH", "--method=PATCH", "-X PATCH"]) {
     const updater = inspectWorkflowGateSignals(
-      `run: gh api repos/o/r/check-runs ${method} -f name=codex/github-review-gate`,
+      `run: gh api repos/o/r/check-runs/123 ${method} -f name=codex/github-review-gate`,
     );
     assert.equal(updater.matches.length, 1, method);
     assert.equal(updater.matches[0].kind, "reserved-check-run-name", method);
@@ -870,6 +888,29 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     );
   }
 
+  const implicitItemPost = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs/123 -f name=codex/github-review-gate",
+  );
+  assert.deepEqual(implicitItemPost.matches, []);
+  const headerFieldText = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs -H 'X-Note: -f name=codex/github-review-gate' -f other=value",
+  );
+  assert.deepEqual(headerFieldText.matches, []);
+  const repeatedName = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f name=ordinary",
+  );
+  assert.deepEqual(repeatedName.matches, []);
+  for (const source of [
+    "run: gh api repos/o/r/check-runs -H '-f=name=codex/github-review-gate' -f other=value",
+    "run: gh api repos/o/r/check-runs --jq '-f=name=codex/github-review-gate' -f other=value",
+    "run: gh api repos/o/r/check-runs -f Name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs -f",
+    "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name='$NAME'",
+    "NAME=codex/github-review-gate\nrun: gh api repos/o/r/check-runs -f name=$NAME",
+  ]) {
+    assert.deepEqual(inspectWorkflowGateSignals(source).matches, [], source);
+  }
+
   const unrelated = inspectWorkflowGateSignals(
     "run: gh api repos/example/releases -f name=codex/github-review-gate",
   );
@@ -881,7 +922,7 @@ test("finds a reserved CheckRun name only beside the explicit check-runs API", (
     "  publish:",
     "    steps:",
     "      - run: |",
-    "          gh api repos/example/check-runs -f name=codex/github-review-gate",
+    "          gh api repos/example/repo/check-runs -f name=codex/github-review-gate",
   ].join("\n"));
   assert.equal(blockScalar.matches.length, 1);
   assert.equal(blockScalar.matches[0].kind, "reserved-check-run-name");
@@ -1204,6 +1245,18 @@ test("keeps accepted ordinary-installer coverage examples warning-only", () => {
     const result = inspectWorkflowGateSignals(content);
     assert.deepEqual(result.matches, [], issue);
     assert.ok(result.warnings.length > 0, `${issue} should remain visible as a warning`);
+  }
+});
+
+test("keeps accepted descriptor-redirection transport examples warning-only", () => {
+  for (const source of [
+    "run: gh api repos/o/r/check-runs 2>&1 -f name=codex/github-review-gate",
+    "run: gh api repos/o/r/check-runs &>build.log -f name=codex/github-review-gate",
+    `run: curl -X POST https://api.github.com/repos/o/r/check-runs 2>&1 -d '{"name":"codex/github-review-gate"}'`,
+  ]) {
+    const result = inspectWorkflowGateSignals(source);
+    assert.deepEqual(result.matches, [], source);
+    assert.ok(result.warnings.length > 0, source);
   }
 });
 

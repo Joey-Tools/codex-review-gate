@@ -627,7 +627,7 @@ function yamlFieldsOnLine(text) {
   for (const match of text.matchAll(pattern)) {
     const boundary = text[match.index];
     const state = yamlSyntaxState(text, match.index);
-    if (state.quote !== null && !isJsonParseQuotedPayload(text, state.quoteStart)) continue;
+    if (state.quote !== null) continue;
 
     let containerStack = state.stack;
     if (boundary === "{") {
@@ -653,7 +653,6 @@ function yamlFieldsOnLine(text) {
 function yamlSyntaxState(text, end) {
   const stack = [];
   let quote = null;
-  let quoteStart = null;
   let escaped = false;
   for (let index = 0; index < end; index += 1) {
     const character = text[index];
@@ -662,16 +661,12 @@ function yamlSyntaxState(text, end) {
       else if (quote === '"' && character === "\\") escaped = true;
       else if (character === quote) {
         if (quote === "'" && text[index + 1] === "'") index += 1;
-        else {
-          quote = null;
-          quoteStart = null;
-        }
+        else quote = null;
       }
       continue;
     }
     if (character === "'" || character === '"') {
       quote = character;
-      quoteStart = index;
     } else if (character === "{" || character === "[") {
       stack.push(character);
     } else if (character === "}" || character === "]") {
@@ -679,11 +674,7 @@ function yamlSyntaxState(text, end) {
       if (stack.at(-1) === expected) stack.pop();
     }
   }
-  return { quote, quoteStart, stack };
-}
-
-function isJsonParseQuotedPayload(text, quoteStart) {
-  return quoteStart !== null && /\bJSON\.parse\s*\(\s*$/u.test(text.slice(0, quoteStart));
+  return { quote, stack };
 }
 
 function yamlFieldValueEnd(text, start, containerStack) {
@@ -729,8 +720,8 @@ function cliContextExpression(text) {
   const admission = cliApiSupportsFieldPublisher(command);
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
-  if (endpoint === null || !/\/(?:statuses\/[^/?#\s]+|check-runs)(?:[/?#\s]|$)/iu.test(endpoint)) return null;
-  if (["GET", "HEAD"].includes(admission.method)) return null;
+  if (!/^\/?repos\/[^/]+\/[^/]+\/statuses\/[^/?#]+$/iu.test(endpoint ?? "")) return null;
+  if ((admission.method ?? "POST") !== "POST") return null;
   return cliFieldExpression(command, "context");
 }
 
@@ -778,7 +769,13 @@ function cliApiSupportsFieldPublisher(command) {
       continue;
     }
     if (argument.startsWith("-X") || argument.startsWith("--method")) return false;
-    if (valueOptions.has(argument)) index += 1;
+    if (valueOptions.has(argument)) {
+      if (arguments_[index + 1] === undefined) return false;
+      index += 1;
+      continue;
+    }
+    if (["-f=", "--field=", "--raw-field=", "-H=", "--header="].some((prefix) => argument.startsWith(prefix))) continue;
+    if (index !== 2) return false;
   }
   return hostname === null || hostname.toLowerCase() === "github.com" ? { method } : false;
 }
@@ -788,8 +785,13 @@ function cliCheckRunNameExpression(text) {
   const admission = cliApiSupportsFieldPublisher(command);
   if (admission === false) return null;
   const endpoint = cliApiEndpoint(command);
-  if (endpoint === null || !/\/check-runs(?:[/?#\s]|$)/iu.test(endpoint)) return null;
-  if (["GET", "HEAD"].includes(admission.method)) return null;
+  if (/^\/?repos\/[^/]+\/[^/]+\/check-runs$/iu.test(endpoint ?? "")) {
+    if ((admission.method ?? "POST") !== "POST") return null;
+  } else if (/^\/?repos\/[^/]+\/[^/]+\/check-runs\/[^/?#]+$/iu.test(endpoint ?? "")) {
+    if (admission.method !== "PATCH") return null;
+  } else {
+    return null;
+  }
   return cliFieldExpression(command, "name");
 }
 
@@ -1083,6 +1085,9 @@ function runCommand(text) {
   return text.match(/^\s*(?:-\s*)?run\s*:\s*(.*)$/iu)?.[1]?.trim() ?? text.trim();
 }
 
+// Descriptor redirections are an accepted warning-only coverage gap here.
+// This bounded prefix scan does not parse shell redirection grammar; see the
+// public workflow-scan risk boundary before adding new shell recognizers.
 function firstShellCommand(command) {
   let quote = null;
   let escaped = false;
@@ -1112,20 +1117,27 @@ function firstShellCommand(command) {
 }
 
 function cliFieldExpression(text, field) {
-  const wholeField = text.match(
-    new RegExp(`(?:^|\\s)(?:-f|--field|--raw-field)(?:\\s+|=)\\s*(['"])${field}=([^'"]*)\\1`, "iu"),
-  );
-  if (wholeField) return `${wholeField[1]}${wholeField[2]}${wholeField[1]}`;
-  const fieldValue = text.match(
-    new RegExp(
-      `(?:^|\\s)(?:-f|--field|--raw-field)(?:\\s+|=)\\s*${field}=(?:"([^"]*)"|'([^']*)'|([^\\s'"]+))`,
-      "iu",
-    ),
-  );
-  if (!fieldValue) return null;
-  if (fieldValue[1] !== undefined) return `"${fieldValue[1]}"`;
-  if (fieldValue[2] !== undefined) return `'${fieldValue[2]}'`;
-  return fieldValue[3];
+  const arguments_ = shellWords(text);
+  if (!arguments_ || arguments_[0] !== "gh" || arguments_[1] !== "api") return null;
+  const values = [];
+  for (let index = 3; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (["-H", "--header", "-X", "--method", "--hostname"].includes(argument)) {
+      index += 1;
+      continue;
+    }
+    let value = null;
+    if (["-f", "--field", "--raw-field"].includes(argument)) {
+      value = arguments_[index + 1];
+      index += 1;
+    } else if (["-f=", "--field=", "--raw-field="].some((prefix) => argument.startsWith(prefix))) {
+      value = argument.slice(argument.indexOf("=") + 1);
+    }
+    if (typeof value === "string" && value.startsWith(`${field}=`)) {
+      values.push(value.slice(value.indexOf("=") + 1));
+    }
+  }
+  return values.length === 1 && !values[0].includes("$") ? JSON.stringify(values[0]) : null;
 }
 
 function isContextField(key) {

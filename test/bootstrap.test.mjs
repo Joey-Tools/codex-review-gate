@@ -7345,6 +7345,18 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
       `jobs:\n  build:\n    steps:\n      - name: 'metadata, context: "codex/github-review-gate", end'\n        run: echo ready\n`,
     ],
     [
+      "json-parse-display-name-is-data",
+      `jobs:\n  build:\n    name: JSON.parse('{"context":"codex/github-review-gate"}')\n    steps:\n      - run: echo ready\n`,
+    ],
+    [
+      "header-field-prose-is-not-a-payload-field",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs -H 'X-Note: -f name=codex/github-review-gate' -f other=value\n",
+    ],
+    [
+      "implicit-gh-post-is-not-check-run-update",
+      "jobs:\n  build:\n    steps:\n      - run: gh api repos/example/repo/check-runs/123 -f name=codex/github-review-gate\n",
+    ],
+    [
       "curl-nested-name-is-not-check-run-name",
       `jobs:\n  build:\n    steps:\n      - run: curl -X POST --json '{"output":{"name":"codex/github-review-gate"},"name":"other","head_sha":"HEAD"}' https://api.github.com/repos/example/repo/check-runs\n`,
     ],
