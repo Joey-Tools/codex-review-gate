@@ -861,14 +861,25 @@ Direct human UI merge outside this closure is unsupported.
 
 ## Supported boundary
 
-Stable v2.0 supports GitHub.com public and private repositories; ordinary
+Current v2 releases support GitHub.com public and private repositories; ordinary
 same-repository branches with an open, non-draft PR targeting the default
-branch; GitHub-hosted Linux runners (`ubuntu-slim`, with `ubuntu-latest` as the
-adopted fallback); and ordinary merge, squash and rebase methods.
+branch; Linux runners in GitHub-hosted or self-hosted environments; and
+ordinary merge, squash and rebase methods. The default runner selection remains
+`ubuntu-slim`, with `ubuntu-latest` as the adopted fallback. The installed
+workflow's explicit `runs-on` expression remains authoritative; these defaults
+apply only when its configured selection falls back to them.
 
 It fails closed for GHES, forks, merge queues, non-default bases, drafts,
-bot-owned PRs, self-hosted/Windows/macOS runners, and new operations on closed
-or merged PRs.
+bot-owned PRs, Windows/macOS runners, and new operations on closed or merged
+PRs.
+
+Selecting a self-hosted Linux runner is an operator trust assumption: the
+operator is responsible for the runner host and its isolation. The Action does
+not attest to host integrity or isolation, and separate GitHub jobs do not
+provide host isolation. The token-bearing controller host must be trusted. No
+additional runner-specific trust flag, allowlist, host API, attestation, or
+approval mechanism is required by the Action; this does not change any
+separate workflow or environment approval requirements.
 
 The runtime is API-only. It does not check out or execute consumer/PR code,
 upload artifacts, retain raw API payloads, or introduce a runtime GitHub App.

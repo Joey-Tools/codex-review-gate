@@ -1020,13 +1020,22 @@ merge outside this closure is unsupported.
 
 ## Supported boundary and non-goals
 
-Stable v2.0 supports GitHub.com public and private repositories, an open
+Current v2 releases support GitHub.com public and private repositories, an open
 non-draft PR from an ordinary same-repository branch to the default branch,
-GitHub-hosted Linux runners and ordinary merge/squash/rebase methods.
+Linux runners in GitHub-hosted or self-hosted environments, and ordinary
+merge/squash/rebase methods. The default runner selection remains
+`ubuntu-slim`, with `ubuntu-latest` as the adopted fallback. An installed
+workflow's explicit `runs-on` expression remains authoritative; these defaults
+apply only when its configured selection falls back to them.
 
 It fails closed for GHES, forks, merge queues, non-default bases, drafts,
-bot-owned PRs, self-hosted/Windows/macOS runners and new operations on closed or
-merged PRs.
+bot-owned PRs, Windows/macOS runners and new operations on closed or merged
+PRs. A selected self-hosted Linux runner is trusted by operator assumption;
+the Action does not prove host integrity or isolation, and separate GitHub jobs
+are not host isolation. The controller host must be trusted when it can receive
+the controller token. No additional runner-specific trust flag, allowlist,
+host API, attestation, or approval mechanism is required; this does not change
+any separate workflow or environment approval requirements.
 
 The design does not claim that:
 

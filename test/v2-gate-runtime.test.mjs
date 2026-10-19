@@ -1369,6 +1369,23 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
   }
 });
 
+test("Linux self-hosted verifier reaches healthy success for stable clean evidence", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [workflowRequest()],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "self-hosted-verifier" });
+  environment.RUNNER_ENVIRONMENT = "self-hosted";
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.deepEqual(github.statusWrites, []);
+});
+
 test("output persistence failure leaves one authoritative unhealthy summary", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest()],
@@ -11768,8 +11785,23 @@ test("unsupported scope is unhealthy/not_applicable and receives no status write
     ["base", { pullRequestOverrides: { base: { ref: "release" } } }, {}],
     ["ghes", {}, { serverUrl: "https://ghe.example.test" }],
     ["windows", {}, {}, (environment) => { environment.RUNNER_OS = "Windows"; }],
-    ["self-hosted", {}, {}, (environment) => {
+    ["windows-self-hosted", {}, {}, (environment) => {
+      environment.RUNNER_OS = "Windows";
       environment.RUNNER_ENVIRONMENT = "self-hosted";
+    }],
+    ["macos-hosted", {}, {}, (environment) => { environment.RUNNER_OS = "macOS"; }],
+    ["macos-self-hosted", {}, {}, (environment) => {
+      environment.RUNNER_OS = "macOS";
+      environment.RUNNER_ENVIRONMENT = "self-hosted";
+    }],
+    ["unknown-runner-environment", {}, {}, (environment) => {
+      environment.RUNNER_ENVIRONMENT = "custom";
+    }],
+    ["missing-runner-environment", {}, {}, (environment) => {
+      delete environment.RUNNER_ENVIRONMENT;
+    }],
+    ["missing-runner-os", {}, {}, (environment) => {
+      delete environment.RUNNER_OS;
     }],
   ]) {
     const github = createGitHubMock(mockOptions);
@@ -13641,6 +13673,24 @@ test("controller binds REST run, job, and CheckRun to feature head while verifie
   );
   assert.equal(inventoryCall.search.includes(`head_sha=${HEAD}`), true);
   assert.equal(inventoryCall.search.includes(`head_sha=${TEST_MERGE}`), false);
+});
+
+test("Linux self-hosted controller reaches healthy verifier-rerun outcome", async (context) => {
+  const github = createGitHubMock();
+  const environment = runtimeEnvironment(context, {
+    suffix: "self-hosted-controller",
+    eventName: "workflow_dispatch",
+  });
+  environment.RUNNER_ENVIRONMENT = "self-hosted";
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.deepEqual(github.rerunRequests, ["7001"]);
+  assert.deepEqual(github.statusWrites, []);
 });
 
 test("controller rejects verifier REST objects attached to the test-merge SHA", async (context) => {

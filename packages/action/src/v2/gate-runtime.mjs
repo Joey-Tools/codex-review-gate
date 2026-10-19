@@ -4618,11 +4618,13 @@ function classifyUnsupportedV2Target(repository, pullRequest, config) {
   ) {
     return "Action v2 supports GitHub.com only";
   }
+  if (config.environment.RUNNER_OS !== "Linux") {
+    return `Action v2 supports Linux runners only (received RUNNER_OS=${config.environment.RUNNER_OS ?? "missing"})`;
+  }
   if (
-    config.environment.RUNNER_OS !== "Linux" ||
-    config.environment.RUNNER_ENVIRONMENT !== "github-hosted"
+    !["github-hosted", "self-hosted"].includes(config.environment.RUNNER_ENVIRONMENT)
   ) {
-    return "Action v2 supports GitHub-hosted Linux runners only";
+    return `Action v2 requires a known Linux runner environment (github-hosted or self-hosted; received RUNNER_ENVIRONMENT=${config.environment.RUNNER_ENVIRONMENT ?? "missing"})`;
   }
   if (repository.fork) return "Action v2 does not support installation on a fork repository";
   if (!isOpenV2PullRequest(pullRequest)) {

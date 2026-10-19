@@ -671,14 +671,20 @@ gh pr merge "$PR_NUMBER" \
 
 ## 支持边界
 
-stable v2.0 支持 GitHub.com public/private repositories；以 default branch 为 base
-的 open、non-draft PR 及普通 same-repository branches；GitHub-hosted Linux
-runners（优先 `ubuntu-slim`，采用 `ubuntu-latest` fallback）；以及普通 merge、
-squash 和 rebase methods。
+当前 v2 支持 GitHub.com public/private repositories；以 default branch 为 base
+的 open、non-draft PR 及普通 same-repository branches；GitHub-hosted 或 self-hosted
+环境中的 Linux runners；以及普通 merge、squash 和 rebase methods。默认 runner
+选择仍是 `ubuntu-slim`，采用 `ubuntu-latest` fallback。已安装 workflow 中显式配置的
+`runs-on` expression 仍然有效；这些默认值只在该配置采用默认选择时生效。
 
-GHES、forks、merge queues、non-default bases、drafts、bot-owned PRs、
-self-hosted/Windows/macOS runners，以及对 closed/merged PR 发起的新 operation 都会
-fail closed。
+GHES、forks、merge queues、non-default bases、drafts、bot-owned PRs、Windows/macOS
+runners，以及对 closed/merged PR 发起的新 operation 都会 fail closed。
+
+选择 self-hosted Linux runner 是基于 operator 信任的假设：operator 负责 runner
+host 及其隔离。Action 不会证明 host integrity 或 isolation；独立 GitHub jobs 也不提供
+host isolation。必须信任能够接收 controller token 的 host。Action 不要求额外的 runner-specific
+trust flag、allowlist、host API、attestation 或 approval mechanism；这不改变独立的 workflow
+或 environment approval 要求。
 
 runtime 只调用 API，不 checkout 或执行 consumer/PR code，不上传 artifacts，不保留
 raw API payload，也不引入 runtime GitHub App。diagnostics 只是 best effort，绝不

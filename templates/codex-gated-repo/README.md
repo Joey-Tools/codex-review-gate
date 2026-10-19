@@ -108,7 +108,10 @@ event filters or permission declarations.
 Organization-variable visibility determines which
 repositories receive the selection. Setting a variable alone does not update
 an already installed consumer: update both workflow files to the new
-`runs-on` expression. This needs no Action runtime release.
+`runs-on` expression. Changing only the runner variable or these `runs-on`
+labels needs no Action runtime release. The Linux self-hosted runtime
+compatibility change itself must be included in a newly released `@v2` Action
+payload before consumers can use that support.
 
 The shared runner selection also affects the controller, which has
 `actions: write` and `pull-requests: write`, and may receive the optional
@@ -116,7 +119,10 @@ The shared runner selection also affects the controller, which has
 host as trusted operator-controlled configuration. The exact workflow digest
 does not bind variable values or host state, and separate GitHub jobs do not
 provide host isolation. Any host that can receive the controller token must be
-trusted; use dedicated or ephemeral trusted runners for token-bearing jobs.
+trusted. Dedicated or ephemeral runners may be an operator's chosen risk
+mitigation, but are not an Action-enforced prerequisite. The Action does not
+attest to host integrity or isolation. Linux self-hosted runners are supported
+on this operator-trust basis; Windows and macOS runners remain unsupported.
 
 Limits are selected only through the `default` or `expanded` profile; a
 repository that regularly needs the latter may set
@@ -193,8 +199,9 @@ and non-gate context: use trusted metadata and GitHub job results, never execute
 PR-produced text or downloaded mutable/unprotected code. Structural admission
 is not a static proof of arbitrary shell behavior; a workflow digest does not
 bind variable values or self-hosted host state, and separate jobs do not provide
-host isolation. Use dedicated or ephemeral trusted runners for token-bearing
-publishers. A workflow digest also cannot bind future changes to an unprotected
+host isolation. Operators may choose dedicated or ephemeral runners as a risk
+mitigation for token-bearing publishers, but the host itself must be trusted.
+A workflow digest also cannot bind future changes to an unprotected
 dependency. Each explicitly declared file must match that SHA-256 of its UTF-8
 bytes at every inventory read and have exactly `statuses: write` among the
 policy's relevant write permissions. Missing, changed, duplicate,

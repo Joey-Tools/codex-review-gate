@@ -156,11 +156,16 @@ This variable takes precedence over the legacy
 `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` fallback. If neither is set, the
 workflows use `ubuntu-slim`. Runner labels do not register or discover a runner,
 alter branch protections, grant credentials or permissions, or change workflow
-event filters or permission declarations. Organization-variable visibility
+event filters or permission declarations. The installed workflow's explicit
+`runs-on` expression defines runner selection; documented defaults apply only
+when that expression selects the fallback. Organization-variable visibility
 determines which repositories receive the selection. This variable affects
 both workflows. Updating an installed consumer requires updating both
-canonical workflow files, but no Action runtime release. The variable alone
-cannot change an older installed workflow.
+canonical workflow files. Changing only the runner variable or workflow
+`runs-on` labels does not require an Action runtime release. The Linux
+self-hosted runtime compatibility change itself must be included in a newly
+released `@v2` Action payload before consumers can use that support. The
+variable alone cannot change an older installed workflow.
 
 Treat the runner variable and any self-hosted runner it selects as trusted
 operator-controlled configuration. The controller has `actions: write` and
@@ -168,8 +173,11 @@ operator-controlled configuration. The controller has `actions: write` and
 `CODEX_REVIEW_GATE_REQUEST_TOKEN` secret. An exact workflow digest does not bind
 variable values or runner host state, and separate GitHub jobs do not provide
 host isolation. Any self-hosted host that can receive the controller's token
-must be trusted; use dedicated or ephemeral trusted runners for token-bearing
-jobs.
+must be trusted. Dedicated or ephemeral runners may be an operator's chosen
+risk mitigation, but are not an Action-enforced prerequisite. The Action does
+not attest to host integrity or isolation. Linux self-hosted runners are
+supported on this operator-trust basis; Windows and macOS runners remain
+unsupported.
 
 The verifier's read-only permissions include `actions: read`: it must fetch its
 own `pull_request` run's GitHub-server `created_at` through the Actions run
@@ -1364,9 +1372,10 @@ The control-plane owner reviews the exact runner selector, inline scripts and
 data flow: trusted metadata supplies the target SHA/context, and GitHub job
 results supply the terminal outcome. The workflow digest does not bind
 referenced variable values or self-hosted host state, and separate jobs are not
-host isolation; use dedicated or ephemeral trusted runners for token-bearing
-publishers. Do not execute PR-produced text or downloaded mutable/unprotected
-code, or trust a test artifact's claimed outcome.
+host isolation. The operator must trust any host that receives a token;
+dedicated or ephemeral runners are optional risk mitigations, not an
+Action-enforced prerequisite. Do not execute PR-produced text or downloaded
+mutable/unprotected code, or trust a test artifact's claimed outcome.
 
 Then add the declaration to local preview and
 apply, remote staging and activation, and later full-profile cleanup commands.
