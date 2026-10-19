@@ -242,6 +242,30 @@ These are conservative classification limits, not new interpreters or
 additional false-positive waivers; the four accepted conservative matches
 and eight warning-only cases remain unchanged.
 
+Three narrow R11 corrections prevent false positives without inferring
+runtime expansion ([partial repository placeholder](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309295711),
+[caller workflow path case](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309295712),
+[folded `uses` prefix](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309295713)). When the target repository is known and an endpoint has a recognized exact
+`{owner}` or `{repo}` placeholder in one repository component, a different
+valid literal ASCII owner or repository component still establishes that the
+destination is foreign. Do not substitute the placeholder, infer its runtime
+value from the environment/current directory, or perform a network lookup.
+For reusable workflow caller identity, compare owner/repository identity
+case-insensitively but keep `.github/workflows/` path components and the
+workflow path/extension exact and case-sensitive. For a supported folded
+`uses` block scalar, defer classification until the complete scalar boundary;
+only a complete single-content-line value with a plain `>-` or `|-`
+strip-chomp marker can be matched. Multiline or blank-containing, truncated,
+over-budget, explicit-indentation, non-strip-chomp, or otherwise uncertain values remain
+unclassified rather than being matched from a physical-line prefix. These
+rules distinguish an ordinary terminal LF/CRLF's empty split record from
+actual blank scalar content, so a complete one-line strip-chomp caller at EOF
+does not lose its match merely because the file has a terminating newline. The
+bounded literal corrections add no placeholder substitution, environment or
+YAML interpreter, and no new conservative false-positive waiver.
+The four named conservative matches, original eight warning-only examples,
+and strict installer/runtime controls remain unchanged.
+
 Any backslash inside a double-quoted shell word leaves that command
 unclassified instead of interpreting escape rules or erasing characters into a different exact name. A quoted
 gh endpoint must end at a token boundary; quoted/unquoted endpoint concatenation

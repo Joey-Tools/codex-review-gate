@@ -11,10 +11,7 @@ const MAX_FLOW_COLLECTION_CHARS = 2048;
 const MAX_FLOW_COLLECTION_DEPTH = 8;
 const MAX_FOLDED_JOB_NAME_LINES = 4;
 
-const ACTION_CALLERS = [
-  /^JoeyTeng\/codex-review-gate-action(?:\/\.github\/workflows\/codex-review-gate\.ya?ml)?@[^\s,}"']+$/iu,
-  /^Joey-Tools\/codex-review-gate\/\.github\/workflows\/codex-review-gate\.yml@[^\s,}"']+$/iu,
-];
+const MAX_FOLDED_USES_LINES = 16;
 
 /**
  * Best-effort segmented text heuristic covering only a recognized subset of
@@ -91,6 +88,9 @@ export function inspectWorkflowGateSignals(
   const clipped = content.slice(0, MAX_INPUT_CHARS);
   const rawLines = clipped.split(/\r\n|\n|\r/u, MAX_LINES + 1);
   const inputTruncated = content.length > clipped.length || rawLines.length > MAX_LINES;
+  const terminalEmptyLineIndex = !inputTruncated && /(?:\r\n|\n|\r)$/u.test(content)
+    ? rawLines.length - 1
+    : -1;
   const lines = rawLines.slice(0, MAX_LINES).map((raw, index) => {
     if (raw.length > MAX_LINE_CHARS) {
       addWarning(
@@ -105,6 +105,7 @@ export function inspectWorkflowGateSignals(
       line: index + 1,
       raw: limited,
       text: stripComments(limited),
+      terminalEmpty: index === terminalEmptyLineIndex && raw === "",
       truncated:
         raw.length > MAX_LINE_CHARS ||
         (content.length > clipped.length && index === rawLines.length - 1),
@@ -180,7 +181,10 @@ export function inspectWorkflowGateSignals(
     if (line.truncated) {
       yamlAnchors.clear();
       if (foldedJobName) foldedJobName.unclassified = true;
-      if (foldedUses) foldedUses = null;
+      if (foldedUses) {
+        finishFoldedUses(foldedUses, addMatch, addWarning, true);
+        foldedUses = null;
+      }
       continue;
     }
     if (line.yamlQuotedScalarContinuation) {
@@ -205,6 +209,7 @@ export function inspectWorkflowGateSignals(
         foldedJobName = null;
       }
       yamlAnchors.clear();
+      if (foldedUses) finishFoldedUses(foldedUses, addMatch, addWarning);
       foldedUses = null;
     } else if (!line.yamlScalarContent && !isRunCommandLine(line.text)) {
       registerYamlScalarAnchors(line, yamlAnchors, addWarning);
@@ -239,23 +244,31 @@ export function inspectWorkflowGateSignals(
       }
     }
     if (foldedUses) {
-      if (!line.text.trim()) {
-        foldedUses.remaining -= 1;
-      } else if (indentationOf(line.text) > foldedUses.indent) {
-        const expression = line.text.trim();
-        const value = resolveSimpleLiteral(expression, new Map());
-        if (foldedUses.selector) {
-          if (!addCallerMatch(value, line, addMatch)) {
-            warnUnscopedCaller(expression, value, line, addWarning);
-          }
+      if (line.terminalEmpty) {
+        finishFoldedUses(foldedUses, addMatch, addWarning);
+        foldedUses = null;
+        continue;
+      }
+      if (!line.raw.trim()) {
+        foldedUses.unclassified = true;
+        foldedUses.lines += 1;
+        continue;
+      }
+      if (indentationOf(line.raw) > foldedUses.indent) {
+        foldedUses.lines += 1;
+        if (foldedUses.lines === 1 && !foldedUses.unclassified) {
+          foldedUses.content = line.raw.slice(indentationOf(line.raw));
+          foldedUses.contentLine = line.line;
+          foldedUses.contentRaw = line.raw;
         } else {
-          warnUnscopedCaller(expression, value, line, addWarning);
+          foldedUses.unclassified = true;
         }
-        foldedUses.remaining -= 1;
+        if (foldedUses.lines > MAX_FOLDED_USES_LINES) foldedUses.unclassified = true;
+        continue;
       } else {
+        finishFoldedUses(foldedUses, addMatch, addWarning);
         foldedUses = null;
       }
-      if (foldedUses && foldedUses.remaining <= 0) foldedUses = null;
     }
     if (!line.text.trim()) continue;
     inspectLineSignals(
@@ -272,9 +285,24 @@ export function inspectWorkflowGateSignals(
     const yamlFields = line.yamlScalarContent || line.yamlDataField ? [] : fieldsOutsideFlowData(line);
     const uses = yamlFields.find((field) => field.key === "uses");
     if (uses && isBlockScalarIndicator(stripYamlAnchor(uses.value))) {
+      const indicator = stripYamlAnchor(uses.value);
+      const supported = indicator === ">-" || indicator === "|-";
+      if (!supported) {
+        addWarning(
+          "ambiguous-codex-review-gate-caller",
+          line.line,
+          "A uses selector block scalar without a supported plain strip-chomp marker is left unclassified by the bounded text scan.",
+          line.raw,
+        );
+      }
       foldedUses = {
         indent: indentationOf(line.text),
-        remaining: 4,
+        lines: 0,
+        content: null,
+        contentLine: line.line,
+        contentRaw: line.raw,
+        supported,
+        unclassified: line.truncated,
         selector: uses && line.selectorUseStarts?.has(uses.start) === true,
       };
     }
@@ -315,6 +343,8 @@ export function inspectWorkflowGateSignals(
       inputTruncated,
     );
   }
+
+  if (foldedUses) finishFoldedUses(foldedUses, addMatch, addWarning, inputTruncated);
 
   for (const segment of splitScopes(lines)) {
     for (const window of boundedWindows(segment)) {
@@ -700,12 +730,67 @@ function looksLikeGateCaller(value) {
 }
 
 function addCallerMatch(value, line, addMatch) {
-  if (!value || !ACTION_CALLERS.some((pattern) => pattern.test(value))) return false;
-  const kind = value.startsWith("Joey-Tools/")
-    ? "legacy-codex-review-gate-caller"
-    : "codex-review-gate-action-caller";
+  const kind = callerKind(value);
+  if (kind === null) return false;
   addMatch(kind, line.line, line.raw);
   return true;
+}
+
+function callerKind(value) {
+  if (typeof value !== "string") return null;
+  const match = value.match(/^([^/@]+)\/([^/@]+)(?:\/([^@]+))?@([^\s,}"']+)$/u);
+  if (!match) return null;
+  const [, owner, repository, workflowPath = null] = match;
+  if (
+    asciiCaseInsensitiveEqual(owner, "JoeyTeng") &&
+    asciiCaseInsensitiveEqual(repository, "codex-review-gate-action") &&
+    (workflowPath === null ||
+      workflowPath === ".github/workflows/codex-review-gate.yml" ||
+      workflowPath === ".github/workflows/codex-review-gate.yaml")
+  ) {
+    return "codex-review-gate-action-caller";
+  }
+  if (
+    asciiCaseInsensitiveEqual(owner, "Joey-Tools") &&
+    asciiCaseInsensitiveEqual(repository, "codex-review-gate") &&
+    workflowPath === ".github/workflows/codex-review-gate.yml"
+  ) {
+    return "legacy-codex-review-gate-caller";
+  }
+  return null;
+}
+
+function finishFoldedUses(foldedUses, addMatch, addWarning, inputIncomplete = false) {
+  if (!foldedUses.selector) return;
+  if (
+    !foldedUses.supported ||
+    foldedUses.unclassified ||
+    foldedUses.lines !== 1 ||
+    foldedUses.content === null ||
+    inputIncomplete
+  ) {
+    if (foldedUses.supported) {
+      addWarning(
+        "ambiguous-codex-review-gate-caller",
+        foldedUses.contentLine,
+        `A uses selector block scalar was not classified within the ${MAX_FOLDED_USES_LINES}-line bounded single-line scan.`,
+        foldedUses.contentRaw,
+      );
+    }
+    return;
+  }
+
+  if (!addCallerMatch(foldedUses.content, {
+    line: foldedUses.contentLine,
+    raw: foldedUses.contentRaw,
+  }, addMatch)) {
+    warnUnscopedCaller(
+      foldedUses.content,
+      foldedUses.content,
+      { line: foldedUses.contentLine, raw: foldedUses.contentRaw },
+      addWarning,
+    );
+  }
 }
 
 function indentationOf(text) {
@@ -1040,10 +1125,23 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
 function isKnownForeignRepositoryEndpoint(endpoint, repositoryFullName) {
   if (typeof repositoryFullName !== "string") return false;
   const target = repositoryFullName.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/u);
-  const destination = endpoint?.match(/^\/?repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\//u);
+  const destination = endpoint?.match(/^\/?repos\/([^/?#]+)\/([^/?#]+)\//u);
   if (!target || !destination) return false;
-  return `${destination[1]}/${destination[2]}`.toLowerCase() !==
-    `${target[1]}/${target[2]}`.toLowerCase();
+  const targetParts = target.slice(1);
+  const destinationParts = destination.slice(1);
+  const placeholders = new Set(["{owner}", "{repo}"]);
+  const hasSupportedPlaceholder = destinationParts.some((component) => placeholders.has(component));
+  if (!hasSupportedPlaceholder) {
+    if (!destinationParts.every((component) => /^[A-Za-z0-9_.-]+$/u.test(component))) return false;
+    return `${destinationParts[0]}/${destinationParts[1]}`.toLowerCase() !==
+      `${targetParts[0]}/${targetParts[1]}`.toLowerCase();
+  }
+
+  return destinationParts.some((component, index) =>
+    !placeholders.has(component) &&
+    /^[A-Za-z0-9_.-]+$/u.test(component) &&
+    component.toLowerCase() !== targetParts[index].toLowerCase(),
+  );
 }
 
 function supportedGitHubApiPath(target) {

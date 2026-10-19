@@ -638,6 +638,36 @@ test("finds literal action and legacy reusable-workflow callers", () => {
   assert.ok(unrelatedSourceWorkflows.warnings.length > 0);
 });
 
+test("compares caller owner and repository case-insensitively but keeps workflow paths exact", () => {
+  const positive = inspectWorkflowGateSignals([
+    "jobs:",
+    "  callers:",
+    "    steps:",
+    "      - uses: jOEyTENG/CODEX-REVIEW-GATE-ACTION@v2",
+    "      - uses: JOEY-TOOLS/CODEX-REVIEW-GATE/.github/workflows/codex-review-gate.yml@v1",
+  ].join("\n"));
+  assert.deepEqual(
+    positive.matches.map(({ kind }) => kind),
+    ["codex-review-gate-action-caller", "legacy-codex-review-gate-caller"],
+  );
+
+  const pathCase = inspectWorkflowGateSignals([
+    "jobs:",
+    "  callers:",
+    "    steps:",
+    "      - uses: JoeyTeng/codex-review-gate-action/.GITHUB/workflows/codex-review-gate.yml@v2",
+    "      - uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.YML@v2",
+    "      - uses: Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.YML@v1",
+    "      - uses: Joey-Tools/codex-review-gate/.github/workflows/CODEX-REVIEW-GATE.yml@master",
+    "      - uses: JoeyTeng/codex-review-gate-action/.github/WORKFLOWS/codex-review-gate.yml@v1",
+  ].join("\n"));
+  assert.deepEqual(pathCase.matches, []);
+  assert.equal(
+    inspectWorkflowGateSignals("jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@topic@ref").matches.length,
+    1,
+  );
+});
+
 test("blocks only job and step uses selectors, warning on unrelated uses data", () => {
   const selectors = inspectWorkflowGateSignals([
     "jobs:",
@@ -1015,19 +1045,135 @@ test("warns instead of resolving anchors past the per-document cap", () => {
   assert.ok(result.warnings.some(({ kind }) => kind === "unknown-yaml-scalar-alias"));
 });
 
-test("finds known caller literals on the next line of folded uses scalars", () => {
+test("finds known caller literals on one content line of strip-chomp folded uses scalars", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
     "  folded:",
     "    steps:",
     "      - uses: >-",
     "          JoeyTeng/codex-review-gate-action@v2",
-    "      - uses: >",
+    "      - uses: >-",
     "          Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@v1",
   ].join("\n"));
 
   assert.deepEqual(
     result.matches.map(({ kind }) => kind),
+    ["codex-review-gate-action-caller", "legacy-codex-review-gate-caller"],
+  );
+});
+
+test("does not match prefixes or uncertain folded uses bodies", () => {
+  for (const marker of [">2-", ">-2", "|2-"]) {
+    const explicitIndent = inspectWorkflowGateSignals(`jobs:\n  gate:\n    uses: ${marker}\n      JoeyTeng/codex-review-gate-action@v2\n`);
+    assert.deepEqual(explicitIndent.matches, []);
+    assert.ok(explicitIndent.warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"));
+  }
+  const multipleLines = inspectWorkflowGateSignals([
+    "jobs:",
+    "  folded:",
+    "    steps:",
+    "      - uses: >-",
+    "          JoeyTeng/codex-review-gate-action@v2",
+    "          extra suffix",
+    "      - uses: JoeyTeng/codex-review-gate-action@v3",
+  ].join("\n"));
+  assert.deepEqual(
+    multipleLines.matches.map(({ kind, line }) => [kind, line]),
+    [["codex-review-gate-action-caller", 7]],
+  );
+  assert.ok(multipleLines.warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"));
+
+  for (const content of [
+    [
+      "jobs:",
+      "  folded:",
+      "    steps:",
+      "      - uses: >",
+      "          JoeyTeng/codex-review-gate-action@v2",
+    ].join("\n"),
+    [
+      "jobs:",
+      "  folded:",
+      "    steps:",
+      "      - uses: >-",
+      "",
+      "          JoeyTeng/codex-review-gate-action@v2",
+    ].join("\n"),
+    [
+      "jobs:",
+      "  folded:",
+      "    steps:",
+      "      - uses: >-",
+      `          JoeyTeng/codex-review-gate-action@v2 ${"x".repeat(4096)}`,
+    ].join("\n"),
+    [
+      "jobs:",
+      "  folded:",
+      "    steps:",
+      "      - uses: >-",
+      ...Array.from({ length: 17 }, () => "          extra content"),
+      "          JoeyTeng/codex-review-gate-action@v2",
+    ].join("\n"),
+  ]) {
+    const result = inspectWorkflowGateSignals(content);
+    assert.deepEqual(result.matches, []);
+    assert.ok(result.warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"));
+  }
+
+  for (const body of [
+    "          JoeyTeng/codex-review-gate-action@v2 ",
+    '          "JoeyTeng/codex-review-gate-action@v2"',
+  ]) {
+    const result = inspectWorkflowGateSignals([
+      "jobs:",
+      "  folded:",
+      "    steps:",
+      "      - uses: >-",
+      body,
+    ].join("\n"));
+    assert.deepEqual(result.matches, []);
+  }
+});
+
+test("finalizes bounded folded uses at EOF and YAML document boundaries", () => {
+  const eofLines = [
+    "jobs:",
+    "  folded:",
+    "    steps:",
+    "      - uses: >-",
+    "          JoeyTeng/codex-review-gate-action@v2",
+  ];
+  const eof = inspectWorkflowGateSignals(eofLines.join("\n"));
+  assert.deepEqual(eof.matches.map(({ kind }) => kind), ["codex-review-gate-action-caller"]);
+  for (const ending of ["\n", "\r\n"]) {
+    const withTerminalNewline = inspectWorkflowGateSignals(eofLines.join(ending) + ending);
+    assert.deepEqual(
+      withTerminalNewline.matches.map(({ kind }) => kind),
+      ["codex-review-gate-action-caller"],
+      JSON.stringify(ending),
+    );
+  }
+
+  const actualBlankContent = inspectWorkflowGateSignals([
+    ...eofLines,
+    "",
+  ].join("\n") + "\n");
+  assert.deepEqual(actualBlankContent.matches, []);
+  assert.ok(actualBlankContent.warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"));
+
+  const boundary = inspectWorkflowGateSignals([
+    "jobs:",
+    "  folded:",
+    "    steps:",
+    "      - uses: >-",
+    "          JoeyTeng/codex-review-gate-action@v2",
+    "---",
+    "jobs:",
+    "  next:",
+    "    uses: Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@v1",
+  ].join("\n"));
+  assert.deepEqual(
+    boundary.matches.map(({ kind }) => kind),
     ["codex-review-gate-action-caller", "legacy-codex-review-gate-caller"],
   );
 });
@@ -1162,6 +1308,15 @@ test("keeps Windows GH executable discovery outside the literal lowercase gh gra
 });
 
 test("filters literal API publishers for a known foreign repository only", () => {
+  for (const endpoint of [
+    "repos/{owner}/other/check-runs",
+    "repos/other/{repo}/check-runs",
+    "repos/{repo}/other/check-runs",
+    "repos/other/{owner}/check-runs",
+  ]) {
+    const command = `run: gh api '${endpoint}' -f name=codex/github-review-gate -f head_sha=0123456789abcdef0123456789abcdef01234567`;
+    assert.deepEqual(inspectWorkflowGateSignals(command, { repositoryFullName: "acme/project" }).matches, []);
+  }
   const cli = "run: gh api repos/other/repo/statuses/$SHA -f context=codex/github-review-gate -f state=success";
   const curl = `run: curl -X POST -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/other/repo/statuses/$SHA`;
   const sameTarget = [
@@ -1194,6 +1349,30 @@ test("filters literal API publishers for a known foreign repository only", () =>
     const unknownTarget = `run: gh api ${endpoint} -f context=codex/github-review-gate -f state=success`;
     assert.equal(
       inspectWorkflowGateSignals(unknownTarget, { repositoryFullName: "target/repo" }).matches.length,
+      1,
+      endpoint,
+    );
+  }
+
+  for (const endpoint of [
+    "repos/{owner}/other/statuses/$SHA",
+    "repos/other/{repo}/statuses/$SHA",
+  ]) {
+    const partialPlaceholder = `run: gh api ${endpoint} -f context=codex/github-review-gate -f state=success`;
+    assert.equal(
+      inspectWorkflowGateSignals(partialPlaceholder, { repositoryFullName: "acme/project" }).matches.length,
+      0,
+      endpoint,
+    );
+  }
+  for (const endpoint of [
+    "repos/{owner}/{repo}/statuses/$SHA",
+    "repos/$OWNER/other/statuses/$SHA",
+    "repos/other%2Fowner/project/statuses/$SHA",
+  ]) {
+    const unknownOrFullPlaceholder = `run: gh api ${endpoint} -f context=codex/github-review-gate -f state=success`;
+    assert.equal(
+      inspectWorkflowGateSignals(unknownOrFullPlaceholder, { repositoryFullName: "acme/project" }).matches.length,
       1,
       endpoint,
     );
