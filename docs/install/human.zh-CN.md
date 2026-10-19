@@ -120,15 +120,21 @@ gh variable set CODEX_REVIEW_GATE_RUNNER_LABELS \
 该 variable 优先于旧的 `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true` fallback。两者都未设置时，
 workflow 使用 `ubuntu-slim`。Runner label 不会自动发现或注册 runner、修改 branch protection，
 授予 credentials 或 permissions，也不会改变 workflow event filters 或 permission 声明。
+该 variable 不会覆盖已安装 workflow 中显式配置的 `runs-on` expression；这些默认值仅在该
+表达式选择 fallback 时生效。
 Organization variable 的 visibility 决定哪些 repository 会收到这个选择。该值同时
-影响 verifier 和 controller；已安装的 consumer 必须更新两份 canonical workflow 文件才会生效，
-但不需要发布新的 Action runtime。仅设置 variable 不会改变旧版已安装 workflow。
+影响 verifier 和 controller；已安装的 consumer 必须更新两份 canonical workflow 文件才会生效。
+仅更改 runner variable 或 workflow `runs-on` labels 不需要发布新的 Action runtime。Linux
+self-hosted runtime compatibility 改动本身必须包含在新发布的 `@v2` Action payload 中，consumer
+才可使用该支持。仅设置 variable 不会改变旧版已安装 workflow。
 
 请把 runner variable 与它选择的 self-hosted runner 都视为由 operator 控制的 trusted
 configuration。Controller 拥有 `actions: write` 和 `pull-requests: write`，并且在配置时还可能
 收到可选的 `CODEX_REVIEW_GATE_REQUEST_TOKEN` secret。Exact workflow digest 不绑定 variable
-值或 runner host state；独立 GitHub jobs 也不提供 host isolation。能够接收 controller token
-的 self-hosted host 必须可信；对携带 token 的 jobs 使用专用或 ephemeral trusted runner。
+值或 runner host state；独立 GitHub jobs 也不提供 host isolation，Action 也不会证明 host
+integrity 或 isolation。能够接收 controller token 的 host 必须可信。专用或 ephemeral runner
+可作为 operator 自选的风险缓解措施，但不是 Action 强制要求。Linux self-hosted runners 基于
+这一 operator trust assumption 获得支持；Windows/macOS runners 仍不支持。
 
 Verifier 的只读权限包括 `actions: read`：它必须通过 Actions run API 取得自身
 `pull_request` run 由 GitHub 服务器记录的 `created_at`。Private repository 必须有

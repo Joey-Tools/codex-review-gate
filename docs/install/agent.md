@@ -2023,13 +2023,18 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    The value selects the runner for both verifier and controller, and takes
    precedence over `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true`. If it is unset,
    the legacy variable selects `ubuntu-latest` when true; otherwise the
-   default is `ubuntu-slim`. Runner labels do not discover or register runners,
+   default is `ubuntu-slim`. An installed workflow's explicit `runs-on`
+   expression remains authoritative; these defaults apply only when its
+   configured selection falls back to them. Runner labels do not discover or register runners,
    alter branch protections, grant credentials or permissions, or change workflow
    event filters or permission declarations. If using an
    organization variable, limit its visibility to the intended repositories.
    A variable alone does not update previously installed workflows; consumers
    must update both canonical workflow files to the new `runs-on` expression.
-   No Action runtime release is needed.
+   Changing only the runner variable or these `runs-on` labels needs no Action
+   runtime release. The Linux self-hosted runtime compatibility change itself
+   must be included in a newly released `@v2` Action payload before consumers
+   can use that support.
 
    Treat the variable and selected self-hosted host as trusted,
    operator-controlled configuration. The controller has `actions: write` and
@@ -2037,7 +2042,11 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    `CODEX_REVIEW_GATE_REQUEST_TOKEN` secret. An exact workflow digest does not
    bind variable values or host state, and separate GitHub jobs are not host
    isolation. Any self-hosted host handling the controller token must be
-   trusted; use dedicated or ephemeral trusted runners for token-bearing jobs.
+   trusted. Dedicated or ephemeral runners may be an operator's chosen risk
+   mitigation, but are not an Action-enforced prerequisite. The Action does
+   not attest to host integrity or isolation. Linux self-hosted runners are
+   supported on this operator-trust basis; Windows and macOS runners remain
+   unsupported.
 
    If `CODEX_REVIEW_GATE_RUNNER_LABELS` is unset and `ubuntu-slim` is
    unavailable, the legacy hosted fallback remains available:

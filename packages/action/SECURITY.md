@@ -98,6 +98,17 @@ for accepted coverage limits and examples.
 
 ## Runtime boundary
 
+Current v2 runtime support is limited to Linux runners whose GitHub-provided
+environment is identified as `github-hosted` or `self-hosted`; Windows and
+macOS remain unsupported. Selecting a self-hosted Linux runner is an operator
+trust assumption. The operator is responsible for the host and any isolation;
+the Action does not attest to host integrity or isolation, and separate GitHub
+jobs do not isolate a shared host. In particular, trust any controller host
+that can receive `actions: write`, `pull-requests: write`, or the optional
+request token. No additional runner-specific trust flag, allowlist, host API,
+attestation, or approval mechanism is required. This does not waive any
+independent workflow, environment, or repository approval controls.
+
 Retain the verifier's closed `pull_request` activity types `opened`, `reopened`,
 `synchronize` and `ready_for_review`. It is read-only and has no authoritative
 write API. Retain the controller's closed `issue_comment` `created`, protected

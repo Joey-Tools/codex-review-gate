@@ -840,13 +840,19 @@ gh pr merge "$PR_NUMBER" \
 
 ## 支持边界和 non-goals
 
-stable v2.0 支持 GitHub.com public/private repositories、从普通
-same-repository branch 到 default branch 的 open non-draft PR、GitHub-hosted
-Linux runners，以及普通 merge/squash/rebase methods。
+当前 v2 支持 GitHub.com public/private repositories、从普通
+same-repository branch 到 default branch 的 open non-draft PR、GitHub-hosted 或
+self-hosted 环境中的 Linux runners，以及普通 merge/squash/rebase methods。默认
+runner 选择仍是 `ubuntu-slim`，采用 `ubuntu-latest` fallback。
+已安装 workflow 中显式配置的 `runs-on` expression 仍然有效；这些默认值仅在该配置采用
+默认选择时生效。
 
-GHES、forks、merge queues、non-default bases、drafts、bot-owned PRs、
-self-hosted/Windows/macOS runners，以及对 closed/merged PR 发起的新 operation 都会
-fail closed。
+GHES、forks、merge queues、non-default bases、drafts、bot-owned PRs、Windows/macOS
+runners，以及对 closed/merged PR 发起的新 operation 都会 fail closed。选择
+self-hosted Linux runner 是基于 operator 信任的假设；Action 不会证明 host integrity
+或 isolation，独立 GitHub jobs 也不提供 host isolation。能够接收 controller token 的
+controller host 必须可信。无需额外 runner-specific trust flag、allowlist、host API、
+attestation 或 approval mechanism；这不改变独立的 workflow 或 environment approval 要求。
 
 本设计不宣称：
 
