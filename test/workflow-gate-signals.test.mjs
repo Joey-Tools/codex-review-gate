@@ -602,8 +602,10 @@ test("finds literal action and legacy reusable-workflow callers", () => {
     "  one:",
     "    steps:",
     "      - uses: JoeyTeng/codex-review-gate-action@v2",
-    "      - uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
-    "      - uses: Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@0123456789abcdef",
+    "  two:",
+    "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
+    "  three:",
+    "    uses: Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@0123456789abcdef",
   ].join("\n"));
 
   assert.deepEqual(
@@ -644,7 +646,8 @@ test("compares caller owner and repository case-insensitively but keeps workflow
     "  callers:",
     "    steps:",
     "      - uses: jOEyTENG/CODEX-REVIEW-GATE-ACTION@v2",
-    "      - uses: JOEY-TOOLS/CODEX-REVIEW-GATE/.github/workflows/codex-review-gate.yml@v1",
+    "  reusable:",
+    "    uses: JOEY-TOOLS/CODEX-REVIEW-GATE/.github/workflows/codex-review-gate.yml@v1",
   ].join("\n"));
   assert.deepEqual(
     positive.matches.map(({ kind }) => kind),
@@ -663,7 +666,7 @@ test("compares caller owner and repository case-insensitively but keeps workflow
   ].join("\n"));
   assert.deepEqual(pathCase.matches, []);
   assert.equal(
-    inspectWorkflowGateSignals("jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@topic@ref").matches.length,
+    inspectWorkflowGateSignals("jobs:\n  gate:\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@topic@ref").matches.length,
     1,
   );
 });
@@ -671,17 +674,17 @@ test("compares caller owner and repository case-insensitively but keeps workflow
 test("blocks only job and step uses selectors, warning on unrelated uses data", () => {
   const selectors = inspectWorkflowGateSignals([
     "jobs:",
-    "  reusable:",
-    "    uses: JoeyTeng/codex-review-gate-action@v2",
-    "  steps:",
+    "  root_action:",
     "    steps:",
     "      - uses: JoeyTeng/codex-review-gate-action@v2",
+    "  reusable:",
+    "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2",
   ].join("\n"));
   assert.equal(selectors.matches.length, 2);
   assert.ok(selectors.matches.every(({ kind }) => kind === "codex-review-gate-action-caller"));
 
   const flowJobSelector = inspectWorkflowGateSignals(
-    "{jobs: {reusable: {uses: JoeyTeng/codex-review-gate-action@v2}}}",
+    "{jobs: {reusable: {uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2}}}",
   );
   assert.equal(flowJobSelector.matches.length, 1);
   assert.equal(flowJobSelector.matches[0].kind, "codex-review-gate-action-caller");
@@ -691,6 +694,18 @@ test("blocks only job and step uses selectors, warning on unrelated uses data", 
   );
   assert.equal(flowStepSelector.matches.length, 1);
   assert.equal(flowStepSelector.matches[0].kind, "codex-review-gate-action-caller");
+
+  for (const content of [
+    "jobs:\n  wrong_job_role:\n    uses: JoeyTeng/codex-review-gate-action@v2",
+    "jobs:\n  wrong_step_role:\n    steps:\n      - uses: Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@v2",
+    "{jobs: {build: {steps: [{uses: Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@v2}]}}}",
+  ]) {
+    assert.deepEqual(inspectWorkflowGateSignals(content).matches, [], content);
+    assert.ok(
+      inspectWorkflowGateSignals(content).warnings.some(({ kind }) => kind === "ambiguous-codex-review-gate-caller"),
+      content,
+    );
+  }
 
   for (const content of [
     "jobs: {build: {steps: [{name: gate, uses: JoeyTeng/codex-review-gate-action@v2, with: {uses: JoeyTeng/codex-review-gate-action@v1}}]}}",
@@ -1048,12 +1063,13 @@ test("warns instead of resolving anchors past the per-document cap", () => {
 test("finds known caller literals on one content line of strip-chomp folded uses scalars", () => {
   const result = inspectWorkflowGateSignals([
     "jobs:",
-    "  folded:",
+    "  folded_action:",
     "    steps:",
     "      - uses: >-",
     "          JoeyTeng/codex-review-gate-action@v2",
-    "      - uses: >-",
-    "          Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@v1",
+    "  folded_workflow:",
+    "    uses: >-",
+    "      Joey-Tools/codex-review-gate/.github/workflows/codex-review-gate.yml@v1",
   ].join("\n"));
 
   assert.deepEqual(
@@ -1305,6 +1321,39 @@ test("keeps Windows GH executable discovery outside the literal lowercase gh gra
 
   const supported = inspectWorkflowGateSignals(`run: gh api ${body}`);
   assert.deepEqual(supported.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+});
+
+test("leaves scalar publishers unclassified when relevant gh fields use nested syntax", () => {
+  const conflicts = [
+    "run: gh api repos/o/r/check-runs -f name[sub]=x -f name=codex/github-review-gate -f head_sha=abc",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -F name[0]=x -f head_sha=abc",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate --field=name[]=x -f head_sha=abc",
+    "run: gh api repos/o/r/check-runs --raw-field name[sub]=x --raw-field name=codex/github-review-gate -f head_sha=abc",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha[sub]=abc",
+    "run: gh api repos/o/r/check-runs -F=head_sha[]=x -f name=codex/github-review-gate -f head_sha=abc",
+    "run: gh api repos/o/r/check-runs -f name=codex/github-review-gate -f head_sha=abc -f head_sha[]",
+    "run: gh api repos/o/r/statuses/$SHA -f context[sub]=x -f context=codex/github-review-gate -f state=success",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=success -f state[0]=failure",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=success --field state[]=failure",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=success -f context[]",
+    "run: gh api repos/o/r/statuses/$SHA -f context[] -f context=codex/github-review-gate -f state=success",
+    "run: gh api repos/o/r/statuses/$SHA -F=state[]=failure -f context=codex/github-review-gate -f state=success",
+    "run: gh api repos/o/r/statuses/$SHA -f state[]=failure -f context=codex/github-review-gate -f state=success",
+    "run: gh api repos/o/r/statuses/$SHA -f context=codex/github-review-gate -f state=success --raw-field=context[sub]=x",
+  ];
+  for (const command of conflicts) {
+    assert.deepEqual(inspectWorkflowGateSignals(command).matches, [], command);
+  }
+
+  const unrelatedNestedField = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs -f note[sub]=ignored -f name=codex/github-review-gate -f head_sha=abc",
+  );
+  assert.deepEqual(unrelatedNestedField.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
+
+  const nestedTextInHeader = inspectWorkflowGateSignals(
+    "run: gh api repos/o/r/check-runs -H 'X-Note: name[sub]=ignored' -f name=codex/github-review-gate -f head_sha=abc",
+  );
+  assert.deepEqual(nestedTextInHeader.matches.map(({ kind }) => kind), ["reserved-check-run-name"]);
 });
 
 test("filters literal API publishers for a known foreign repository only", () => {
@@ -2080,6 +2129,32 @@ test("matches fixed curl API route segments case-sensitively and rejects literal
   );
   assert.equal(statusControl.matches.length, 1);
   assert.equal(statusControl.matches[0].kind, "reserved-status-context");
+});
+
+test("does not apply gh repository placeholders to curl URL paths", () => {
+  const payload = `'{"context":"codex/github-review-gate","state":"success"}'`;
+  for (const target of [
+    "https://api.github.com/repos/{owner}/other/statuses/$SHA",
+    "https://api.github.com/repos/%7Bowner%7D/other/statuses/$SHA",
+  ]) {
+    const result = inspectWorkflowGateSignals(
+      `run: curl -g -X POST -d ${payload} '${target}'`,
+      { repositoryFullName: "acme/project" },
+    );
+    assert.deepEqual(result.matches, [], target);
+  }
+
+  const queryControl = inspectWorkflowGateSignals(
+    `run: curl -g -X POST -d ${payload} 'https://api.github.com/repos/acme/project/statuses/$SHA?probe={value}'`,
+    { repositoryFullName: "acme/project" },
+  );
+  assert.deepEqual(queryControl.matches.map(({ kind }) => kind), ["reserved-status-context"]);
+
+  const ordinaryLiteral = inspectWorkflowGateSignals(
+    `run: curl -X POST -d ${payload} https://api.github.com/repos/acme/project/statuses/$SHA`,
+    { repositoryFullName: "acme/project" },
+  );
+  assert.deepEqual(ordinaryLiteral.matches.map(({ kind }) => kind), ["reserved-status-context"]);
 });
 
 test("finds only explicit commit-status POST publishers in bounded curl commands", () => {

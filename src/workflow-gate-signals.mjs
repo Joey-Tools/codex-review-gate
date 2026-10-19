@@ -303,7 +303,7 @@ export function inspectWorkflowGateSignals(
         contentRaw: line.raw,
         supported,
         unclassified: line.truncated,
-        selector: uses && line.selectorUseStarts?.has(uses.start) === true,
+        role: line.selectorUseRoles?.get(uses.start) ?? null,
       };
     }
     const name = yamlFields.find((field) => isNameField(field.key));
@@ -480,7 +480,7 @@ function inspectLineSignals(
       const value = resolveField(field.value);
       if (line.selectorUseStarts?.has(field.start)) {
         recognizedUses.push(field.value);
-        if (!addCallerMatch(value, line, addMatch)) {
+        if (!addCallerMatch(value, line.selectorUseRoles?.get(field.start), line, addMatch)) {
           warnUnscopedCaller(field.value, value, line, addWarning);
         }
       }
@@ -499,14 +499,17 @@ function inspectLineSignals(
       addMatch("reserved-job-name", line.line, line.raw);
     }
   }
-  for (const field of [
-    ...(line.flowJobFields?.uses ?? []),
-    ...(line.inlineJobFields?.uses ?? []),
-    ...(line.flowStepUses ?? []),
-  ]) {
+  for (const field of [...(line.flowJobFields?.uses ?? []), ...(line.inlineJobFields?.uses ?? [])]) {
     recognizedUses.push(field.value);
     const value = resolveField(field.value);
-    if (!addCallerMatch(value, line, addMatch)) {
+    if (!addCallerMatch(value, "job", line, addMatch)) {
+      warnUnscopedCaller(field.value, value, line, addWarning);
+    }
+  }
+  for (const field of line.flowStepUses ?? []) {
+    recognizedUses.push(field.value);
+    const value = resolveField(field.value);
+    if (!addCallerMatch(value, "step", line, addMatch)) {
       warnUnscopedCaller(field.value, value, line, addWarning);
     }
   }
@@ -592,7 +595,14 @@ function inspectWindow(
       for (const field of fieldsOutsideFlowData(line)) {
         if (field.key === "uses") {
           if (line.selectorUseStarts?.has(field.start)) {
-            inspectCaller(field.value, literals, line, addMatch, addWarning);
+            inspectCaller(
+              field.value,
+              line.selectorUseRoles?.get(field.start),
+              literals,
+              line,
+              addMatch,
+              addWarning,
+            );
           }
           continue;
         }
@@ -607,12 +617,11 @@ function inspectWindow(
     ]) {
       inspectContext("name", field.value, yamlLiterals, line, reserved, addMatch, addWarning, resolveYamlWindowLiteral);
     }
-    for (const field of [
-      ...(line.flowJobFields?.uses ?? []),
-      ...(line.inlineJobFields?.uses ?? []),
-      ...(line.flowStepUses ?? []),
-    ]) {
-      inspectCaller(field.value, literals, line, addMatch, addWarning);
+    for (const field of [...(line.flowJobFields?.uses ?? []), ...(line.inlineJobFields?.uses ?? [])]) {
+      inspectCaller(field.value, "job", literals, line, addMatch, addWarning);
+    }
+    for (const field of line.flowStepUses ?? []) {
+      inspectCaller(field.value, "step", literals, line, addMatch, addWarning);
     }
     const cliContext = cliContextExpression(line.text, repositoryFullName, implicitCliHostUncertain, implicitCliRepositoryUncertain);
     if (cliContext) {
@@ -700,10 +709,10 @@ function inspectContext(
   }
 }
 
-function inspectCaller(expression, literals, line, addMatch, addWarning) {
+function inspectCaller(expression, role, literals, line, addMatch, addWarning) {
   const value = resolveSimpleLiteral(stripYamlAnchor(expression), literals);
   if (
-    !addCallerMatch(value, line, addMatch) &&
+    !addCallerMatch(value, role, line, addMatch) &&
     looksLikeGateCaller(`${expression} ${value ?? ""}`)
   ) {
     addWarning(
@@ -729,14 +738,14 @@ function looksLikeGateCaller(value) {
   return /codex-review-gate-action|Joey-Tools\/codex-review-gate|JoeyTeng/iu.test(value);
 }
 
-function addCallerMatch(value, line, addMatch) {
-  const kind = callerKind(value);
+function addCallerMatch(value, role, line, addMatch) {
+  const kind = callerKind(value, role);
   if (kind === null) return false;
   addMatch(kind, line.line, line.raw);
   return true;
 }
 
-function callerKind(value) {
+function callerKind(value, role) {
   if (typeof value !== "string") return null;
   const match = value.match(/^([^/@]+)\/([^/@]+)(?:\/([^@]+))?@([^\s,}"']+)$/u);
   if (!match) return null;
@@ -746,14 +755,17 @@ function callerKind(value) {
     asciiCaseInsensitiveEqual(repository, "codex-review-gate-action") &&
     (workflowPath === null ||
       workflowPath === ".github/workflows/codex-review-gate.yml" ||
-      workflowPath === ".github/workflows/codex-review-gate.yaml")
+      workflowPath === ".github/workflows/codex-review-gate.yaml") &&
+    ((workflowPath === null && role === "step") ||
+      (workflowPath !== null && role === "job"))
   ) {
     return "codex-review-gate-action-caller";
   }
   if (
     asciiCaseInsensitiveEqual(owner, "Joey-Tools") &&
     asciiCaseInsensitiveEqual(repository, "codex-review-gate") &&
-    workflowPath === ".github/workflows/codex-review-gate.yml"
+    workflowPath === ".github/workflows/codex-review-gate.yml" &&
+    role === "job"
   ) {
     return "legacy-codex-review-gate-caller";
   }
@@ -761,7 +773,7 @@ function callerKind(value) {
 }
 
 function finishFoldedUses(foldedUses, addMatch, addWarning, inputIncomplete = false) {
-  if (!foldedUses.selector) return;
+  if (foldedUses.role === null) return;
   if (
     !foldedUses.supported ||
     foldedUses.unclassified ||
@@ -780,7 +792,7 @@ function finishFoldedUses(foldedUses, addMatch, addWarning, inputIncomplete = fa
     return;
   }
 
-  if (!addCallerMatch(foldedUses.content, {
+  if (!addCallerMatch(foldedUses.content, foldedUses.role, {
     line: foldedUses.contentLine,
     raw: foldedUses.contentRaw,
   }, addMatch)) {
@@ -1098,6 +1110,9 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
 
   const apiPath = supportedGitHubApiPath(target);
   if (apiPath === null) return null;
+  // gh placeholders are not curl URL substitutions; do not interpret
+  // brace-bearing curl paths as a concrete repository destination.
+  if (/[{}]|%7[bd]/iu.test(apiPath)) return null;
   if (isKnownForeignRepositoryEndpoint(apiPath, repositoryFullName)) return null;
   const checkRunsEndpoint = /^\/repos\/[^/]+\/[^/]+\/check-runs$/u.test(apiPath);
   const statusesEndpoint = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/]+$/u.test(apiPath);
@@ -1471,8 +1486,11 @@ function cliFieldValues(text, field) {
     } else if (["-f=", "-F=", "--field=", "--raw-field="].some((prefix) => argument.startsWith(prefix))) {
       value = argument.slice(argument.indexOf("=") + 1);
     }
-    if (typeof value === "string" && value.startsWith(`${field}=`)) {
-      values.push(value.slice(value.indexOf("=") + 1));
+    if (typeof value === "string") {
+      const equalsIndex = value.indexOf("=");
+      const key = equalsIndex < 0 ? value : value.slice(0, equalsIndex);
+      if (key.startsWith(`${field}[`)) return null;
+      if (equalsIndex >= 0 && key === field) values.push(value.slice(equalsIndex + 1));
     }
   }
   return values;
@@ -1610,7 +1628,7 @@ function markYamlJobNameFields(lines) {
     ) {
       stepIndent = indent;
       stepPropertyIndent = null;
-      if (key?.toLowerCase() === "uses") markSelectorUse(line);
+      if (key?.toLowerCase() === "uses") markSelectorUse(line, "step");
       continue;
     }
     if (jobPropertyIndent === null) jobPropertyIndent = indent;
@@ -1620,7 +1638,7 @@ function markYamlJobNameFields(lines) {
         activeJob?.nameLines.push(line);
       }
       if (key?.toLowerCase() === "uses") {
-        markSelectorUse(line);
+        markSelectorUse(line, "job");
       }
       if (key?.toLowerCase() === "steps") {
         const flowSteps = simpleFlowStepUses(text.slice(text.indexOf(":") + 1));
@@ -1649,14 +1667,14 @@ function markYamlJobNameFields(lines) {
       stepIndent = indent;
       stepPropertyIndent = null;
       if (key?.toLowerCase() === "uses") {
-        markSelectorUse(line);
+        markSelectorUse(line, "step");
       }
       continue;
     }
     if (stepIndent !== null && indent > stepIndent) {
       if (stepPropertyIndent === null) stepPropertyIndent = indent;
       if (indent === stepPropertyIndent && key?.toLowerCase() === "uses") {
-        markSelectorUse(line);
+        markSelectorUse(line, "step");
       }
     }
   }
@@ -1750,7 +1768,7 @@ function markUnknownRunContinuations(lines, reserved, addWarning) {
   }
 }
 
-function markSelectorUse(line) {
+function markSelectorUse(line, role) {
   if (line.yamlDataField || line.yamlScalarContent) return;
   const field = fieldsOnLine(line.text).find(
     (candidate) =>
@@ -1760,6 +1778,8 @@ function markSelectorUse(line) {
   if (!field) return;
   line.selectorUseStarts ??= new Set();
   line.selectorUseStarts.add(field.start);
+  line.selectorUseRoles ??= new Map();
+  line.selectorUseRoles.set(field.start, role);
 }
 
 function markYamlDataAndScalarFields(lines) {

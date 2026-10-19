@@ -266,6 +266,11 @@ YAML interpreter, and no new conservative false-positive waiver.
 The four named conservative matches, original eight warning-only examples,
 and strict installer/runtime controls remain unchanged.
 
+Three R12 role and value-scope corrections keep the existing literal
+classifiers from overclaiming ([curl brace path](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309370811),
+[workflow-file selector role](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309370820),
+[CLI field collisions](https://github.com/Joey-Tools/codex-review-gate/pull/128#discussion_r4309370826)). A literal curl URL path containing braces is unclassified; GitHub's `{owner}` / `{repo}` endpoint-placeholder rule is specific to the supported `gh api` form and is not applied to curl. Reusable-workflow and action selector checks use the existing job/step role annotations: a selector only counts in its matching workflow-file/job or root-action/step role. A wrong or unknown role remains uncertain and warning-only rather than being reinterpreted by a new YAML parser. For supported CLI argument layouts, conflicting spellings of a relevant core field—such as a scalar field key alongside bracket-nested or array-style keys—leave that request candidate unclassified. Do not evaluate JSON, CLI types, schemas or values, and do not discard an otherwise recognized command solely because an unrelated field is nested. These narrow boundaries preserve unrelated matching while adding no general placeholder, role, YAML or CLI-value interpreter. The four named conservative matches, original eight warning-only cases, R11 single-line strip-chomp behavior, and strict installer/runtime/workflow/version/tag scope remain unchanged.
+
 Any backslash inside a double-quoted shell word leaves that command
 unclassified instead of interpreting escape rules or erasing characters into a different exact name. A quoted
 gh endpoint must end at a token boundary; quoted/unquoted endpoint concatenation

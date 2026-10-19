@@ -6047,7 +6047,7 @@ test("prepare-worktree blocks an additional direct v2 caller before writing", ()
     mkdirSync(workflowsDirectory, { recursive: true });
     writeFileSync(
       join(workflowsDirectory, "duplicate-v2.yml"),
-      "jobs:\n  duplicate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+      "jobs:\n  duplicate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
       "utf8",
     );
 
@@ -6433,8 +6433,11 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     "JoeyTeng/codex-review-gate-action@v3",
     "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v2",
   ]) {
+    const content = caller.includes("/.github/workflows/")
+      ? `jobs:\n  gate:\n    uses: ${caller}\n`
+      : `jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: ${caller}\n`;
     assert.equal(
-      workflowContainsCodexReviewGateCaller(`jobs:\n  gate:\n    uses: ${caller}\n`),
+      workflowContainsCodexReviewGateCaller(content),
       true,
       caller,
     );
@@ -6447,7 +6450,7 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   );
   for (const opaqueUses of [
     "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
-    "jobs:\n  gate:\n    uses: \"JoeyTeng/codex-review-gate-action\\\n      @v2\"\n",
+    "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: \"JoeyTeng/codex-review-gate-action\\\n          @v2\"\n",
   ]) {
     assert.throws(
       () => workflowContainsCodexReviewGateCaller(opaqueUses),
@@ -6493,14 +6496,14 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
       "caller",
       () =>
         workflowContainsCodexReviewGateCaller(
-          "jobs:\r  gate:\r    uses: JoeyTeng/codex-review-gate-action@v2\n",
+          "jobs:\r  gate:\r    runs-on: ubuntu-slim\r    steps:\r      - uses: JoeyTeng/codex-review-gate-action@v2\n",
         ),
     ],
     [
       "legacy-caller",
       () =>
         workflowContainsLegacyV1Caller(
-          "jobs:\r  gate:\r    uses: JoeyTeng/codex-review-gate-action@v1\n",
+          "jobs:\r  gate:\r    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
         ),
     ],
   ]) {
@@ -6938,8 +6941,8 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
     [
       "v2 caller",
       bridge.replace(
-        "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
-        CANONICAL_V2_WORKFLOW_USES,
+        "jobs:\n",
+        `jobs:\n  direct-v2:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: ${CANONICAL_V2_WORKFLOW_USES}\n`,
       ),
       /must not produce or call the v2 gate/u,
     ],
@@ -6951,8 +6954,8 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
     [
       "direct v1 caller",
       bridge.replace(
-        "JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1",
-        "JoeyTeng/codex-review-gate-action@v1",
+        "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
+        "    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v1\n",
       ),
       /exactly one literal/u,
     ],
@@ -6960,7 +6963,7 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
       "second caller",
       bridge.replace(
         "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
-        "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n  second:\n    uses: JoeyTeng/codex-review-gate-action@v1\n",
+        "    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n  second:\n    runs-on: ubuntu-slim\n    steps:\n      - name: Second direct v1 caller\n        uses: JoeyTeng/codex-review-gate-action@v1\n",
       ),
       /exactly one literal/u,
     ],
@@ -7312,7 +7315,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     ...cleanInventory,
     {
       path: ".github/workflows/extra-v2.yml",
-      content: "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+      content: "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
     },
   ];
   assert.throws(
@@ -7321,7 +7324,7 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
   );
   for (const blockCaller of [
     "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
-    "jobs:\n  gate:\n    uses: >-\n      JoeyTeng/codex-review-gate-action@v2\n",
+    "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: >-\n          JoeyTeng/codex-review-gate-action@v2\n",
   ]) {
     assert.throws(
       () =>
@@ -7839,19 +7842,19 @@ test("legacy bridge inventory requires explicit profile, fixed path, and exact b
     ],
     [
       "direct-v1",
-      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v1\n",
+      "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v1\n",
     ],
     [
       "direct-v2",
-      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+      "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
     ],
     [
       "future-ref",
-      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v10\n",
+      "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v10\n",
     ],
     [
       "malicious-ref",
-      "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v1-malicious\n",
+      "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v1-malicious\n",
     ],
     ["writer", "permissions:\n  checks: write\njobs: {}\n"],
   ]) {
@@ -8005,7 +8008,7 @@ test("remote inventory blocks gate signals but accepts unrelated workflow writes
     for (const [name, extraContent, expected] of [
       [
         "extra-v2",
-        "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+        "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
         /Additional workflows contain Codex gate callers or reserved gate signals.*extra\.yml/u,
       ],
       [
@@ -10847,7 +10850,7 @@ test("remote bridge admission rejects missing, drifted, displaced, unflagged, or
           responses[`repos/${repoSlug}/git/blobs/extra-v2-blob`] = {
             encoding: "base64",
             content: Buffer.from(
-              "jobs:\n  gate:\n    uses: JoeyTeng/codex-review-gate-action@v2\n",
+              "jobs:\n  gate:\n    runs-on: ubuntu-slim\n    steps:\n      - uses: JoeyTeng/codex-review-gate-action@v2\n",
               "utf8",
             ).toString("base64"),
           };
