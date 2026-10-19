@@ -2092,6 +2092,57 @@ test("does not classify curl publishers with a literal Content-Length override",
   }
 });
 
+test("does not classify curl publishers with an empty literal Authorization header", () => {
+  const headers = [
+    "-H 'Authorization:'",
+    "-H 'Authorization:   '",
+    "--header 'aUtHoRiZaTiOn;'",
+    "--header='Authorization: '",
+    "--header='authorization;'",
+  ];
+  const payload = `'{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}'`;
+  for (const header of headers) {
+    const result = inspectWorkflowGateSignals(
+      `run: curl --http1.1 -X POST ${header} -d ${payload} https://api.github.com/repos/o/r/check-runs`,
+    );
+    assert.deepEqual(result.matches, [], header);
+    assert.ok(
+      result.warnings.some(({ kind }) => kind === "reserved-status-context-reference"),
+      header,
+    );
+    assert.deepEqual(
+      inspectWorkflowGateSignals(
+        `run: curl -X POST ${header} -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+      ).matches,
+      [],
+      header,
+    );
+  }
+
+  for (const headersInOrder of [
+    "-H 'Authorization:' -H 'Authorization: nonempty'",
+    "-H 'Authorization: nonempty' --header 'Authorization;'",
+  ]) {
+    const result = inspectWorkflowGateSignals(
+      `run: curl -X POST ${headersInOrder} -d ${payload} https://api.github.com/repos/o/r/check-runs`,
+    );
+    assert.deepEqual(result.matches, [], headersInOrder);
+  }
+
+  const nonemptyAuthorization = inspectWorkflowGateSignals(
+    `run: curl -X POST -H 'Authorization: nonempty' -d ${payload} https://api.github.com/repos/o/r/check-runs`,
+  );
+  assert.deepEqual(
+    nonemptyAuthorization.matches.map(({ kind }) => kind),
+    ["reserved-check-run-name"],
+  );
+
+  const statusControl = inspectWorkflowGateSignals(
+    `run: curl -X POST --header 'Authorization: nonempty' -d '{"context":"codex/github-review-gate","state":"success"}' https://api.github.com/repos/o/r/statuses/$SHA`,
+  );
+  assert.deepEqual(statusControl.matches.map(({ kind }) => kind), ["reserved-status-context"]);
+});
+
 test("matches fixed curl API route segments case-sensitively and rejects literal backslashes", () => {
   const payload = `'{"name":"codex/github-review-gate","head_sha":"0123456789abcdef0123456789abcdef01234567"}'`;
   const endpoint = "https://api.github.com/repos/target/repo/check-runs";

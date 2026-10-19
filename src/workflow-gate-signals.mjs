@@ -1095,6 +1095,9 @@ function curlPublisherSignal(text, reserved, repositoryFullName) {
         // Host and Content-Length overrides alter request routing/framing; do
         // not interpret or recompute curl's effective headers.
         if (/^\s*(?:host|content-length)\s*[:;]/iu.test(value)) return null;
+        // An empty Authorization value can suppress curl's default auth. Any
+        // such literal makes this bounded request unknown, even with duplicates.
+        if (/^\s*authorization\s*[:;]\s*$/iu.test(value)) return null;
       }
       continue;
     }
