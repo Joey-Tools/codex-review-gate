@@ -4,6 +4,7 @@ import {
   parseWorkflowYamlMapping as parseReviewedStatusWriterMapping,
   tokenizeWorkflowYaml as tokenizeReviewedStatusWriterWorkflow,
 } from "./workflow-yaml.mjs";
+import { inspectWorkflowGateSignals } from "./workflow-gate-signals.mjs";
 
 export const DEFAULT_STATUS_CONTEXT = "codex/github-review-gate";
 export const LEGACY_STATUS_CONTEXT = "codex/review-gate";
@@ -4628,6 +4629,66 @@ export function workflowSingleProducerPolicyViolations(
   return violations;
 }
 
+export function escapeWorkflowPathForDiagnostic(path) {
+  return JSON.stringify(path).slice(1, -1).replace(
+    /[\u007f-\u009f\u2028\u2029]/gu,
+    (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+// Ordinary installation scans for likely gate collisions, not for a proof that
+// every other workflow is incapable of writing a reserved signal. Unrelated
+// write authority and constructions the text scanner cannot resolve are trusted
+// operator configuration and are reported without rewriting those workflows.
+export function inspectUnrelatedV2Workflows(
+  workflowFiles,
+  {
+    canonicalPaths = [DEFAULT_WORKFLOW_PATH, DEFAULT_CONTROLLER_WORKFLOW_PATH],
+    repositoryFullName,
+  } = {},
+) {
+  if (!Array.isArray(workflowFiles) || !Array.isArray(canonicalPaths)) {
+    throw new Error("Workflow signal inspection requires file and canonical-path arrays.");
+  }
+  const excludedPaths = new Set(canonicalPaths);
+  const matches = [];
+  const warnings = [];
+  for (const file of workflowFiles) {
+    if (
+      typeof file?.path !== "string" ||
+      typeof file?.content !== "string"
+    ) {
+      throw new Error("Workflow signal inspection requires exact paths and text content.");
+    }
+    if (excludedPaths.has(file.path)) continue;
+    const inspection = inspectWorkflowGateSignals(file.content, {
+      reservedCheckName: DEFAULT_STATUS_CONTEXT,
+      repositoryFullName,
+    });
+    matches.push(...inspection.matches.map((match) => ({ path: file.path, ...match })));
+    warnings.push(...inspection.warnings.map((warning) => ({ path: file.path, ...warning })));
+    try {
+      const permissions = [...workflowWritePermissions(file.content, { includeAllWrites: true })].sort();
+      if (permissions.length > 0) {
+        warnings.push({
+          path: file.path,
+          kind: "unrelated-workflow-write",
+          line: 1,
+          message: "Operator-trusted unrelated workflow has write permissions. Inspect the workflow source; this is not proof of an isolated or unique gate producer.",
+        });
+      }
+    } catch {
+      warnings.push({
+        path: file.path,
+        kind: "unrelated-workflow-permissions-unclassified",
+        line: 1,
+        message: "Unrelated permissions were not classified. Inspect the workflow source; it remains operator-trusted.",
+      });
+    }
+  }
+  return { matches, warnings };
+}
+
 // The digest pins exact UTF-8 bytes approved through Code Review; it does not
 // prove that the inline shell program is benign. The structural profile below
 // only excludes implicit permissions and YAML-provided executable inputs such
@@ -5361,7 +5422,7 @@ function validateReviewedStatusWriterSteps(tokens, header, jobId) {
   );
 }
 
-function workflowWritePermissions(value) {
+function workflowWritePermissions(value, { includeAllWrites = false } = {}) {
   if (typeof value !== "string") {
     throw new Error("Workflow content must be text before permissions inspection.");
   }
@@ -5448,8 +5509,12 @@ function workflowWritePermissions(value) {
         continue;
       }
       if (scalar === "write-all") {
-        for (const permission of SINGLE_PRODUCER_WRITE_PERMISSIONS) {
-          writes.add(permission);
+        if (includeAllWrites) {
+          writes.add("write-all");
+        } else {
+          for (const permission of SINGLE_PRODUCER_WRITE_PERMISSIONS) {
+            writes.add(permission);
+          }
         }
         continue;
       }
@@ -5500,7 +5565,7 @@ function workflowWritePermissions(value) {
           `Workflow has an opaque ${permission} permission: ${access || "<mapping>"}`,
         );
       }
-      if (access === "write" && SINGLE_PRODUCER_WRITE_PERMISSIONS.has(permission)) {
+      if (access === "write" && (includeAllWrites || SINGLE_PRODUCER_WRITE_PERMISSIONS.has(permission))) {
         writes.add(permission);
       }
     }
@@ -5748,7 +5813,12 @@ export function decodeGitHubBlobContent(value) {
 export function validateCanonicalV2WorkflowInventory(
   workflowFiles,
   canonicalWorkflows,
-  { legacyBridge = false, reviewedStatusWriters = [] } = {},
+  {
+    legacyBridge = false,
+    reviewedStatusWriters = [],
+    strictUnrelatedWorkflows = legacyBridge,
+    repositoryFullName,
+  } = {},
 ) {
   return validateV2WorkflowInventory(
     workflowFiles,
@@ -5756,6 +5826,8 @@ export function validateCanonicalV2WorkflowInventory(
     {
       legacyBridge,
       reviewedStatusWriters,
+      strictUnrelatedWorkflows,
+      repositoryFullName,
       validateVerifier: validateCanonicalV2VerifierWorkflowContent,
       validateController: validateCanonicalV2ControllerWorkflowContent,
       validateInstalledVerifier: validateInstalledCanonicalV2VerifierWorkflowContent,
@@ -5847,6 +5919,8 @@ function validateV2WorkflowInventory(
   {
     legacyBridge,
     reviewedStatusWriters = [],
+    strictUnrelatedWorkflows = true,
+    repositoryFullName,
     validateVerifier,
     validateController,
     validateInstalledVerifier = validateVerifier,
@@ -5861,6 +5935,9 @@ function validateV2WorkflowInventory(
   }
   if (typeof legacyBridge !== "boolean") {
     throw new Error("Legacy bridge inventory admission must be an explicit boolean.");
+  }
+  if (typeof strictUnrelatedWorkflows !== "boolean") {
+    throw new Error("Unrelated workflow policy must be an explicit boolean.");
   }
   const canonicalEntries = normalizeCanonicalWorkflowEntries(
     canonicalWorkflows,
@@ -5904,6 +5981,19 @@ function validateV2WorkflowInventory(
     workflowFiles,
     reviewedStatusWriters,
   );
+
+  if (!strictUnrelatedWorkflows) {
+    const inspection = inspectUnrelatedV2Workflows(workflowFiles, {
+      canonicalPaths: [...canonicalPaths],
+      repositoryFullName,
+    });
+    if (inspection.matches.length > 0) {
+      throw new Error(
+        `Additional workflows contain Codex gate callers or reserved gate signals: ${inspection.matches.map((match) => `${escapeWorkflowPathForDiagnostic(match.path)}:${match.line} (${match.kind}: ${match.excerpt})`).join("; ")}`,
+      );
+    }
+    return canonicalWorkflows;
+  }
 
   const callerPaths = workflowFiles
     .filter(

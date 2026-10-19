@@ -1,11 +1,11 @@
 ---
 id: 20261018-action-v226-release-intent
 title: Action v2.2.6 Release Intent
-status: active
+status: completed
 created: 2026-10-18
 updated: 2026-10-18
 branch: codex/release-v2.2.6
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/130
 supersedes: []
 superseded_by:
 ---
@@ -64,17 +64,29 @@ superseded_by:
   journal validation and whitespace validation passed.
   Source-fix validation is not production publication evidence.
 
-## Next Steps
+## Published Result
 
-- Let the reviewed manifest change reach protected source `master`; its normal
-  push-triggered publisher is the initial release run. Do not dispatch a
-  duplicate initial publication or retry an ambiguous mutation blindly.
-- Obtain human `marketplace-production` approval for the privileged stage, then
-  independently verify the immutable full tag/Release, assets, provenance and
-  signed floating `v2` result before claiming production delivery.
-- After verified publication, refresh installer PR #128 to merge-ready using
-  the updated Action and current scope. This workstream does not authorize
-  merging #128 or changing HDR/protection configuration.
+- Release-intent PR #130 landed normally as source commit
+  `98a0ab4cfc3cc27b2046deefd6aa00e7017bb7be`; its normal manifest push started
+  [publisher run 39110105204](https://github.com/Joey-Tools/codex-review-gate/actions/runs/39110105204),
+  attempt 1. Human approval released the protected job. No duplicate initial
+  dispatch, publication rerun, agent approval call or bypass was used.
+- Immutable [Release v2.2.6](https://github.com/JoeyTeng/codex-review-gate-action/releases/tag/v2.2.6)
+  is `416350861`. Release commit `c1d5fc87c73beef9882add0294cb582b54003fbd`
+  contains the frozen Action tree and has the admitted `v2.2.5` target as its
+  only parent. Full tag object `619df711a1267b09fa56cc9405cc7ad6a1df75c8`
+  and floating `v2` object `54f179149d32c260647ace6cc4b3fae14da65fcb` both
+  peel to that commit; all three GitHub signatures are verified and valid.
+- The separate credential-free
+  [public verifier job](https://github.com/Joey-Tools/codex-review-gate/actions/runs/39110105204/job/117639465127)
+  verified asset/provenance bytes and OpenPGP signatures, completing with
+  `verification_state=verified`, `verification_stage=complete`,
+  `recovery_code=none`, `next_action=none`, the exact source SHA above and
+  `observed_tag=v2.2.6`. Parent read-back independently corroborated target
+  refs/tree/parent, signatures, immutable Release identity and its three assets.
+- Publication is complete. Installer PR #128 uses this separately published
+  runtime; its readiness workstream still does not authorize merging #128 or
+  changing HDR/protection configuration.
 
 ## Evidence
 

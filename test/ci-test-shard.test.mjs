@@ -75,6 +75,7 @@ const coreTestRelativePaths = [
   "test/v2-action.test.mjs",
   "test/v2-gate-runtime.test.mjs",
   "test/v2-workflow-contract.test.mjs",
+  "test/workflow-gate-signals.test.mjs",
   "test/workflow-security-contract.test.mjs",
   "test/workflow-yaml.test.mjs",
 ];

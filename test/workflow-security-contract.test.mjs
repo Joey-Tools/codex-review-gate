@@ -16,6 +16,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   canonicalLegacyReviewGateInventoryBytes,
+  inspectUnrelatedV2Workflows,
   validateCanonicalV2ControllerWorkflowContent,
   validateCanonicalV2WorkflowInventory,
   validateCanonicalLegacyBridgeWorkflowContent,
@@ -204,17 +205,12 @@ test("source self-installation matches canonical v2 assets after its temporary v
     [
       "additional v1 caller",
       "name: unexpected\njobs:\n  bridge:\n    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1\n",
-      /Additional v1\/v2 gate callers/u,
-    ],
-    [
-      "additional status writer",
-      "name: unexpected\npermissions:\n  statuses: write\njobs: {}\n",
-      /single-producer policy/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
     [
       "additional reserved check producer",
       "name: unexpected\njobs:\n  producer:\n    name: codex/github-review-gate\n    runs-on: ubuntu-latest\n",
-      /single-producer policy/u,
+      /Additional workflows contain Codex gate callers or reserved gate signals/u,
     ],
   ]) {
     assert.throws(
@@ -230,6 +226,25 @@ test("source self-installation matches canonical v2 assets after its temporary v
       name,
     );
   }
+
+  const unrelatedWriter = {
+    path: ".github/workflows/additional-status-writer.yml",
+    content: "name: unexpected\npermissions:\n  statuses: write\njobs: {}\n",
+  };
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      [...inventory, unrelatedWriter],
+      canonicalWorkflows,
+    ),
+    canonicalWorkflows,
+  );
+  assert.ok(
+    inspectUnrelatedV2Workflows([...inventory, unrelatedWriter]).warnings.some(
+      (warning) =>
+        warning.path === unrelatedWriter.path &&
+        warning.kind === "unrelated-workflow-write",
+    ),
+  );
 });
 
 test("source state-machine check names have a static non-reserved prefix", () => {

@@ -1052,62 +1052,35 @@ disable v2 or delete the old organization rule as recovery.
    paths. Remove a file only when it is dedicated to v1; otherwise remove or
    deactivate the legacy job. Repeat the preview until no v1 caller remains.
 
-   If it reports an unrelated `statuses: write` workflow, do not delete a
-   functioning CI producer's permission just to satisfy installation. Obtain
-   explicit control-plane-owner review. First isolate every status publisher
-   from PR execution with explicit job-level `statuses: write` and
-   self-contained inline Bash steps. Keep workflow-level permissions
-   read-only. The publisher `runs-on` may be a literal runner-label string, a
-   literal label array, or the exact
-   `fromJSON(vars.<NAME>_RUNNER_LABELS || '<JSON array>')` form. The variable
-   name must match `[A-Z][A-Z0-9_]*_RUNNER_LABELS`, and the fallback must be a
-   non-empty JSON array of string labels. When set, the variable value must
-   also be valid JSON resolving to a label string or non-empty label array.
-   For example:
+   The ordinary current-v2 installer uses a scoped keyword scan (a best-effort
+   scan of workflow source text) for additional Codex gate callers and uses of
+   the same reserved gate signal (`codex/github-review-gate`, the required
+   CheckRun context). Only explicit matches recognized by the scanner remain
+   blocking. The scan also checks fragmented text, literal concatenations, and
+   simple local-variable forms where it can; only detected candidates that
+   cannot be classified warn. Unsupported literal forms may be missed, so no
+   warning does not prove that no other workflow can emit the signal.
+   Unrelated keywords and contexts are ignored. It does not execute workflows,
+   prove their full data flow, prevent a malicious same-name forgery, or
+   establish a unique producer. See the [workflow scan risk boundary](workflow-scan-risk-boundary.md)
+   for the accepted coverage limits and examples.
 
-   ```yaml
-   runs-on: ${{ fromJSON(vars.HDR_STREAMING_LINUX_RUNNER_LABELS || '["self-hosted","Linux","X64","hdr-streaming-linux"]') }}
-   ```
+   Unrelated workflow-local write permissions such as `statuses`, `checks`,
+   `actions`, or `contents`, and opaque workflow-local declarations, are
+   operator warnings, not blockers. Do not remove these permissions or isolate
+   unrelated publishers to install the gate. Review the warnings as an
+   operator-trust decision; the installer does not change unrelated workflows.
+   The repository-wide default-permissions preflight in step 2 remains a
+   separate strict requirement. The canonical verifier/controller, CODEOWNERS,
+   and ruleset checks also remain strict.
 
-   Do not use arbitrary runner expressions.
-   A privileged job cannot use actions, checkouts, artifacts, repository
-   scripts, containers, services, or inherited executable defaults. Test jobs
-   may retain their normal dependencies but must not receive status-write
-   authority.
-   Each privileged job has exactly one literal `run: |` Bash step with
-   `shell: bash`; its step-level `env` explicitly clears `BASH_ENV` and `ENV`
-   and sets `GH_TOKEN: ${{ github.token }}`. Put metadata in that step's `env`,
-   not a job-level environment. Literal `needs`, `if`, job outputs and one
-   step ID are supported for trusted metadata handoff.
-   Review the exact runner selector, inline publishers and their data flow:
-   target SHA/context must come from trusted metadata and the terminal state
-   from GitHub job results, never PR-produced executable text or a claimed
-   result in a test artifact. A workflow digest does not bind variable values
-   or self-hosted host state, and separate jobs are not host isolation; use
-   dedicated or ephemeral trusted runners for token-bearing publishers. Do not
-   download or execute mutable/unprotected code in a publisher.
-   Only then compute its digest
-   (`shasum -a 256 "$TARGET_ROOT/.github/workflows/FILE.yml"`) and repeat
-   `--reviewed-status-writer .github/workflows/FILE.yml@SHA256` for each reviewed
-   file in both local commands and every subsequent full-profile remote
-   staging, activation, cleanup-plan derivation, and cleanup-verification
-   command. At most 32 unique declarations are accepted. Do not automatically
-   approve every reported writer or regenerate a stale digest without renewed
-   review. The helper checks exact UTF-8 content, requires exactly
-   `statuses: write` among relevant writes, and retains all gate-caller,
-   reserved-job-name, canonical-workflow and other write-permission checks.
-   Read-only/no-op declarations also fail. Admission checks the isolated
-   publisher structure; owner review of the exact inline script remains the
-   trust boundary for its behavior and contexts, not a shell-code proof. A
-   workflow digest cannot protect future changes to an unprotected script.
-   Canonical
-   CODEOWNERS and independent exact-head owner approval remain mandatory.
-   Do not combine declarations with `--legacy-bridge`: that combination is
-   rejected at initial admission because later bridge removal retains a
-   frozen policy. Historical organization handoff/bridge-removal and source-only
-   proofs remain unchanged and cannot use these declarations.
-   Existing restrictions on which repositories/modes may apply a cleanup
-   plan are unchanged; this option does not authorise a new cleanup write.
+   `--reviewed-status-writer` is optional compatibility for the older
+   exact-digest and isolated-publisher check; omit it for an ordinary current
+   install. If explicitly supplied, follow the [human guide's compatibility
+   section](human.md#optional-compatibility-reviewed-status-writer) and repeat
+   the same reviewed digest at each applicable phase. Do not combine it with
+   `--legacy-bridge`: historical organization handoff/bridge-removal and
+   source-only proof contracts remain frozen and strict.
 6. Prove that both installed workflows exactly match the templates, then read
    the final effective CODEOWNERS rules:
 
