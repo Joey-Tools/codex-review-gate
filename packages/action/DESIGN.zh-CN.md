@@ -478,8 +478,13 @@ authority；后续 clean 仍须独立满足上文的 trusted、未编辑、精�
 request 的归因缺口，包括由更早、针对不同 head 的 request 留下的缺口；也不要求每个旧 request
 必须由自己的后续 `+1` 结清。历史不会被删除或标为已完成。`C` 之前有效的非终态 provider
 activity 并不能证明旧 flight 必须先完成；`C` 当时或之后的相关 activity，以及更新的 physical
-request boundary，仍会阻塞。恢复不清除 findings 或未知 provider errors；只有上文明确识别且更早的
-service-failure carrier 允许被后续 witness 取代。仍不豁免 unknown、edited、
+request boundary，仍会阻塞。恢复不清除 findings 或未知 provider errors；上文明确识别且更早的
+service-failure carrier 允许被后续 witness 取代。另一个窄例外是：official 顶层 clean receipt
+的其余正文合规，但完全缺少 Reviewed commit marker。它仍属于 malformed，不会被猜测绑定到
+任何 commit，也不提供 positive authority；只有更晚的合格 request 及其独立有效的 current-head
+recovery clean，才能使这个旧 missing-marker error 不再阻塞。结论、可选 disclosure、时间与
+official provenance 必须全部有效，且不能夹带 finding。重复或格式错误的 marker、无效 disclosure、
+未知额外正文及其他 parse error 都不适用。仍不豁免 unknown、edited、
 deleted、forged、scope-drifted 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮
 稳定 snapshot。新的 verifier run ID 使用自己的 cutoff，不继承旧 witness。
 

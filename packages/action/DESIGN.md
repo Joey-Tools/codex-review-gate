@@ -583,8 +583,16 @@ request to acquire its own closing `+1`. This does not delete the history or
 label those requests completed. Valid nonterminal provider activity before
 `C` does not prove that an older flight must finish first; relevant activity at
 or after `C`, or a newer request boundary, remains blocking. The recovery does
-not clear findings or unknown provider errors. Only the explicitly recognised
-older service-failure carrier above may be superseded; this does not waive unknown, edited,
+not clear findings or unknown provider errors. The explicitly recognised
+older service-failure carrier above may be superseded. One other narrow
+non-clean category is an otherwise valid official top-level clean receipt
+whose Reviewed commit marker is completely absent. It remains malformed and
+never gains a guessed commit binding or positive authority. Only a later
+eligible request and its independently valid current-head recovery clean may
+supersede that earlier missing-marker error. The conclusion, optional
+disclosure, timestamps and official provenance must otherwise be valid, with
+no finding content. Duplicate or malformed markers, invalid disclosure,
+unknown extra content and other parse errors do not qualify. This does not waive unknown, edited,
 deleted, forged, scope-drifted or ambiguous evidence. It requires complete
 inventory, exact refetches and two stable snapshots. A new verifier run ID has
 a new cutoff and cannot inherit the witness.

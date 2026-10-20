@@ -5872,6 +5872,288 @@ test("an exact canonical second request can recover after a pre-run generation",
   assert.equal(result.report.recoveryCode, "none");
 });
 
+test("a later canonical clean can supersede only an otherwise-valid hashless clean", async (context) => {
+  const verifierRunId = 39473808375;
+  const firstRequest = workflowRequest({
+    id: 6298004126,
+    body: canonicalRequestBody(HEAD, { runId: "39473852001" }),
+    user: { ...HUMAN, login: "JoeyTeng-Codex" },
+    created_at: "2026-10-20T18:20:32Z",
+    updated_at: "2026-10-20T18:20:32Z",
+  });
+  const hashlessClean = cleanIssueComment(HEAD, {
+    id: 6298097004,
+    body: [
+      "Codex Review: Didn't find any major issues.",
+      "",
+      ...officialCodexAboutFooter(),
+    ].join("\n"),
+    created_at: "2026-10-20T18:25:13Z",
+    updated_at: "2026-10-20T18:25:13Z",
+  });
+  const recoveryRequest = workflowRequest({
+    id: 6298601972,
+    body: canonicalRequestBody(HEAD, { runId: "39478113977" }),
+    user: { ...HUMAN, login: "JoeyTeng-Codex" },
+    created_at: "2026-10-20T18:49:48Z",
+    updated_at: "2026-10-20T18:49:48Z",
+  });
+  const recoveryClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 6298648788,
+    created_at: "2026-10-20T18:51:59Z",
+    updated_at: "2026-10-20T18:51:59Z",
+  });
+  const selfVerifierRun = verifierSelfRun({
+    id: verifierRunId,
+    run_attempt: 4,
+    created_at: "2026-10-20T18:20:03Z",
+    run_started_at: "2026-10-20T18:52:16Z",
+    html_url: `https://github.com/${REPOSITORY}/actions/runs/${verifierRunId}`,
+  });
+  const github = createGitHubMock({
+    issueComments: [firstRequest, hashlessClean, recoveryRequest, recoveryClean],
+    selfVerifierRun,
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "hashless-clean-canonical-recovery",
+  });
+  environment.GITHUB_RUN_ID = String(verifierRunId);
+
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("hashless clean recovery does not relax marker, head, edit, provenance, history, or finding guards", async (context) => {
+  const verifierRunId = 39473808375;
+  const firstRequest = workflowRequest({
+    id: 6298004126,
+    body: canonicalRequestBody(HEAD, { runId: String(verifierRunId) }),
+    created_at: "2026-10-20T18:20:32Z",
+    updated_at: "2026-10-20T18:20:32Z",
+  });
+  const hashlessClean = cleanIssueComment(HEAD, {
+    id: 6298097004,
+    body: [
+      "Codex Review: Didn't find any major issues.",
+      "",
+      ...officialCodexAboutFooter(),
+    ].join("\n"),
+    created_at: "2026-10-20T18:25:13Z",
+    updated_at: "2026-10-20T18:25:13Z",
+  });
+  const recoveryRequest = workflowRequest({
+    id: 6298601972,
+    body: canonicalRequestBody(HEAD, { runId: String(verifierRunId) }),
+    created_at: "2026-10-20T18:49:48Z",
+    updated_at: "2026-10-20T18:49:48Z",
+  });
+  const recoveryClean = cleanIssueComment(HEAD, {
+    id: 6298648788,
+    created_at: "2026-10-20T18:51:59Z",
+    updated_at: "2026-10-20T18:51:59Z",
+  });
+  const selfVerifierRun = verifierSelfRun({
+    id: verifierRunId,
+    run_attempt: 4,
+    created_at: "2026-10-20T18:20:03Z",
+    run_started_at: "2026-10-20T18:52:16Z",
+    html_url: `https://github.com/${REPOSITORY}/actions/runs/${verifierRunId}`,
+  });
+  const finding = findingIssueComment(HEAD, {
+    id: 6298200000,
+    created_at: "2026-10-20T18:30:00Z",
+    updated_at: "2026-10-20T18:30:00Z",
+  });
+  const hashlessBody = hashlessClean.body;
+  const malformedHashless = [
+    [
+      "duplicate-marker",
+      [
+        "Codex Review: Didn't find any major issues.",
+        "",
+        "**Reviewed commit:** `aaaaaaaaaa`",
+        "",
+        "**Reviewed commit:** `aaaaaaaaaa`",
+      ].join("\n"),
+    ],
+    [
+      "malformed-marker",
+      [
+        "Codex Review: Didn't find any major issues.",
+        "",
+        "**Reviewed commit:**",
+        "`aaaaaaaaaa`",
+      ].join("\n"),
+    ],
+    [
+      "bad-footer",
+      hashlessBody.replace("</details>", "Please fix this.\n</details>"),
+    ],
+    [
+      "finding-bearing",
+      hashlessBody.replace(
+        "Codex Review: Didn't find any major issues.",
+        "Codex Review: Didn't find any major issues.\n\n### 💡 Codex Review",
+      ),
+    ],
+  ];
+  const cases = [
+    {
+      suffix: "hashless-alone",
+      comments: [firstRequest, hashlessClean],
+      expectedOutcome: "pending",
+    },
+    {
+      suffix: "no-latest-clean",
+      comments: [firstRequest, hashlessClean, recoveryRequest],
+      expectedOutcome: "pending",
+    },
+    {
+      suffix: "clean-before-request",
+      comments: [
+        firstRequest,
+        hashlessClean,
+        cleanIssueComment(HEAD, {
+          id: 6298601900,
+          created_at: "2026-10-20T18:49:47Z",
+          updated_at: "2026-10-20T18:49:47Z",
+        }),
+        recoveryRequest,
+      ],
+    },
+    {
+      suffix: "wrong-head-clean",
+      comments: [firstRequest, hashlessClean, recoveryRequest, cleanIssueComment(OLD_HEAD, {
+        id: recoveryClean.id,
+        created_at: recoveryClean.created_at,
+        updated_at: recoveryClean.updated_at,
+      })],
+    },
+    {
+      suffix: "ambiguous-head-clean",
+      comments: [firstRequest, hashlessClean, recoveryRequest, cleanIssueComment(HEAD.slice(0, 10), {
+        id: recoveryClean.id,
+        created_at: recoveryClean.created_at,
+        updated_at: recoveryClean.updated_at,
+      })],
+      commitResolution: () => ({ status: 422, message: "short SHA is ambiguous" }),
+    },
+    ...malformedHashless.map(([suffix, body]) => ({
+      suffix,
+      comments: [
+        firstRequest,
+        { ...hashlessClean, body },
+        recoveryRequest,
+        recoveryClean,
+      ],
+    })),
+    {
+      suffix: "edited-hashless-carrier",
+      comments: [
+        firstRequest,
+        { ...hashlessClean, updated_at: "2026-10-20T18:26:00Z" },
+        recoveryRequest,
+        recoveryClean,
+      ],
+    },
+    {
+      suffix: "invalid-hashless-carrier-chronology",
+      comments: [
+        firstRequest,
+        { ...hashlessClean, updated_at: "2026-10-20T18:25:12Z" },
+        recoveryRequest,
+        recoveryClean,
+      ],
+    },
+    {
+      suffix: "edited-recovery-request",
+      comments: [
+        firstRequest,
+        hashlessClean,
+        { ...recoveryRequest, updated_at: "2026-10-20T18:49:49Z" },
+        recoveryClean,
+      ],
+    },
+    {
+      suffix: "edited-recovery-clean",
+      comments: [
+        firstRequest,
+        hashlessClean,
+        recoveryRequest,
+        { ...recoveryClean, updated_at: "2026-10-20T18:52:00Z" },
+      ],
+    },
+    {
+      suffix: "invalid-provider-provenance",
+      comments: [
+        firstRequest,
+        hashlessClean,
+        recoveryRequest,
+        { ...recoveryClean, performed_via_github_app: { slug: "other-app" } },
+      ],
+    },
+    {
+      suffix: "deleted-provider-history",
+      comments: [firstRequest, hashlessClean, recoveryRequest, recoveryClean],
+      deletedEvents: [deletedCommentEvent({
+        id: "CDE_hashless_provider_history",
+        createdAt: "2026-10-20T18:35:00Z",
+      })],
+    },
+    {
+      suffix: "base-epoch",
+      comments: [firstRequest, hashlessClean, recoveryRequest, recoveryClean],
+      baseEpoch: baseRefChangedEvent({ createdAt: "2026-10-20T18:40:00Z" }),
+    },
+    {
+      suffix: "unresolved-prior-finding",
+      comments: [firstRequest, hashlessClean, finding, recoveryRequest, recoveryClean],
+      expectedOutcome: "failure",
+    },
+    {
+      suffix: "unresolved-old-inline-thread",
+      comments: [firstRequest, hashlessClean, recoveryRequest, recoveryClean],
+      reviewThreads: [reviewThread({
+        id: "PRRT_hashless_old_unresolved",
+        isResolved: false,
+        isOutdated: true,
+        comments: { nodes: [{
+          url: `https://github.com/${REPOSITORY}/pull/${PR}#discussion_r6298200001`,
+          author: { ...CODEX_BOT },
+        }] },
+      })],
+      expectedOutcome: "pending",
+      expectedRecovery: "wait_then_reconcile",
+    },
+  ];
+
+  for (const { suffix, comments, commitResolution, deletedEvents, baseEpoch, reviewThreads,
+    expectedOutcome, expectedRecovery } of cases) {
+    const github = createGitHubMock({
+      issueComments: comments,
+      commitResolution,
+      deletedCommentEvents: deletedEvents,
+      baseEpoch,
+      reviewThreads,
+      selfVerifierRun,
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `hashless-guard-${suffix}`,
+    });
+    environment.GITHUB_RUN_ID = String(verifierRunId);
+    const { result } = await runGate(environment, github);
+
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    if (expectedOutcome) assert.equal(result.report.gateOutcome, expectedOutcome, suffix);
+    if (expectedRecovery) assert.equal(result.report.recoveryCode, expectedRecovery, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
 test("a post-run ordinary request without a new clean waits without requiring a replacement PR", async (context) => {
   const github = createGitHubMock({
     issueComments: [ordinaryRequest(), cleanIssueComment(HEAD), recoveryRequest()],

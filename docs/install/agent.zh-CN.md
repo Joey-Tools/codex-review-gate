@@ -1665,7 +1665,10 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    取得可信、未经编辑的 exact-head clean 后 reconcile。优先等待现有 provider 事件自动
    reconcile，只有 verifier 未刷新时才手动 reconcile。新请求不会豁免 finding 或历史检查，
    确实不可闭合的历史仍保留 replacement 路径。其他 recovery code 必须先执行指定动作，
-   再进行后续 exact-head reconcile。
+   再进行后续 exact-head reconcile。更早的 official clean 若仅缺少 Reviewed commit marker，
+   本身绝不是 pass receipt；只有其余正文合规，且更晚的合格 request 已有有效 exact-head clean，
+   才能通过窄范围 current-head recovery 解除这个旧错误。不要删除或编辑旧评论、猜测其 SHA，
+   也不要把任意 malformed 正文都当成这个例外。
    可推导时，
    `findings_unresolved`、`findings_resolved`、`findings_historical` 与
    `findings_indeterminate` 只出现在 summary/sticky diagnostic。

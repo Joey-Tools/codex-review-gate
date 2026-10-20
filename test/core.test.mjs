@@ -2167,6 +2167,68 @@ test("rejects clean issue comments with missing or conflicting commit markers", 
   assert.equal(missingBlankLine.kind, "malformed");
 });
 
+test("v2 hashless-clean recovery provenance is opt-in and requires closed remainder grammar", () => {
+  const lead = "Codex Review: Didn't find any major issues.";
+  const validHashlessBody = [lead, "", officialCodexDisclosure()].join("\n");
+  const parse = (body, overrides = {}, classifyV2HashlessCleanRecovery = true) =>
+    parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body, overrides),
+      { owner: "owner", repo: "repo", classifyV2HashlessCleanRecovery },
+    );
+
+  const defaultParse = parse(validHashlessBody, {}, false);
+  assert.equal(defaultParse.kind, "malformed");
+  assert.equal(defaultParse.reason, "clean Codex issue comment must contain exactly one Reviewed commit marker");
+  assert.equal(defaultParse.recoveryProvenance, undefined);
+
+  const classified = parse(validHashlessBody);
+  assert.equal(classified.kind, "malformed");
+  assert.equal(classified.reason, "clean Codex issue comment must contain exactly one Reviewed commit marker");
+  assert.equal(
+    classified.recoveryProvenance,
+    "codex-v2-hashless-clean-closed-grammar-v1",
+  );
+  assert.deepEqual(classified.parseDiagnostics, {
+    profile: "top-level-clean-issue-comment-v2",
+    stage: "reviewed-commit",
+    reasonCode: "reviewed_commit_marker_invalid",
+  });
+
+  const noFooter = parse(`${lead}\n\n`);
+  assert.equal(noFooter.kind, "malformed");
+  assert.equal(
+    noFooter.recoveryProvenance,
+    "codex-v2-hashless-clean-closed-grammar-v1",
+  );
+
+  const malformedBodies = [
+    `${lead}\n${officialCodexDisclosure()}`,
+    `${lead}\n\nUnsupported extra prose.`,
+    [
+      lead,
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+      "",
+      "**Reviewed commit:** `abcdef1234`",
+    ].join("\n"),
+    [lead, "", "**Reviewed commit:**"].join("\n"),
+    [lead, "", officialCodexDisclosure().replace("</details>", "Please fix this.\n</details>")].join("\n"),
+    [lead, "", "### 💡 Codex Review"].join("\n"),
+    [lead, "", "![P1 Badge](https://img.shields.io/badge/P1-red)"].join("\n"),
+  ];
+  for (const body of malformedBodies) {
+    const artifact = parse(body);
+    assert.equal(artifact.kind, "malformed", body.slice(0, 100));
+    assert.equal(artifact.recoveryProvenance, undefined, body.slice(0, 100));
+  }
+
+  const edited = parse(validHashlessBody, {
+    updated_at: "2026-07-23T08:00:01Z",
+  });
+  assert.equal(edited.kind, "malformed");
+  assert.equal(edited.recoveryProvenance, undefined);
+});
+
 test("classifies noncanonical Codex terminal prefixes as malformed", () => {
   for (const body of [
     "codex review : unsupported terminal format",
