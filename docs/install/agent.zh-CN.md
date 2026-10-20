@@ -1659,8 +1659,13 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
 
    任何非 success result 都按 `recovery_code` 与 summary 的 concrete next action 操作。
    Finding 通常产生 healthy failure；unhealthy execution 是恢复问题，不是 finding
-   verdict。`healthy/pending` 是 fail-closed，不能授权 success。只有 `wait_provider` 是
-   纯等待；其他 recovery code 都必须先执行指定动作，再进行后续 exact-head reconcile。
+   verdict。`healthy/pending` 是 fail-closed，不能授权 success。`wait_provider` 不代表必须
+   更换 PR：最新审查仍在运行时先等待；若审查已结束、findings 已解决，且完整、未经编辑的历史
+   符合 current-head clean recovery 条件，可在原 PR 发一条新的合格 `@codex review`，
+   取得可信、未经编辑的 exact-head clean 后 reconcile。优先等待现有 provider 事件自动
+   reconcile，只有 verifier 未刷新时才手动 reconcile。新请求不会豁免 finding 或历史检查，
+   确实不可闭合的历史仍保留 replacement 路径。其他 recovery code 必须先执行指定动作，
+   再进行后续 exact-head reconcile。
    可推导时，
    `findings_unresolved`、`findings_resolved`、`findings_historical` 与
    `findings_indeterminate` 只出现在 summary/sticky diagnostic。

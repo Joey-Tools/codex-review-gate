@@ -1989,9 +1989,16 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    Follow `recovery_code` and the summary's concrete next action for every
    non-success result. Findings normally produce a healthy failing gate; an
    unhealthy execution is a recovery problem, not a finding verdict.
-   `healthy/pending` is fail-closed and cannot authorize success. Only
-   `wait_provider` is a pure wait; every other recovery code requires the
-   named action before a later exact-head reconcile. When derivable,
+   `healthy/pending` is fail-closed and cannot authorize success.
+   `wait_provider` is not proof that a replacement PR is mandatory: wait while
+   the latest review runs; if it ended with findings now resolved and the
+   intact, unedited history qualifies for current-head clean recovery, post one
+   fresh eligible `@codex review`, obtain a trusted unedited exact-head clean,
+   and reconcile. Prefer the existing automatic provider-event reconcile;
+   manually reconcile only if it did not refresh the verifier. New requests
+   never waive findings or history validation, and genuinely unclosable history
+   retains its replacement path. Other recovery codes require their named
+   action before a later exact-head reconcile. When derivable,
    `findings_unresolved`,
    `findings_resolved`, `findings_historical`, and `findings_indeterminate`
    appear only in the summary and sticky diagnostic.

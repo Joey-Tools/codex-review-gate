@@ -8561,9 +8561,11 @@ test("opt-in write policy caches permissions and avoids exact-refetch DoS", asyn
   assert.equal(deniedResult.report.recoveryCode, "wait_provider");
   assert.equal(deniedResult.report.requiresReplacementPr, true);
   const deniedSummary = readFileSync(deniedEnvironment.GITHUB_STEP_SUMMARY, "utf8");
-  assert.match(deniedSummary, /Do not add another review boundary on the original PR/iu);
-  assert.match(deniedSummary, /Open a replacement PR/iu);
-  assert.match(deniedSummary, /exactly one canonical review generation/iu);
+  assert.match(deniedSummary, /Wait for the latest eligible (?:@|&#64;)codex review request/iu);
+  assert.match(deniedSummary, /request history intact and unedited/iu);
+  assert.match(deniedSummary, /post exactly one fresh eligible, unedited (?:@|&#64;)codex review request/iu);
+  assert.match(deniedSummary, /A missing terminal clean alone does not require a replacement PR/iu);
+  assert.doesNotMatch(deniedSummary, /Do not add another review boundary on the original PR/iu);
   assert.doesNotMatch(deniedSummary, /Wait for Codex to publish a terminal result/iu);
   assert.equal(deniedGitHub.statusWrites.some(({ state }) => state === "success"), false);
   assert.equal(
@@ -14894,6 +14896,50 @@ test("recovery diagnostics route request-clean and finding fixes by proven linea
     readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
     buildV2StickyCommentBody(result.report, { prNumber: PR, headSha: HEAD, ...context }),
   ];
+
+  const pendingRequestA = ordinaryRequest({ id: 301, user: READER });
+  const pendingRequestB = ordinaryRequest({
+    id: 302,
+    user: HUMAN,
+    created_at: "2026-08-25T08:01:00Z",
+    updated_at: "2026-08-25T08:01:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-302`,
+  });
+  const pendingLineageGitHub = createGitHubMock({
+    issueComments: [pendingRequestA, pendingRequestB],
+    reviews: [inlineParentReview(HEAD, {
+      submitted_at: "2026-08-25T08:02:00Z",
+    })],
+  });
+  const pendingLineageEnvironment = runtimeEnvironment(context, {
+    suffix: "recovery-wait-provider-with-unclosable-lineage",
+  });
+  const { result: pendingLineage } = await runGate(
+    pendingLineageEnvironment,
+    pendingLineageGitHub,
+  );
+  assert.equal(pendingLineage.exitCode, 1);
+  assert.equal(pendingLineage.report.executionHealth, "healthy");
+  assert.equal(pendingLineage.report.gateOutcome, "pending");
+  assert.equal(pendingLineage.report.recoveryCode, "wait_provider");
+  assert.equal(pendingLineage.report.requiresReplacementPr, true);
+  assert.equal(
+    pendingLineageGitHub.statusWrites.some(({ state }) => state === "success"),
+    false,
+  );
+  for (const diagnostic of diagnostics(pendingLineage, pendingLineageEnvironment)) {
+    assert.match(diagnostic, /wait for the latest eligible (?:@|&#64;)codex review request.*finish if running/iu);
+    assert.match(diagnostic, /if it yields a trusted, unedited top-level Codex terminal clean uniquely bound to the exact current PR head, reconcile directly/iu);
+    assert.match(diagnostic, /otherwise resolve findings; only with no base epoch.*during this request lineage, all findings resolved/iu);
+    assert.match(diagnostic, /request history intact and unedited/iu);
+    assert.match(diagnostic, /post exactly one fresh eligible, unedited (?:@|&#64;)codex review request/iu);
+    assert.match(diagnostic, /wait for a trusted, unedited top-level Codex terminal clean uniquely bound to the exact current PR head, then reconcile/iu);
+    assert.match(diagnostic, /missing terminal clean alone does not require a replacement PR/iu);
+    assert.match(diagnostic, /a new request or wait does not clear findings or waive request-history validation/iu);
+    assert.match(diagnostic, /a base epoch or edited, deleted, or unclosable history confirmed on reconciliation may still require a replacement PR/iu);
+    assert.doesNotMatch(diagnostic, /Do not add another review boundary on the original PR/iu);
+  }
+
   assert.equal(replacement.report.requiresReplacementPr, false);
   for (const diagnostic of diagnostics(replacement, replacementEnvironment, {
     headCleanRecoveryAction: "request",
