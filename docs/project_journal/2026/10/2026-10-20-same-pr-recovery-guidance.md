@@ -81,3 +81,24 @@ superseded_by:
   These are scoped local checks, not a whole-repository or Node.js 20 pass.
   Required remote review/CI and the later separate release intent remain
   independent delivery gates, not claims made by this completed source slice.
+
+## Documentation Contract Correction
+
+- The first source checkpoint received a trustworthy current-head clean and a
+  successful native review gate. Ordinary Node.js 20 and 24 core CI each failed
+  the same documentation contract, which still required the old claim that
+  `wait_provider` permits only a pure wait. This was an obsolete copy assertion,
+  not an authentication, publisher or provider failure.
+- Synchronize the packaged English/Chinese design and cookbook guidance with
+  the conditional recovery advice, and replace only that obsolete assertion
+  with positive recovery conditions and a guard against the old pure-wait
+  wording. Preserve all reaction liveness, head binding, pending fail-closed and
+  real replacement assertions. This closes a documentation/test omission
+  without changing the recovery verdict, its flags or permission checks.
+- The complete 43-test documentation/security contract file passes on Node.js
+  v24.15.0. Five initial worker attempts passed 42/43 because new copy assertions
+  were too sensitive to Markdown wrapping and mixed-language wording; the sixth
+  passed 43/43. The final parent-owned assertions normalize whitespace and
+  check independent recovery conditions rather than sentence layouts, and a
+  further full 43/43 run passes. All attempt logs are retained. These were test
+  matching corrections, not additional runtime defects.

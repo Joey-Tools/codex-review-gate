@@ -278,9 +278,10 @@ default branch.
 4. Dispatch `reconcile` for the exact head.
 5. Read the four Action outputs and the Actions summary:
    `execution_health`, `gate_outcome`, `recovery_code`, `retry_safe`.
-6. Always follow the one concrete `recovery_code` action in the summary. Only
-   `wait_provider` is a pure wait. Do not infer clean from zero counts, a
-   pending result or a sticky comment.
+6. Always follow the one concrete `recovery_code` action in the summary.
+   `wait_provider` is not automatically a passive wait; use its conditional
+   wait, reconcile or fresh-request guidance below. Do not infer clean from
+   zero counts, a pending result or a sticky comment.
 7. When the result reaches `healthy/success`, perform the exact-head merge
    closure below immediately before merge.
 
@@ -300,7 +301,7 @@ unbound predecessor requires a replacement PR.
 | `healthy/success` | Stable complete current-head clean evidence was proved. | Perform the final verifier/head/ruleset reread; merge only if all still match. |
 | `healthy/failure` | Qualifying findings were proved. | Follow the summary reason and finding links. Fix and reconcile on the original PR only when lineage remains recoverable; an unclosable historical lineage requires a replacement PR carrying the fixes and one canonical generation. |
 | `unhealthy/failure` | Findings were proved but execution or final result handling also failed. | Keep the findings blocking, repair the named execution boundary and reconcile. |
-| `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. | Follow `recovery_code`; wait without another action only for `wait_provider`. |
+| `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. | Follow `recovery_code`; `wait_provider` means no qualifying terminal result is yet available. Wait while the review is running, or reconcile an existing qualifying exact-head clean. |
 | `unhealthy/pending` | API, pagination, cap or stability execution is incomplete. | Follow the recovery code; do not treat it as no findings. |
 | `healthy/not_applicable` | A delayed automatic event no longer applies. | Usually no action; reconcile the current head if a gate decision is still needed. |
 | `unhealthy/not_applicable` | The manual target is invalid or unsupported. | Correct the target or use a supported scope; do not bypass the ruleset. |
@@ -344,7 +345,7 @@ provider error, or base-epoch requirement.
 | Code | Safe next action |
 | --- | --- |
 | `none` | No evaluator recovery is required; perform exact-head merge closure. |
-| `wait_provider` | Wait for Codex to publish terminal evidence; do not spam requests. |
+| `wait_provider` | No qualifying terminal result is available yet; this alone does not mean the PR must be replaced. Wait while the review is running, or reconcile if a trusted exact-head clean already exists. If the review finishes without a qualifying current-head clean, resolve all findings first. Only intact, unedited request history with no base epoch allows one fresh eligible `@codex review`; wait for its subsequent trusted unedited exact-head clean, then reconcile. A missing clean alone is not proof of unclosable history. A new request or wait does not clear findings or waive history checks; edited, deleted or otherwise unclosable history may still require the indicated repair or replacement path. This guidance does not change the pending verdict; do not spam requests. |
 | `reconcile` | Reread the exact current head and run one scoped reconcile. |
 | `fix_findings` | Follow the summary reason. Normally fix the reported current findings, separately resolve inline conversations, obtain later head-bound clean evidence, then reconcile. If the reason also reports an unclosable historical lineage, put the fixes on a replacement PR and run exactly one canonical generation there instead of requesting again on the original PR. |
 | `request_clean_generation` | Follow the summary reason and lineage. For a recoverable latest/current canonical request, stay on the original PR: obtain the required direct `+1` on the named request, or—only for the unique, no-base-epoch, single-flight unedited default-`any` ordinary candidate—wait for its matching unedited official current-head top-level issue-comment terminal clean or exact closed `COMMENTED` Codex inline-parent review. Generic pull-request reviews cannot confirm that candidate. The recovery-only duplicate cohort above is not a request path: never create it; if the immutable snapshot already qualifies, reconcile it, and a canonical successor still needs its own direct `+1`. A finding still blocks and never confirms it. Create exactly one newer canonical generation only when the reason says one is still needed. A historical gap may reset on a legitimate new head only when every ambiguous predecessor is explicitly bound to another full head. A default-`any` ordinary candidate with neither a direct receipt nor a terminal-clean contender is not such a predecessor. If a provider-confirmed ordinary, edited, malformed, denied, deleted, or otherwise unbound predecessor makes that gap unclosable, do not request again on that PR/head; open a replacement PR and run one canonical generation there. |
