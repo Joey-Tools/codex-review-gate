@@ -238,8 +238,9 @@ gh workflow run "$WORKFLOW" \
 4. 为 exact head dispatch `reconcile`。
 5. 读取四个 Action outputs 和 Actions summary：`execution_health`、
    `gate_outcome`、`recovery_code`、`retry_safe`。
-6. 始终执行 summary 中唯一具体的 `recovery_code` action；only `wait_provider` 是
-   pure wait。不要根据 zero counts、pending result 或 sticky comment 推断 clean。
+6. 始终执行 summary 中唯一具体的 `recovery_code` action。`wait_provider` 不一定只是等待；
+   按下文的条件指引选择等待、reconcile 或 fresh request。不要根据 zero counts、pending result
+   或 sticky comment 推断 clean。
 7. 结果达到 `healthy/success` 后，在 merge 前立即执行 exact-head merge closure。
 
 任一步骤中 head 发生变化都必须停止。读取 new current head、summary 与完整 physical
@@ -256,7 +257,7 @@ ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor �
 | `healthy/success` | 已证明稳定、完整的 current-head clean evidence。 | 执行 final verifier/head/ruleset 重读；全部仍匹配才 merge。 |
 | `healthy/failure` | 已证明符合条件的 findings。 | 按 summary reason 与 finding links 操作。只有 lineage 仍可恢复时，才在原 PR 修复并 reconcile；不可闭合的 historical lineage 必须把修复放到 replacement PR，并在其中只运行一个 canonical generation。 |
 | `unhealthy/failure` | 已证明 findings，但 execution 或 final result handling 同时失败。 | 保持 findings 阻塞，修复指定 execution boundary，再 reconcile。 |
-| `healthy/pending` | evaluation 安全完成，但 current state 尚不能授权 success。 | 按 `recovery_code` 操作；只有 `wait_provider` 可以不执行其他动作而等待。 |
+| `healthy/pending` | evaluation 安全完成，但 current state 尚不能授权 success。 | 按 `recovery_code` 操作；`wait_provider` 表示尚无合格的 terminal result。review 仍在运行时等待，或对已有的合格 exact-head clean 直接 reconcile。 |
 | `unhealthy/pending` | API、pagination、cap 或 stability execution 不完整。 | 按 recovery code 操作；绝不能把它解释为没有 findings。 |
 | `healthy/not_applicable` | delayed automatic event 已不再适用。 | 通常无需操作；仍需 gate decision 时 reconcile current head。 |
 | `unhealthy/not_applicable` | manual target 无效或不受支持。 | 修正 target 或使用 supported scope；不要 bypass ruleset。 |
@@ -294,7 +295,7 @@ current-head recovery。下表中的历史 lineage/replacement 指示仅在该�
 | Code | 安全 next action |
 | --- | --- |
 | `none` | evaluator 无需恢复；执行 exact-head merge closure。 |
-| `wait_provider` | 等待 Codex 发布 terminal evidence；不要 spam requests。 |
+| `wait_provider` | 尚无合格的 terminal result；仅此并不表示必须更换 PR。review 仍在运行时等待；若可信的 exact-head clean 已存在，直接 reconcile。若 review 已结束但没有合格的 current-head clean，先解决所有 findings。只有 request history 完整、未编辑且没有 base epoch 时，才可在原 PR 发出一条新的合格 `@codex review`；等待随后出现的可信、未经编辑的 exact-head clean，再 reconcile。单纯缺少 clean 不能证明 history 无法闭合。新请求或等待不会清除 findings，也不会豁免 history 校验；已编辑、已删除或其他确实无法闭合的 history，仍可能要求按指引修复或使用 replacement PR。这些提示不会改变 pending 判定；不要 spam requests。 |
 | `reconcile` | 重读 exact current head 并运行一次 scoped reconcile。 |
 | `fix_findings` | 按 summary reason 操作。通常先修复报告的 current findings，另行解决 inline conversations，再取得合格 clean evidence 后 reconcile。若 finding 只是 policy-only inline finding，已解决的 conversation 只满足 ruleset 条件；同一 exact head 上已有的 qualified inline-parent receipt 可独立确认 clean，否则仍按 `request_clean_generation` 分流。若 reason 同时指出不可闭合的 historical lineage，应把修复放到 replacement PR，并在其中只运行一个 canonical generation，不得在原 PR 重发。 |
 | `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；或者仅限唯一、没有 base epoch、single-flight、未编辑的 default-`any` ordinary candidate，等待其匹配的未编辑 official current-head 顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head `COMMENTED` inline-parent review。generic pull-request review clean 不能确认该 candidate。上文 recovery-only duplicate cohort 不是 request path：不得主动创建；若 immutable snapshot 已满足它，应 reconcile；若有 canonical successor，后者仍需自身 direct `+1`。finding 仍独立阻塞，绝不确认它。只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。既没有 direct receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |

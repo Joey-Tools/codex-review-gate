@@ -2465,11 +2465,28 @@ test("package docs preserve reaction liveness and pending recovery semantics", (
       name,
     );
     assert.match(guide, /recovery_code/u, name);
-    assert.match(
-      guide,
-      /only\s+`wait_provider`[\s\S]{0,100}pure wait/iu,
+    const recoveryCopy = guide.replace(/\s+/gu, " ");
+    assert.doesNotMatch(
+      recoveryCopy,
+      /only `wait_provider`.{0,100}pure wait/iu,
       name,
     );
+    for (const condition of [
+      /(?:does not by itself prove|this alone does not mean).{0,100}replac|(?:不等于必须|本身不表示|仅此并不表示).{0,40}更换/iu,
+      /wait while (?:the )?review is running|(?:review|审查)\s*仍在运行.{0,35}等待/iu,
+      /exact-head clean/iu,
+      /reconcile/iu,
+      /findings that are now resolved|resolve all findings first|findings\s*已解决|先解决\s*所有 findings/iu,
+      /(?:intact|完整)[,、 ]+(?:unedited|未经编辑|未编辑)/iu,
+      /(?:without (?:a )?|with no |no |没有 |无 |并无 )base epoch/iu,
+      /fresh eligible `@codex review`|新的合格 `@codex review`/iu,
+      /subsequent trusted unedited exact-head clean|随后.{0,80}exact-head clean/iu,
+      /never clears findings|does not clear findings|never changes the pending verdict|不会清除 findings|不会改变 pending 判定/iu,
+      /edited, deleted|(?:已编辑、已删除|编辑、删除)/iu,
+      /repair or replacement|replacement path|修复.{0,35}replacement/iu,
+    ]) {
+      assert.ok(condition.test(recoveryCopy), `${name}: ${condition}`);
+    }
   }
 });
 

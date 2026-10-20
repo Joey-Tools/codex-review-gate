@@ -1114,6 +1114,20 @@ function recoveryInstruction(
     }
     return `Repair the canonical workflow permissions or installation, then retry${target}.`;
   }
+  if (code === "wait_provider" && requiresReplacementPr) {
+    return (
+      `Wait for the latest eligible @codex review request${target} to finish if running. If it ` +
+      `yields a trusted, unedited top-level Codex terminal clean uniquely bound to the exact ` +
+      `current PR head, reconcile directly. Otherwise resolve findings; only with no base epoch ` +
+      `(base retarget or force-push boundary) during this request lineage, all findings resolved, ` +
+      `and request history intact and unedited, post exactly one fresh eligible, unedited @codex ` +
+      `review request${target}. Wait for a trusted, unedited top-level Codex terminal clean ` +
+      `uniquely bound to the exact current PR head, then reconcile. A missing terminal clean alone ` +
+      `does not require a replacement PR. A new request or wait does not clear findings or waive ` +
+      `request-history validation; a base epoch or edited, deleted, or unclosable history ` +
+      `confirmed on reconciliation may still require a replacement PR.`
+    );
+  }
   if (requiresReplacementPr) {
     return (
       `Do not add another review boundary on the original PR${target}: its observed historical ` +

@@ -593,7 +593,13 @@ direct status projection 与 `status_projection` 已删除。finding counts 仍�
 
 `healthy/pending` 不能安全授权 success，即使 evaluator 已可信地完成执行；它不是
 弱化的 success。每一种结果（包括 pending 与 not-applicable）都必须按自己的
-`recovery_code` 前进；only `wait_provider` 是无需 repair 或 reconcile 的 pure wait。
+`recovery_code` 与具体 next action 前进。`wait_provider` 表示尚无合格的 terminal result，
+不等于必须更换 PR。审查仍在运行时先等待；若审查已结束、其 findings 已解决，且请求历史完整、
+未经编辑并无 base epoch，可按上文的 current-head clean recovery，在原 PR 发一条新的合格
+`@codex review`，取得随后出现的可信、未经编辑的 exact-head clean，再 reconcile。
+现有 provider 事件通常会自动请求这次 reconcile。单纯缺少 clean 不能证明历史不可闭合；
+编辑、删除或其他确实不可闭合的证据仍须按指引修复或走 replacement 路径。
+这些提示不会改变 pending 判定，也不会豁免 finding 或历史证据检查。
 
 无需额外 evidence query 即可推导时，sticky diagnostic 和 Actions summary 会报告：
 
