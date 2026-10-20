@@ -6,6 +6,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import {
+  CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE,
   codexInlineParentReviewBodyHasClosedGrammar,
   parseCodexIssueCommentArtifact,
   parseCodexReviewArtifact,
@@ -6005,6 +6006,13 @@ function reduceV2Evidence({
         message: artifact.reason ||
           `Codex artifact ${artifact.source}:${artifact.id} is malformed`,
         createdAt: artifact.createdAt,
+        recoveryProvenance:
+          artifact.source === "issue-comment" &&
+          artifact.edited !== true &&
+          !artifact.orderingError &&
+          !artifact.resolutionError
+            ? artifact.recoveryProvenance
+            : null,
       }));
       indeterminate += 1;
       continue;
@@ -6194,6 +6202,8 @@ function reduceV2Evidence({
       currentCleans: positiveCleans,
       requestReactions,
       generationLineage,
+      allowHeadCleanRecovery:
+        error.recoveryProvenance === CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE,
     })) {
       blockingErrors.push(error.message);
     }
@@ -7309,10 +7319,16 @@ function normalizeV2EvidenceError(value) {
   const message = typeof value === "string" ? value : value?.message;
   const createdAt = typeof value === "string" ? null : value?.createdAt;
   const rawHeadSha = typeof value === "string" ? "" : String(value?.headSha || "").toLowerCase();
+  const recoveryProvenance =
+    typeof value !== "string" &&
+    value?.recoveryProvenance === CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE
+      ? CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE
+      : null;
   return {
     message: oneLine(message, "Unknown Codex evidence error"),
     createdMs: isCanonicalUtcTimestamp(createdAt) ? Date.parse(createdAt) : null,
     headSha: FULL_SHA.test(rawHeadSha) ? rawHeadSha : null,
+    ...(recoveryProvenance ? { recoveryProvenance } : {}),
   };
 }
 
@@ -8348,6 +8364,7 @@ async function collectV2ProviderEvidence(
       repo: config.repo,
       botLogins: EXACT_CODEX_LOGINS,
       allowShortCommitRefs: true,
+      classifyV2HashlessCleanRecovery: !observedEdit,
       allowKnownServiceFailure: true,
       allowKnownReceiptEnvelope: true,
     });

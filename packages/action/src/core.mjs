@@ -14,6 +14,8 @@ export const OFFICIAL_CODEX_APP_SLUG = "chatgpt-codex-connector";
 export const V2_OFFICIAL_CODEX_BOT_LOGIN =
   "chatgpt-codex-connector[bot]";
 export const CODEX_CLEAN_COMMENT_LEAD = "Codex Review: Didn't find any major issues.";
+export const CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE =
+  "codex-v2-hashless-clean-closed-grammar-v1";
 const CODEX_REVIEW_RECEIPT_ENVELOPE_V1 = "<!-- codex-review-receipt:v1 -->";
 const CODEX_PROVIDER_SERVICE_FAILURE_LEAD =
   "Codex Review: Something went wrong. Try again later by commenting “@codex review”.";
@@ -400,6 +402,7 @@ export function parseCodexIssueCommentArtifact(
     repo = "",
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
     allowShortCommitRefs = false,
+    classifyV2HashlessCleanRecovery = false,
     allowKnownServiceFailure = false,
     allowKnownReceiptEnvelope = false,
   } = {},
@@ -462,7 +465,12 @@ export function parseCodexIssueCommentArtifact(
         parseDiagnostics: cleanIssueCommentParseDiagnostics("finding-signal", "finding_signal"),
       };
     }
-    const parsed = parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs);
+    const parsed = parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs, {
+      classifyV2HashlessCleanRecovery:
+        classifyV2HashlessCleanRecovery === true &&
+        base.edited !== true &&
+        !base.orderingError,
+    });
     if (!parsed.ok) {
       return {
         ...base,
@@ -475,6 +483,9 @@ export function parseCodexIssueCommentArtifact(
             ? {}
             : { commitRefLength: parsed.commitRefLength },
         ),
+        ...(parsed.recoveryProvenance
+          ? { recoveryProvenance: parsed.recoveryProvenance }
+          : {}),
       };
     }
     return {
@@ -1596,7 +1607,11 @@ function codexProviderServiceFailureBodyHasClosedGrammar(body) {
     );
 }
 
-function parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs) {
+function parseTopLevelCleanIssueCommentBody(
+  body,
+  allowShortCommitRefs,
+  { classifyV2HashlessCleanRecovery = false } = {},
+) {
   const lines = body.replace(/\r\n?/g, "\n").split("\n");
   const conclusion = lines[0] || "";
   if (!cleanIssueCommentConclusionHasClosedGrammar(conclusion)) {
@@ -1620,6 +1635,11 @@ function parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs) {
       stage: "reviewed-commit",
       reasonCode: "reviewed_commit_marker_invalid",
       reason: "clean Codex issue comment must contain exactly one Reviewed commit marker",
+      ...(classifyV2HashlessCleanRecovery &&
+        markerLabels.length === 0 &&
+        hashlessCleanIssueCommentHasClosedGrammar(body)
+        ? { recoveryProvenance: CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE }
+        : {}),
     };
   }
   if (markerLineIndex === 1) {
@@ -1657,6 +1677,18 @@ function parseTopLevelCleanIssueCommentBody(body, allowShortCommitRefs) {
   }
 
   return { ok: true, commitRef, disclosurePresent: true };
+}
+
+function hashlessCleanIssueCommentHasClosedGrammar(body) {
+  const lines = body.replace(/\r\n?/g, "\n").split("\n");
+  if (lines.length === 1) return true;
+  if (lines[1]?.trim() !== "") return false;
+
+  const disclosureStart = skipBlankLines(lines, 1);
+  return disclosureStart === lines.length ||
+    officialIssueCommentCleanDisclosureHasClosedGrammar(
+      lines.slice(disclosureStart).join("\n"),
+    );
 }
 
 function cleanIssueCommentConclusionHasClosedGrammar(line) {

@@ -537,7 +537,13 @@ resolves them unambiguously to the selected full head SHA.
 
 The conservative cutoff is not the exact PR `synchronize` time; Git commit
 dates and unverified event timestamps are never fallbacks. This recovery does
-not clear findings or provider errors, nor does it forgive edited, deleted,
+not clear findings or unknown provider errors. Only the recognised earlier
+service failure and an otherwise valid official clean receipt with a wholly
+missing Reviewed commit marker may be superseded by a later eligible request
+and its valid current-head recovery clean. A hashless receipt never supplies
+positive authority or a guessed SHA. Duplicate/malformed markers, invalid
+disclosure, extra unknown content and finding-bearing receipts do not qualify.
+Recovery does not forgive edited, deleted,
 scope-drifted or ambiguous evidence. It still requires complete
 inventory, exact refetches and two stable snapshots. Historical request
 liveness alone is not a veto: an older request's unclosed official `eyes`

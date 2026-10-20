@@ -1998,7 +1998,12 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    manually reconcile only if it did not refresh the verifier. New requests
    never waive findings or history validation, and genuinely unclosable history
    retains its replacement path. Other recovery codes require their named
-   action before a later exact-head reconcile. When derivable,
+   action before a later exact-head reconcile. An earlier official clean that
+   only lacks its Reviewed commit marker is never a pass receipt. When its
+   remaining body is valid, the narrow current-head recovery path can retire
+   that old error after a later eligible request and valid exact-head clean;
+   do not delete or edit the old comment, guess its SHA, or treat arbitrary
+   malformed content as this exception. When derivable,
    `findings_unresolved`,
    `findings_resolved`, `findings_historical`, and `findings_indeterminate`
    appear only in the summary and sticky diagnostic.

@@ -406,7 +406,11 @@ current head 的 clean。
 short SHA 只有被 GitHub 无歧义解析为所选 current full head SHA 才接受。
 
 该保守 cutoff 不是 PR `synchronize` 的精确时间；Git commit date 和未经验证的 event timestamp
-都不能作为 fallback。此恢复不能清除 finding 或 provider error，也不豁免 edited、deleted、scope
+都不能作为 fallback。此恢复不能清除 finding 或未知 provider error。只有更早的已识别 service
+failure，以及其余正文合规、但完全缺少 Reviewed commit marker 的 official clean receipt，
+才允许被更晚的合格 request 及其有效 current-head recovery clean 取代。无 hash receipt 本身
+不提供 positive authority，也不会被猜测补上 SHA。重复或格式错误的 marker、无效 disclosure、
+未知额外正文和夹带 finding 的 receipt 不适用。恢复不豁免 edited、deleted、scope
 drift 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮稳定 snapshot。
 旧请求上未结清的 official `eyes` 不能压过更新的 current-head attestation，旧 request reaction
 变化本身也不能破坏这条恢复路径的稳定性。所选 clean 之后的新相关 activity 或更新的 physical
