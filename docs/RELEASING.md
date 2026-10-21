@@ -173,7 +173,7 @@ stages:
 | `plan` | Unprivileged | Check the exact source commit, manifest, SemVer, reachability, release policy, and immutable target-parent policy. |
 | `candidate-a` | Unprivileged | Independently materialize and upload candidate A on a clean runner; record its tree, inventory, modes, sizes, and SHA-256 digests. |
 | `candidate-b` | Unprivileged | Independently materialize and upload candidate B on another clean runner. |
-| `source-validation` | Unprivileged | After both candidates are frozen, validate a current exact source commit across four bootstrap shards, one explicit core cell, and four Release-test shards on nine clean runners; retained legacy source recovery preserves its compatible five-cell partition. |
+| `source-validation` | Unprivileged | After both candidates are frozen, validate a current exact source commit across four bootstrap shards, four automatically discovered core-file shards, and four Release-test shards on twelve clean runners; retained legacy source recovery preserves its compatible five-cell coverage partition. |
 | `assemble` | Unprivileged | Require byte-identical candidates and produce the canonical candidate bundle. |
 | `publication-plan` | Unprivileged | Reconstruct and validate the publication plan and candidate before approval; upload no privileged material. |
 | `publish` | Privileged | After Environment approval, revalidate everything and perform signed remote publication. |
@@ -183,16 +183,22 @@ The light unprivileged `plan`, `candidate-a`, `candidate-b`, `assemble`,
 `publication-plan`, and `verify` jobs use `ubuntu-slim` with 14-minute
 timeouts. GitHub imposes a separate 15-minute hard limit on that single-CPU
 runner, so current exact-source tests run in the `source-validation` matrix on
-nine `ubuntu-24.04` runners: four mutually exclusive bootstrap shards, one
-explicit core inventory, and four mutually exclusive Release-test shards. Each
-cell has a 14-minute timeout and `fail-fast: false`. The core cell runs
-`npm run check` but does not rediscover bootstrap or Release suites serially.
-This replaces two serial full-suite validations that each took more than 17
-minutes in the first live RC run while preserving independent candidate
-construction. A retained legacy frozen source whose test inventory or sealed
-bootstrap-shard capability does not match this partition falls back to its
-source-local core discovery with the Release suite disabled, while the four
-Release shards preserve the compatible five-cell partition. The privileged
+twelve `ubuntu-24.04` runners: four mutually exclusive bootstrap shards, four
+core-file shards, and four mutually exclusive Release-test shards. Each cell
+has a 14-minute timeout and `fail-fast: false`. Core tests are recursively
+discovered from the frozen source's `test/**/*.test.mjs` files and sorted
+deterministically; only the bootstrap and Release suites are excluded because
+their existing internal four-way adapters own them. The remaining files use
+Node's native `--test-shard=I/4`, so new ordinary test files are included without
+updating a filename allowlist. Core shard 1 also runs `npm run check`. Empty
+core discovery does not fall back to implicit Node test discovery.
+This preserves independent candidate construction without concentrating the
+entire bootstrap suite in one serial cell. Eligibility depends on the sealed
+bootstrap-shard capability, not equality with a hardcoded test inventory. A
+retained source without that capability uses source-local full discovery in
+only core shard 1 with the Release suite disabled; the other core/bootstrap
+cells skip their test commands, while the four Release shards preserve the
+compatible five-cell coverage partition. The privileged
 `publish` job retains `ubuntu-24.04` with its
 existing 30-minute timeout.
 
@@ -467,14 +473,17 @@ audit is incomplete and must not be reported as successful.
 independently. Each materializes, packs, and uploads its candidate on a
 separate clean runner. Only after both uploads succeed does the
 `source-validation` matrix create detached exact-source worktrees. A current
-source uses nine clean runners: four bootstrap shards, a core cell that runs
-`npm run check` plus the closed current core inventory, and four Release cells
-that partition the complete Release-pipeline inventory. The matrix preserves
+source uses twelve clean runners: four bootstrap shards, four core-file shards
+with recursive automatic discovery, and four Release cells that partition the
+complete Release-pipeline inventory. Core shard 1 additionally runs
+`npm run check`; every discovered ordinary test file belongs to exactly one
+core shard, without a closed filename inventory. The matrix preserves
 all cell results, and `assemble` depends on the entire matrix, so any failed or
-missing cell blocks publication. If a retained frozen source has a different
-test inventory or lacks the sealed bootstrap-shard capability, the core cell
-deliberately reverts to its source-local full discovery with Release tests
-disabled; the four Release cells retain the legacy five-cell coverage partition.
+missing cell blocks publication. If a retained frozen source lacks the sealed
+bootstrap-shard capability, only core shard 1 deliberately reverts to its
+source-local full discovery with Release tests disabled; the four Release
+cells retain the legacy five-cell coverage partition. Merely adding test files
+does not select that fallback.
 Source test code cannot mutate either
 already-uploaded candidate because validation jobs do not download those
 artifacts. Candidate independence remains enforced by the two separate

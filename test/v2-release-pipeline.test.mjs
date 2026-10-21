@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -2511,8 +2512,24 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
       "            kind: bootstrap",
       "            bootstrap_test_shard: \"4/4\"",
       "            release_test_shard: \"off\"",
-      "          - name: core",
+      "          - name: core 1/4",
       "            kind: core",
+      "            core_test_shard: \"1/4\"",
+      "            bootstrap_test_shard: \"off\"",
+      "            release_test_shard: \"off\"",
+      "          - name: core 2/4",
+      "            kind: core",
+      "            core_test_shard: \"2/4\"",
+      "            bootstrap_test_shard: \"off\"",
+      "            release_test_shard: \"off\"",
+      "          - name: core 3/4",
+      "            kind: core",
+      "            core_test_shard: \"3/4\"",
+      "            bootstrap_test_shard: \"off\"",
+      "            release_test_shard: \"off\"",
+      "          - name: core 4/4",
+      "            kind: core",
+      "            core_test_shard: \"4/4\"",
       "            bootstrap_test_shard: \"off\"",
       "            release_test_shard: \"off\"",
       "          - name: release 1/4",
@@ -2545,25 +2562,19 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
     sourceInventoryStep,
     /^      - name: Classify frozen source test inventory\n        id: source_test_inventory$/mu,
   );
-  for (const path of [
-    "test/bootstrap.test.mjs",
-    "test/ci-test-shard.test.mjs",
-    "test/core.test.mjs",
-    "test/evidence-budget.test.mjs",
-    "test/gate-runner.test.mjs",
-    "test/organization-review-gate-handoff.test.mjs",
-    "test/producer-receipt.test.mjs",
-    "test/release-provenance.test.mjs",
-    "test/required-ci-workflow.test.mjs",
-    "test/v2-action.test.mjs",
-    "test/v2-gate-runtime.test.mjs",
-    "test/v2-release-pipeline.test.mjs",
-    "test/v2-workflow-contract.test.mjs",
-    "test/workflow-security-contract.test.mjs",
-  ]) {
-    assert.match(sourceInventoryStep, new RegExp(`^            ${path.replaceAll(".", "\\.")}$`, "mu"));
-  }
-  assert.match(sourceInventoryStep, /find test -type f -name '\*\.test\.mjs' -print \| LC_ALL=C sort/u);
+  assert.match(
+    sourceInventoryStep,
+    /find test -type f -name '\*\.test\.mjs' -print0 \| LC_ALL=C sort -z > "\$inventory_file"/u,
+  );
+  assert.match(sourceInventoryStep, /while IFS= read -r -d '' test_file; do/u);
+  assert.doesNotMatch(sourceInventoryStep, /current_test_files|current_inventory|mapfile/u);
+  assert.deepEqual(
+    sourceInventoryStep.match(/test\/[A-Za-z0-9_./-]+\.test\.mjs/gu),
+    ["test/bootstrap.test.mjs", "test/v2-release-pipeline.test.mjs"],
+    "only the two internal-shard suites are designated boundaries",
+  );
+  assert.match(sourceInventoryStep, /core_test_file_count == 0/u);
+  assert.match(sourceInventoryStep, /missing a designated heavy test suite/u);
   assert.match(
     sourceInventoryStep,
     /bootstrap_shard_capability_commit=5b0d1726461b48c1b71ec8db051e57fd516d7196/u,
@@ -2572,11 +2583,11 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
     sourceInventoryStep,
     /git merge-base --is-ancestor "\$bootstrap_shard_capability_commit" "\$RELEASE_SOURCE_SHA"/u,
   );
-  assert.match(sourceInventoryStep, /current_inventory=false/u);
   assert.match(sourceInventoryStep, /modern_partition=false/u);
-  assert.match(sourceInventoryStep, /\[\[ "\$current_inventory" == true && "\$bootstrap_shards" == true \]\]/u);
+  assert.match(sourceInventoryStep, /if \[\[ "\$bootstrap_shards" == true \]\]/u);
   assert.match(sourceInventoryStep, /printf 'modern_partition=%s\\n' "\$modern_partition" >> "\$GITHUB_OUTPUT"/u);
   assert.match(sourceInventoryStep, /Legacy frozen source test inventory/u);
+  assert.doesNotMatch(sourceInventoryStep, /\b(?:git fetch|git clone|curl|npm test|node --test)\b/u);
   const bootstrapShardEnvironment = [
     "CODEX",
     "REVIEW",
@@ -2604,23 +2615,42 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
     bootstrapValidationStep,
     /^          cd "\$RUNNER_TEMP\/release-source"\n          node --test --test-concurrency=1 --test-reporter=dot test\/bootstrap\.test\.mjs$/mu,
   );
-  const coreValidationStep = workflowStepBlock(validation, "Run syntax and core tests");
+  const syntaxCheckStep = workflowStepBlock(validation, "Run syntax checks");
+  assert.match(
+    syntaxCheckStep,
+    /^      - name: Run syntax checks\n        if: \$\{\{ matrix\.suite\.kind == 'core' && matrix\.suite\.core_test_shard == '1\/4' && steps\.source_test_inventory\.outputs\.modern_partition == 'true' \}\}/mu,
+  );
+  assert.match(
+    syntaxCheckStep,
+    /^          cd "\$RUNNER_TEMP\/release-source"\n          npm run check$/mu,
+  );
+  const coreValidationStep = workflowStepBlock(validation, "Run discovered core test shard");
   assert.match(
     coreValidationStep,
-    /^      - name: Run syntax and core tests\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.modern_partition == 'true' \}\}/mu,
+    /^      - name: Run discovered core test shard\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.modern_partition == 'true' \}\}/mu,
   );
   assert.match(
     coreValidationStep,
-    /^          cd "\$RUNNER_TEMP\/release-source"\n          npm run check\n          node --test --test-concurrency=1 --test-reporter=dot test\/ci-test-shard\.test\.mjs test\/core\.test\.mjs test\/evidence-budget\.test\.mjs test\/gate-runner\.test\.mjs test\/organization-review-gate-handoff\.test\.mjs test\/producer-receipt\.test\.mjs test\/release-provenance\.test\.mjs test\/required-ci-workflow\.test\.mjs test\/v2-action\.test\.mjs test\/v2-gate-runtime\.test\.mjs test\/v2-workflow-contract\.test\.mjs test\/workflow-security-contract\.test\.mjs$/mu,
+    /^          CODEX_REVIEW_GATE_CORE_TEST_SHARD: \$\{\{ matrix\.suite\.core_test_shard \}\}$/mu,
   );
-  assert.doesNotMatch(coreValidationStep, /\bnpm test\b/u);
+  assert.match(coreValidationStep, /find test -type f -name '\*\.test\.mjs' -print0 \| LC_ALL=C sort -z/u);
+  assert.match(coreValidationStep, /test\/bootstrap\.test\.mjs\|test\/v2-release-pipeline\.test\.mjs/u);
+  assert.match(coreValidationStep, /core_test_files=\(\)/u);
+  assert.match(coreValidationStep, /core_test_files\[@\]\} == 0/u);
+  assert.match(coreValidationStep, /refusing implicit Node test discovery/u);
+  assert.match(coreValidationStep, /Discovered %s core test files for shard %s/u);
+  assert.match(
+    coreValidationStep,
+    /node --test --test-concurrency=1 --test-reporter=dot "--test-shard=\$core_test_shard" "\$\{core_test_files\[@\]\}"/u,
+  );
+  assert.doesNotMatch(coreValidationStep, /\bnpm (?:run check|test)\b/u);
   const legacyValidationStep = workflowStepBlock(
     validation,
     "Run legacy source test discovery",
   );
   assert.match(
     legacyValidationStep,
-    /^      - name: Run legacy source test discovery\n        if: \$\{\{ matrix\.suite\.kind == 'core' && steps\.source_test_inventory\.outputs\.modern_partition != 'true' \}\}/mu,
+    /^      - name: Run legacy source test discovery\n        if: \$\{\{ matrix\.suite\.kind == 'core' && matrix\.suite\.core_test_shard == '1\/4' && steps\.source_test_inventory\.outputs\.modern_partition != 'true' \}\}/mu,
   );
   assert.match(
     legacyValidationStep,
@@ -2647,6 +2677,206 @@ test("release workflow assigns runners and timeout headroom by workload", () => 
     `${releaseShardEnvironment}: ${matrixShardExpression}`,
   ));
   assert.match(assemble, /^    needs: \[candidate-a, candidate-b, source-validation\]$/mu);
+
+  const listTestFiles = (directory, relativePath) => readdirSync(directory, {
+    withFileTypes: true,
+  }).flatMap((entry) => {
+    const absolutePath = join(directory, entry.name);
+    const relativeFilePath = join(relativePath, entry.name);
+    if (entry.isDirectory()) return listTestFiles(absolutePath, relativeFilePath);
+    return entry.isFile() && entry.name.endsWith(".test.mjs")
+      ? [relativeFilePath]
+      : [];
+  });
+  const sourceTestPaths = listTestFiles(join(repositoryRoot, "test"), "test").sort();
+  for (const path of [
+    "test/bootstrap.test.mjs",
+    "test/v2-release-pipeline.test.mjs",
+    "test/reviewed-status-writers.test.mjs",
+    "test/workflow-gate-signals.test.mjs",
+    "test/workflow-yaml.test.mjs",
+  ]) {
+    assert.ok(sourceTestPaths.includes(path), `missing discovered fixture input: ${path}`);
+  }
+
+  const root = mkdtempSync(join(tmpdir(), "publisher test discovery-"));
+  try {
+    const fakeBin = join(root, "fake bin");
+    const failedFindBin = join(root, "failed find bin");
+    mkdirSync(fakeBin, { recursive: true });
+    mkdirSync(failedFindBin, { recursive: true });
+    const fakeGit = join(fakeBin, "git");
+    writeFileSync(fakeGit, `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" == 4 ]]
+[[ "$1" == merge-base && "$2" == --is-ancestor ]]
+[[ "$3" == 5b0d1726461b48c1b71ec8db051e57fd516d7196 ]]
+[[ "$4" == "$RELEASE_SOURCE_SHA" ]]
+printf '%s\\n' "$*" >> "$FAKE_GIT_CALLS"
+if [[ "$FAKE_BOOTSTRAP_SHARDS" == true ]]; then exit 0; fi
+exit 1
+`);
+    chmodSync(fakeGit, 0o755);
+    const failedFind = join(failedFindBin, "find");
+    writeFileSync(failedFind, `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' invoked >> "$FAKE_FIND_CALLS"
+exit 47
+`);
+    chmodSync(failedFind, 0o755);
+
+    // Keep generated fixture imports separate from this suite's source-only
+    // registration inventory, which must count only the real import above.
+    const testModule = (testPath) => [
+      'import { appendFileSync } from "node:fs";',
+      ["import test from \"node:", "test\";"].join(""),
+      `test(${JSON.stringify(testPath)}, () => {`,
+      `  appendFileSync(process.env.CORE_TEST_MARKER_FILE, ${JSON.stringify(`${testPath}\n`)});`,
+      "});",
+      "",
+    ].join("\n");
+    const makeFixtureSource = (label, testPaths) => {
+      const runnerTemp = join(root, `${label} runner temp`);
+      const source = join(runnerTemp, "release-source");
+      mkdirSync(source, { recursive: true });
+      for (const testPath of testPaths) write(join(source, testPath), testModule(testPath));
+      return { runnerTemp, source };
+    };
+    const classifierScript = workflowRunScript(sourceInventoryStep);
+    const coreRunnerScript = workflowRunScript(coreValidationStep);
+    const classify = (label, fixture, { capability = true, failDiscovery = false } = {}) => {
+      const outputPath = join(root, `${label}.github-output`);
+      const summaryPath = join(root, `${label}.step-summary`);
+      const gitCallsPath = join(root, `${label}.git-calls`);
+      const findCallsPath = join(root, `${label}.find-calls`);
+      writeFileSync(outputPath, "");
+      writeFileSync(summaryPath, "");
+      writeFileSync(gitCallsPath, "");
+      writeFileSync(findCallsPath, "");
+      const pathPrefix = failDiscovery ? failedFindBin : fakeBin;
+      const result = invoke("bash", ["-c", classifierScript], {
+        cwd: fixture.source,
+        env: {
+          FAKE_BOOTSTRAP_SHARDS: String(capability),
+          FAKE_FIND_CALLS: findCallsPath,
+          FAKE_GIT_CALLS: gitCallsPath,
+          GITHUB_OUTPUT: outputPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          PATH: `${pathPrefix}:${fakeBin}:${executionEnv.PATH}`,
+          RELEASE_SOURCE_SHA: "1111111111111111111111111111111111111111",
+          RUNNER_TEMP: fixture.runnerTemp,
+        },
+      });
+      return {
+        result,
+        output: readFileSync(outputPath, "utf8"),
+        summary: readFileSync(summaryPath, "utf8"),
+        gitCalls: readFileSync(gitCallsPath, "utf8"),
+        findCalls: readFileSync(findCallsPath, "utf8"),
+      };
+    };
+    const runCoreShards = (label, fixture, expectedCorePaths) => {
+      const shards = [];
+      const commandOutput = [];
+      for (const shard of ["1/4", "2/4", "3/4", "4/4"]) {
+        const markerPath = join(root, `${label} ${shard.replace("/", "-")}.markers`);
+        writeFileSync(markerPath, "");
+        const env = {
+          ...executionEnv,
+          CODEX_REVIEW_GATE_CORE_TEST_SHARD: shard,
+          CORE_TEST_MARKER_FILE: markerPath,
+          PATH: `${fakeBin}:${executionEnv.PATH}`,
+          RUNNER_TEMP: fixture.runnerTemp,
+        };
+        delete env.NODE_TEST_CONTEXT;
+        const result = spawnSync("bash", ["-c", coreRunnerScript], {
+          cwd: fixture.source,
+          encoding: "utf8",
+          env,
+          maxBuffer: 64 * 1024 * 1024,
+        });
+        assert.equal(result.status, 0, `${label} shard ${shard}: ${result.stderr}\n${result.stdout}`);
+        assert.ok(
+          result.stdout.includes(`Discovered ${expectedCorePaths.length} core test files for shard ${shard}.`),
+          `${label} shard ${shard} should report its file count`,
+        );
+        commandOutput.push({ shard, stdout: result.stdout, stderr: result.stderr });
+        shards.push(readFileSync(markerPath, "utf8").split("\n").filter(Boolean));
+      }
+      return { shards, commandOutput };
+    };
+
+    const syntheticSpacePath = "test/nested suite/fixture with spaces.test.mjs";
+    assert.ok(!sourceTestPaths.includes(syntheticSpacePath));
+    const allFixturePaths = [...sourceTestPaths, syntheticSpacePath];
+    const fullFixture = makeFixtureSource("full", allFixturePaths);
+    const fullClassification = classify("full", fullFixture);
+    assert.equal(fullClassification.result.status, 0, fullClassification.result.stderr);
+    assert.match(fullClassification.output, /^modern_partition=true$/mu);
+    assert.equal(fullClassification.gitCalls.trim().split("\n").length, 1);
+    assert.equal(fullClassification.findCalls.trim().length, 0);
+
+    const designatedHeavyPaths = [
+      "test/bootstrap.test.mjs",
+      "test/v2-release-pipeline.test.mjs",
+    ];
+    const expectedCorePaths = allFixturePaths.filter((path) => !designatedHeavyPaths.includes(path));
+    const firstRun = runCoreShards("full first pass", fullFixture, expectedCorePaths);
+    const secondRun = runCoreShards("full repeat", fullFixture, expectedCorePaths);
+    assert.deepEqual(secondRun.shards, firstRun.shards, "native shard selection must remain deterministic");
+    const observedCorePaths = firstRun.shards.flat();
+    assert.equal(
+      new Set(observedCorePaths).size,
+      expectedCorePaths.length,
+      JSON.stringify(firstRun.commandOutput),
+    );
+    assert.deepEqual([...observedCorePaths].sort(), [...expectedCorePaths].sort());
+    assert.doesNotMatch(observedCorePaths.join("\n"), /test\/(?:bootstrap|v2-release-pipeline)\.test\.mjs/u);
+
+    const fewCorePaths = expectedCorePaths.slice(0, 2);
+    const fewFixture = makeFixtureSource("fewer than four", [
+      ...designatedHeavyPaths,
+      ...fewCorePaths,
+    ]);
+    const fewClassification = classify("fewer than four", fewFixture);
+    assert.equal(fewClassification.result.status, 0, fewClassification.result.stderr);
+    assert.match(fewClassification.output, /^modern_partition=true$/mu);
+    const fewShardRuns = runCoreShards("fewer than four", fewFixture, fewCorePaths);
+    const observedFewCorePaths = fewShardRuns.shards.flat();
+    assert.deepEqual([...observedFewCorePaths].sort(), [...fewCorePaths].sort());
+    assert.equal(new Set(observedFewCorePaths).size, fewCorePaths.length);
+    assert.doesNotMatch(observedFewCorePaths.join("\n"), /test\/(?:bootstrap|v2-release-pipeline)\.test\.mjs/u);
+
+    const emptyCoreFixture = makeFixtureSource("empty core", designatedHeavyPaths);
+    const emptyCoreClassification = classify("empty core", emptyCoreFixture);
+    assert.notEqual(emptyCoreClassification.result.status, 0);
+    assert.match(emptyCoreClassification.result.stderr, /no discovered core test files/u);
+    assert.equal(emptyCoreClassification.output, "");
+
+    const missingHeavyFixture = makeFixtureSource("missing heavy", [
+      "test/bootstrap.test.mjs",
+      ...fewCorePaths,
+    ]);
+    const missingHeavyClassification = classify("missing heavy", missingHeavyFixture);
+    assert.notEqual(missingHeavyClassification.result.status, 0);
+    assert.match(missingHeavyClassification.result.stderr, /missing a designated heavy test suite/u);
+    assert.equal(missingHeavyClassification.output, "");
+
+    const legacyFixture = makeFixtureSource("legacy", [fewCorePaths[0]]);
+    const legacyClassification = classify("legacy", legacyFixture, { capability: false });
+    assert.equal(legacyClassification.result.status, 0, legacyClassification.result.stderr);
+    assert.match(legacyClassification.output, /^modern_partition=false$/mu);
+    assert.match(legacyClassification.summary, /Core 1\/4 retains source-local serial discovery/u);
+    assert.equal(legacyClassification.gitCalls.trim().split("\n").length, 1);
+
+    const failedDiscovery = classify("failed discovery", fullFixture, { failDiscovery: true });
+    assert.notEqual(failedDiscovery.result.status, 0);
+    assert.equal(failedDiscovery.output, "", "a failed find pipeline must not classify a partial inventory");
+    assert.equal(failedDiscovery.gitCalls, "", "capability classification must not follow failed discovery");
+    assert.equal(failedDiscovery.findCalls, "invoked\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("workflow and publisher expose the adopted staged ABI and scoped credentials", () => {
