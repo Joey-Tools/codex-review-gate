@@ -331,8 +331,24 @@ jobs:
             kind: bootstrap
             bootstrap_test_shard: "4/4"
             release_test_shard: "off"
-          - name: core
+          - name: core 1/4
             kind: core
+            core_test_shard: "1/4"
+            bootstrap_test_shard: "off"
+            release_test_shard: "off"
+          - name: core 2/4
+            kind: core
+            core_test_shard: "2/4"
+            bootstrap_test_shard: "off"
+            release_test_shard: "off"
+          - name: core 3/4
+            kind: core
+            core_test_shard: "3/4"
+            bootstrap_test_shard: "off"
+            release_test_shard: "off"
+          - name: core 4/4
+            kind: core
+            core_test_shard: "4/4"
             bootstrap_test_shard: "off"
             release_test_shard: "off"
           - name: release 1/4
@@ -370,42 +386,45 @@ jobs:
           cd "$RUNNER_TEMP/release-source"
           # First master commit whose bootstrap suite exposes the sealed four-way shard ABI.
           bootstrap_shard_capability_commit=5b0d1726461b48c1b71ec8db051e57fd516d7196
-          current_test_files=(
-            test/bootstrap.test.mjs
-            test/ci-test-shard.test.mjs
-            test/core.test.mjs
-            test/evidence-budget.test.mjs
-            test/gate-runner.test.mjs
-            test/organization-review-gate-handoff.test.mjs
-            test/producer-receipt.test.mjs
-            test/release-provenance.test.mjs
-            test/required-ci-workflow.test.mjs
-            test/v2-action.test.mjs
-            test/v2-gate-runtime.test.mjs
-            test/v2-release-pipeline.test.mjs
-            test/v2-workflow-contract.test.mjs
-            test/workflow-security-contract.test.mjs
-          )
-          mapfile -t discovered_test_files < <(
-            find test -type f -name '*.test.mjs' -print | LC_ALL=C sort
-          )
-          current_inventory=true
-          if (( ${#discovered_test_files[@]} != ${#current_test_files[@]} )); then
-            current_inventory=false
-          else
-            for index in "${!current_test_files[@]}"; do
-              if [[ "${discovered_test_files[$index]}" != "${current_test_files[$index]}" ]]; then
-                current_inventory=false
-                break
-              fi
-            done
-          fi
+          inventory_file="$(mktemp "$RUNNER_TEMP/release-test-inventory.XXXXXX")"
+          trap 'rm -f "$inventory_file"' EXIT
+          find test -type f -name '*.test.mjs' -print0 | LC_ALL=C sort -z > "$inventory_file"
+          discovered_test_files=()
+          while IFS= read -r -d '' test_file; do
+            discovered_test_files+=("$test_file")
+          done < "$inventory_file"
           bootstrap_shards=false
           if git merge-base --is-ancestor "$bootstrap_shard_capability_commit" "$RELEASE_SOURCE_SHA"; then
             bootstrap_shards=true
           fi
           modern_partition=false
-          if [[ "$current_inventory" == true && "$bootstrap_shards" == true ]]; then
+          if [[ "$bootstrap_shards" == true ]]; then
+            core_test_file_count=0
+            bootstrap_suite_found=false
+            release_suite_found=false
+            if (( ${#discovered_test_files[@]} > 0 )); then
+              for test_file in "${discovered_test_files[@]}"; do
+                case "$test_file" in
+                  test/bootstrap.test.mjs)
+                    bootstrap_suite_found=true
+                    continue
+                    ;;
+                  test/v2-release-pipeline.test.mjs)
+                    release_suite_found=true
+                    continue
+                    ;;
+                esac
+                ((core_test_file_count += 1))
+              done
+            fi
+            if [[ "$bootstrap_suite_found" != true || "$release_suite_found" != true ]]; then
+              echo "The frozen source exposes bootstrap sharding but is missing a designated heavy test suite." >&2
+              exit 1
+            fi
+            if (( core_test_file_count == 0 )); then
+              echo "The frozen source exposes bootstrap sharding but has no discovered core test files." >&2
+              exit 1
+            fi
             modern_partition=true
           fi
           printf 'modern_partition=%s\n' "$modern_partition" >> "$GITHUB_OUTPUT"
@@ -413,10 +432,9 @@ jobs:
             {
               echo "## Legacy frozen source test inventory"
               echo
-              echo "This recovery source does not expose the current inventory and bootstrap shard ABI."
-              echo "The core cell will retain source-local serial discovery with the"
-              echo "Release suite disabled, while the four Release shards preserve the"
-              echo "legacy five-cell partition."
+              echo "This recovery source predates the bootstrap shard ABI."
+              echo "Core 1/4 retains source-local serial discovery with the Release suite disabled;"
+              echo "the other core and bootstrap cells skip, while the four Release shards remain enabled."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Run bootstrap test shard
@@ -426,14 +444,47 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/release-source"
           node --test --test-concurrency=1 --test-reporter=dot test/bootstrap.test.mjs
-      - name: Run syntax and core tests
-        if: ${{ matrix.suite.kind == 'core' && steps.source_test_inventory.outputs.modern_partition == 'true' }}
+      - name: Run syntax checks
+        if: ${{ matrix.suite.kind == 'core' && matrix.suite.core_test_shard == '1/4' && steps.source_test_inventory.outputs.modern_partition == 'true' }}
         run: |
           cd "$RUNNER_TEMP/release-source"
           npm run check
-          node --test --test-concurrency=1 --test-reporter=dot test/ci-test-shard.test.mjs test/core.test.mjs test/evidence-budget.test.mjs test/gate-runner.test.mjs test/organization-review-gate-handoff.test.mjs test/producer-receipt.test.mjs test/release-provenance.test.mjs test/required-ci-workflow.test.mjs test/v2-action.test.mjs test/v2-gate-runtime.test.mjs test/v2-workflow-contract.test.mjs test/workflow-security-contract.test.mjs
+      - name: Run discovered core test shard
+        if: ${{ matrix.suite.kind == 'core' && steps.source_test_inventory.outputs.modern_partition == 'true' }}
+        env:
+          CODEX_REVIEW_GATE_CORE_TEST_SHARD: ${{ matrix.suite.core_test_shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/release-source"
+          core_test_shard="${CODEX_REVIEW_GATE_CORE_TEST_SHARD:?}"
+          if [[ ! "$core_test_shard" =~ ^[1-4]/4$ ]]; then
+            echo "Invalid core test shard: $core_test_shard" >&2
+            exit 1
+          fi
+          inventory_file="$(mktemp "$RUNNER_TEMP/release-core-test-inventory.XXXXXX")"
+          trap 'rm -f "$inventory_file"' EXIT
+          find test -type f -name '*.test.mjs' -print0 | LC_ALL=C sort -z > "$inventory_file"
+          discovered_test_files=()
+          while IFS= read -r -d '' test_file; do
+            discovered_test_files+=("$test_file")
+          done < "$inventory_file"
+          core_test_files=()
+          if (( ${#discovered_test_files[@]} > 0 )); then
+            for test_file in "${discovered_test_files[@]}"; do
+              case "$test_file" in
+                test/bootstrap.test.mjs|test/v2-release-pipeline.test.mjs) continue ;;
+              esac
+              core_test_files+=("$test_file")
+            done
+          fi
+          if (( ${#core_test_files[@]} == 0 )); then
+            echo "The frozen source has no discovered core test files; refusing implicit Node test discovery." >&2
+            exit 1
+          fi
+          printf 'Discovered %s core test files for shard %s.\n' "${#core_test_files[@]}" "$core_test_shard"
+          node --test --test-concurrency=1 --test-reporter=dot "--test-shard=$core_test_shard" "${core_test_files[@]}"
       - name: Run legacy source test discovery
-        if: ${{ matrix.suite.kind == 'core' && steps.source_test_inventory.outputs.modern_partition != 'true' }}
+        if: ${{ matrix.suite.kind == 'core' && matrix.suite.core_test_shard == '1/4' && steps.source_test_inventory.outputs.modern_partition != 'true' }}
         env:
           CODEX_REVIEW_GATE_RELEASE_TEST_SHARD: "off"
         run: |
