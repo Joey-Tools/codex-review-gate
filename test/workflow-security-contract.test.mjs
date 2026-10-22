@@ -2479,14 +2479,34 @@ test("package docs preserve reaction liveness and pending recovery semantics", (
       /findings that are now resolved|resolve all findings first|findings\s*已解决|先解决\s*所有 findings/iu,
       /(?:intact|完整)[,、 ]+(?:unedited|未经编辑|未编辑)/iu,
       /(?:without (?:a )?|with no |no |没有 |无 |并无 )base epoch/iu,
-      /fresh eligible `@codex review`|新的合格 `@codex review`/iu,
-      /subsequent trusted unedited exact-head clean|随后.{0,80}exact-head clean/iu,
+      /fresh eligible `@codex review`|eligible unedited request after the cutoff|新的合格 `@codex review`/iu,
+      /subsequent trusted unedited exact-head clean|later trusted, unedited exact-head top-level clean|随后.{0,80}exact-head clean/iu,
       /never clears findings|does not clear findings|never changes the pending verdict|不会清除 findings|不会改变 pending 判定/iu,
       /edited, deleted|(?:已编辑、已删除|编辑、删除)/iu,
       /repair or replacement|replacement path|修复.{0,35}replacement/iu,
     ]) {
       assert.ok(condition.test(recoveryCopy), `${name}: ${condition}`);
     }
+  }
+});
+
+test("packaged head-clean recovery documents the post-base-epoch cutoff", () => {
+  for (const name of [
+    "README.md",
+    "README.zh-CN.md",
+    "DESIGN.md",
+    "DESIGN.zh-CN.md",
+    "COOKBOOK.md",
+    "COOKBOOK.zh-CN.md",
+  ]) {
+    const guide = packageDocs[name].replace(/\s+/gu, " ");
+    assert.match(guide, /current-head clean recovery/iu, name);
+    assert.match(
+      guide,
+      /T = max\(original verifier created_at, latest base epoch\)/u,
+      name,
+    );
+    assert.match(guide, /T < R < C/u, name);
   }
 });
 

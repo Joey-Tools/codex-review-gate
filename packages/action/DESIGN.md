@@ -564,11 +564,11 @@ preserved merely because it has a full-head binding. This recovers an immutable
 historical pair; agents must not deliberately create one.
 
 A separate *current-head clean recovery* admits a fresh head-scoped witness
-when a trusted clean is already on the current head but predates this verifier
-run. This recovery is available only when there is no base epoch. Its cutoff
-`T` is the GitHub-server `created_at` of the original `pull_request` verifier
-run, fixed across attempts of that run ID; it is not the PR synchronize-event
-time. A witness consists of one eligible request `R`: either an exact,
+for an existing verifier. Without a base epoch, its cutoff `T` is the
+GitHub-server `created_at` of
+the original `pull_request` verifier run, fixed across attempts of that run
+ID; it is not the PR synchronize-event time. A witness consists of one eligible
+request `R`: either an exact,
 unedited ordinary `@codex review` from a `User`, or a verified, unedited
 canonical Actions request whose repository, PR, full head/base tuple, and
 workflow-run marker match the selected PR and verifier scope. Both forms are
@@ -580,15 +580,12 @@ unique full-SHA binding covers the selected head, not request-to-result
 causality); posting `R` does not prove Codex started.
 
 Under the configured `any` request-author policy, a token-generated `User`
-request may carry a canonical hidden marker (a workflow-added comment marker
-that binds the request scope). It remains an ordinary user request, not a
-workflow-authored request or workflow authority. The ordinary witness path
-may accept that marked request only when its `repositoryId`, `prNumber`,
-`headSha`, `baseSha`, `baseRef`, and `baseRepositoryId` all match the selected
-PR and verifier scope exactly, in addition to the existing exact-request and
-authorized User checks. The marker does not set workflow provenance or
-head-bound authority. The later clean must independently satisfy the same
-trusted, unedited, exact-current-head receipt requirements above.
+request may carry a canonical hidden marker. It remains an ordinary user
+request, not a workflow-authored request or workflow authority. For this
+recovery, marker metadata does not veto an otherwise eligible exact ordinary
+request or establish its head binding; the later clean independently supplies
+current-head attribution. A canonical Actions request still requires its
+verified current-scope and workflow-run binding.
 
 Historical ordinary requests before `T` remain in the complete lineage audit.
 An eligible witness may ignore their request-attribution gaps, including a gap
@@ -610,6 +607,30 @@ unknown extra content and other parse errors do not qualify. This does not waive
 deleted, forged, scope-drifted or ambiguous evidence. It requires complete
 inventory, exact refetches and two stable snapshots. A new verifier run ID has
 a new cutoff and cannot inherit the witness.
+
+For an existing verifier whose history contains a base epoch, the same
+head-attested recovery has a narrowly scoped post-epoch form. Set
+`T = max(original verifier created_at, latest base epoch)` and require strict
+`T < R < C`. `R` may be an exact,
+unedited ordinary `@codex review` from an authorized `User`, a verified,
+unedited canonical Actions request bound to the selected scope, or an unedited
+token-generated `User` request with the eligible ordinary request shape;
+hidden marker metadata neither grants workflow authority nor vetoes that
+ordinary request. `C` must be a later,
+trusted, unedited official top-level issue-comment clean with an explicit
+commit reference that resolves uniquely to the selected current full head.
+The request must be the latest physical boundary before `C`, and no later
+request boundary may follow `C`. Relevant provider activity at or after `C`
+remains blocking; nonterminal activity before `C` alone does not require an
+older flight to finish. This is head
+attribution, not request-to-clean causality: the clean identifies the reviewed
+head, so it need not identify the triggering comment. This exception provides
+a fresh current-head recovery for that existing verifier only. It does not
+close arbitrary predecessor gaps, make unbound terminal payloads positive
+lineage carriers, blanket-promote other unconfirmed ordinary candidates, or
+supersede a finding. Complete
+pagination, exact refetches, two stable snapshots, provider/history guards and
+resolution of every review thread remain required.
 
 The permission threshold protects generation resets, not negative evidence.
 Qualifying provider findings block regardless of the request author's
@@ -658,10 +679,12 @@ predecessor, requires a qualifying `+1` directly on that request, except for
 the fresh current-head clean recovery above. Provider
 terminal payloads have no originating request ID, so a later carrier could be
 delayed or duplicated from any older generation; stable snapshots cannot make
-that attribution unique. After a base epoch, the current-head clean recovery
-does not apply: existing rules require an exact-current-tuple canonical
-Actions request with a direct provider `+1`, and a top-level terminal clean
-adds no authority.
+that attribution unique. For ordinary post-epoch lineage, existing rules
+still require an exact-current-tuple canonical Actions request with a direct
+provider `+1`, and a top-level terminal clean adds no authority. The separate
+post-epoch current-head clean recovery above applies only to an already-
+existing verifier's fresh head-attested witness; it is not a general lineage
+exception.
 
 The separately defined duplicate cohort is the only other recovery-only
 exception to that ordinary second-boundary rule: its one top-level clean
@@ -688,11 +711,14 @@ that terminal; the interval still participates in predecessor-gap liveness,
 and no other carrier receives that exemption.
 
 After any observed base epoch, terminal payloads cannot prove which
-request/base snapshot produced them. In that degraded lineage mode, only a
-qualifying `+1` directly attached to the latest strictly post-epoch,
+request/base snapshot produced them. In ordinary degraded-lineage evaluation,
+only a qualifying `+1` directly attached to the latest strictly post-epoch,
 base-bound canonical workflow request is a positive or superseding carrier.
 An unlineaged terminal clean remains diagnostic evidence and cannot pass or
-clear a finding. This is a deliberate fail-closed exception to carrier parity.
+clear a finding. This is a deliberate fail-closed exception to carrier parity;
+the separately specified post-epoch current-head recovery applies only to an
+existing verifier's fresh head-attested witness and grants no lineage
+authority.
 For an unconfirmed default-`any` ordinary candidate, a direct official
 post-revision `eyes` or `+1` is first a receipt that promotes it into a
 boundary. For the ordinary single-flight candidate, the only alternative is
@@ -975,11 +1001,15 @@ pair is not an instruction by itself. `wait_provider` does not by itself prove
 that the PR must be replaced. Wait while the review is running; if a trusted,
 unedited exact-head clean is already available, reconcile it. If the review
 finishes without a qualifying current-head clean, resolve all findings first.
-Only an intact, unedited request history with no base epoch may use fresh
-current-head clean recovery: post one fresh eligible `@codex review`, obtain
-its subsequent trusted unedited exact-head clean, then reconcile. A new request
-or wait never clears findings or waives history checks. A missing clean alone
-is not an unclosable-history verdict. Edited, deleted or otherwise unclosable
+An intact, unedited request history may use fresh current-head clean recovery:
+without a base epoch, use the verifier-run cutoff; with a base epoch, use the
+later of that cutoff and the latest base-epoch time. In either case, obtain an
+eligible unedited request after the cutoff and a later trusted, unedited
+exact-head top-level clean, then reconcile. The post-epoch route requires the
+clean's explicit commit reference to resolve uniquely to current full head;
+it does not require a causal link to the request comment. A new request or
+wait never clears findings or waives history checks. A missing clean alone is
+not an unclosable-history verdict. Edited, deleted or otherwise unclosable
 evidence still requires the indicated repair or replacement path. This
 guidance never changes the pending verdict.
 

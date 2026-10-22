@@ -516,10 +516,10 @@ already exists in the immutable GitHub snapshot.
 
 A separate *current-head clean recovery* lets a fresh review request and a
 trusted current-head clean recover an existing verifier, without proving that
-older review requests finished. This recovery is
-available only when there is no base epoch. The cutoff `T` is the GitHub-server
-`created_at` of the original `pull_request` verifier run; retries keep that
-same cutoff. A witness consists of one eligible request `R`: either an exact,
+older review requests finished. With no base epoch, cutoff `T` is the
+GitHub-server `created_at` of the original `pull_request` verifier run;
+retries keep that same cutoff. With an observed base epoch, use the narrow
+post-epoch form below. A witness consists of one eligible request `R`: either an exact,
 unedited ordinary `@codex review` from a `User`, or a verified canonical
 Actions request whose repository, PR, full head/base tuple, and workflow-run
 marker match the selected PR and verifier scope. Both forms are followed by a
@@ -531,18 +531,27 @@ unique full-SHA binding covers the selected head, not request-to-result
 causality); posting `R` does not prove Codex started.
 
 Under the configured `any` request-author policy, a token-generated `User`
-request may carry a canonical hidden marker (a workflow-added comment marker
-that binds the request scope). It remains an ordinary user request, not a
-workflow-authored request or workflow authority. The ordinary recovery path
-accepts it only when the marker's `repositoryId`, `prNumber`, `headSha`,
-`baseSha`, `baseRef`, and `baseRepositoryId` all exactly match the selected
-PR and verifier scope, alongside the existing exact-request and
-authorized User checks. The marker does not grant workflow provenance or head-bound
-authority; the later clean still must independently and unambiguously resolve
-to the exact current full head SHA.
-After a base epoch, this recovery does not apply: the existing rule still
-requires an exact-current-tuple canonical Actions request with a direct
-provider `+1`; a top-level terminal clean adds no authority. Older
+request may carry a canonical hidden marker. It remains an ordinary user
+request, not a workflow-authored request or workflow authority. For this
+recovery, marker metadata does not veto an otherwise eligible exact ordinary
+request or establish its head binding; the later clean independently supplies
+current-head attribution.
+
+For an existing verifier after a base epoch, set
+`T = max(original verifier created_at, latest base epoch)` and require strict
+`T < R < C`. `R` may also be a token-generated, unedited `User` request with
+the eligible ordinary request shape; alternatively it may be a verified,
+unedited canonical Actions request whose full current scope and workflow-run
+marker match. `C` must contain an explicit full or unambiguous short commit
+reference that resolves uniquely to the selected current full head. This
+clean attests which head was reviewed; it need not identify the exact request
+comment that triggered the review. Keep the same latest-request-boundary,
+no-request-after-clean, no-relevant-provider-activity-at-or-after-clean,
+complete-inventory, exact-refetch, stable-snapshot and thread-resolution
+guards. This narrowly supplies a fresh head-attested witness for the existing
+verifier; ordinary post-epoch lineage still requires an exact-current-tuple
+canonical Actions request with a direct provider `+1`, and an unlineaged
+terminal clean does not gain general authority. Older
 requests remain in the complete inventory, but older request count, author
 type, canonical markers, attribution gaps, and unsettled request reactions do
 not invalidate this witness. Recovery does not mark those requests completed
@@ -581,15 +590,17 @@ Every snapshot also reads the latest GitHub PR timeline
 `BaseRefChangedEvent` or `BaseRefForcePushedEvent`. Positive request and clean
 authority must be strictly newer than that base epoch; equal timestamps are
 ambiguous and stay pending. A provider terminal payload does not identify the
-request or base snapshot that produced it, so a PR with an observed base epoch
-uses a deliberately narrower recovery rule: only a qualifying provider `+1`
+request or base snapshot that produced it, so ordinary lineage on a PR with
+an observed base epoch uses a deliberately narrower rule: only a qualifying provider `+1`
 attached directly to a strictly post-epoch, base-bound canonical workflow
 request can supply positive clean authority or supersede an older finding.
 Ordinary direct `@codex review` requests remain supported without a workflow
-marker on PRs that have no base epoch. They can use either of the two receipt
-forms above, but the terminal form is unavailable after a base epoch. Findings
-remain conservative across the epoch boundary, and an unlineaged terminal clean
-stays pending rather than being guessed into the new generation.
+marker on PRs that have no base epoch. They can use either of the two first-
+generation receipt forms above; those ordinary-lineage terminal receipts are
+unavailable after a base epoch. The separately defined post-epoch current-head
+recovery is limited to a fresh witness for an existing verifier. Findings
+remain conservative across the epoch boundary, and an unlineaged terminal
+clean stays pending rather than being guessed into a new generation.
 
 Apart from current-head clean recovery, terminal clean text and a qualifying
 provider `+1` have equal clean authority only for the first physical
@@ -630,9 +641,11 @@ directly on that request, except for the fresh current-head clean recovery
 above. An unbound terminal cannot prove whether it belongs
 to the newer request or is a delayed or duplicate carrier from an older one;
 it therefore cannot pass or supersede findings for the newer generation. With
-a base epoch, the current-head clean recovery does not apply: the existing
-rule requires an exact-current-tuple canonical Actions request with a direct
-provider `+1`, and a top-level terminal clean adds no authority.
+a base epoch, ordinary successor lineage still requires an
+exact-current-tuple canonical Actions request with a direct provider `+1`, and
+a top-level terminal clean adds no authority. This does not broaden the
+separately scoped existing-verifier current-head recovery above: that witness
+does not close arbitrary gaps or clear findings.
 
 A same-or-later official `eyes` or provider activity signal no later than a
 successor keeps the predecessor open; equality with the successor is

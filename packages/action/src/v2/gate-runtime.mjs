@@ -5907,6 +5907,7 @@ function reduceV2Evidence({
     baseRepositoryId,
     baseEpoch,
     requests,
+    headCleanRecovery,
   });
   const {
     baseEpochMs,
@@ -5918,6 +5919,9 @@ function reduceV2Evidence({
     requests: [...(requestBoundaries ?? []), ...deletedBoundaries],
   });
   const requestEpoch = selectLatestV2RequestEpoch(generationRequests);
+  const selectedHeadRecoveryRequest =
+    headCleanRecovery?.kind === "current-head-attestation" &&
+    requestEpoch.selected?.id === headCleanRecovery.requestId;
   if (requestEpoch.error) {
     blockingErrors.push(requestEpoch.error);
     indeterminate += 1;
@@ -6124,6 +6128,10 @@ function reduceV2Evidence({
     Number.isFinite(verifierRunCreatedMs) &&
     Date.parse(artifact.createdAt) <= verifierRunCreatedMs
   );
+  const selectedHeadRecoveryClean = (artifact) =>
+    selectedHeadRecoveryRequest &&
+    artifact.source === "issue-comment" &&
+    String(artifact.id) === String(headCleanRecovery.cleanId);
   const positiveCleans = currentArtifacts.filter((artifact) =>
     artifact.kind === "clean" &&
     (
@@ -6133,11 +6141,13 @@ function reduceV2Evidence({
     ) &&
     (
       artifact.source === "request-reaction" ||
+      selectedHeadRecoveryClean(artifact) ||
       !hasPreRunCurrentHeadClean ||
       requestEpoch.selected?.revisionMs > verifierRunCreatedMs
     ) &&
     (
       baseEpochMs === null ||
+      selectedHeadRecoveryClean(artifact) ||
       (
         artifact.source === "request-reaction" &&
         requestEpoch.selected?.headBound === true &&
@@ -6147,7 +6157,8 @@ function reduceV2Evidence({
   );
   const hasUnattributableEpochTerminalClean = baseEpochMs !== null &&
     currentArtifacts.some((artifact) =>
-      artifact.kind === "clean" && artifact.source !== "request-reaction"
+      artifact.kind === "clean" && artifact.source !== "request-reaction" &&
+      !selectedHeadRecoveryClean(artifact)
     );
   const directSelectedGenerationClean = positiveCleans.find((artifact) =>
     artifact.source === "request-reaction" &&
@@ -6269,7 +6280,7 @@ function reduceV2Evidence({
   const latestBoundaryCannotBeContinued = latestPhysicalBoundary !== null &&
     latestPhysicalBoundary.authorized !== true &&
     latestPhysicalBoundary.physicalOnlyReason !== "post-run-unconfirmed-review-request";
-  const headAttestedRecoveryActive = baseEpochMs === null &&
+  const headAttestedRecoveryActive = selectedHeadRecoveryRequest &&
     generationLineage.headCleanRecovery?.kind === "current-head-attestation";
   const requiresReplacementPr = !headAttestedRecoveryActive && (
     generationLineage.gapClosures.some((closure) => closure === null) ||
@@ -6434,6 +6445,7 @@ function selectCurrentV2RequestGenerations({
   baseRepositoryId,
   baseEpoch,
   requests,
+  headCleanRecovery,
 }) {
   const baseEpochMs = baseEpoch?.event && isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
     ? Date.parse(baseEpoch.event.createdAt)
@@ -6449,7 +6461,14 @@ function selectCurrentV2RequestGenerations({
   });
   const generationRequests = baseEpochMs === null
     ? currentRequests
-    : currentRequests.filter((request) => request.headBound === true);
+    : currentRequests.filter((request) =>
+        request.headBound === true ||
+        (
+          headCleanRecovery?.kind === "current-head-attestation" &&
+          request.id === headCleanRecovery.requestId &&
+          request.revisionMs > headCleanRecovery.recoveryFloorMs
+        )
+      );
   return { baseEpochMs, currentRequests, generationRequests };
 }
 
@@ -6747,9 +6766,17 @@ function selectV2CurrentHeadCleanRecovery({
   // the clean. The latest eligible request is the only request boundary it
   // authorizes; all earlier request lineage remains auditable but cannot veto
   // this head-attested clean through attribution or request-reaction liveness.
+  const hasBaseEpoch = baseEpoch?.event !== null && baseEpoch?.event !== undefined;
+  const baseEpochMs = hasBaseEpoch &&
+    isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
+    ? Date.parse(baseEpoch.event.createdAt)
+    : null;
+  const recoveryFloorMs = hasBaseEpoch
+    ? Math.max(verifierRunCreatedMs, baseEpochMs ?? Number.POSITIVE_INFINITY)
+    : verifierRunCreatedMs;
   if (
     !Number.isFinite(verifierRunCreatedMs) ||
-    (baseEpoch?.event !== null && baseEpoch?.event !== undefined) ||
+    (hasBaseEpoch && baseEpochMs === null) ||
     (providerErrors ?? []).length > 0 ||
     (providerArtifacts ?? []).some((artifact) =>
       artifact?.source === "issue-comment" && artifact.edited === true
@@ -6773,7 +6800,7 @@ function selectV2CurrentHeadCleanRecovery({
   if (physical.length === 0) return null;
   const requestBoundary = physical.at(-1);
   if (
-    requestBoundary.revisionMs <= verifierRunCreatedMs ||
+    requestBoundary.revisionMs <= recoveryFloorMs ||
     physical.filter((boundary) =>
       boundary.revisionMs === requestBoundary.revisionMs
     ).length !== 1
@@ -6792,21 +6819,15 @@ function selectV2CurrentHeadCleanRecovery({
   const isAuthorizedOrdinaryBoundary = (boundary) => {
     const request = authorizedById.get(boundary?.id);
     const comment = request?.comment;
-    const canonical = parseCanonicalV2ReviewRequestBody(comment?.body);
-    const exactCurrentTargetMarker = canonical !== null &&
-      canonical.repositoryId === String(repositoryId) &&
-      canonical.prNumber === String(prNumber) &&
-      canonical.headSha === headSha &&
-      canonical.baseSha === baseSha &&
-      canonical.baseRef === baseRef &&
-      canonical.baseRepositoryId === baseRepositoryId;
+    // User-authored request markers remain unbound ordinary boundaries. Their
+    // embedded target metadata does not veto an independent exact-head clean.
     return request !== undefined &&
       request.headBound !== true &&
       request.binding === null &&
       comment?.id !== undefined &&
       (
         isExactV2OrdinaryReviewRequestBody(comment.body) ||
-        exactCurrentTargetMarker
+        hasExactV2PhysicalReviewRequestShape(comment.body)
       ) &&
       comment.user?.type === "User" &&
       typeof comment.user?.login === "string" &&
@@ -6852,17 +6873,17 @@ function selectV2CurrentHeadCleanRecovery({
     artifact?.kind === "finding" &&
     String(artifact.resolvedHeadSha || artifact.headSha || "").toLowerCase() === headSha
   );
-  if (deferHistoryProjectionForFindings && hasCurrentHeadFinding) return null;
+  if ((hasBaseEpoch || deferHistoryProjectionForFindings) && hasCurrentHeadFinding) {
+    return null;
+  }
   if (
     request.headBound === true &&
     hasCurrentHeadFinding &&
     hasV2DirectPlusOneAfterRequest(request, requestReactions)
   ) {
-    // Preserve the ordinary +1-based supersession path when a current-head
-    // finding depends on its reaction-derived gap-closure proof.
+    // Preserve the existing no-epoch +1-based finding-supersession path.
     return null;
   }
-
   // Keep the head-attested clean available alongside a direct reaction: the
   // reaction retains its ordinary request-bound semantics, while this clean
   // is excluded from superseding findings and evidence errors.
@@ -6880,7 +6901,7 @@ function selectV2CurrentHeadCleanRecovery({
     .filter(({ artifact, window }) =>
       window !== null &&
       window.carrierCreatedMs > request.revisionMs &&
-      window.carrierCreatedMs > verifierRunCreatedMs &&
+      window.carrierCreatedMs > recoveryFloorMs &&
       isCanonicalUtcTimestamp(artifact.createdAt) &&
       Date.parse(artifact.createdAt) === window.carrierCreatedMs
     )
@@ -6900,6 +6921,7 @@ function selectV2CurrentHeadCleanRecovery({
     kind: "current-head-attestation",
     requestId: request.id,
     cleanId: selected.artifact.id,
+    recoveryFloorMs,
     verifierRunCreatedMs,
     priorRequestBoundaries: priorBoundaries.map((boundary) => ({
       id: boundary.id,

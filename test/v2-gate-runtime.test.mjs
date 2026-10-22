@@ -2066,7 +2066,7 @@ test("the only canonical request at the base epoch cannot gain authority from it
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("after a base epoch only a direct canonical-request +1 can recover clean", async (context) => {
+test("after a base epoch an exact-head clean can attest the latest request", async (context) => {
   const epoch = baseRefChangedEvent();
   const generation = workflowRequest({
     created_at: "2026-08-25T08:10:00Z",
@@ -2084,9 +2084,8 @@ test("after a base epoch only a direct canonical-request +1 can recover clean", 
     suffix: "base-epoch-unattributed-terminal-clean",
   });
   const { result: lateClean } = await runGate(lateCleanEnvironment, lateCleanGitHub);
-  assert.equal(lateClean.report.gateOutcome, "pending");
-  assert.equal(lateClean.report.recoveryCode, "request_clean_generation");
-  assert.match(lateClean.report.reason, /cannot be attributed.*canonical request/u);
+  assert.equal(lateClean.report.gateOutcome, "success", lateClean.report.reason);
+  assert.equal(lateClean.report.recoveryCode, "none");
   assert.equal(lateCleanGitHub.statusWrites.some(({ state }) => state === "success"), false);
 
   const findingGitHub = createGitHubMock({
@@ -5182,7 +5181,7 @@ test("a pre-run request's unclosed eyes activity does not block current-head cle
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("PR 34 User canonical request recovers only for its exact target and complete evidence", async (context) => {
+test("PR 34 User canonical request recovers despite stale metadata with complete evidence", async (context) => {
   const cutoff = "2026-10-09T15:45:43Z";
   const oldRequests = [
     [6081765588, OLD_HEAD, "2026-10-09T13:23:00Z", "2026-10-09T13:24:00Z"],
@@ -5341,7 +5340,8 @@ test("PR 34 User canonical request recovers only for its exact target and comple
     environmentFor("wrong-base-binding"),
     makeGitHub({ request: wrongBaseRequest }),
   );
-  assert.notEqual(wrongBinding.result.report.gateOutcome, "success");
+  assert.equal(wrongBinding.result.report.gateOutcome, "success", wrongBinding.result.report.reason);
+  assert.equal(wrongBinding.result.report.requiresReplacementPr, false);
 });
 
 test("old official request reactions may churn between stable snapshots after head attestation", async (context) => {
@@ -5473,7 +5473,7 @@ test("an inline-parent review cannot replace a post-run current-head top-level c
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("a post-run canonical Actions request recovers only for the exact current tuple", async (context) => {
+test("post-run canonical Actions recovery keeps its exact tuple guard and accepts later epoch recovery", async (context) => {
   const cutoff = "2026-08-25T08:10:00Z";
   const exact = workflowRequest({
     id: 531,
@@ -5515,10 +5515,11 @@ test("a post-run canonical Actions request recovers only for the exact current t
     selfVerifierRun: verifierSelfRun({ created_at: cutoff }),
   });
   const postEpochEnvironment = runtimeEnvironment(context, {
-    suffix: "post-run-canonical-after-base-epoch-needs-direct-receipt",
+    suffix: "post-run-canonical-after-base-epoch-exact-head-clean",
   });
   const { result: postEpoch } = await runGate(postEpochEnvironment, postEpochGithub);
-  assert.notEqual(postEpoch.report.gateOutcome, "success");
+  assert.equal(postEpoch.report.gateOutcome, "success", postEpoch.report.reason);
+  assert.equal(postEpoch.report.requiresReplacementPr, false);
   assert.equal(postEpochGithub.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -5699,7 +5700,7 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
     })],
   });
   cases.push({
-    suffix: "ordinary-request-after-base-epoch",
+    suffix: "request-before-new-base-epoch",
     comments: [
       ordinaryRequest({
         id: 559,
@@ -5709,7 +5710,7 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
       currentRequest,
       currentClean,
     ],
-    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:11:30Z" }),
   });
   cases.push({
     suffix: "later-request-after-clean",
@@ -6105,9 +6106,9 @@ test("hashless clean recovery does not relax marker, head, edit, provenance, his
       })],
     },
     {
-      suffix: "base-epoch",
+      suffix: "base-epoch-after-request",
       comments: [firstRequest, hashlessClean, recoveryRequest, recoveryClean],
-      baseEpoch: baseRefChangedEvent({ createdAt: "2026-10-20T18:40:00Z" }),
+      baseEpoch: baseRefChangedEvent({ createdAt: "2026-10-20T18:50:30Z" }),
     },
     {
       suffix: "unresolved-prior-finding",
@@ -6463,7 +6464,7 @@ test("head-attested recovery ignores reactions attached to older request boundar
   }
 });
 
-test("head-attested recovery accepts older request lineage but not later requests or a base epoch", async (context) => {
+test("head-attested recovery accepts older request lineage but not later requests", async (context) => {
   const thirdRequest = ordinaryRequest({
     id: 501,
     created_at: "2026-08-25T08:13:00Z",
@@ -6501,10 +6502,6 @@ test("head-attested recovery accepts older request lineage but not later request
 
   const cases = [
     ["third-request", { issueComments: [...recoveryEvidence(), thirdRequest] }],
-    ["base-epoch", {
-      issueComments: recoveryEvidence(),
-      baseEpoch: baseRefChangedEvent(),
-    }],
   ];
   for (const [suffix, githubOptions] of cases) {
     const github = createGitHubMock({
@@ -6514,6 +6511,54 @@ test("head-attested recovery accepts older request lineage but not later request
     const environment = runtimeEnvironment(context, { suffix: `recovery-lineage-${suffix}` });
     const { result } = await runGate(environment, github);
     assert.equal(result.exitCode, 1, suffix);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+
+  for (const [suffix, request, epoch] of [
+    ["ordinary", recoveryRequest(), baseRefChangedEvent()],
+    ["current-user-marker", recoveryRequest({
+      body: canonicalRequestBody(HEAD),
+    }), baseRefChangedEvent()],
+    ["stale-user-marker", recoveryRequest({
+      body: canonicalRequestBody(OLD_HEAD, {
+        baseSha: OLD_HEAD,
+        baseRef: "release",
+        baseRepositoryId: "999",
+        runId: "999",
+      }),
+    }), baseRefChangedEvent()],
+    ["force-pushed-base", recoveryRequest(), baseRefForcePushedEvent()],
+  ]) {
+    const github = createGitHubMock({
+      baseEpoch: { ...epoch, createdAt: "2026-08-25T08:10:00Z" },
+      issueComments: recoveryEvidence({ request }),
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `recovery-lineage-base-epoch-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 0, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.requiresReplacementPr, false, suffix);
+    assert.deepEqual(github.statusWrites, []);
+  }
+
+  for (const [suffix, epochAt, runAt] of [
+    ["before-base-epoch", "2026-08-25T08:11:30Z", "2026-08-25T08:10:00Z"],
+    ["equal-base-epoch", "2026-08-25T08:11:00Z", "2026-08-25T08:10:00Z"],
+    ["before-verifier-creation", "2026-08-25T08:10:00Z", "2026-08-25T08:11:30Z"],
+  ]) {
+    const github = createGitHubMock({
+      baseEpoch: baseRefChangedEvent({ createdAt: epochAt }),
+      issueComments: recoveryEvidence(),
+      selfVerifierRun: verifierSelfRun({ created_at: runAt }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `recovery-lineage-request-${suffix}`,
+    });
+    const { result } = await runGate(environment, github);
     assert.notEqual(result.report.gateOutcome, "success", suffix);
     assert.deepEqual(github.statusWrites, [], suffix);
   }
@@ -7545,7 +7590,9 @@ test("the latest request and exact clean govern older duplicate-cohort activity"
     suffix: "duplicate-cohort-base-epoch",
   });
   const { result: baseEpochResult } = await runGate(baseEpochEnvironment, baseEpochGitHub);
-  assert.notEqual(baseEpochResult.report.gateOutcome, "success");
+  assert.equal(baseEpochResult.report.gateOutcome, "success", baseEpochResult.report.reason);
+  assert.equal(baseEpochResult.report.recoveryCode, "none");
+  assert.equal(baseEpochResult.report.requiresReplacementPr, false);
 });
 
 test("a previous-head request does not make a current default-any terminal receipt ambiguous", async (context) => {
@@ -7572,7 +7619,7 @@ test("a previous-head request does not make a current default-any terminal recei
   assert.equal(result.report.requiresReplacementPr, false);
 });
 
-test("a base epoch rejects a default-any terminal clean receipt", async (context) => {
+test("a base epoch wrong-head clean receipt does not recover a default-any request", async (context) => {
   const request = ordinaryRequest({ user: READER });
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
@@ -7580,7 +7627,10 @@ test("a base epoch rejects a default-any terminal clean receipt", async (context
   });
   const github = createGitHubMock({
     baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:59:00Z" }),
-    issueComments: [request, terminal],
+    issueComments: [request, cleanIssueComment(OLD_HEAD, {
+      created_at: terminal.created_at,
+      updated_at: terminal.updated_at,
+    })],
   });
   const environment = runtimeEnvironment(context, {
     suffix: "default-any-terminal-receipt-base-epoch",
@@ -7589,7 +7639,7 @@ test("a base epoch rejects a default-any terminal clean receipt", async (context
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "request_clean_generation");
-  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(result.report.requiresReplacementPr, false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -15259,6 +15309,9 @@ test("recovery diagnostics route request-clean and finding fixes by proven linea
     suffix: "recovery-lineage-existing-current-request",
   });
   const { result: direct } = await runGate(directEnvironment, directGitHub);
+  assert.equal(direct.report.gateOutcome, "success", direct.report.reason);
+  assert.equal(direct.report.recoveryCode, "none");
+  assert.equal(direct.report.requiresReplacementPr, false);
 
   const generationGitHub = createGitHubMock({ baseEpoch: epoch });
   const generationEnvironment = runtimeEnvironment(context, {
@@ -15367,7 +15420,6 @@ test("recovery diagnostics route request-clean and finding fixes by proven linea
     assert.doesNotMatch(diagnostic, /replacement PR/iu);
   }
   for (const [result, environment] of [
-    [direct, directEnvironment],
     [generation, generationEnvironment],
   ]) {
     assert.equal(result.report.requiresReplacementPr, false);
@@ -15379,6 +15431,10 @@ test("recovery diagnostics route request-clean and finding fixes by proven linea
       assert.match(diagnostic, /create exactly one canonical generation/iu);
       assert.doesNotMatch(diagnostic, /replacement PR/iu);
     }
+  }
+  for (const diagnostic of diagnostics(direct, directEnvironment)) {
+    assert.match(diagnostic, /No recovery action is required/iu);
+    assert.doesNotMatch(diagnostic, /create exactly one canonical generation/iu);
   }
   for (const diagnostic of diagnostics(findingGap, findingGapEnvironment)) {
     assert.match(diagnostic, /fix the unresolved Codex findings/iu);
