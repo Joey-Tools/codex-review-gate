@@ -315,10 +315,131 @@ export function parseCodexIssueCommentTerminalHeading(body) {
   };
 }
 
-function normalizeCodexCommentBody(body) {
-  return String(body || "")
-    .trim()
+function normalizeCodexCommentBody(body, { trim = true } = {}) {
+  const source = String(body || "");
+  return (trim ? source.trim() : source)
     .replace(/\r\n?|[\u000B\u000C\u0085\u2028\u2029]/g, "\n");
+}
+
+function htmlCommentEnd(body, start) {
+  const close = body.indexOf("-->", start + 4);
+  return close < 0 ? -1 : close + 3;
+}
+
+function boundaryCommentIsVisibleCode(body, start) {
+  if (boundaryCommentHasLocalCodePrefix(body, start)) return true;
+
+  const lineStart = body.lastIndexOf("\n", start - 1) + 1;
+  let fence = null;
+  for (const line of body.slice(0, lineStart).split("\n")) {
+    const marker = /^ {0,3}(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (!marker) continue;
+    if (fence === null) {
+      fence = { char: marker[0], length: marker.length };
+    } else if (
+      marker[0] === fence.char &&
+      marker.length >= fence.length &&
+      /^ {0,3}(`{3,}|~{3,})[\t ]*$/u.test(line)
+    ) {
+      fence = null;
+    }
+  }
+  if (fence !== null) return true;
+
+  let inlineCodeRun = 0;
+  for (let cursor = lineStart; cursor < start;) {
+    if (body[cursor] !== "`" || (cursor > lineStart && body[cursor - 1] === "\\")) {
+      cursor += 1;
+      continue;
+    }
+    let runEnd = cursor + 1;
+    while (body[runEnd] === "`") runEnd += 1;
+    const length = runEnd - cursor;
+    if (inlineCodeRun === 0) {
+      inlineCodeRun = length;
+    } else if (inlineCodeRun === length) {
+      inlineCodeRun = 0;
+    }
+    cursor = runEnd;
+  }
+  return inlineCodeRun !== 0;
+}
+
+function boundaryCommentHasLocalCodePrefix(body, start) {
+  let precedingBackslashes = 0;
+  for (let cursor = start - 1; cursor >= 0 && body[cursor] === "\\"; cursor -= 1) {
+    precedingBackslashes += 1;
+  }
+  if (precedingBackslashes % 2 === 1) return true;
+
+  const lineStart = body.lastIndexOf("\n", start - 1) + 1;
+  const prefix = body.slice(lineStart, start);
+  if (/^ {0,3}>/u.test(prefix) || /^[ \t]+$/u.test(prefix)) {
+    let indentationColumns = 0;
+    for (const character of prefix) {
+      indentationColumns += character === "\t" ? 4 - (indentationColumns % 4) : 1;
+    }
+    if (indentationColumns >= 4 || /^ {0,3}>/u.test(prefix)) return true;
+  }
+  return false;
+}
+
+function stripBoundaryHtmlComments(body) {
+  let projected = body;
+  let cursor = 0;
+  while (cursor < projected.length) {
+    const commentStart = projected.indexOf("<!--", cursor);
+    if (commentStart < 0) break;
+    if (projected.slice(cursor, commentStart).trim() !== "") break;
+    const commentEnd = htmlCommentEnd(projected, commentStart);
+    if (commentEnd < 0) break;
+    const lineStart = projected.lastIndexOf("\n", commentStart - 1) + 1;
+    const indentation = projected.slice(lineStart, commentStart);
+    if (
+      /^ {0,3}>/u.test(indentation) ||
+      /^[ \t]+$/u.test(indentation) && indentationColumns(indentation) >= 4
+    ) break;
+    cursor = commentEnd;
+  }
+  if (cursor > 0) projected = projected.slice(cursor);
+
+  let suffixStart = projected.length;
+  let scanEnd = projected.trimEnd().length;
+  suffixStart = scanEnd;
+  while (scanEnd > 0) {
+    const commentStart = projected.lastIndexOf("<!--", scanEnd - 1);
+    if (commentStart < 0 || htmlCommentEnd(projected, commentStart) !== scanEnd) break;
+    if (boundaryCommentHasLocalCodePrefix(projected, commentStart)) break;
+    suffixStart = commentStart;
+    scanEnd = projected.slice(0, suffixStart).trimEnd().length;
+  }
+  if (
+    suffixStart < projected.trimEnd().length &&
+    !boundaryCommentIsVisibleCode(projected, suffixStart)
+  ) {
+    projected = projected.slice(0, suffixStart);
+  }
+  return projected.trim();
+}
+
+function indentationColumns(indentation) {
+  let columns = 0;
+  for (const character of indentation) {
+    columns += character === "\t" ? 4 - (columns % 4) : 1;
+  }
+  return columns;
+}
+
+export function projectCodexBodyForGrammar(
+  body,
+  { allowBoundaryComments = false } = {},
+) {
+  const normalized = normalizeCodexCommentBody(body, {
+    trim: allowBoundaryComments !== true,
+  });
+  return allowBoundaryComments === true
+    ? stripBoundaryHtmlComments(normalized)
+    : normalized;
 }
 
 function unwrapKnownCodexReviewReceiptEnvelope(body) {
@@ -405,12 +526,18 @@ export function parseCodexIssueCommentArtifact(
     classifyV2HashlessCleanRecovery = false,
     allowKnownServiceFailure = false,
     allowKnownReceiptEnvelope = false,
+    allowBoundaryComments = false,
   } = {},
 ) {
-  const normalizedBody = normalizeCodexCommentBody(comment?.body);
-  const body = allowKnownReceiptEnvelope === true
+  const normalizedBody = normalizeCodexCommentBody(comment?.body, {
+    trim: allowBoundaryComments !== true,
+  });
+  const receiptBody = allowKnownReceiptEnvelope === true
     ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
     : normalizedBody;
+  const body = allowBoundaryComments === true
+    ? stripBoundaryHtmlComments(receiptBody)
+    : receiptBody;
   const terminalHeading = parseCodexIssueCommentTerminalHeading(body);
   if (!terminalHeading.terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
     return null;
@@ -549,14 +676,20 @@ export function parseCodexReviewArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
     allowShortCommitRefs = false,
     allowKnownReceiptEnvelope = false,
+    allowBoundaryComments = false,
   } = {},
 ) {
-  const normalizedBody = allowKnownReceiptEnvelope === true
-    ? normalizeCodexCommentBody(review?.body)
-    : String(review?.body || "").trim();
-  const body = allowKnownReceiptEnvelope === true
+  const normalizedBody = allowBoundaryComments === true
+    ? normalizeCodexCommentBody(review?.body, { trim: false })
+    : allowKnownReceiptEnvelope === true
+      ? normalizeCodexCommentBody(review?.body)
+      : String(review?.body || "").trim();
+  const receiptBody = allowKnownReceiptEnvelope === true
     ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
     : normalizedBody;
+  const body = allowBoundaryComments === true
+    ? stripBoundaryHtmlComments(receiptBody)
+    : receiptBody;
   const terminalLooking =
     new Set(["APPROVED", "COMMENTED", "CHANGES_REQUESTED"]).has(review?.state) ||
     body.startsWith("### 💡 Codex Review");
@@ -661,18 +794,24 @@ export function codexInlineParentReviewBodyHasClosedGrammar(
   {
     allowShortCommitRefs = false,
     allowKnownReceiptEnvelope = false,
+    allowBoundaryComments = false,
   } = {},
 ) {
   if (review?.state !== "COMMENTED" || !isFullCommitSha(review?.commit_id)) {
     return false;
   }
 
-  const normalizedBody = normalizeCodexCommentBody(review.body);
-  const body = allowKnownReceiptEnvelope === true
+  const normalizedBody = normalizeCodexCommentBody(review.body, {
+    trim: allowBoundaryComments !== true,
+  });
+  const receiptBody = allowKnownReceiptEnvelope === true
     ? unwrapKnownCodexReviewReceiptEnvelope(normalizedBody)
     : normalizedBody;
   const receiptEnvelopeWasUnwrapped =
-    allowKnownReceiptEnvelope === true && body !== normalizedBody;
+    allowKnownReceiptEnvelope === true && receiptBody !== normalizedBody;
+  const body = allowBoundaryComments === true
+    ? stripBoundaryHtmlComments(receiptBody)
+    : receiptBody;
   if (!body || body.length > 5_000) {
     return false;
   }
@@ -703,7 +842,7 @@ export function codexInlineParentReviewBodyHasClosedGrammar(
     }
     disclosureStart = 3;
   } else if (
-    !receiptEnvelopeWasUnwrapped ||
+    (!receiptEnvelopeWasUnwrapped && allowBoundaryComments !== true) ||
     lines.some((line) => /^\*\*Reviewed commit:\*\*/i.test(line))
   ) {
     return false;

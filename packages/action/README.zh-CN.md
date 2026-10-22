@@ -284,13 +284,30 @@ resolved”，作为 server-side merge guard。
 可选说明段只能是尾部一个闭合的 `<details>`，包含一个 `About Codex in GitHub`
 summary。启用介绍、触发方式、reaction 和其他功能介绍分别识别，因此支持的旧、新
 介绍文案、链接形式及无害空白变化不再要求整段逐字匹配。未知正文、嵌套或未闭合
-结构、重复 summary、额外尾文仍不能放行。finding 格式信号扫描原始正文，包括说明段。
+结构、重复 summary、额外尾文仍不能放行。finding 格式信号扫描投影后的正文，包括说明段。
 此文法只用于顶层 clean issue comment，不放宽共享的 inline-parent review receipt 文法。
 
 Verifier 的有界 CLI 日志和 Actions Summary 会标明相关 carrier、解析阶段与原因代码，
 以及可获得的 head 解析和请求选择上下文。不输出原始评论正文或 token；诊断信息也不
 提供 pass 权威。未知 provider 格式与真实 unresolved finding 分开报告，两者在各自
 恢复条件满足前均不会 success。
+
+### 首尾隐藏注释
+
+V2 在应用既有可见正文文法之前，忽略 provider 正文首尾完整闭合的 HTML 注释。
+注释名称不设白名单：已观察到的 `codex-review-receipt:v1`、
+`codex-code-review-finding:v1`、任意名称、多条和多行首尾注释都只作展示包装，
+也不要求空行分隔。仅有注释不能提供 terminal result。
+
+这是首尾兼容层，不是完整 Markdown renderer。正文中间的注释、任意 HTML、可见正文、
+代码示例和未闭合注释不会被当作包装一律移除。可见 finding、commit/provider 归属及
+conversation 要求不变。原始正文仍用于编辑检测、exact refetch 和稳定 snapshot 指纹；
+只改变解析器的输入。legacy/default shared parser 行为不变。
+
+官方 `COMMENTED` inline-parent review 仍须通过既有闭合可见正文文法，并由完整 native
+`commit_id` 绑定 commit。V2 中该特定文法可以不重复正文 commit 字段，不取决于是否带
+隐藏包装；只使用旧 known-envelope 选项的 legacy 调用方保持原来的窄规则。顶层 clean
+issue comment 仍须显式声明 commit，识别 parent receipt 也不会豁免未解决的 inline finding。
 
 ### Codex 活动摘要只供诊断
 

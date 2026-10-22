@@ -7695,17 +7695,17 @@ test("receipt envelope: historical wrapped and unwrapped inline parents allow a 
   }
 });
 
-test("historical native-parent receipt with separator whitespace and no body SHA allows a later clean without waiving unresolved threads", async (context) => {
+test("historical native-parent closed grammar preserves native SHA and thread guards with optional boundary comments", async (context) => {
   const review = historicalNativeParentReviewWithoutBodySha(OLD_HEAD, {
     submitted_at: "2026-08-25T08:02:00Z",
   });
-  const invalidReceipts = [
+  const receiptCases = [
     ["missing-native-sha", { ...review, commit_id: "" }],
     ["short-native-sha", { ...review, commit_id: OLD_HEAD.slice(0, 10) }],
     ["missing-envelope", {
       ...review,
       body: review.body.replace(`${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n\n`, ""),
-    }],
+    }, true],
     ["extra-finding-payload", {
       ...review,
       body: `${review.body}\n\n- [P1] This is an unclosed finding payload.`,
@@ -7713,9 +7713,9 @@ test("historical native-parent receipt with separator whitespace and no body SHA
     ["duplicate-envelope", {
       ...review,
       body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${review.body}`,
-    }],
+    }, true],
   ];
-  const unwrappedWithoutBodySha = invalidReceipts.find(([suffix]) =>
+  const unwrappedWithoutBodySha = receiptCases.find(([suffix]) =>
     suffix === "missing-envelope"
   )[1];
   assert.equal(unwrappedWithoutBodySha.state, "COMMENTED");
@@ -7779,7 +7779,7 @@ test("historical native-parent receipt with separator whitespace and no body SHA
     }
   }
 
-  for (const [suffix, invalidReview] of invalidReceipts) {
+  for (const [suffix, candidateReview, compatible = false] of receiptCases) {
     const github = createGitHubMock({
       issueComments: [
         workflowRequest({
@@ -7791,15 +7791,20 @@ test("historical native-parent receipt with separator whitespace and no body SHA
           updated_at: "2026-08-25T08:10:00Z",
         }),
       ],
-      reviews: [invalidReview],
+      reviews: [candidateReview],
     });
     const environment = runtimeEnvironment(context, {
-      suffix: `historical-native-parent-invalid-no-body-sha-${suffix}`,
+      suffix: `historical-native-parent-compatibility-no-body-sha-${suffix}`,
     });
     const { result } = await runGate(environment, github);
 
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
-    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    if (compatible) {
+      assert.equal(result.report.gateOutcome, "success", suffix);
+      assert.equal(result.report.counts.indeterminate, 0, suffix);
+    } else {
+      assert.notEqual(result.report.gateOutcome, "success", suffix);
+      assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    }
   }
 });
 
@@ -7879,17 +7884,19 @@ test("receipt envelope: current inline-parent provider identity and eligibility 
   }
 });
 
-test("receipt envelope: malformed, unknown, and duplicate markers fail closed", async (context) => {
+test("boundary comments permit arbitrary names and separators but retain incomplete and visible-payload blockers", async (context) => {
   const valid = inlineParentReview(HEAD, {
     submitted_at: "2026-08-25T08:02:00Z",
   });
   const cases = [
-    ["malformed-separator", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n${valid.body}`],
-    ["unknown-version", `<!-- codex-review-receipt:v2 -->\n\n${valid.body}`],
-    ["duplicate-marker", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${valid.body}`],
+    ["no-blank-separator", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n${valid.body}`, true],
+    ["arbitrary-version", `<!-- codex-review-receipt:v2 -->\n\n${valid.body}`, true],
+    ["duplicate-marker", `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${valid.body}`, true],
+    ["incomplete-marker", `<!-- codex-review-receipt:v2\n\n${valid.body}`, false],
+    ["visible-finding", `<!-- header -->\n${valid.body}\n\n- [P1] Visible finding payload.\n<!-- footer -->`, false],
   ];
 
-  for (const [suffix, body] of cases) {
+  for (const [suffix, body, compatible] of cases) {
     const review = { ...valid, body };
     const github = createGitHubMock({
       issueComments: [ordinaryRequest({ user: READER })],
@@ -7900,9 +7907,14 @@ test("receipt envelope: malformed, unknown, and duplicate markers fail closed", 
     });
     const { result } = await runGate(environment, github);
 
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
-    assert.ok(result.report.counts.indeterminate >= 1, suffix);
-    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    if (compatible) {
+      assert.equal(result.report.gateOutcome, "success", suffix);
+      assert.equal(result.report.counts.indeterminate, 0, suffix);
+    } else {
+      assert.notEqual(result.report.gateOutcome, "success", suffix);
+      assert.ok(result.report.counts.indeterminate >= 1, suffix);
+      assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+    }
   }
 });
 
@@ -10666,6 +10678,34 @@ test("approved review short commit also requires GitHub resolution and native co
   assert.equal(resolved.report.gateOutcome, "success");
   assert.ok(resolvedGitHub.calls.some((call) => call.path.endsWith(`/commits/${short}`)));
 
+  const hiddenRef = OLD_HEAD.slice(0, 10);
+  const wrappedReview = approvedReview(short);
+  wrappedReview.body = `<!-- metadata \`${hiddenRef}\` -->\n${wrappedReview.body}\n<!-- footer \`${hiddenRef}\` -->`;
+  const wrappedGitHub = createGitHubMock({
+    issueComments: [request],
+    reviews: [wrappedReview],
+    reactionsByCommentId: requestAcknowledgement,
+  });
+  const { result: wrapped } = await runGate(runtimeEnvironment(context, {
+    suffix: "approved-short-hidden-refs",
+  }), wrappedGitHub);
+  assert.equal(wrapped.report.gateOutcome, "success");
+  assert.ok(wrappedGitHub.calls.some((call) => call.path.endsWith(`/commits/${short}`)));
+  assert.equal(wrappedGitHub.calls.some((call) => call.path.endsWith(`/commits/${hiddenRef}`)), false);
+
+  const wrongVisibleReview = approvedReview(hiddenRef);
+  wrongVisibleReview.body = `<!-- \`${short}\` -->${wrongVisibleReview.body}<!-- tail -->`;
+  const wrongVisibleGitHub = createGitHubMock({
+    issueComments: [request],
+    reviews: [wrongVisibleReview],
+    reactionsByCommentId: requestAcknowledgement,
+  });
+  const { result: wrongVisible } = await runGate(runtimeEnvironment(context, {
+    suffix: "approved-wrong-visible-ref",
+  }), wrongVisibleGitHub);
+  assert.notEqual(wrongVisible.report.gateOutcome, "success");
+  assert.equal(wrongVisibleGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
   const ambiguousGitHub = createGitHubMock({
     issueComments: [request],
     reviews: [approvedReview(short)],
@@ -10844,6 +10884,102 @@ test("malformed provider terminal evidence is indeterminate and cannot pass", as
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "request_clean_generation");
   assert.equal(result.report.counts.indeterminate > 0, true);
+});
+
+test("PR 50 boundary-comment evidence (synthetic repository adaptation) preserves finding and thread gates", async (context) => {
+  const oldNativeFinding = findingReview(OLD_HEAD, {
+    id: 5607082812,
+    body: [
+      "<!-- codex-code-review-finding:v1 -->",
+      "",
+      "",
+      "### 💡 Codex Review",
+      "",
+      `https://github.com/${REPOSITORY}/blob/${OLD_HEAD}/src/main.rs#L4582`,
+      "A historical finding from the older reviewed head.",
+    ].join("\n"),
+    submitted_at: "2026-08-25T08:05:00Z",
+  });
+  const request = workflowRequest({
+    id: 6329051019,
+    body: canonicalRequestBody(HEAD, {
+      baseSha: BASE,
+      baseRef: "main",
+      runId: "123",
+    }),
+    user: HUMAN,
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const clean = cleanIssueComment(HEAD, {
+    id: 6329108860,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const makeGitHub = ({
+    review = oldNativeFinding,
+    cleanComment = clean,
+    threads = [
+      reviewThread({ id: "PRRT_pr50_resolved_1", isResolved: true }),
+      reviewThread({ id: "PRRT_pr50_resolved_2", isResolved: true }),
+    ],
+  } = {}) => createGitHubMock({
+    issueComments: [request, cleanComment],
+    reviews: [review],
+    reviewThreads: threads,
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:09:00Z" }),
+  });
+  const environmentFor = (suffix) => runtimeEnvironment(context, {
+    suffix: `pr50-boundary-comment-${suffix}`,
+  });
+
+  const positiveGitHub = makeGitHub();
+  const { result: positive } = await runGate(
+    environmentFor("resolved"),
+    positiveGitHub,
+  );
+  assert.equal(positive.report.gateOutcome, "success", positive.report.reason);
+  assert.equal(positive.report.counts.indeterminate, 0);
+  assert.equal(positive.report.reviewThreads.unresolved, 0);
+  assert.equal(positive.report.reviewThreads.resolved, 2);
+  assert.equal(positive.report.counts.historical, 1);
+
+  const unresolvedGitHub = makeGitHub({
+    threads: [reviewThread({ id: "PRRT_pr50_unresolved", isResolved: false })],
+  });
+  const { result: unresolved } = await runGate(
+    environmentFor("unresolved-thread"),
+    unresolvedGitHub,
+  );
+  assert.equal(unresolved.report.gateOutcome, "pending");
+  assert.equal(unresolved.report.reviewThreads.unresolved, 1);
+  assert.equal(unresolvedGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const liveFinding = findingReview(HEAD, {
+    id: 5607082813,
+    body: oldNativeFinding.body.replaceAll(OLD_HEAD, HEAD),
+    submitted_at: "2026-08-25T08:12:00Z",
+  });
+  const liveFindingGitHub = makeGitHub({ review: liveFinding });
+  const { result: liveFindingResult } = await runGate(
+    environmentFor("live-finding"),
+    liveFindingGitHub,
+  );
+  assert.equal(liveFindingResult.report.gateOutcome, "failure");
+  assert.equal(liveFindingResult.report.counts.unresolved, 1);
+
+  const wrongShaClean = cleanIssueComment("b".repeat(40), {
+    id: 6329108861,
+    created_at: "2026-08-25T08:15:00Z",
+    updated_at: "2026-08-25T08:15:00Z",
+  });
+  const wrongShaGitHub = makeGitHub({ cleanComment: wrongShaClean });
+  const { result: wrongSha } = await runGate(
+    environmentFor("wrong-visible-sha"),
+    wrongShaGitHub,
+  );
+  assert.equal(wrongSha.report.gateOutcome, "pending");
+  assert.equal(wrongShaGitHub.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("older malformed and provider-identity errors become historical after a strict clean generation", async (context) => {

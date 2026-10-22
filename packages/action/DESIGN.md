@@ -410,23 +410,37 @@ Provider carriers must bind exact bot identity. Similar names, copied text or
 user-authored claims have no authority. A finding's severity label does not
 affect blocking: any qualifying finding blocks.
 
-The v2 issue-comment and pull-request-review parsers also accept one observed presentation envelope:
-the exact standalone leading `<!-- codex-review-receipt:v1 -->` line followed
-by a blank line. Existing line-ending normalization applies before this narrow
-unwrap. The shared parser opts into this compatibility explicitly; legacy
-callers retain their default behavior. The envelope alone is never evidence:
-the inner body must still pass the existing terminal grammar, Bot/App
-provenance, commit and request binding, and complete-snapshot finding guards.
-Wrapped findings and known service failures keep their non-clean semantics.
-Unknown, malformed, duplicate, misplaced or marker-only envelopes cannot supply
-clean authority; arbitrary HTML is not removed. Original carrier bodies and
-server metadata remain unchanged for identity, edit and fingerprint checks.
-The same opt-in unwrap applies to native inline-parent review receipts before
-their existing closed-grammar and native-commit checks. A historical wrapped
-parent is classified normally rather than becoming a permanent malformed
-artifact; its resolved threads still cannot supply current-head clean, and
-any unresolved thread continues to block. The marker does not change review
-state, finding severity, or historical/current-head attribution.
+The V2 provider parser profile projects away complete leading/trailing HTML
+comments before parsing issue-comment, native review and inline-parent bodies.
+It accepts arbitrary names, repeated or multiline boundary comments and does
+not require a blank separator. Both the previously supported receipt marker
+and the observed `<!-- codex-code-review-finding:v1 -->` finding marker are
+decoration, not authority. Findings and known service failures retain their
+non-clean meaning after projection. Comments supply no conclusion or binding;
+native review states retain their existing independently validated semantics.
+Interior comments, visible text, code examples, arbitrary HTML and incomplete
+comment delimiters are not generally stripped. This is deliberately a boundary
+compatibility layer, not a Markdown/HTML interpreter.
+
+The shared parser opts into this profile explicitly; legacy/default callers
+and the older known-receipt-only option retain their existing behavior.
+Original carrier bodies and server metadata stay unchanged for identity,
+edit, exact-refetch and fingerprint checks. Approved-review commit-reference
+collection uses the same projection as its grammar, not hidden comment text.
+All visible finding checks, Bot/App provenance, commit/request binding and
+complete-snapshot guards remain required. The closed V2 inline-parent grammar
+may omit a body commit field because the full native `commit_id` supplies its
+binding, independent of whether a hidden wrapper is present. Top-level clean
+issue comments still require their explicit body commit field. A historical
+wrapped review is classified normally, not promoted to current-head clean;
+any unresolved thread still blocks.
+
+[GitHub's review API](https://docs.github.com/en/rest/pulls/reviews) offers raw,
+text and HTML bodies. An authenticated probe of the observed finding showed
+that rendered fields expand its blob link into a source card and alter the
+Markdown needed by the current grammar. They are not used as a replacement
+carrier. The dependency-free Action keeps the narrow projection rather than
+adding a Markdown AST parser and distribution dependency for edge comments.
 The separate official PR-level summary and its embedded state remain
 non-authoritative and cannot substitute for a qualifying terminal carrier.
 
