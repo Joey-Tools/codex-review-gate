@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:4",
   "schema_version": 4,
-  "version": "2.2.8",
+  "version": "2.2.9",
   "contract_versions": {
     "toolchain": "node24",
     "release_schema": 4,
@@ -12,13 +12,13 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "a70242b9598cf7a722ac75bc26353c9a242dbffb"
+    "tree": "1b35039db8bed68a331ea9e2c5448feb066ccbab"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "0fddbcaeb54dcf4ab1e0aa47b2d1a39d7edcd1b1",
-    "previous_version": "2.2.7"
+    "expected_head": "e258b4a750528a8437393a0e31b208455cec5413",
+    "previous_version": "2.2.8"
   },
   "files": [
     {
@@ -39,15 +39,15 @@
       "path": "DESIGN.md",
       "type": "file",
       "mode": "100644",
-      "size": 65055,
-      "sha256": "5961f0e5dae8d070d4cee56120bbc252ed131469a7ca660c320c847640f33ec0"
+      "size": 65904,
+      "sha256": "3b2a391514c2245c5596f59e2f52bbd1274546b1f4e020d0dd0e6be61eb33d2a"
     },
     {
       "path": "DESIGN.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 64425,
-      "sha256": "44e378db7d449fcad734dbfc3f37da2ba1d6a5421c8780388be639e81a2062ad"
+      "size": 64988,
+      "sha256": "1a7eb29f5451c080c044fa38e0a7c80d7c0e4c02309a130278874ea0ba594b8d"
     },
     {
       "path": "EULA.md",
@@ -67,15 +67,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 55605,
-      "sha256": "2c27da27e4ded767075da650f1b93d9bf03816b3525fa50af04107021fdbf22b"
+      "size": 56521,
+      "sha256": "c36bffae015d8988a9f48ffd41efa8b9814428a75781f4f863c64824138f6f6b"
     },
     {
       "path": "README.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 52932,
-      "sha256": "b9e7f8265bed67ec5421ca8b5a1168c483f6fc6c01e9c24d0911bc9040d9af45"
+      "size": 54150,
+      "sha256": "cf8bd4d495c9a10d98ba65201ff5e82681029eda7a22f435c0930fd9b94531f1"
     },
     {
       "path": "SECURITY.md",
@@ -110,7 +110,7 @@
       "type": "file",
       "mode": "100644",
       "size": 481,
-      "sha256": "12b6280a9c298e35756b4ffec38c41effba9256859b806af28fd7af913c717b2"
+      "sha256": "7dde07dd1709d464e2a2bc003e20fc47b75bbb23c2a9c4de1619bda535ded97f"
     },
     {
       "path": "producer-receipt.schema.json",
@@ -123,8 +123,8 @@
       "path": "src/core.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 74333,
-      "sha256": "6a139f6f00a088978b942a76ae553c4d1affd362f020d4c578c71e16ac461ebc"
+      "size": 78952,
+      "sha256": "8395a279cf07b5c9a2e65e1621d9af3a047dcc61eeb28969b24de7c041cf7fec"
     },
     {
       "path": "src/evidence-budget.mjs",
@@ -144,8 +144,8 @@
       "path": "src/v2/gate-runtime.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 372914,
-      "sha256": "2ca650fda25a9e5d8896425e0fc88804147e3083f574ede7ede20ca06d0ccd67"
+      "size": 373175,
+      "sha256": "f1fe0c4d0fa2ddcaab6509b850bc227b2e18c076ed83f30be967eebcd3811981"
     }
   ],
   "entrypoint": {
