@@ -346,19 +346,27 @@ provider carriers 必须绑定 exact bot identity。相似 name、复制的文�
 claim 都没有 authority。finding severity label 不影响 blocking：任何符合条件的
 finding 都会阻塞。
 
-v2 issue-comment 和 pull-request-review parser 还兼容一个已观察到的展示封套（正文前的固定隐藏标记）：
-独占首行的 `<!-- codex-review-receipt:v1 -->`，随后必须有一个空行。先沿用既有换行
-规范化，再只移除这一层已知封套。shared parser 由 v2 调用方显式启用该兼容；legacy
-调用方默认行为不变。标记本身不是证据：内层正文仍须通过既有 terminal grammar、
-Bot/App provenance、commit 与 request binding，以及完整 snapshot 的 finding 校验。
-包裹后的 finding 与已知 service failure 仍保持 non-clean 语义。未知、格式错误、重复、
-非首部或只有标记的封套都不能提供 clean authority，也不会泛化移除任意 HTML。原始
-carrier body 与 server metadata 不变，继续用于 identity、edit 与 fingerprint 校验。
-同一个显式启用的解包步骤也用于 native inline-parent review receipt，随后仍检查既有
-closed grammar 和 native commit。历史 wrapped parent 按正常规则归类，不再仅因这个
-已知外层标记而成为永久 malformed artifact；历史 resolved thread 不提供 current-head
-clean，任何 unresolved thread 仍会阻塞。标记不会改变 review state、finding severity
-或 historical/current-head attribution。
+V2 provider parser 在 issue-comment、native review 和 inline-parent body 的首尾移除完整
+闭合的 HTML 注释，再解析可见正文。支持任意名称、多条、多行，不要求空行分隔；之前
+支持的 receipt marker 和新观察到的 `<!-- codex-code-review-finding:v1 -->` 都只是展示
+包装，不提供 authority。包裹后的 finding 和已知 service failure 仍保持 non-clean 语义；
+注释不提供结论或 commit 绑定，native review state 保持既有独立校验语义。
+中间注释、可见正文、代码示例、任意 HTML 和未闭合注释不会被
+泛化删除；这是首尾兼容层，不是 Markdown/HTML interpreter。
+
+shared parser 由 V2 显式启用此 profile；legacy/default 调用方以及旧 known-receipt-only
+选项保持既有行为。原始 carrier body 与 server metadata 不变，继续用于 identity、edit、
+exact refetch 和 fingerprint 校验。APPROVED review 的 commit-reference 收集与其文法
+使用同一份投影，不再读取隐藏注释中的 SHA。所有可见 finding、Bot/App provenance、
+commit/request binding 和完整 snapshot 校验仍然必要。V2 的闭合 inline-parent 文法可以
+省略正文 commit 字段，因为完整 native `commit_id` 已提供绑定，不取决于隐藏包装是否存在；
+顶层 clean issue comment 仍须显式携带 commit。历史 wrapped review 按正常规则归类，
+不会提升为 current-head clean；任何 unresolved thread 仍会阻塞。
+
+[GitHub review API](https://docs.github.com/en/rest/pulls/reviews) 提供 raw、text 和 HTML
+正文，但对本次 finding 的认证读取表明，rendered 字段会把 blob 链接展开为 source card，
+并改写现有文法依赖的 Markdown，因此不替代原始 carrier。Action 保持无运行时依赖，
+不为首尾注释引入 Markdown AST parser 及其分发依赖。
 独立的官方 PR-level summary 及其内嵌 state 仍不具有判定权，不能替代合格 terminal carrier。
 
 已观察到的官方 service-failure issue comment（provider 执行失败的普通 PR 评论）是单独的

@@ -10,6 +10,7 @@ import {
   codexInlineParentReviewBodyHasClosedGrammar,
   parseCodexIssueCommentArtifact,
   parseCodexReviewArtifact,
+  projectCodexBodyForGrammar,
 } from "../core.mjs";
 
 export const V2_REQUIRED_CHECK_NAME = "codex/github-review-gate";
@@ -4689,6 +4690,7 @@ function providerEventIsStale(event, currentHead, { owner, repo } = {}) {
     botLogins: EXACT_CODEX_LOGINS,
     allowShortCommitRefs: true,
     allowKnownReceiptEnvelope: true,
+    allowBoundaryComments: true,
     owner,
     repo,
   });
@@ -8367,6 +8369,7 @@ async function collectV2ProviderEvidence(
       classifyV2HashlessCleanRecovery: !observedEdit,
       allowKnownServiceFailure: true,
       allowKnownReceiptEnvelope: true,
+      allowBoundaryComments: true,
     });
     if (artifact) {
       artifact.htmlUrl = comment.html_url;
@@ -8449,6 +8452,7 @@ async function collectV2ProviderEvidence(
     if (codexInlineParentReviewBodyHasClosedGrammar(review, {
       allowShortCommitRefs: true,
       allowKnownReceiptEnvelope: true,
+      allowBoundaryComments: true,
     })) {
       // This closed parent wrapper carries no non-inline finding payload. Its
       // children remain entirely outside this REST-only reducer: the required
@@ -8464,6 +8468,7 @@ async function collectV2ProviderEvidence(
       botLogins: EXACT_CODEX_LOGINS,
       allowShortCommitRefs: true,
       allowKnownReceiptEnvelope: true,
+      allowBoundaryComments: true,
     });
     if (artifact) {
       if (
@@ -8578,8 +8583,11 @@ function v2InlineParentReviewCleanArtifact(review) {
 }
 
 function approvedReviewCommitReferences(body) {
+  const projectedBody = projectCodexBodyForGrammar(body, {
+    allowBoundaryComments: true,
+  });
   return [...new Set(
-    [...String(body || "").matchAll(/`([0-9a-f]{7,40})`/giu)]
+    [...projectedBody.matchAll(/`([0-9a-f]{7,40})`/giu)]
       .map((match) => match[1].toLowerCase()),
   )].sort();
 }

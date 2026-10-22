@@ -47,6 +47,7 @@ import {
   parseCodexIssueCommentArtifact,
   parseCodexIssueCommentTerminalHeading,
   parseCodexReviewArtifact,
+  projectCodexBodyForGrammar,
   parseJsonResponseText,
   parseMarkerCommentBody,
   parseStateCommentBody,
@@ -1508,6 +1509,113 @@ test("receipt envelopes preserve wrapped finding, failure, and provenance semant
   assert.equal(editedComment.body, editedBody);
 });
 
+test("V2 boundary-comment projection strips only complete outer HTML comments", () => {
+  const project = (body) => projectCodexBodyForGrammar(body, {
+    allowBoundaryComments: true,
+  });
+
+  for (const body of [
+    "<!-- one -->visible<!-- two -->",
+    "<!-- one -->\n\n<!-- two\nmultiline -->\r\nvisible\r\n<!-- three -->",
+    "<!-- one --><!-- two -->visible<!-- three --><!-- four -->",
+  ]) {
+    assert.equal(project(body), "visible");
+  }
+
+  for (const body of [
+    ["visible <!-- interior --> text", "visible <!-- interior --> text"],
+    ["`<!-- inline example -->`", "`<!-- inline example -->`"],
+    ["```html\n<!-- fenced example -->\n```", "```html\n<!-- fenced example -->\n```"],
+    ["\\<!-- escaped example -->", "\\<!-- escaped example -->"],
+    ["> <!-- quoted example -->", "> <!-- quoted example -->"],
+    ["    <!-- indented example -->", "<!-- indented example -->"],
+    ["\t<!-- tab-indented example -->", "<!-- tab-indented example -->"],
+    [
+      "visible\n<!-- hidden -->\n    <!-- visible indented code -->",
+      "visible\n<!-- hidden -->\n    <!-- visible indented code -->",
+    ],
+    [
+      "visible\n<!-- hidden -->\n\t<!-- visible tab-indented code -->",
+      "visible\n<!-- hidden -->\n\t<!-- visible tab-indented code -->",
+    ],
+    ["<!-- incomplete comment", "<!-- incomplete comment"],
+    ["<!--\n```\n-->\n<!-- second -->\nvisible", "visible"],
+  ]) {
+    assert.equal(project(body[0]), body[1], body[0]);
+  }
+});
+
+test("V2 boundary comments preserve finding and clean parser classifications only by projection", () => {
+  const findingBody = [
+    "### 💡 Codex Review",
+    "",
+    `https://github.com/owner/repo/blob/${FULL_SHA_A}/src/lib.mjs#L12-L14`,
+  ].join("\n");
+  const review = liveCodexReview({
+    state: "COMMENTED",
+    commit_id: FULL_SHA_A,
+    body: `<!-- codex-code-review-finding:v1 -->\n\n${findingBody}`,
+  });
+
+  assert.equal(parseCodexReviewArtifact(review, {
+    owner: "owner",
+    repo: "repo",
+    allowShortCommitRefs: true,
+    allowKnownReceiptEnvelope: true,
+  }).kind, "malformed", "legacy/default parsing does not strip arbitrary comments");
+
+  const projectedFinding = parseCodexReviewArtifact(review, {
+    owner: "owner",
+    repo: "repo",
+    allowShortCommitRefs: true,
+    allowKnownReceiptEnvelope: true,
+    allowBoundaryComments: true,
+  });
+  assert.equal(projectedFinding.kind, "finding");
+  assert.equal(projectedFinding.headSha, FULL_SHA_A);
+  assert.equal(projectedFinding.findingCount, 1);
+
+  const cleanBody = `Coverage: \`${FULL_SHA_A}\`.\n\nNo findings.`;
+  const cleanReview = liveCodexReview({
+    body: `<!-- arbitrary\nmultiline wrapper -->\n${cleanBody}\n<!-- trailing -->`,
+  });
+  const cleanArtifact = parseCodexReviewArtifact(cleanReview, {
+    owner: "owner",
+    repo: "repo",
+    allowShortCommitRefs: true,
+    allowKnownReceiptEnvelope: true,
+    allowBoundaryComments: true,
+  });
+  assert.equal(cleanArtifact.kind, "clean");
+  assert.equal(cleanArtifact.headSha, FULL_SHA_A);
+
+  const visibleClean = `Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** \`${FULL_SHA_A}\``;
+  const options = { allowBoundaryComments: true, allowShortCommitRefs: true };
+  for (const body of [
+    visibleClean,
+    `<!-- arbitrary -->${visibleClean}<!-- tail -->`,
+    `\uFEFF\u00A0<!-- metadata \`${FULL_SHA_B}\` -->\r\n${visibleClean}\r\n<!-- multiline\nmetadata -->\u00A0`,
+    codexReviewReceiptEnvelope(visibleClean),
+  ]) {
+    const comment = liveCodexIssueComment(body);
+    const result = parseCodexIssueCommentArtifact(comment, options);
+    assert.equal(result.kind, "clean");
+    assert.equal(result.commitRef, FULL_SHA_A);
+    assert.equal(comment.body, body, "projection never edits the carrier");
+  }
+  for (const body of [
+    `<!-- header -->${visibleClean}\n- [P1] Visible finding.<!-- footer -->`,
+    `<!-- header -->${visibleClean}\n**Reviewed commit:** \`${FULL_SHA_B}\`<!-- footer -->`,
+    `<!-- incomplete\n${visibleClean}`,
+    `\`\`\`markdown\n<!-- header -->${visibleClean}\n\`\`\``,
+    `<!-- \`${FULL_SHA_A}\` -->Codex Review: Didn't find any major issues.<!-- tail -->`,
+  ]) {
+    assert.notEqual(parseCodexIssueCommentArtifact(
+      liveCodexIssueComment(body), options,
+    )?.kind, "clean", body);
+  }
+});
+
 test("recognizes only the opt-in closed Codex provider service-failure grammar", () => {
   const body = [
     "Codex Review: Something went wrong. Try again later by commenting “@codex review”.",
@@ -2830,6 +2938,20 @@ test("opts inline-parent review grammar into the exact v1 receipt envelope", () 
     true,
     "the opted-in native parent may bind through its full commit_id",
   );
+  for (const body of [
+    bodyWithoutReviewedCommit,
+    `<!-- arbitrary leading -->\n${bodyWithoutReviewedCommit}\n<!-- arbitrary trailing -->`,
+    `<!-- first --><!-- second -->${bodyWithoutReviewedCommit}<!-- third -->`,
+  ]) {
+    assert.equal(
+      codexInlineParentReviewBodyHasClosedGrammar(
+        { ...unwrappedReview, body },
+        { allowBoundaryComments: true },
+      ),
+      true,
+      "the V2 profile binds the visible wrapper directly to its full native commit_id",
+    );
+  }
   assert.equal(
     codexInlineParentReviewBodyHasClosedGrammar(
       {
@@ -2841,6 +2963,18 @@ test("opts inline-parent review grammar into the exact v1 receipt envelope", () 
     ),
     false,
     "omitting the body commit line requires a full native commit_id",
+  );
+  assert.equal(
+    codexInlineParentReviewBodyHasClosedGrammar(
+      {
+        ...unwrappedReview,
+        commit_id: FULL_SHA_A.slice(0, 10),
+        body: bodyWithoutReviewedCommit,
+      },
+      { allowBoundaryComments: true },
+    ),
+    false,
+    "boundary-comment mode still requires a full native commit_id for omitted body binding",
   );
 
   for (const [name, separator] of [
