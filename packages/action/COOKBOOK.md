@@ -141,19 +141,27 @@ pending. Canonical workflows fix
 to an ordinary consumer workflow. `write`/`maintain`/`admin` is reserved for a
 nonstandard future verifier identity that can read collaborator permissions.
 
-For an existing verifier with no observed base epoch, recovery is simpler:
-post one fresh exact, unedited `@codex review`, then wait for an unedited
-official top-level clean whose full or unambiguous short SHA resolves to the
-current PR head. The original verifier run cutoff `T`, request `R`, and clean
-`C` must satisfy `T < R < C`, with no newer physical request boundary or
-relevant later provider activity. Old request attribution gaps and unsettled
-old `eyes` do not veto this witness or its stable-snapshot comparison. Actual
-findings, unresolved review threads, provider errors and acquisition/history
-guards remain independent. The existing provider event normally requests the
-verifier rerun; if delivery fails, run one scoped `reconcile`. No empty commit
-is required. Posting the request does not guarantee Codex starts. After a base
-epoch, use the existing exact-current-tuple canonical request/direct `+1`
-path instead. See [the full recovery contract](README.md#review-generations-and-recovery).
+For an existing verifier, fresh current-head clean recovery uses
+`T = max(original verifier created_at, latest base epoch)` (when no base epoch
+was observed, `T` is just the original verifier run's server `created_at`).
+Post one fresh eligible `@codex review` request `R` (exact and unedited), then wait for a
+later trusted, unedited exact-head top-level clean `C` from the official provider whose explicit full or
+unambiguous short SHA resolves uniquely to the current PR head. Require strict
+`T < R < C`, no request boundary after `C`, and no relevant provider
+activity at or after `C`. `R` may be an authorized ordinary `User` request, the
+exact-scope canonical Actions request, or a token-generated `User` request
+with the eligible ordinary request shape. Its hidden marker is not authority
+and its tuple metadata does not veto an otherwise eligible ordinary request.
+The clean attests the reviewed head; it need not identify
+the exact triggering comment. This post-epoch path supplies a fresh
+head-attested witness for the existing verifier only; ordinary post-epoch lineage still follows the
+exact-current-tuple canonical request/direct `+1` rules. Old request
+attribution gaps and unsettled old `eyes` do not veto a qualifying witness,
+but actual findings, unresolved review threads, provider errors and
+acquisition/history guards remain independent. The existing provider event
+normally requests the verifier rerun; if delivery fails, run one scoped
+`reconcile`. No empty commit is required. Posting the request does not
+guarantee Codex starts. See [the full recovery contract](README.md#review-generations-and-recovery).
 
 Do not spam duplicate direct requests. A separate legacy recovery
 exception is the duplicate cohort: exactly two strictly sequential, unedited
@@ -345,7 +353,7 @@ provider error, or base-epoch requirement.
 | Code | Safe next action |
 | --- | --- |
 | `none` | No evaluator recovery is required; perform exact-head merge closure. |
-| `wait_provider` | No qualifying terminal result is available yet; this alone does not mean the PR must be replaced. Wait while the review is running, or reconcile if a trusted exact-head clean already exists. If the review finishes without a qualifying current-head clean, resolve all findings first. Only intact, unedited request history with no base epoch allows one fresh eligible `@codex review`; wait for its subsequent trusted unedited exact-head clean, then reconcile. A missing clean alone is not proof of unclosable history. A new request or wait does not clear findings or waive history checks; edited, deleted or otherwise unclosable history may still require the indicated repair or replacement path. This guidance does not change the pending verdict; do not spam requests. |
+| `wait_provider` | No qualifying terminal result is available yet; this alone does not mean the PR must be replaced. Wait while the review is running, or reconcile if a trusted exact-head clean already exists. If the review finishes without a qualifying current-head clean, resolve all findings first. An intact, unedited history may use fresh current-head clean recovery with `T = max(original verifier created_at, latest base epoch)`; see the scoped post-epoch witness above. A missing clean alone is not proof of unclosable history. A new request or wait does not clear findings or waive history checks; edited, deleted or otherwise unclosable history may still require the indicated repair or replacement path. This guidance does not change the pending verdict; do not spam requests. |
 | `reconcile` | Reread the exact current head and run one scoped reconcile. |
 | `fix_findings` | Follow the summary reason. Normally fix the reported current findings, separately resolve inline conversations, obtain later head-bound clean evidence, then reconcile. If the reason also reports an unclosable historical lineage, put the fixes on a replacement PR and run exactly one canonical generation there instead of requesting again on the original PR. |
 | `request_clean_generation` | Follow the summary reason and lineage. For a recoverable latest/current canonical request, stay on the original PR: obtain the required direct `+1` on the named request, or—only for the unique, no-base-epoch, single-flight unedited default-`any` ordinary candidate—wait for its matching unedited official current-head top-level issue-comment terminal clean or exact closed `COMMENTED` Codex inline-parent review. Generic pull-request reviews cannot confirm that candidate. The recovery-only duplicate cohort above is not a request path: never create it; if the immutable snapshot already qualifies, reconcile it, and a canonical successor still needs its own direct `+1`. A finding still blocks and never confirms it. Create exactly one newer canonical generation only when the reason says one is still needed. A historical gap may reset on a legitimate new head only when every ambiguous predecessor is explicitly bound to another full head. A default-`any` ordinary candidate with neither a direct receipt nor a terminal-clean contender is not such a predecessor. If a provider-confirmed ordinary, edited, malformed, denied, deleted, or otherwise unbound predecessor makes that gap unclosable, do not request again on that PR/head; open a replacement PR and run one canonical generation there. |

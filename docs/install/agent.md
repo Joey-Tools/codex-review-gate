@@ -1811,7 +1811,16 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    every later gap and positive/superseding authority require a qualifying `+1`
    directly on the corresponding canonical request, except for the exact
    two-boundary current-head clean recovery below.
-   With a base epoch, every gap requires direct `+1` evidence. Never attribute
+   With a base epoch, ordinary post-epoch lineage requires direct `+1` evidence
+   for every gap. An existing verifier has a separate narrow current-head clean
+   recovery: require `T = max(original verifier created_at, latest base epoch)`,
+   an eligible fresh request `R` (ordinary `@codex review`, including a
+   PAT-generated `User` request with the exact canonical marker, which grants
+   no workflow authority), and a later unedited official top-level
+   issue-comment clean `C` explicitly bound to the selected current full head,
+   with strict `T < R < C`; request-to-clean causality is not required. Follow
+   the full guards in
+   [`packages/action/DESIGN.md`](../../packages/action/DESIGN.md). Never attribute
    a later terminal to a newer generation merely by timestamp; it may be a
    delayed or duplicate carrier from an older flight. Treat edited unbound
    provider-triggerable request shape as a physical boundary even when edited,

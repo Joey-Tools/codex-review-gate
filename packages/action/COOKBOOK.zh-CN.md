@@ -120,14 +120,17 @@ fail-closed pending。canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHO
 workflow 添加 strict policy。`write`/`maintain`/`admin` 仅保留给将来可以读取 collaborator
 permission 的 nonstandard verifier identity。
 
-已有 verifier 且没有观察到 base epoch 时，恢复操作更简单：发一条新鲜、exact、未编辑的
-`@codex review`，等待随后出现的未编辑 official 顶层 clean，其中 full 或无歧义 short SHA
-必须解析为 current PR head。原始 verifier run cutoff `T`、request `R` 与 clean `C` 必须满足
-`T < R < C`；不能有更新的 physical request boundary 或后续相关 provider activity。
+已有 verifier 可使用 current-head clean recovery，不论是否观察到 base epoch：发一条新鲜、exact、未编辑的
+authorized `User` `@codex review`（可包括带 PAT marker 的普通 request），等待随后出现的未编辑 official
+顶层 clean `C`，其显式 full 或无歧义 short SHA 必须解析为 current PR head。无 base epoch 时，`T` 是原始
+verifier run 的 `created_at`；有 base epoch 时，`T` 取原始 verifier `created_at` 与最新 base epoch
+时间中较晚者，即 `T = max(original verifier created_at, latest base epoch)`。request `R` 与 clean `C`
+必须满足 `T < R < C`；不能有更新的 physical request boundary 或后续相关 provider activity。
 旧请求的归因缺口、未结清的旧 `eyes` 不再否决这个见证，也不能间接破坏稳定 snapshot 比较。
 真实 findings、未解决 review threads、provider errors 和 acquisition/history guards 仍独立生效。
 现有 provider event 通常会请求 verifier rerun；事件未送达时执行一次 scoped `reconcile`。
-不要求 empty commit；发请求不保证 Codex 启动。出现 base epoch 后，仍走现有
+不要求 empty commit；发请求不保证 Codex 启动。此例外仅恢复既有 verifier 的 current-head clean，
+不闭合任意 predecessor gap，也不能清除 finding。普通 post-epoch lineage 仍走现有
 exact-current-tuple canonical request/direct `+1` 路径。
 完整合同见 [README](README.zh-CN.md#review-generation-与恢复)。
 

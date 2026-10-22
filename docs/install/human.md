@@ -270,7 +270,17 @@ prove that it belongs to the newer request rather than an older flight. Without
 a base epoch, provider terminal evidence may close only the first gap; every
 later gap and the newer generation's clean authority require a qualifying `+1`
 directly on the corresponding canonical request. With a base epoch, every gap
-does. Physical boundaries and positive authority are separate: an edited,
+requires that `+1` in ordinary post-epoch lineage; this does not exclude the
+narrow current-head clean recovery for an existing verifier described in
+[`packages/action/DESIGN.md`](../../packages/action/DESIGN.md). That recovery
+sets `T` to the later of the original verifier's `created_at` and latest base
+epoch, then requires a fresh eligible request `R` (ordinary `@codex review`,
+including a PAT-generated `User` request with the exact canonical marker; the
+marker grants no workflow authority) and a later, unedited official top-level
+issue-comment clean `C` whose explicit full or unambiguous short commit reference resolves uniquely to
+the current head, with `T < R < C`. The request need not be proven to have
+caused the clean. Physical
+boundaries and positive authority are separate: an edited,
 malformed, wrong-author, denied, or stale-base request can remain a boundary
 without gaining authority. A new head recovers an unclosed gap only when every
 ambiguous predecessor is explicitly bound to a different full head. An

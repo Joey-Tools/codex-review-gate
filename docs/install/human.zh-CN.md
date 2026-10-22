@@ -202,7 +202,14 @@ liveness 也无法排序，必须保持 predecessor open。
 一旦出现第二个物理 request boundary，unbound terminal 就无法证明自己属于新 request，
 而不是旧 flight 的延迟结果。没有 base epoch 时，provider terminal evidence 只能闭合
 第一个 gap；之后的每个 gap 和新 generation 的 clean authority，都必须来自直接附着在
-对应 canonical request 上的合格 `+1`。有 base epoch 时，每个 gap 都必须如此。若旧 gap
+对应 canonical request 上的合格 `+1`。有 base epoch 时，普通 post-epoch lineage 的每个
+gap 都必须如此；但这不排除既有 verifier 的窄范围 current-head clean recovery，详见
+[`packages/action/DESIGN.zh-CN.md`](../../packages/action/DESIGN.zh-CN.md)。该 recovery 要求
+令 `T` 为 original verifier 的 `created_at` 与 latest base epoch 两者中较晚者；之后有新的
+合格 request `R`（ordinary `@codex review`，也包括带精确 canonical marker 的 PAT 生成 `User`
+request；该 marker 不授予 workflow authority），以及随后出现、未编辑的 official 顶层
+issue-comment clean `C`，其 commit reference 显式且唯一地绑定当前 full head，满足严格顺序
+`T < R < C`。不要求证明该 request 实际触发了 clean。若旧 gap
 已经无法在原始窗口内闭合，必须先区分 physical boundary 与 positive authority：edited、
 malformed、wrong-author、denied 或 stale-base request 可以保留为 boundary，但没有
 authority。只有每个歧义 predecessor 都显式绑定另一个 full head 时，新 head 才能恢复。

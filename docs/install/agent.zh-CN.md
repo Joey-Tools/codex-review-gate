@@ -1512,8 +1512,15 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    boundary。没有 base epoch 时，unbound provider terminal evidence 只能闭合第一个 gap；
    只要前面已有物理 request，之后的每个 gap 和 positive/superseding authority 都必须来自
    直接附着在对应 canonical request 上的合格 `+1`，唯一相关例外是下文精确限定的
-   两条 boundary 的 current-head clean recovery。有 base epoch 时，每个 gap 都必须使用
-   direct `+1`。绝不能只按 timestamp 把
+   两条 boundary 的 current-head clean recovery。有 base epoch 时，普通 post-epoch lineage
+   的每个 gap 都必须使用 direct `+1`。既有 verifier 另有窄范围 current-head clean recovery：
+   令 `T = max(original verifier created_at, latest base epoch)`，要求新的合格 request `R`
+   （ordinary `@codex review`，也包括带精确 canonical marker 的 PAT 生成 `User` request；该
+   marker 不授予 workflow authority），以及随后出现、未编辑的 official 顶层 issue-comment
+   clean `C`，其 commit reference 显式且唯一绑定所选 current full head，满足严格顺序
+   `T < R < C`；不要求证明 request 与 clean 的因果关系。
+   完整 guards 见
+   [`packages/action/DESIGN.zh-CN.md`](../../packages/action/DESIGN.zh-CN.md)。绝不能只按 timestamp 把
    later terminal 归给新 generation；它可能是旧 flight 的延迟或重复 carrier。每条可能
    触发 provider 的 request shape 都是物理 boundary，即使它 edited、malformed、
    wrong-author、denied 或 stale-base；这些条件只移除 positive authority，不移除可能的

@@ -462,25 +462,29 @@ provider artifact、该 exclusive window 中额外的 provider artifact 或不�
 property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。此规则只恢复不可变的历史
 pair；agent 不得主动创建。
 
-另有 *current-head clean recovery*，仅在没有 base epoch 时允许用新鲜的 head-scoped witness
-恢复已经指向 current head、但早于本次 verifier run 的可信 clean。cutoff `T` 是原始 `pull_request`
-verifier run 的 GitHub-server `created_at`，并在同一 run ID 的 retries 中固定；它不是 PR
-synchronize event 的精确时间。request `R` 可为一条符合条件、exact、未编辑的 ordinary
-`@codex review`（`User` 作者），或一条已验证、未编辑的 canonical Actions request，其 repository、PR、
-完整 head/base tuple 和 workflow-run marker 与所选 PR/verifier scope 完全匹配。随后必须有一条可信、未编辑的 top-level issue-comment terminal clean `C`，
-其 resolved full SHA 唯一等于 current head。时间顺序严格为 `T < R < C`；`R` 必须是 `C`
+另有 *current-head clean recovery*，用于以新鲜的 head-scoped witness 恢复既有 verifier，
+不要求事先存在早于该 run 的 clean。无 base epoch 时，cutoff `T` 是原始 `pull_request`
+verifier run 的 GitHub-server `created_at`；存在 base epoch 时，`T` 取该时间与最新 base epoch
+时间中较晚者，即 `T = max(original verifier created_at, latest base epoch)`。同一 run ID 的原始
+`created_at` 在 retries 中固定；最新 base epoch 随完整 timeline 重新读取。原始时间不是 PR synchronize
+event 的精确时间。request `R` 可为符合条件、exact、
+未编辑的 authorized `User` ordinary `@codex review`，包括 PAT 发出的普通 request；也可为已验证、
+未编辑且与所选 scope 完全匹配的 canonical Actions request。canonical Actions request 仍须满足
+其既有 repository、PR、完整 head/base tuple 和 workflow-run marker 绑定。随后必须有一条可信、未编辑的
+top-level issue-comment terminal clean `C`，其显式 reviewed commit 唯一解析为 current full head SHA。
+时间顺序严格为 `T < R < C`；`R` 必须是 `C`
 之前最新的 physical request boundary，`C` 之后不能有新的 request boundary。这是 current-head
 attestation（证明 clean 指向所选 current head，不证明 request 与 clean 的因果关系），而不是
 因果匹配：timestamps 与 head binding 不证明 `R` 导致 `C`，也不证明发出
 `R` 会启动 Codex。
 
-在当前配置的 `any` request-author policy 下，token 生成的 `User` request 可能携带 canonical hidden
-marker（workflow 添加、用于绑定 request scope 的 comment marker）。它仍然是普通 user request，
-不是 workflow-authored request，也不具备 workflow authority。只有当 marker 中的
-`repositoryId`、`prNumber`、`headSha`、`baseSha`、`baseRef` 和 `baseRepositoryId` 全部与所选 PR
-及 verifier scope 精确一致，并且满足现有 exact-request 与 authorized User 条件时，ordinary
-witness 路径才接受这个带 marker 的 request。Marker 不会设置 workflow provenance 或 head-bound
-authority；后续 clean 仍须独立满足上文的 trusted、未编辑、精确绑定 current head 的 receipt 条件。
+在当前配置的 `any` request-author policy 下，PAT 发出的 `User` request 可能携带 canonical hidden
+marker（workflow 添加、用于标记 request scope 的 comment marker）。它仍然是普通 user request，
+不是 workflow-authored request，也不具备 workflow authority。对于此恢复见证，该 marker 不要求其
+`repositoryId`、`prNumber`、head/base SHA、`baseRef` 或 `baseRepositoryId` 与当前 scope 匹配；只要
+comment 本身是 authorized `User` 发出的 exact、未编辑 ordinary request，就可作为 `R`。marker 不会
+授予 workflow provenance、workflow authority 或 head-bound authority。current-head 绑定来自后续
+clean `C` 对 current full head SHA 的独立、无歧义显式引用，而不是来自触发 request 的 marker。
 
 `T` 之前的 ordinary requests 仍完整保留在 lineage audit 中。合格的恢复见证可以忽略这些历史
 request 的归因缺口，包括由更早、针对不同 head 的 request 留下的缺口；也不要求每个旧 request
@@ -531,9 +535,10 @@ predecessor-to-successor gap，以及任何前面已有物理 request 的 genera
 positive/superseding authority，都必须来自直接附着于该 request 的合格 `+1`，
 唯一相关例外是上文的新鲜 current-head clean recovery。provider
 terminal payload 没有 originating request ID；后到的 carrier 可能来自任一旧 generation，
-两个 stable snapshots 也无法使该归属唯一。出现 base epoch 后，current-head clean recovery 不适用：
-现有规则要求 exact-current-tuple canonical Actions request 上的 direct provider `+1`，top-level
-terminal clean 不增加 authority。
+两个 stable snapshots 也无法使该归属唯一。普通 post-epoch lineage 仍要求 exact-current-tuple
+canonical Actions request 上的 direct provider `+1`，top-level terminal clean 不会增加该 lineage
+authority；但既有 verifier 可按上文更窄的 epoch 后 current-head clean recovery 使用新鲜见证。该见证
+不闭合任意 predecessor gap，也不把 unbound terminal 变成 lineage carrier。
 
 上文定义的 duplicate cohort 是该 ordinary 第二条 boundary 规则的另一条 recovery-only 例外：
 它的一条顶层 clean 只闭合已经存在的两条 request cohort，不能闭合或为 canonical successor
