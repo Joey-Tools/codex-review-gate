@@ -14,6 +14,17 @@ after a push. `integration_id: 15368` identifies the whole GitHub Actions App,
 not either workflow, so it is not a substitute for the byte-verified workflows
 and the CODEOWNERS control plane.
 
+Ordinary PRs still target `DEFAULT_BRANCH` directly. GitHub-native stacked PRs
+are also supported only when authenticated metadata binds the stack trunk to
+that same branch; arbitrary feature-base chains and other trunks are outside
+scope. Native stacks carry trunk protection through every layer, but every PR
+still requires its own Codex gate. The floating `@v2` runtime accepts stack
+scope; immediate verification on stack join requires the updated canonical
+verifier workflow's `stacked` activity type. Existing four-activity copies
+remain usable and can be refreshed through the ordinary workflow update path.
+Keep the ruleset rooted on `DEFAULT_BRANCH`; do not create per-feature-branch
+rulesets.
+
 ## Inputs and stop conditions
 
 Resolve these values first:
@@ -1307,7 +1318,7 @@ The canonical workflows must have this contract after the merge:
   activation path;
 - verifier path `.github/workflows/codex-review-gate.yml`, workflow name
   `Codex Review Gate Verifier`, `pull_request` types `opened`, `reopened`,
-  `synchronize`, `ready_for_review`, and required job
+  `synchronize`, `ready_for_review`, `stacked`, and required job
   `codex/github-review-gate` on the exact PR feature-head SHA;
 - controller path `.github/workflows/codex-review-gate-controller.yml`, workflow
   name `Codex Review Gate Controller`, exact Codex `issue_comment` `created`,
@@ -1343,12 +1354,12 @@ condition: the verifier's `run-name` gives each run a dynamic name. The Action
 still verifies the exact canonical workflow ID, path, run, and PR scope.
 Public-repository policy rules
 out a writable `pull_request_target` handler. The controller accepts only an
-open, ready (non-draft), same-repository PR targeting the current default
-branch, with the failed verifier bound to its current exact head and no
+open, ready (non-draft), same-repository PR with a direct base on the current
+default branch or a verified native-stack trunk on that branch, with the failed verifier bound to its current exact head and no
 matching canonical request already present, including a marker from an earlier
 controller run that matches the same repository, PR, head, and base. A failure
 after `opened`,
-`reopened`, `synchronize`, or `ready_for_review` can qualify. With
+`reopened`, `synchronize`, `ready_for_review`, or native `stacked` can qualify. With
 `CODEX_REVIEW_GATE_AUTO_REQUEST` exactly `true`, it uses the existing
 `begin-review` operation with `request_review=true` in request-only mode
 (post the request without immediately rerunning the verifier). A later

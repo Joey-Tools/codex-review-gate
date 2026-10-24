@@ -28,7 +28,7 @@ resolved” 的 server-side 要求。
 ## 架构和 trust boundaries
 
 ```text
-pull_request opened/reopened/synchronize/ready_for_review
+pull_request opened/reopened/synchronize/ready_for_review/stacked
                                 |
                                 v
           copied read-only canonical verifier
@@ -115,11 +115,19 @@ required check 的 `integration_id: 15368` 标识整个 GitHub Actions App，因
 CODEOWNERS、Code Owner review、strict freshness、no bypass 与 canary collision readback
 共同构成 adopted compound boundary。
 
-verifier 只接收 `pull_request` `opened`、`reopened`、`synchronize` 与
-`ready_for_review`，并在不是 same-repository、open、ready、default-base scope 时 fail
-closed。`edited` 被明确排除：base retarget 后，ready PR 必须转为 draft 再 mark ready，
+verifier 接收 `pull_request` `opened`、`reopened`、`synchronize`、`ready_for_review` 与 GitHub
+原生 `stacked`。PR 加入原生 stack 时，`stacked` action 提供即时验证；它补充而不替代
+`synchronize`。`@v2` runtime 接受新 action，但已安装的四-action verifier workflow 必须更新并
+加入 `stacked` 才能获得即时 wake-up。Verifier 要求 same-repository、open、ready PR 的 direct base 是 current
+default branch；唯一例外是经验证的 GitHub 原生 stacked-PR metadata 将 stack trunk 绑定到同一
+default branch。任意手工 feature-base 链、fork 和其他 trunk 的 stack 均拒绝。PR direct base
+ref/SHA 与 stack trunk ref/SHA 是不同的 exact binding，且会重新验证当前 stack identity/position
+及 trunk。GitHub 的 stack object 还提供 size，但把新 PR 加到本 PR 上方造成的 size-only 增长不
+改变本 PR 的 scope。
+每个 PR 独立运行 verifier，不继承下层 PR 的 review 结果。受保护 controller 和 ruleset 仍以
+default branch 为根。`edited` 被明确排除：base retarget 后，ready PR 必须转为 draft 再 mark ready，
 已经是 draft 的 PR 直接 mark ready。新的 `ready_for_review` event 会为 current exact
-head/base/test-merge scope 创建 verifier；旧 event rerun 不能代替。这四种 event 产生的
+head/base/test-merge scope 创建 verifier；旧 event rerun 不能代替。这些 event 产生的
 failed verifier 都可能进入可选 `workflow_run` 路径。
 
 GitHub 会把 verifier run/job/native CheckRun 记录在 exact PR feature-head SHA 上，尽管
@@ -129,7 +137,8 @@ head/base values 与 fresh PR read 一致。事件校验仅限 head/base 的 SHA
 event `merge_commit_sha` 可以缺失或来自历史快照，不作为 binding input。受保护的 top-level `run-name` 提供第二份
 receipt：run `display_title` 必须是
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>`，其唯一 PR binding 还必须携带
-current feature head 与 default-branch base SHA。这个 execution binding 使 successful
+current feature head 与 exact direct-base ref/SHA。对于 native stack，另行验证的 current metadata
+会绑定 trunk ref/SHA。这个 execution binding 使 successful
 feature-head CheckRun 能证明它评估了 exact current test-merge；CheckRun 本身并不属于
 test-merge SHA。
 
@@ -246,7 +255,8 @@ capability，也不保证 delivery；缺少 official Codex evidence 时保持 pe
 canonical `Codex Review Gate Verifier` 首次 attempt（`run_attempt=1`）failure 只是
 trigger，不直接授权 review request。受保护的
 `workflow_run` 路径重读已完成且失败的 verifier 与 PR，并要求 same-repository PR 仍然
-open、ready、以 default branch 为 base，且 verifier 绑定的是 exact current head。
+open、ready，direct base 为 default branch，或经验证的 native-stack trunk 仍绑定该 default
+branch，且 verifier 绑定 exact current head。
 只有当前 repository/PR/head/base scope 没有 matching canonical request，才发送带
 canonical marker 的 exact `@codex review`；证据缺失或有歧义时保持 blocking。POST
 结果不确定时重读并保持 pending，不盲目发送第二条；跨 run 采用 marker 不保证严格
@@ -865,13 +875,15 @@ gh pr merge "$PR_NUMBER" \
 ## 支持边界和 non-goals
 
 当前 v2 支持 GitHub.com public/private repositories、从普通
-same-repository branch 到 default branch 的 open non-draft PR、GitHub-hosted 或
+same-repository branch 到 default branch 的 open non-draft PR，以及经验证的 GitHub 原生
+stack metadata 将 trunk 绑定到该 default branch 的 stacked PR；GitHub-hosted 或
 self-hosted 环境中的 Linux runners，以及普通 merge/squash/rebase methods。默认
 runner 选择仍是 `ubuntu-slim`，采用 `ubuntu-latest` fallback。
 已安装 workflow 中显式配置的 `runs-on` expression 仍然有效；这些默认值仅在该配置采用
 默认选择时生效。
 
-GHES、forks、merge queues、non-default bases、drafts、bot-owned PRs、Windows/macOS
+GHES、forks、merge queues、任意非 default base、手工 feature-base 链和 non-default trunk
+stack、drafts、bot-owned PRs、Windows/macOS
 runners，以及对 closed/merged PR 发起的新 operation 都会 fail closed。选择
 self-hosted Linux runner 是基于 operator 信任的假设；Action 不会证明 host integrity
 或 isolation，独立 GitHub jobs 也不提供 host isolation。能够接收 controller token 的

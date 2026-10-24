@@ -2446,10 +2446,15 @@ test("fixed frozen handoff inventory accepts only the recorded immutable workflo
     /exact supported runs-on expression/u,
     "the immutable handoff does not gain the current runner contract",
   );
-  const frozenVerifierWithCurrentRunner = FROZEN_HANDOFF_VERIFIER_WORKFLOW.replace(
-    `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}`,
-    `    runs-on: ${RUNNER_LABELS_EXPRESSION}`,
-  );
+  const frozenVerifierWithCurrentRunner = FROZEN_HANDOFF_VERIFIER_WORKFLOW
+    .replace(
+      `    runs-on: ${PREVIOUS_RUNNER_LABELS_EXPRESSION}`,
+      `    runs-on: ${RUNNER_LABELS_EXPRESSION}`,
+    )
+    .replace(
+      "    types: [opened, reopened, synchronize, ready_for_review]",
+      "    types: [opened, reopened, synchronize, ready_for_review, stacked]",
+    );
   assert.throws(
     () => validateCanonicalV2WorkflowContent(frozenVerifierWithCurrentRunner),
     /unexpected top-level permissions mapping/u,
@@ -7028,6 +7033,143 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
     () => validateCanonicalLegacyBridgeWorkflowContent(bridge.replaceAll("\n", "\r")),
     /bare CR/u,
   );
+});
+
+test("installed verifier narrowly upgrades the previous pull request lifecycle", () => {
+  const canonicalLifecycle =
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked]";
+  const previousLifecycle =
+    "    types: [opened, reopened, synchronize, ready_for_review]";
+  const cleanInventory = [
+    { path: DEFAULT_WORKFLOW_PATH, content: CANONICAL_WORKFLOW },
+    {
+      path: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+      content: CANONICAL_CONTROLLER_WORKFLOW,
+    },
+  ];
+
+  assert.equal(
+    validateCanonicalV2WorkflowContent(CANONICAL_WORKFLOW),
+    CANONICAL_WORKFLOW,
+    "the canonical verifier requires the stacked event",
+  );
+  assert.throws(
+    () => validateCanonicalV2WorkflowContent(
+      CANONICAL_WORKFLOW.replace(canonicalLifecycle, previousLifecycle),
+    ),
+    /adopted pull_request lifecycle types/u,
+    "the previous lifecycle is installed compatibility only",
+  );
+
+  const previousInstalledVerifier = CANONICAL_WORKFLOW.replace(
+    canonicalLifecycle,
+    previousLifecycle,
+  );
+  assert.notEqual(previousInstalledVerifier, CANONICAL_WORKFLOW);
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      cleanInventory.map((file) =>
+        file.path === DEFAULT_WORKFLOW_PATH
+          ? { ...file, content: previousInstalledVerifier }
+          : file,
+      ),
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "the exact previous lifecycle normalizes to canonical installed bytes",
+  );
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(cleanInventory, CANONICAL_WORKFLOWS),
+    CANONICAL_WORKFLOWS,
+    "the exact current lifecycle remains accepted",
+  );
+
+  for (const [name, eventTypes] of [
+    [
+      "reordered events",
+      "opened, reopened, ready_for_review, synchronize, stacked",
+    ],
+    [
+      "extra event",
+      "opened, reopened, synchronize, ready_for_review, stacked, closed",
+    ],
+    [
+      "trailing event scalar text",
+      "opened, reopened, synchronize, ready_for_review, stacked] extra",
+    ],
+    [
+      "trailing event scalar comment",
+      "opened, reopened, synchronize, ready_for_review, stacked] # comment",
+    ],
+  ]) {
+    const replacement = eventTypes.endsWith(" extra")
+      ? `    types: [${eventTypes}`
+      : eventTypes.endsWith(" # comment")
+        ? `    types: [${eventTypes}`
+        : `    types: [${eventTypes}]`;
+    const invalidVerifier = CANONICAL_WORKFLOW.replace(
+      canonicalLifecycle,
+      replacement,
+    );
+    assert.throws(
+      () => validateCanonicalV2WorkflowContent(invalidVerifier),
+      /adopted pull_request lifecycle types/u,
+      `${name}: canonical validation`,
+    );
+    assert.throws(
+      () => validateCanonicalV2WorkflowInventory(
+        cleanInventory.map((file) =>
+          file.path === DEFAULT_WORKFLOW_PATH
+            ? { ...file, content: invalidVerifier }
+            : file,
+        ),
+        CANONICAL_WORKFLOWS,
+      ),
+      /adopted pull_request lifecycle types/u,
+      name,
+    );
+  }
+
+  for (const [name, invalidVerifier] of [
+    [
+      "extra event trigger",
+      CANONICAL_WORKFLOW.replace(
+        "  pull_request:\n",
+        "  push:\n  pull_request:\n",
+      ),
+    ],
+    [
+      "changed job control",
+      CANONICAL_WORKFLOW.replace(
+        "  cancel-in-progress: true",
+        "  cancel-in-progress: false",
+      ),
+    ],
+    [
+      "changed job name",
+      CANONICAL_WORKFLOW.replace(
+        "    name: codex/github-review-gate",
+        "    name: codex/other-check",
+      ),
+    ],
+    [
+      "changed permission",
+      CANONICAL_WORKFLOW.replace("  issues: read", "  issues: write"),
+    ],
+  ]) {
+    assert.throws(
+      () => validateCanonicalV2WorkflowInventory(
+        cleanInventory.map((file) =>
+          file.path === DEFAULT_WORKFLOW_PATH
+            ? { ...file, content: invalidVerifier }
+            : file,
+        ),
+        CANONICAL_WORKFLOWS,
+      ),
+      /pull_request lifecycle types|cancel superseded attempts|missing required fragment|unexpected top-level permissions mapping|differs from the canonical v2 verifier workflow bytes/u,
+      name,
+    );
+  }
 });
 
 test("post-merge inventory rejects an extra default-branch v1 caller", () => {
@@ -14880,9 +15022,10 @@ syncBuiltinESMExports();
 `;
 }
 
+// One focused installed-verifier compatibility case raises the prior 170 count.
 assert.equal(
   test.registeredCount,
-  170,
+  171,
   "bootstrap test shard registration inventory drift",
 );
 

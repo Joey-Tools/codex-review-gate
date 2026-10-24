@@ -13,8 +13,9 @@ repository; event `merge_commit_sha` may be missing or historical and is not a
 binding input. A
 protected top-level `run-name` makes GitHub expose
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` as the run's exact
-`display_title`; activation also requires the run's sole PR binding to contain
-the current feature head and default-branch base SHA. These receipts bind a
+  `display_title`; activation also requires the run's sole PR binding to contain
+  the current feature head and exact direct-base ref/SHA. For a native stack,
+  current metadata separately binds the trunk ref/SHA. These receipts bind a
 successful feature-head CheckRun to the exact current test-merge, even though
 the CheckRun itself is not attached to the test-merge SHA. Every verifier run
 rebuilds its decision from GitHub. A
@@ -153,8 +154,15 @@ lets an agent perform that same installation for a person.
 
 The canonical verifier has one entry:
 
-- `pull_request` with activity types `opened`, `reopened`, `synchronize` and
-  `ready_for_review`.
+- `pull_request` with activity types `opened`, `reopened`, `synchronize`,
+  `ready_for_review`, and GitHub-native `stacked`.
+
+The `stacked` action is the immediate wake-up when a PR joins a native stack.
+The released `@v2` runtime can validate the new scope, but an installed verifier
+workflow must also include `stacked` in its activity types to receive that
+wake-up. Existing four-action workflow copies remain usable; refresh them from
+the canonical template to get immediate join-triggered verification. The
+`stacked` action supplements, and does not replace, `synchronize`.
 
 The protected-default-branch controller has only these entries:
 
@@ -191,12 +199,13 @@ operation selector, so a case variant such as `TRUE` can still select
 overrides the organisation value. The existing request path is unchanged: only
 a first-attempt failure (`run_attempt=1`) with a unique PR association triggers
 the protected controller to re-fetch the completed verifier and current
-same-repository, open, ready PR on the default base. It posts a canonical
+eligible same-repository, open, ready PR. It posts a canonical
 request if no exact repository/PR/head/base match exists, or adopts an existing
 match. The request is the entire automatic operation: there is no immediate
 verifier rerun. A later exact Codex bot comment or protected manual
 `reconcile` performs that rerun. This path may follow `opened`, `reopened`,
-`synchronize` or `ready_for_review`, not just a push. A merge conflict can
+`synchronize`, `ready_for_review`, or native `stacked`, not just a push. A merge
+conflict can
 prevent the `pull_request` verifier from running; without that run there is no
 automatic request, so resolve the conflict and use manual recovery if needed.
 `workflow_run` keeps the writable controller on the protected default branch
@@ -239,12 +248,25 @@ and scope checks after the runner starts. An edited Codex comment does not
 automatically start the canonical controller; use protected manual `reconcile`
 for that recovery. The Action still parses an `edited` event for compatibility
 with direct callers, but that is not a canonical automatic ingress.
-The verifier fails closed unless the PR is same-repository, open, ready and
-targets the current default branch. A base retarget does not create a current
-verifier because `pull_request.edited` is intentionally absent. For a ready PR,
-convert it to draft and mark it ready again; for an already-draft PR, mark it
-ready. The resulting `ready_for_review` event creates a verifier for the new
-exact head/base/test-merge scope. A native rerun of the old event is not a substitute.
+The verifier requires a same-repository, open, ready PR whose direct base is
+the current default branch, except for a GitHub-native stacked PR whose
+authenticated stack metadata proves that its trunk is the repository's current
+default branch. Arbitrary manually chained feature-base PRs, forks, and stacks
+with another trunk remain unsupported. The PR's direct base ref/SHA and the
+stack trunk ref/SHA are distinct bindings and are both checked with current
+stack membership. Each PR receives its own gate; no lower PR's review result is
+inherited and no stack merge is performed. The protected controller still
+executes from the default branch.
+
+A base-ref retarget does not create a current verifier because
+`pull_request.edited` is intentionally absent. Refresh verifier evidence for
+the new scope with the existing draft-to-ready recovery; if the report requests
+it, post a fresh `@codex review`. A native rerun of the old event is not a
+substitute. Base-tip movement and trunk/membership drift are evaluated against
+their separately bound current scope; do not assume every base advance
+invalidates head-bound clean review evidence. GitHub's native `stacked` webhook
+action is a `pull_request` activity type, not a top-level webhook event, and
+must not be treated as a substitute for `synchronize`.
 
 Manual runs use the protected default-branch workflow. A feature-ref dispatch
 is unsupported. The typed `workflow_dispatch` business inputs are:
@@ -905,15 +927,17 @@ Direct human UI merge outside this closure is unsupported.
 
 ## Supported boundary
 
-Current v2 releases support GitHub.com public and private repositories; ordinary
-same-repository branches with an open, non-draft PR targeting the default
-branch; Linux runners in GitHub-hosted or self-hosted environments; and
+Current v2 releases support GitHub.com public and private repositories;
+ordinary same-repository branches with an open, non-draft PR targeting the
+default branch, plus GitHub-native stacked PRs whose authenticated stack
+metadata binds the trunk to that default branch; Linux runners in GitHub-hosted or self-hosted environments; and
 ordinary merge, squash and rebase methods. The default runner selection remains
 `ubuntu-slim`, with `ubuntu-latest` as the adopted fallback. The installed
 workflow's explicit `runs-on` expression remains authoritative; these defaults
 apply only when its configured selection falls back to them.
 
-It fails closed for GHES, forks, merge queues, non-default bases, drafts,
+It fails closed for GHES, forks, merge queues, arbitrary non-default bases,
+manual feature-branch chains, and stacks with a non-default trunk, as well as drafts,
 bot-owned PRs, Windows/macOS runners, and new operations on closed or merged
 PRs.
 

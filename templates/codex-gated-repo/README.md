@@ -14,8 +14,9 @@ This directory contains the canonical consumer-side assets:
 - `rulesets/codex-review-gate.json` is the default-branch ruleset, shipped with
   enforcement disabled.
 
-Copy both workflows unchanged. The verifier runs for pull-request `opened`,
-`reopened`, `synchronize`, and `ready_for_review` events and emits the sole
+Copy both workflows unchanged. The current verifier runs for pull-request
+`opened`, `reopened`, `synchronize`, `ready_for_review`, and native `stacked`
+events and emits the sole
 required native CheckRun. The controller provides `issue_comment`
 `created` bot filtering before runner allocation, an opt-in `workflow_run`
 `completed` entry for the canonical verifier's `pull_request` runs, and the sole manual entry
@@ -40,12 +41,14 @@ select `begin-review`, but the runtime rejects it before posting. A repository
 value overrides the organisation value. The existing request path is unchanged:
 only a uniquely associated first-attempt failure (`run_attempt=1`) uses
 `begin-review`; the controller revalidates the exact current PR/head/base. For
-an open, ready, same-repository PR targeting the current default branch, it may
+an open, ready, same-repository PR targeting the current default branch—or a
+GitHub-native stacked PR whose authenticated metadata binds its trunk to that
+default branch—it may
 post a canonical request if no current-scope match exists or adopt an existing
 match; uncertain outcomes remain pending. The automatic path is request-only:
 it does not immediately rerun the verifier. A later Codex bot comment or
 protected manual `reconcile` processes the provider result. This may follow any
-of the four verifier PR events above, not just `synchronize`. If a merge
+of the verifier PR events above, including native `stacked`. If a merge
 conflict prevents the verifier from running, no automatic request is possible;
 resolve the conflict and use manual recovery if needed. For the Joey-Tools rollout,
 set the organisation variable's selected-repository visibility first to only
@@ -266,7 +269,8 @@ Rollout order:
    run/job/CheckRun recorded against the exact current PR feature-head SHA and
    require its exact `display_title` to be
    `codex-review-gate-verifier/<PR>/<current test-merge SHA>` and its sole PR
-   binding to contain the current feature head and default-branch base SHA,
+   binding to contain the current feature head and exact direct-base ref/SHA,
+   with native stack trunk ref/SHA separately validated,
    with no same-name legacy commit status or competing CheckRun; the verifier
    executes on `refs/pull/N/merge` and validates `GITHUB_REF`, `GITHUB_SHA`, the
    event scope and a fresh PR read, so the CheckRun itself does not belong to

@@ -262,7 +262,7 @@ test("automatic runner admission separates read-only PR verification from verifi
   const workflow = parseControllerWorkflow(templateController);
   assert.deepEqual(blockDirectKeys(verifier.events), ["pull_request"]);
   assert.deepEqual(blockScalarMapping(verifier.pullRequest), {
-    types: "[opened, reopened, synchronize, ready_for_review]",
+    types: "[opened, reopened, synchronize, ready_for_review, stacked]",
   });
   assert.deepEqual(blockDirectKeys(workflow.events), ["issue_comment", "workflow_run", "workflow_dispatch"]);
   assert.deepEqual(blockScalarMapping(workflow.issueComment), {

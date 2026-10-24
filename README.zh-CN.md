@@ -52,14 +52,18 @@ V2 consumer 把两份 canonical workflows 复制到目标仓库的相同路径�
   run 完成后记录 best-effort diagnostic snapshot。显式启用后，同一份 controller 也可在
   canonical verifier 失败后请求评审；无需第三份 workflow。
 
+GitHub 原生 stacked PR 也可符合条件，但必须由经验证的 stack metadata 证明其 trunk 是仓库当前
+default branch；任意手工 feature-branch 链不在支持范围内。PR 自身 direct base ref/SHA 与 stack
+trunk ref/SHA 会分别绑定。每个 PR 都有自己的 Codex gate，不继承下层 PR 的 review 结果。
+
 自动请求默认关闭。把 organisation 或 repository Actions variable
 `CODEX_REVIEW_GATE_AUTO_REQUEST` 设为精确的小写 `true` 才能授权请求；未设置时会跳过
 自动 controller job，其他值均不能发出请求。GitHub Actions 的 job 条件不区分字符串大小写，
 因此 `TRUE` 等大小写变体仍可能分配 controller runner，但 runtime 会在发帖前拒绝。
-repository 值会覆盖 organisation 值。`opened`、`reopened`、`synchronize` 或
-`ready_for_review` 触发 verifier 后，一次完成且失败的 run 可以让受保护 controller
-处理 same-repository、open、ready、以当前 default branch 为 base 且 head 仍精确匹配的
-PR。它校验该 run，可能发送或采用当前 scope 的 canonical `@codex review` request；
+repository 值会覆盖 organisation 值。`opened`、`reopened`、`synchronize`、
+`ready_for_review` 或原生 `stacked` 触发 verifier 后，一次完成且失败的 run 可以让受保护
+controller 处理符合 scope 的 same-repository、open、ready PR，且 head 仍精确匹配。它校验该
+run，可能发送或采用当前 scope 的 canonical `@codex review` request；
 结果不确定时保持 pending。
 自动路径不会立即 rerun verifier；之后由 Codex bot comment 或受保护的 manual
 `reconcile` 处理结果。如果 merge conflict 阻止 verifier 运行，就不会触发自动请求；
@@ -136,6 +140,15 @@ operator 仍须自行信任共用 GitHub Actions App 的其他 workflows。此�
 [Agent 执行手册](docs/install/agent.zh-CN.md)。两者执行同一套 two-PR rollout：一个
 migration PR 移除 v1 并安装 v2，然后用独立无害 canary PR 证明 live gate，最后关闭
 canary、不合并。
+
+## GitHub 原生 stacked PR
+
+GitHub 原生 stacked PR 可在经验证的 stack metadata 证明 trunk 是仓库当前 default branch 时
+符合条件。普通 PR 仍须直接以 default branch 为 base；任意手工 feature-branch 链及 trunk
+不是 default branch 的 stack 均不支持。PR 自身 direct base ref/SHA 与 stack trunk ref/SHA
+分别绑定。每个 PR 都有自己的 Codex gate，不继承下层 PR 的 review 结果。受保护 controller
+和已安装 ruleset 仍以 default branch 为根。参见 GitHub 的[stack metadata](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests)
+与 [stacked CI 优化](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/optimizing-ci-for-stacked-pull-requests)。
 
 ## Bootstrap
 

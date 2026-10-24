@@ -3780,6 +3780,9 @@ export function validateCanonicalV2VerifierWorkflowContent(value) {
     requestAuthorPermission: CANONICAL_REQUEST_AUTHOR_PERMISSION,
     permissionMapping: CANONICAL_VERIFIER_PERMISSION_MAPPING,
     runnerExpressions: [CANONICAL_RUNNER_LABELS_EXPRESSION],
+    pullRequestLifecycleTypes: [
+      "opened, reopened, synchronize, ready_for_review, stacked",
+    ],
   });
 }
 
@@ -3788,6 +3791,10 @@ function validateInstalledCanonicalV2VerifierWorkflowContent(value) {
     requestAuthorPermission: CANONICAL_REQUEST_AUTHOR_PERMISSION,
     permissionMapping: CANONICAL_VERIFIER_PERMISSION_MAPPING,
     runnerExpressions: INSTALLED_RUNNER_LABELS_EXPRESSIONS,
+    pullRequestLifecycleTypes: [
+      "opened, reopened, synchronize, ready_for_review",
+      "opened, reopened, synchronize, ready_for_review, stacked",
+    ],
   });
 }
 
@@ -3796,6 +3803,9 @@ function validateFrozenHandoffV2VerifierWorkflowContent(value) {
     requestAuthorPermission: FROZEN_HANDOFF_REQUEST_AUTHOR_PERMISSION,
     permissionMapping: FROZEN_HANDOFF_VERIFIER_PERMISSION_MAPPING,
     runnerExpressions: [PREVIOUS_CANONICAL_RUNNER_LABELS_EXPRESSION],
+    pullRequestLifecycleTypes: [
+      "opened, reopened, synchronize, ready_for_review",
+    ],
   });
 }
 
@@ -3803,6 +3813,7 @@ function validateV2VerifierWorkflowContent(value, {
   requestAuthorPermission,
   permissionMapping,
   runnerExpressions,
+  pullRequestLifecycleTypes,
 }) {
   if (typeof value !== "string" || value === "") {
     throw new Error("Canonical v2 verifier workflow must be non-empty UTF-8 text.");
@@ -3827,7 +3838,15 @@ function validateV2VerifierWorkflowContent(value, {
   if (value.includes(LEGACY_V1_WORKFLOW_USES) || /@v1(?:\s|$)/m.test(value)) {
     throw new Error("Canonical v2 verifier workflow must not retain a v1 caller.");
   }
-  if (!/^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review\]$/m.test(value)) {
+  const pullRequestMappingCount = (value.match(/^  pull_request:$/gm) ?? []).length;
+  const pullRequestLifecycleMatches = [
+    ...value.matchAll(/^  pull_request:\n    types: \[([^\]\n]*)\]$/gm),
+  ];
+  if (
+    pullRequestMappingCount !== 1 ||
+    pullRequestLifecycleMatches.length !== 1 ||
+    !pullRequestLifecycleTypes.includes(pullRequestLifecycleMatches[0][1])
+  ) {
     throw new Error(
       "Canonical v2 verifier workflow must expose only the adopted pull_request lifecycle types.",
     );
@@ -4506,8 +4525,22 @@ function installedVerifierMatchesCanonical(installed, canonical) {
 
 function installedVerifierMatchesCanonicalWithRunnerUpgrade(installed, canonical) {
   return installedWorkflowMatchesCanonical(
-    normalizePreviousRunnerExpression(installed),
+    normalizePreviousRunnerExpression(
+      normalizePreviousVerifierPullRequestLifecycle(installed),
+    ),
     canonical,
+  );
+}
+
+function normalizePreviousVerifierPullRequestLifecycle(value) {
+  const previousLifecycle =
+    "    types: [opened, reopened, synchronize, ready_for_review]";
+  if (typeof value !== "string" || value.split(previousLifecycle).length !== 2) {
+    return value;
+  }
+  return value.replace(
+    previousLifecycle,
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked]",
   );
 }
 

@@ -2778,6 +2778,20 @@ test("frozen organization handoff admission remains distinct from current contro
     }),
     frozenWorkflows,
   );
+  const frozenPullRequestLifecycleLine =
+    "    types: [opened, reopened, synchronize, ready_for_review]";
+  const currentPullRequestLifecycleLine =
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked]";
+  assert.equal(
+    frozenWorkflows.verifier.split(frozenPullRequestLifecycleLine).length,
+    2,
+    "the immutable historical verifier retains its exact four-event lifecycle",
+  );
+  assert.equal(
+    currentWorkflows.verifier.split(currentPullRequestLifecycleLine).length,
+    2,
+    "the current verifier fixture has its exact five-event lifecycle",
+  );
   const currentRunnerLine = currentWorkflows.verifier.match(/^    runs-on: .+$/mu)?.[0];
   const frozenRunnerLine = frozenWorkflows.verifier.match(/^    runs-on: .+$/mu)?.[0];
   assert.equal(typeof currentRunnerLine, "string");
@@ -2785,7 +2799,10 @@ test("frozen organization handoff admission remains distinct from current contro
   const currentPermissionFrozenVerifier = frozenWorkflows.verifier.replace(
     "permissions:\n  contents: read\n",
     "permissions:\n  actions: read\n  contents: read\n",
-  ).replace(frozenRunnerLine, currentRunnerLine);
+  ).replace(frozenRunnerLine, currentRunnerLine).replace(
+    frozenPullRequestLifecycleLine,
+    currentPullRequestLifecycleLine,
+  );
   const currentPermissionFrozenWorkflows = {
     ...frozenWorkflows,
     verifier: currentPermissionFrozenVerifier,
@@ -2806,7 +2823,8 @@ test("frozen organization handoff admission remains distinct from current contro
   const frozenPermissionCurrentWorkflows = {
     ...currentWorkflows,
     verifier: currentWorkflows.verifier.replace("  actions: read\n", "")
-      .replace(currentRunnerLine, frozenRunnerLine),
+      .replace(currentRunnerLine, frozenRunnerLine)
+      .replace(currentPullRequestLifecycleLine, frozenPullRequestLifecycleLine),
   };
   assert.throws(
     () => validateFrozenHandoffV2WorkflowInventory(

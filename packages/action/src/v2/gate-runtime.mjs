@@ -2613,8 +2613,58 @@ function initializeV2Scope(
     baseRef: pullRequest.base.ref,
     baseRepositoryId: pullRequest.base.repo.id,
     baseRepositoryFullName: pullRequest.base.repo.full_name,
+    nativeStack: captureV2NativeStackScope(pullRequest),
     testMergeSha: context.testMergeSha,
   });
+}
+
+function captureV2NativeStackScope(pullRequest) {
+  if (!Object.hasOwn(pullRequest || {}, "stack") || pullRequest.stack == null) return null;
+  const stack = pullRequest.stack;
+  if (!isPlainRecord(stack) || !isPlainRecord(stack.base)) {
+    return Object.freeze({ present: true, valid: false });
+  }
+  const baseRef = stack.base.ref;
+  const baseSha = String(stack.base.sha || "").toLowerCase();
+  const valid = Number.isSafeInteger(stack.number) && stack.number > 0 &&
+    Number.isSafeInteger(stack.size) && stack.size > 0 &&
+    Number.isSafeInteger(stack.position) && stack.position > 0 &&
+    stack.position <= stack.size &&
+    typeof baseRef === "string" && baseRef.trim() !== "" && FULL_SHA.test(baseSha);
+  return Object.freeze(valid
+    ? {
+        present: true,
+        valid: true,
+        number: stack.number,
+        size: stack.size,
+        position: stack.position,
+        baseRef,
+        baseSha,
+      }
+    : { present: true, valid: false });
+}
+
+function sameV2NativeStackScope(left, right) {
+  return left === null
+    ? right === null
+    : right !== null &&
+      left.present === right.present &&
+      left.valid === right.valid &&
+      left.number === right.number &&
+      left.position === right.position &&
+      left.baseRef === right.baseRef &&
+      left.baseSha === right.baseSha;
+}
+
+function assertV2NativeStackSnapshotScope(pullRequest, config) {
+  const expected = config.snapshotScope?.nativeStack;
+  const current = captureV2NativeStackScope(pullRequest);
+  if (!sameV2NativeStackScope(current, expected)) {
+    throw new V2RuntimeFailure(
+      "Native pull-request stack membership or trunk scope changed",
+      { recoveryCode: "wait_then_reconcile" },
+    );
+  }
 }
 
 function assertV2VerifierLaunchScope(config, pullRequest) {
@@ -3596,7 +3646,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       prePostPr.head?.ref !== expected.headRef ||
       prePostPr.head?.repo?.id !== expected.headRepositoryId ||
       prePostPr.head?.repo?.full_name !== expected.headRepositoryFullName ||
-      prePostPr.base?.ref !== prePostRepository.default_branch
+      prePostPr.base?.ref !== expected.baseRef
     ) {
       throw new V2StaleFailure(
         "The auto-request PR or default-branch scope changed before review submission",
@@ -3987,11 +4037,13 @@ async function assertV2BeginReviewScope(client, config, initialPr, budget) {
 
 function assertV2BeginReviewScopeSnapshot(current, config, initialPr) {
   assertV2ExpectedSnapshotScope(current, config);
+  assertV2NativeStackSnapshotScope(current, config);
   if (
     String(current.base?.sha || "").toLowerCase() !==
       String(initialPr.base?.sha || "").toLowerCase() ||
     current.base?.ref !== initialPr.base?.ref ||
-    current.base?.repo?.id !== initialPr.base?.repo?.id
+    current.base?.repo?.id !== initialPr.base?.repo?.id ||
+    current.base?.repo?.full_name !== config.snapshotScope.baseRepositoryFullName
   ) {
     throw new V2StaleFailure("Pull-request base scope changed during begin-review");
   }
@@ -4408,7 +4460,13 @@ function validateV2Trigger(config) {
   }
   const event = readEvent(config.environment.GITHUB_EVENT_PATH);
   if (eventName === "pull_request") {
-    const allowedActions = new Set(["opened", "reopened", "synchronize", "ready_for_review"]);
+    const allowedActions = new Set([
+      "opened",
+      "reopened",
+      "synchronize",
+      "ready_for_review",
+      "stacked",
+    ]);
     const eventPr = event?.pull_request;
     const eventHead = String(eventPr?.head?.sha || "").toLowerCase();
     if (
@@ -4648,11 +4706,25 @@ function classifyUnsupportedV2Target(repository, pullRequest, config) {
   }
   if (pullRequest.draft) return "Action v2 does not operate on draft pull requests";
   if (
-    pullRequest.base?.ref !== repository.default_branch ||
     pullRequest.base?.repo?.id !== repository.id ||
     pullRequest.base?.repo?.full_name !== config.repository
   ) {
-    return "Action v2 requires the repository default branch as the pull-request base";
+    return "Action v2 requires a same-repository pull-request base";
+  }
+  const nativeStack = captureV2NativeStackScope(pullRequest);
+  if (config.triggerSource === "pull_request" && config.event?.action === "stacked" &&
+      (!nativeStack || !nativeStack.valid)) {
+    return "Action v2 requires current API native stack metadata for the stacked event";
+  }
+  if (nativeStack !== null &&
+      (!nativeStack.valid || nativeStack.baseRef !== repository.default_branch)) {
+    return "Action v2 requires valid native stack metadata rooted at the repository default branch";
+  }
+  if (
+    pullRequest.base?.ref !== repository.default_branch &&
+    (nativeStack === null || !nativeStack.valid)
+  ) {
+    return "Action v2 requires the repository default branch or a valid native stacked pull request";
   }
   if (
     pullRequest.head?.repo?.id !== repository.id ||
@@ -7930,7 +8002,6 @@ function assertV2FixedSnapshotScope(repository, pullRequest, config) {
     pullRequest.head?.repo?.full_name !== expected.headRepositoryFullName ||
     String(pullRequest.base?.sha || "").toLowerCase() !== expected.baseSha ||
     pullRequest.base?.ref !== expected.baseRef ||
-    pullRequest.base?.ref !== repository.default_branch ||
     pullRequest.base?.repo?.id !== expected.baseRepositoryId ||
     pullRequest.base?.repo?.full_name !== expected.baseRepositoryFullName ||
     String(pullRequest.merge_commit_sha || "").toLowerCase() !== expected.testMergeSha
@@ -7940,6 +8011,7 @@ function assertV2FixedSnapshotScope(repository, pullRequest, config) {
       { recoveryCode: "wait_then_reconcile" },
     );
   }
+  assertV2NativeStackSnapshotScope(pullRequest, config);
 }
 
 async function exactRefetchV2RelevantObjects(
