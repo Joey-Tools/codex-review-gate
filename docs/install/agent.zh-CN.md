@@ -66,11 +66,11 @@ GitHub.com/default-branch PR scope 时停止。
   将来可读取 collaborator permission 的 nonstandard verifier identity。
 - 每次调用 bootstrap 都显式保留同一个 `CONTROL_PLANE_OWNER`。默认值是
   `@JoeyTeng`；非 Joey 仓库必须替换成自己的合格 GitHub user。
-- 在采用需要读取自身 `pull_request` Actions run 的 GitHub-server `created_at` 的
-  floating `v2` runtime 前，要求 canonical read-only verifier 配有
-  `actions: read`。Private repository 缺少此权限时 self-run API 读取失败。
-  须在 release 前升级已安装 consumer workflow；不能使用 Git commit date 或近似
-  event time 代替。
+- 在采用需要验证自身 `pull_request` Actions run 原生 metadata 的 floating `v2` runtime
+  前，要求 canonical read-only verifier 配有 `actions: read`。Private repository 缺少此权限时
+  self-run API 读取失败。该读取绑定 workflow identity 与 current head/ref/test-merge scope，
+  并支持 legacy request-bound recovery；`created_at` 不是 primary exact-head clean 的正向
+  证据 cutoff。须在 release 前升级已安装 consumer workflow。
 
 ## 已完成 cutover 的 fresh audit
 
@@ -1117,10 +1117,10 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   fresh-fixture 两种形态；两者都不是 installation 或 activation path；
 - verifier path `.github/workflows/codex-review-gate.yml`、workflow name
   `Codex Review Gate Verifier`、`pull_request` types `opened`、`reopened`、
-  `synchronize`、`ready_for_review`、`stacked`，以及仅在
-  `changes.base.ref.from` 证明真实 base-ref retarget 时接收的 `edited`；title/body-only edit
-  会在分配 runner 前过滤。Exact PR feature-head SHA 上的 required job
-  为 `codex/github-review-gate`；
+  `synchronize`、`ready_for_review`、`stacked` 与所有 `edited` event。每个订阅 event
+  都执行 exact PR feature-head SHA 上固定的 required job
+  `codex/github-review-gate`，且使用相同 canonical run title；不通过 skipped job 或动态
+  required-check name 过滤。Title/body-only edit 也会完整重新评估当前 evidence；
 - controller path `.github/workflows/codex-review-gate-controller.yml`、workflow
   name `Codex Review Gate Controller`、exact Codex `issue_comment` `created`、
   canonical `Codex Review Gate Verifier` 首次 attempt（`run_attempt=1`）failure
@@ -1144,10 +1144,12 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
 - 没有 cron、`repository_dispatch`、`pull_request_target`、可写
   `pull_request_review`、status bridge、runtime App 或 ledger。
 
-可选的自动请求路径让 canonical `pull_request` verifier 保持只读，并通过现有受保护的
-controller workflow 的 `workflow_run` 运行。普通 event 仍要求 verifier 首次 attempt 失败；已验证的
-base-ref-retarget event 使用独立的 current-scope 检查，title/body-only edit 不符合条件。重跑旧 verifier
-attempt 不会启动此路径。应在 `on.workflow_run.workflows` 使用静态 verifier
+可选自动请求路径让 canonical `pull_request` verifier 保持只读，并通过现有受保护的
+controller workflow 的 `workflow_run` 运行。它仍要求 verifier 首次 attempt failure
+（`run_attempt=1`）；rerun attempt 不会启动此路径。已验证的 base-ref-retarget event 会检查
+current scope；title/body edit 使用相同 run title，没有 metadata-specific request filter。
+有效 current-head clean 可在任何新 reconciliation 中通过，不需要新 request。若 clean evidence
+确实缺失，原 failure-only opt-in path 仍可确保 request。应在 `on.workflow_run.workflows` 使用静态 verifier
 workflow name 订阅，而不要在 job 条件里将 `workflow_run.name` 与静态名称比较：verifier 的
 `run-name` 会使每次 run 的 name 动态变化。Action 仍校验 canonical workflow ID、path、run 和
 PR scope。公开仓库的
@@ -1163,12 +1165,17 @@ failure 都可能符合条件；真实 base-ref-retarget event 也可能符合�
 request-token 配置。之后由合格的
 Codex bot
 `issue_comment` event 或受保护的手动 exact-head `reconcile` 更新 gate。若 merge conflict
-使 verifier 无法运行，就没有可消费的 `workflow_run`：先解决冲突，或按文档走手动恢复路径。Retarget
-后的新 canonical request 与其后 trusted、未编辑的 top-level current-head clean，若显式 short SHA
-能唯一解析为 current head 且 timestamp 晚于 request，可在没有未解决 finding、其他 gate 均通过时满足
-窄范围接受策略。时间顺序是 temporal witness，不证明 request 导致 clean 或 artifact 覆盖某个 base SHA。
-若 filtered event 或匹配 verifier 不可用，使用 draft-to-ready `create_verifier_run` fallback；未更新
-filtered `edited` activity 的旧 consumer workflow 也需要该 fallback。`CODEX_REVIEW_GATE_AUTO_REQUEST` 这项 opt-in 本身不增加第三个 workflow、新
+使 verifier 无法运行，就没有可消费的 `workflow_run`：先解决冲突，或按文档走手动恢复路径。
+
+Primary pass evidence 是可信、未编辑的顶层 terminal clean；显式 SHA 必须唯一解析为 current full
+PR head。它独立于 request/controller attribution 和 verifier run 的原生 `created_at`；每个 run 都重新
+获取当前 evidence，不继承旧 run result 或 cross-run cache。若存在已验证 base-ref-retarget epoch，clean
+的 server timestamp 必须严格晚于最新实际 retarget，包括 A→B→A 序列中的最后一次。时间下限不证明
+request causality 或 base-SHA coverage。Findings 仍按既有 supersession 规则阻塞，exact-head clean
+不能自行清除它们。Legacy hashless 和 request/reaction 路径仍受 request-bound 条件约束。
+若无法验证实际 retarget event，或 current exact head/base/test-merge scope 没有 verifier，使用
+draft-to-ready `create_verifier_run` fallback；consumer 仍须订阅所有 `edited` activity。
+`CODEX_REVIEW_GATE_AUTO_REQUEST` 这项 opt-in 本身不增加第三个 workflow、新
 Action input、runtime App 或 ruleset；v2.2 的独立 request-token input 只用于显式选择请求 comment 作者。
 这是源码支持；consumer 还需对应 Action release 并刷新 canonical workflow 后才能收到该 event。
 
@@ -1274,6 +1281,11 @@ all review conversations resolved: true
 non-fast-forward default-branch updates blocked: true
 bypass actors: explicit empty array
 ```
+
+Conversation resolution 只由该 GitHub ruleset 在服务端强制。Action 不查询 inline threads，也不发现
+effective rulesets；thread diagnostic 保持 schema compatibility，状态为 `not_read`，所有计数为
+`unknown`（不是 verified zero）。Required CheckRun success 仅表示 Codex evidence pass，不代表 PR
+merge-ready。
 
 对于 existing 同名 ruleset，必须确认它覆盖 `DEFAULT_BRANCH`，再检查每一个被保留的额外
 include/exclude target 是否符合预期。不得把更广 targets 的既有 coverage 误报成 helper
@@ -1526,12 +1538,15 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    ordinary、deleted 或其他 unbound predecessor，应新建 replacement PR，并在其中只运行一个
    canonical review generation。
 
+   **Legacy request-bound lineage fallback.** 以下 request/reaction 规则仅用于 legacy
+   hashless clean 和 request-bound `+1` 兼容路径，不是上方 primary exact-head clean 的前置条件。
    把每条物理 request（未确认 default-`any` ordinary candidate 除外）都视为 generation
    boundary。没有 base epoch 时，unbound provider terminal evidence 只能闭合第一个 gap；
    只要前面已有物理 request，之后的每个 gap 和 positive/superseding authority 都必须来自
    直接附着在对应 canonical request 上的合格 `+1`，唯一相关例外是下文精确限定的
-   两条 boundary 的 current-head clean recovery。有 base epoch 时，普通 post-epoch lineage
-   的每个 gap 都必须使用 direct `+1`。既有 verifier 另有窄范围 current-head clean recovery：
+   legacy request-bound current-head clean recovery。有 base epoch 时，普通 post-epoch lineage
+   的每个 gap 都必须使用 direct `+1`。仅对不采用 primary head-bound clean 规则的旧 verifier，
+   以下 legacy request-bound recovery 才适用：
    令 `T = max(original verifier created_at, latest base epoch)`，要求新的合格 request `R`
    （ordinary `@codex review`，也包括带精确 canonical marker 的 PAT 生成 `User` request；该
    marker 不授予 workflow authority），以及随后出现、未编辑的 official 顶层 issue-comment
@@ -1555,14 +1570,15 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    先执行第 4 步 `begin-review` 并要求严格更新的 verifier attempt。不能依靠 direct
    comment 原子化地使旧 success 失效。
 
-   若 pending verifier 的 current head 已有 clean，先通过
-   `GET /repos/{owner}/{repo}/actions/runs/{run_id}` 读取本次 exact
-   `pull_request` verifier run，并要求 GitHub-server `created_at`。它是保守
-   cutoff，不是精确 `synchronize` timestamp；绝不能回退到 Git commit date 或近似
-   event time。若 official、未编辑、绑定 current head 的顶层 issue-comment clean
-   `C0` 不晚于该 cutoff，`C0` 单独不能 pass。这个 cutoff 只针对顶层 issue-comment
-   clean：没有 `C0` 时，较早的 `APPROVED` pull-request review 仍按既有
-   first-generation 规则判断；存在早于 run 的 `C0` 时，它不能绕过 pending。
+   Legacy request-bound clean recovery 只在没有可用 primary evidence、且仍需兼容旧 reducer
+   时适用；当前 head-bound clean 的正常 pass 不使用 verifier-run `created_at` cutoff。
+   在此 legacy recovery 中，若 pending verifier 的 current head 已有 clean，先通过
+   `GET /repos/{owner}/{repo}/actions/runs/{run_id}` 读取本次 exact `pull_request` verifier run，
+   并要求 GitHub-server `created_at`。它是保守 cutoff，不是精确 `synchronize` timestamp；绝不能
+   回退到 Git commit date 或近似 event time。若 official、未编辑、绑定 current head 的顶层
+   issue-comment clean `C0` 不晚于该 cutoff，`C0` 单独不能满足这条 legacy fallback。这个 cutoff
+   只针对顶层 issue-comment clean：没有 `C0` 时，较早的 `APPROVED` pull-request review 仍按既有
+   first-generation 规则判断；存在早于 run 的 `C0` 时，它不能绕过该 legacy pending 状态。
    狭窄恢复只在没有 base epoch、恰好一条
    较早 authorised request `R0`（ordinary 或 canonical）的 first-generation gap
    已由 `C0` 闭合、且没有其他相关 physical boundary 或未闭合 gap 时可用。确认没有
@@ -1579,10 +1595,10 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    无法证明这些条件时，此例外不可用；按 summary 指示走普通 request-bound `+1`
    或 replacement-PR 路径。新的 PR 事件会创建新 cutoff，不保证 `R1/C1` 可复用。
 
-   若无法从 filtered `edited` event 验证 base retarget，或 current exact head/base/test-merge scope 没有
+   若无法从 `edited` event 验证实际 base retarget，或 current exact head/base/test-merge scope 没有
    verifier，按 `create_verifier_run` 恢复：ready PR 先转 draft 再标记 ready；already-draft PR 直接标记
    ready。Reconcile 前必须要求该 exact scope 出现新的 `ready_for_review` verifier；rerun 旧 event 不是有效的
-   retarget recovery。未包含 filtered `edited` activity 的旧 consumer workflow 也使用此 fallback。
+   retarget recovery。若已安装 consumer workflow 没有订阅 `edited` activity，先刷新 canonical workflow。
 
    如果 controller summary 报告 base epoch、base retarget 或
    `request_clean_generation`，不能仅凭该 code 就发送 request；先读取具体 reason、lineage
@@ -1601,9 +1617,9 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
      request，也不能依赖仅修改 commit 来 reset。应从目标 branch/commits 新建 replacement
      PR，只运行一个 canonical producer；验证通过后关闭旧歧义 PR。
 
-   除上文精确限定的 current-head clean recovery 外，在这些 mode 中，later terminal
-   clean 不能证明 request/base lineage，不得视为 pass；
-   findings 仍始终阻塞。
+   符合上方 primary 规则的可信 exact-head terminal clean，不受旧 request gap 限制；legacy
+   hashless clean 或用于 request-bound `+1` lineage 的 clean 仍受这些 fallback 规则约束。
+   Primary clean 与 fallback clean 都不能自行清除 finding；finding 仍按既有 supersession 条件阻塞。
 
 4. 只有 controller 必须协调 fresh request 和 newer verifier attempt 时，才使用
    `begin-review`。下面的 command block 只用于上述可恢复的原 PR 分支；若存在不可闭合的
@@ -1684,16 +1700,16 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
 
    任何非 success result 都按 `recovery_code` 与 summary 的 concrete next action 操作。
    Finding 通常产生 healthy failure；unhealthy execution 是恢复问题，不是 finding
-   verdict。`healthy/pending` 是 fail-closed，不能授权 success。`wait_provider` 不代表必须
-   更换 PR：最新审查仍在运行时先等待；若审查已结束、findings 已解决，且完整、未经编辑的历史
-   符合 current-head clean recovery 条件，可在原 PR 发一条新的合格 `@codex review`，
-   取得可信、未经编辑的 exact-head clean 后 reconcile。优先等待现有 provider 事件自动
-   reconcile，只有 verifier 未刷新时才手动 reconcile。新请求不会豁免 finding 或历史检查，
-   确实不可闭合的历史仍保留 replacement 路径。其他 recovery code 必须先执行指定动作，
-   再进行后续 exact-head reconcile。更早的 official clean 若仅缺少 Reviewed commit marker，
-   本身绝不是 pass receipt；只有其余正文合规，且更晚的合格 request 已有有效 exact-head clean，
-   才能通过窄范围 current-head recovery 解除这个旧错误。不要删除或编辑旧评论、猜测其 SHA，
-   也不要把任意 malformed 正文都当成这个例外。
+   verdict。`healthy/pending` 是 fail-closed，不能授权 success。`wait_provider` 只适用于本次 run
+   新创建 request 且尚无 terminal result 的情形；此时等待 provider。若 automatic controller
+   采用已有 request，则报告 `recovery_code=reconcile`，不表示 provider 仍在运行；应刷新
+   exact-head verifier，以消费已发布 clean 或显式呈现缺失/terminal evidence。Primary pass 缺少
+   clean 时，应取得可信 current-head top-level clean（如适用，须在 retarget 后），不要仅为弥补旧
+   request attribution gap 再发 request。优先等待现有 provider event 自动 reconcile，只有 verifier
+   未刷新时才手动 reconcile。新请求不会豁免 finding 或历史检查，确实不可闭合的历史仍保留
+   replacement 路径。其他 recovery code 必须先执行指定动作，再进行后续 exact-head reconcile。
+   更早的 official clean 若缺少 Reviewed commit marker，本身绝不是 primary pass evidence；不要删除或
+   编辑旧评论、猜测其 SHA，或把任意 malformed 正文当成例外。
    可推导时，
    `findings_unresolved`、`findings_resolved`、`findings_historical` 与
    `findings_indeterminate` 只出现在 summary/sticky diagnostic。

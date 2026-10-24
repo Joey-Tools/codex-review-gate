@@ -64,8 +64,14 @@ After the first attempt (`run_attempt=1`) of the canonical read-only
 may create one canonical request for the current feature head only when the PR
 is still open, ready, in the same repository, targeting the default branch,
 and has no matching canonical request. This may follow `opened`, `reopened`,
-`synchronize` or `ready_for_review`, not just a push. The automatic path is
-request-only: it does not immediately rerun the verifier or turn the failed
+`synchronize`, `ready_for_review`, native `stacked`, or `edited`, not just a push.
+The verifier subscribes to all six events, uses the same fixed required job
+`codex/github-review-gate` and canonical run title, and fully reconciles current
+evidence each time; no skipped or dynamically renamed job is used.
+Title/body-only edits do not invalidate an existing valid same-head clean and
+do not by themselves require a fresh review. The existing failure-only,
+first-attempt opt-in path may still request review when acceptable evidence is
+genuinely missing. The automatic path is request-only: it does not immediately rerun the verifier or turn the failed
 check green. A qualifying Codex Bot `issue_comment` later wakes the controller;
 otherwise dispatch a protected manual `reconcile` for the exact current head.
 If a merge conflict prevents any verifier run, there is no automatic request;
@@ -89,11 +95,29 @@ the exact-head controller run and canonical marker so a pending automatic
 request cannot overlap a direct or manual controller request. The automatic
 path is not a substitute for deliberate same-head re-review after success.
 
-### Ordinary low-cost review
+### Primary exact-head clean
 
-When the exact head is not already carrying a success that must be invalidated,
-the normal agent path below is available only for the first physical generation
-of a PR with no base epoch. Before posting, verify that the current lineage has
+The primary pass evidence is one trusted, unedited official top-level terminal
+clean whose explicit reviewed-commit SHA resolves uniquely to the current full
+PR head. It is independent of request/controller attribution and verifier-run
+`created_at`. If a real base-ref-retarget epoch exists, the clean's server
+timestamp must be strictly later than the latest actual retarget, including an
+A-to-B-to-A sequence. Complete comment/review acquisition, exact refetches,
+two stable snapshots, current test-merge binding and finding rules still
+apply. Every run freshly rebuilds its decision from GitHub; there is no
+cross-run cache, artifact or inherited verifier result. A rerun, ready event
+or title/body metadata reconciliation may reuse a valid same-head clean.
+Findings remain blocking under their existing supersession rules; a clean does
+not silently clear one. If clean evidence is missing, obtain a trusted current-head clean
+(after the latest real retarget when applicable), rather than posting a
+request solely to repair an old attribution gap.
+
+### Ordinary low-cost review and legacy request-bound fallback
+
+When a new request is genuinely needed, the ordinary request path below is
+available only for the first physical generation of a PR with no base epoch.
+The primary exact-head clean above can pass without satisfying these legacy
+lineage requirements. Before posting, verify that the current lineage has
 no earlier provider-confirmed or other physical boundary that is not explicitly
 bound to another full head. A default-`any` ordinary candidate with neither a
 direct receipt nor a terminal-clean contender does not itself create a lineage
@@ -141,7 +165,9 @@ pending. Canonical workflows fix
 to an ordinary consumer workflow. `write`/`maintain`/`admin` is reserved for a
 nonstandard future verifier identity that can read collaborator permissions.
 
-For an existing verifier, fresh current-head clean recovery uses
+The following fresh-clean witness is a legacy request-bound fallback, not a
+prerequisite for the primary exact-head clean above. For an existing verifier,
+it uses
 `T = max(original verifier created_at, latest base epoch)` (when no base epoch
 was observed, `T` is just the original verifier run's server `created_at`).
 Post one fresh eligible `@codex review` request `R` (exact and unedited), then wait for a
@@ -157,8 +183,9 @@ the exact triggering comment. This post-epoch path supplies a fresh
 head-attested witness for the existing verifier only; ordinary post-epoch lineage still follows the
 exact-current-tuple canonical request/direct `+1` rules. Old request
 attribution gaps and unsettled old `eyes` do not veto a qualifying witness,
-but actual findings, unresolved review threads, provider errors and
-acquisition/history guards remain independent. The existing provider event
+but actual findings, provider errors and acquisition/history guards remain
+independent. Inline conversation resolution is enforced only by the installed
+GitHub ruleset, not scanned by the Action. The existing provider event
 normally requests the verifier rerun; if delivery fails, run one scoped
 `reconcile`. No empty commit is required. Posting the request does not
 guarantee Codex starts. See [the full recovery contract](README.md#review-generations-and-recovery).
@@ -309,7 +336,7 @@ unbound predecessor requires a replacement PR.
 | `healthy/success` | Stable complete current-head clean evidence was proved. | Perform the final verifier/head/ruleset reread; merge only if all still match. |
 | `healthy/failure` | Qualifying findings were proved. | Follow the summary reason and finding links. Fix and reconcile on the original PR only when lineage remains recoverable; an unclosable historical lineage requires a replacement PR carrying the fixes and one canonical generation. |
 | `unhealthy/failure` | Findings were proved but execution or final result handling also failed. | Keep the findings blocking, repair the named execution boundary and reconcile. |
-| `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. | Follow `recovery_code`; `wait_provider` means no qualifying terminal result is yet available. Wait while the review is running, or reconcile an existing qualifying exact-head clean. |
+| `healthy/pending` | Evaluation completed safely, but current state cannot authorise success yet. | Follow `recovery_code`; `wait_provider` applies when this run newly posted a request and no terminal result is available. An adopted/duplicate automatic request reports `reconcile`: refresh the exact-head verifier and consume any published clean or surface missing/terminal evidence. |
 | `unhealthy/pending` | API, pagination, cap or stability execution is incomplete. | Follow the recovery code; do not treat it as no findings. |
 | `healthy/not_applicable` | A delayed automatic event no longer applies. | Usually no action; reconcile the current head if a gate decision is still needed. |
 | `unhealthy/not_applicable` | The manual target is invalid or unsupported. | Correct the target or use a supported scope; do not bypass the ruleset. |
@@ -353,7 +380,7 @@ provider error, or base-epoch requirement.
 | Code | Safe next action |
 | --- | --- |
 | `none` | No evaluator recovery is required; perform exact-head merge closure. |
-| `wait_provider` | No qualifying terminal result is available yet; this alone does not mean the PR must be replaced. Wait while the review is running, or reconcile if a trusted exact-head clean already exists. If the review finishes without a qualifying current-head clean, resolve all findings first. An intact, unedited history may use fresh current-head clean recovery with `T = max(original verifier created_at, latest base epoch)`; see the scoped post-epoch witness above. A missing clean alone is not proof of unclosable history. A new request or wait does not clear findings or waive history checks; edited, deleted or otherwise unclosable history may still require the indicated repair or replacement path. This guidance does not change the pending verdict; do not spam requests. |
+| `wait_provider` | This run newly posted a request and no qualifying terminal result is available yet; that alone does not mean the PR must be replaced. Wait while the review is running, then reconcile trusted current-head clean evidence. If an automatic request was adopted rather than newly posted, use `reconcile`; do not infer that the provider is running or finished. Missing-clean guidance is to obtain a trusted exact-head clean (strictly after a real retarget when applicable), not to request solely for an old attribution gap. A new request or wait does not clear findings or waive history checks; edited, deleted or otherwise unclosable history may still require the indicated repair or replacement path. This guidance does not change the pending verdict; do not spam requests. |
 | `reconcile` | Reread the exact current head and run one scoped reconcile. |
 | `fix_findings` | Follow the summary reason. Normally fix the reported current findings, separately resolve inline conversations, obtain later head-bound clean evidence, then reconcile. If the reason also reports an unclosable historical lineage, put the fixes on a replacement PR and run exactly one canonical generation there instead of requesting again on the original PR. |
 | `request_clean_generation` | Follow the summary reason and lineage. For a recoverable latest/current canonical request, stay on the original PR: obtain the required direct `+1` on the named request, or—only for the unique, no-base-epoch, single-flight unedited default-`any` ordinary candidate—wait for its matching unedited official current-head top-level issue-comment terminal clean or exact closed `COMMENTED` Codex inline-parent review. Generic pull-request reviews cannot confirm that candidate. The recovery-only duplicate cohort above is not a request path: never create it; if the immutable snapshot already qualifies, reconcile it, and a canonical successor still needs its own direct `+1`. A finding still blocks and never confirms it. Create exactly one newer canonical generation only when the reason says one is still needed. A historical gap may reset on a legitimate new head only when every ambiguous predecessor is explicitly bound to another full head. A default-`any` ordinary candidate with neither a direct receipt nor a terminal-clean contender is not such a predecessor. If a provider-confirmed ordinary, edited, malformed, denied, deleted, or otherwise unbound predecessor makes that gap unclosable, do not request again on that PR/head; open a replacement PR and run one canonical generation there. |
@@ -519,8 +546,11 @@ multiple diagnostics exist. Other operations may create a diagnostic when none
 exists, but do not update an existing one. The current controller diagnostic
 format omits visible unknown counts and thread detail while retaining typed
 `unknown` values in its hidden payload; it labels itself as a snapshot and
-identifies the authoritative verifier CheckRun. Older canonical payloads,
-including v2.1.6 payloads without `reviewThreads`, remain readable.
+identifies the authoritative verifier CheckRun. The current verifier's
+compatibility field is `review_threads.status: not_read`, with `resolved`,
+`unresolved`, and `total` all `unknown`; it is not a thread inventory or a
+verified zero. Older canonical payloads, including v2.1.6 payloads without
+`reviewThreads`, remain readable.
 
 Only an exact, unedited, official canonical sticky is exempt from physical
 request lineage. An edited, invalid, forged or wrong-provenance marker-looking

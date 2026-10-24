@@ -92,7 +92,6 @@ const V2_REACTION_CONTENTS = new Set([
 const V2_CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER =
   "<!-- codex-pull-request-review-summary -->";
 const V2_DELETED_COMMENTS_PAGE_SIZE = 100;
-const V2_REVIEW_THREADS_PAGE_SIZE = 100;
 const V2_OBSERVED_HISTORY_POISON = Symbol("v2-observed-history-poison");
 const V2_OBSERVED_HISTORY_COUNT_FLOOR = Symbol("v2-observed-history-count-floor");
 const V2_OBSERVED_HISTORY_RAW_IDENTITIES = Symbol(
@@ -194,31 +193,6 @@ const V2_DELETED_COMMENTS_QUERY = `query CodexReviewGateDeletedComments(
     }
   }
 }`;
-const V2_REVIEW_THREADS_QUERY = `query CodexReviewGateReviewThreads(
-  $owner: String!
-  $repo: String!
-  $number: Int!
-  $cursor: String
-) {
-  repository(owner: $owner, name: $repo) {
-    nameWithOwner
-    pullRequest(number: $number) {
-      number
-      reviewThreads(first: ${V2_REVIEW_THREADS_PAGE_SIZE}, after: $cursor) {
-        totalCount
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          id
-          isResolved
-          path
-          isOutdated
-          comments(first: 1) { nodes { url } }
-        }
-      }
-    }
-  }
-}`;
-
 export function normalizeV2Operation(raw) {
   const operation = String(raw ?? "").trim() || "reconcile";
   if (
@@ -630,6 +604,11 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
         `- Review-thread inventory: ${formatV2ReviewThreadStatus(report.reviewThreads.status)}`,
         ...formatV2CarrierDiagnostics(report.carrierDiagnostics),
       ];
+  const threadPolicyNote = report.reviewThreads.status === "not_read"
+    ? [
+        "- Inline conversations are not inventoried by this Action; GitHub's required conversation-resolution rule enforces them separately. Gate success is not merge readiness.",
+      ]
+    : [];
   const body = [
     "## Codex GitHub Review Gate",
     "",
@@ -648,6 +627,7 @@ export function appendV2GateSummary(summaryPath, report, context = {}) {
     ...reasonLines,
     `- Recovery code: \`${report.recoveryCode}\``,
     ...diagnosticMetadata,
+    ...threadPolicyNote,
     ...(context.verifierRunId
       ? [
           `- Verifier run: ${formatV2DiagnosticText(context.verifierRunUrl || context.verifierRunId, "unknown", 500)}`,
@@ -1075,6 +1055,17 @@ function recoveryInstruction(
     ? ` for PR #${prNumber}`
     : "";
   if (
+    headCleanRecoveryAction === "current-head" &&
+    (code === "request_clean_generation" || code === "wait_provider")
+  ) {
+    return (
+      `Wait for or obtain a trusted, unedited top-level Codex terminal clean bound uniquely to ` +
+      `the exact current PR head${target}; reconcile afterward. If a base retarget was observed, ` +
+      `the clean must be strictly newer than that retarget. Older request or reaction lineage ` +
+      `alone does not require another generation or a replacement PR.`
+    );
+  }
+  if (
     headCleanRecoveryAction === "request" &&
     (code === "request_clean_generation" || code === "wait_provider")
   ) {
@@ -1101,6 +1092,13 @@ function recoveryInstruction(
         `the original PR because the reported evidence warning proves an unclosable historical ` +
         `lineage. Open a replacement PR with the fixes, run exactly one canonical review ` +
         `generation there, and then reconcile.`
+      );
+    }
+    if (headCleanRecoveryAction === "current-head") {
+      return (
+        `Fix the unresolved Codex findings first, then wait for or obtain a trusted, unedited ` +
+        `top-level Codex terminal clean bound uniquely to the exact current PR head${target}; ` +
+        `reconcile afterward. Older request lineage alone does not require a replacement PR.`
       );
     }
     return `Fix the unresolved Codex findings, request a new review generation, then reconcile${target}.`;
@@ -2143,13 +2141,19 @@ async function runV2ControllerAction(client, config, context, {
       );
     }
     if (config.triggerSource === "auto") {
+      const adoptedRequest = new Set([
+        "adopted",
+        "duplicates",
+        "adopted-after-unknown",
+        "duplicates-after-unknown",
+      ]).has(reviewRequest.kind);
       const report = buildV2GateReport({
         executionHealth: "healthy",
         gateOutcome: "pending",
-        reason:
-          `Automatic Codex review request ${reviewRequest.commentId} is ${reviewRequest.kind}; ` +
-          "wait for the provider result before reconciling",
-        recoveryCode: "wait_provider",
+        reason: adoptedRequest
+          ? `Existing Codex review request ${reviewRequest.commentId} was adopted; no new request was posted. Reconcile the exact current head to use any published clean or surface missing/terminal evidence.`
+          : `Automatic Codex review request ${reviewRequest.commentId} is ${reviewRequest.kind}; wait for the provider result before reconciling`,
+        recoveryCode: adoptedRequest ? "reconcile" : "wait_provider",
         retrySafe: false,
       });
       await finalizeV2Report(client, config, context, report);
@@ -4553,10 +4557,21 @@ function isV2PullRequestBaseRetargetEvent(event) {
   const previousRef = event?.changes?.base?.ref?.from;
   const currentRef = event?.pull_request?.base?.ref;
   return event?.action === "edited" &&
-    typeof previousRef === "string" && previousRef !== "" &&
-    typeof currentRef === "string" && currentRef !== "" &&
+    typeof previousRef === "string" && previousRef.trim() !== "" &&
+    typeof currentRef === "string" && currentRef.trim() !== "" &&
     previousRef !== currentRef &&
     isCanonicalUtcTimestamp(event?.pull_request?.updated_at);
+}
+
+function hasV2MalformedEditedBaseChange(event) {
+  if (
+    event?.action !== "edited" ||
+    !isPlainRecord(event?.changes) ||
+    !Object.hasOwn(event.changes, "base")
+  ) {
+    return false;
+  }
+  return !isV2PullRequestBaseRetargetEvent(event);
 }
 
 function v2EditedRetargetHasObservedBaseEpoch(event, baseEpoch) {
@@ -4607,9 +4622,10 @@ function validateV2Trigger(config) {
     ]);
     const eventPr = event?.pull_request;
     const eventHead = String(eventPr?.head?.sha || "").toLowerCase();
-    const editedBaseRetarget = isV2PullRequestBaseRetargetEvent(event);
+    const edited = event?.action === "edited";
     if (
-      (!allowedActions.has(event?.action) && !editedBaseRetarget) ||
+      (!allowedActions.has(event?.action) && !edited) ||
+      hasV2MalformedEditedBaseChange(event) ||
       !isPlainRecord(eventPr) ||
       Number(event?.number) !== config.prNumber ||
       Number(eventPr?.number) !== config.prNumber ||
@@ -5034,158 +5050,6 @@ async function loadCompleteV2Snapshot(client, config, {
   };
 }
 
-async function loadV2ReviewThreads(client, config, budget) {
-  const threads = [];
-  const seenIds = new Set();
-  const seenCursors = new Set();
-  let cursor = null;
-  let expectedTotalCount = null;
-  while (true) {
-    const { data } = await client.request(
-      "POST",
-      "/graphql",
-      {
-        query: V2_REVIEW_THREADS_QUERY,
-        variables: {
-          owner: config.owner,
-          repo: config.repo,
-          number: config.prNumber,
-          cursor,
-        },
-      },
-      { budget, safeRead: true },
-    );
-    const label = "pull-request review threads";
-    budget.consumePage(label);
-    if (
-      !isPlainRecord(data) ||
-      (data.errors !== undefined &&
-        (!Array.isArray(data.errors) || data.errors.length > 0)) ||
-      !isPlainRecord(data.data) ||
-      !isPlainRecord(data.data.repository) ||
-      !sameV2GraphQlRepositoryName(
-        data.data.repository.nameWithOwner,
-        config.repository,
-      ) ||
-      !isPlainRecord(data.data.repository.pullRequest) ||
-      data.data.repository.pullRequest.number !== config.prNumber
-    ) {
-      throw new V2RuntimeFailure(
-        "GitHub GraphQL review-thread response was incomplete or inconsistent",
-        { recoveryCode: "wait_then_reconcile" },
-      );
-    }
-
-    const connection = data.data.repository.pullRequest.reviewThreads;
-    const pageInfo = connection?.pageInfo;
-    if (
-      !isPlainRecord(connection) ||
-      !isNonNegativeSafeInteger(connection.totalCount) ||
-      !Array.isArray(connection.nodes) ||
-      connection.nodes.length > V2_REVIEW_THREADS_PAGE_SIZE ||
-      !isPlainRecord(pageInfo) ||
-      typeof pageInfo.hasNextPage !== "boolean" ||
-      !(
-        pageInfo.endCursor === null ||
-        (typeof pageInfo.endCursor === "string" && pageInfo.endCursor.trim() !== "")
-      ) ||
-      (pageInfo.hasNextPage &&
-        (connection.nodes.length === 0 || typeof pageInfo.endCursor !== "string"))
-    ) {
-      throw new V2RuntimeFailure(
-        "GitHub GraphQL review-thread connection was incomplete or inconsistent",
-        { recoveryCode: "wait_then_reconcile" },
-      );
-    }
-    if (expectedTotalCount === null) {
-      expectedTotalCount = connection.totalCount;
-    } else if (connection.totalCount !== expectedTotalCount) {
-      throw new V2RuntimeFailure(
-        "GitHub GraphQL review-thread total count changed during pagination",
-        { recoveryCode: "wait_then_reconcile" },
-      );
-    }
-    if (connection.nodes.length > expectedTotalCount - threads.length) {
-      throw new V2RuntimeFailure(
-        "GitHub GraphQL review-thread page exceeds its declared total count",
-        { recoveryCode: "wait_then_reconcile" },
-      );
-    }
-
-    const pageThreads = [];
-    let diagnosticCommentNodes = 0;
-    for (const [index, thread] of connection.nodes.entries()) {
-      if (
-        !isPlainRecord(thread) ||
-        typeof thread.id !== "string" ||
-        thread.id.trim() === "" ||
-        typeof thread.isResolved !== "boolean" ||
-        typeof thread.isOutdated !== "boolean" ||
-        !(thread.path === null || typeof thread.path === "string")
-      ) {
-        throw new V2RuntimeFailure(
-          `GitHub GraphQL review-thread item ${threads.length + index + 1} was malformed`,
-          { recoveryCode: "wait_then_reconcile" },
-        );
-      }
-      if (seenIds.has(thread.id)) {
-        throw new V2RuntimeFailure(
-          `GitHub GraphQL review-thread identity ${thread.id} appeared more than once`,
-          { recoveryCode: "wait_then_reconcile" },
-        );
-      }
-      seenIds.add(thread.id);
-      const firstComment = Array.isArray(thread.comments?.nodes)
-        ? thread.comments.nodes[0]
-        : null;
-      if (firstComment !== null && typeof firstComment === "object") {
-        diagnosticCommentNodes += 1;
-      }
-      pageThreads.push({
-        id: thread.id,
-        isResolved: thread.isResolved,
-        path: typeof thread.path === "string" ? thread.path : null,
-        isOutdated: thread.isOutdated,
-        url: normalizeV2ReviewThreadCommentUrl(firstComment?.url),
-      });
-    }
-    // Count the repository, pull request, connection, thread nodes, and the
-    // optional first-comment nodes that supply diagnostic links. Nested thread
-    // comments are never enumerated or interpreted.
-    budget.consumeObjects(
-      3 + connection.nodes.length + diagnosticCommentNodes,
-      label,
-    );
-    threads.push(...pageThreads);
-
-    if (!pageInfo.hasNextPage) break;
-    const nextCursor = pageInfo.endCursor;
-    if (nextCursor === cursor || seenCursors.has(nextCursor)) {
-      throw new V2RuntimeFailure(
-        "GitHub GraphQL review-thread pagination did not advance its cursor",
-        { recoveryCode: "wait_then_reconcile" },
-      );
-    }
-    seenCursors.add(nextCursor);
-    cursor = nextCursor;
-  }
-  if (threads.length !== expectedTotalCount) {
-    throw new V2RuntimeFailure(
-      `GitHub GraphQL review-thread inventory was incomplete: ` +
-        `${threads.length} of ${expectedTotalCount}`,
-      { recoveryCode: "wait_then_reconcile" },
-    );
-  }
-  return {
-    threads,
-    fingerprint: threads.map(({ id, isResolved }) => ({ id, isResolved })),
-    diagnostics: threads
-      .filter((thread) => !thread.isResolved)
-      .slice(0, 5)
-      .map(({ path, isOutdated, url }) => ({ path, isOutdated, url })),
-  };
-}
-
 function sameV2GraphQlRepositoryName(left, right) {
   if (typeof left !== "string" || typeof right !== "string") return false;
   const leftParts = left.split("/");
@@ -5285,10 +5149,6 @@ async function loadV2DecisionCarriers(
     (value) => ({ status: "fulfilled", value }),
     (reason) => ({ status: "rejected", reason }),
   );
-  const reviewThreadPromise = loadV2ReviewThreads(client, config, budget).then(
-    (value) => ({ status: "fulfilled", value }),
-    (reason) => ({ status: "rejected", reason }),
-  );
   const issueCommentRead = await issueCommentPromise.then(
     (value) => ({ status: "fulfilled", value }),
     (reason) => ({ status: "rejected", reason }),
@@ -5314,12 +5174,11 @@ async function loadV2DecisionCarriers(
     (value) => ({ status: "fulfilled", value }),
     (reason) => ({ status: "rejected", reason }),
   );
-  const [reviewRead, commentHistoryRead, reviewThreadRead] = await Promise.all([
+  const [reviewRead, commentHistoryRead] = await Promise.all([
     reviewPromise,
     commentHistoryPromise,
-    reviewThreadPromise,
   ]);
-  const carrierReads = [issueCommentRead, reviewRead, commentHistoryRead, reviewThreadRead];
+  const carrierReads = [issueCommentRead, reviewRead, commentHistoryRead];
   let latchError = null;
   let missingPendingReviews = [];
   if (issueCommentRead.status === "fulfilled") {
@@ -5408,31 +5267,71 @@ async function loadV2DecisionCarriers(
       latchError ??= error;
     }
   }
-  const reviewThreadsIncomplete = reviewThreadRead.status === "rejected";
-  if (latchError) {
-    if (reviewThreadsIncomplete) {
-      throw copyV2FailureWithReviewThreadStatus(latchError, "incomplete");
-    }
-    throw latchError;
-  }
+  if (latchError) throw latchError;
   const failedRead = carrierReads.find((read) => read.status === "rejected");
-  if (failedRead) {
-    if (reviewThreadsIncomplete) {
-      throw copyV2FailureWithReviewThreadStatus(failedRead.reason, "incomplete");
-    }
-    throw failedRead.reason;
-  }
+  if (failedRead) throw failedRead.reason;
   const issueComments = issueCommentRead.value;
   const reviews = reviewRead.value;
   const { baseEpoch, deletedCommentEvents, issueCommentEdits } =
     commentHistoryRead.value;
-  const reviewThreadEvidence = reviewThreadRead.value;
-  const requestAuthority = await collectAuthorizedV2Requests(
+  const providerEvidence = await collectV2ProviderEvidence(
     client,
     config,
     budget,
+    headSha,
     issueComments,
+    reviews,
+    diagnosticSummaryIds,
   );
+  const directCurrentHeadClean = selectV2DirectCurrentHeadClean({
+    providerArtifacts: providerEvidence.artifacts,
+    headSha,
+    baseEpoch,
+  });
+  const directCurrentHeadCleanMs = directCurrentHeadClean === null
+    ? null
+    : Date.parse(directCurrentHeadClean.createdAt);
+  const directlySupersededProviderArtifact = (artifact) => {
+    if (
+      !Number.isFinite(directCurrentHeadCleanMs) ||
+      artifact?.source !== "issue-comment" ||
+      artifact.edited === true ||
+      artifact.orderingError ||
+      artifact.resolutionError ||
+      !isCanonicalUtcTimestamp(artifact.createdAt) ||
+      directCurrentHeadCleanMs <= Date.parse(artifact.createdAt)
+    ) {
+      return false;
+    }
+    return artifact.kind === "provider-failure" || (
+      artifact.kind === "malformed" &&
+      artifact.recoveryProvenance === CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE
+    );
+  };
+  const currentHeadFindings = providerEvidence.artifacts.some((artifact) =>
+    artifact.kind === "finding" &&
+    String(artifact.resolvedHeadSha || artifact.headSha || "").toLowerCase() === headSha
+  );
+  const requiresGenerationSupersession =
+    currentHeadFindings ||
+    providerEvidence.errors.length > 0 ||
+    (deletedCommentEvents ?? []).length > 0 ||
+    providerEvidence.artifacts.some((artifact) =>
+      Boolean(artifact.orderingError) ||
+      Boolean(artifact.resolutionError) ||
+      ((artifact.kind === "provider-failure" || artifact.kind === "malformed") &&
+        !directlySupersededProviderArtifact(artifact))
+    );
+  const useDirectCleanBasis = directCurrentHeadClean !== null &&
+    !requiresGenerationSupersession;
+  const requestAuthority = useDirectCleanBasis
+    ? { authorized: [], boundaries: [], errors: [] }
+    : await collectAuthorizedV2Requests(
+        client,
+        config,
+        budget,
+        issueComments,
+      );
   await exactRefetchV2RelevantObjects(
     client,
     config,
@@ -5450,20 +5349,13 @@ async function loadV2DecisionCarriers(
     missingPendingReviews,
     observedIssueCommentEdits,
   );
-  const providerEvidence = await collectV2ProviderEvidence(
-    client,
-    config,
-    budget,
-    headSha,
-    issueComments,
-    reviews,
-    diagnosticSummaryIds,
-  );
   const physicalRequestBoundaries = [
     ...requestAuthority.boundaries,
     ...(deletedCommentEvents ?? []).map(v2DeletedCommentBoundary),
   ].filter((boundary) => isV2CurrentHeadPhysicalBoundary(boundary, headSha));
-  const preliminaryHeadCleanRecovery = selectV2CurrentHeadCleanRecovery({
+  const preliminaryHeadCleanRecovery = useDirectCleanBasis
+    ? null
+    : selectV2CurrentHeadCleanRecovery({
     authorized: requestAuthority.authorized,
     physicalBoundaries: physicalRequestBoundaries,
     baseEpoch,
@@ -5479,12 +5371,14 @@ async function loadV2DecisionCarriers(
     prNumber: config.prNumber,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
     deferHistoryProjectionForFindings: true,
-  });
+    });
   forgetV2AttestedPriorRequestReactionHistory(
     observedIssueCommentEdits,
     preliminaryHeadCleanRecovery,
   );
-  const reactionRequests = selectV2ReactionInventoryRequests({
+  const reactionRequests = useDirectCleanBasis
+    ? []
+    : selectV2ReactionInventoryRequests({
     headSha,
     baseSha,
     baseRef: pullRequest.base.ref,
@@ -5492,15 +5386,17 @@ async function loadV2DecisionCarriers(
     baseEpoch,
     requests: requestAuthority.boundaries,
     authorizedRequests: requestAuthority.authorized,
-  });
-  const reactionInventories = await loadV2RequestReactionInventories(
-    client,
-    config,
-    budget,
-    reactionRequests,
-    observedIssueCommentEdits,
-    preliminaryHeadCleanRecovery,
-  );
+    });
+  const reactionInventories = useDirectCleanBasis
+    ? new Map()
+    : await loadV2RequestReactionInventories(
+        client,
+        config,
+        budget,
+        reactionRequests,
+        observedIssueCommentEdits,
+        preliminaryHeadCleanRecovery,
+      );
   const requestReactions = new Map();
   for (const [id, reactions] of reactionInventories) {
     requestReactions.set(id, reactions);
@@ -5512,7 +5408,9 @@ async function loadV2DecisionCarriers(
   // Codex accepted a user-authored request. Keep those comments in the
   // snapshot and reaction inventory, but let only an official direct reaction
   // or unedited terminal clean receipt promote them into the inputs below.
-  const effectiveRequestAuthority = confirmV2DefaultAnyRequestCandidates({
+  const effectiveRequestAuthority = useDirectCleanBasis
+    ? { ...requestAuthority, headCleanRecovery: null }
+    : confirmV2DefaultAnyRequestCandidates({
     authorized: requestAuthority.authorized,
     boundaries: requestAuthority.boundaries,
     physicalBoundaries: physicalRequestBoundaries,
@@ -5528,7 +5426,7 @@ async function loadV2DecisionCarriers(
     repositoryId: String(config.repositoryId),
     prNumber: config.prNumber,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
-  });
+    });
   const decisionEvidence = reduceV2Evidence({
     headSha,
     baseSha,
@@ -5547,7 +5445,6 @@ async function loadV2DecisionCarriers(
     providerErrors: providerEvidence.errors,
     deletedCommentEvents,
     headCleanRecovery: effectiveRequestAuthority.headCleanRecovery,
-    reviewThreadEvidence,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
   });
   const carrierPayload = {
@@ -5602,7 +5499,6 @@ async function loadV2DecisionCarriers(
     ),
     commitResolutions: providerEvidence.commitResolutions,
     providerErrors: providerEvidence.errors,
-    reviewThreads: reviewThreadEvidence.fingerprint,
     exactRefetch: true,
     decision: decisionEvidence.decision,
     counts: decisionEvidence.counts,
@@ -5610,7 +5506,6 @@ async function loadV2DecisionCarriers(
   return {
     fingerprint: fingerprintV2Snapshot(carrierPayload),
     issueComments,
-    reviewThreadEvidence,
     decisionEvidence,
     issueCommentCountMatched,
     diagnosticSummaryCount: issueComments.filter((comment) =>
@@ -6056,30 +5951,6 @@ function validateV2GraphQlReactionPage(
   return { nextCursor };
 }
 
-function copyV2FailureWithReviewThreadStatus(error, status) {
-  if (error instanceof V2RuntimeFailure) {
-    return new V2RuntimeFailure(error.message, {
-      executionHealth: error.executionHealth,
-      recoveryCode: error.recoveryCode,
-      gateOutcome: error.gateOutcome,
-      counts: error.counts,
-      httpStatus: error.httpStatus,
-      responseReceived: error.responseReceived,
-      responsePhase: error.responsePhase,
-      retrySafe: error.retrySafe,
-      requiresReplacementPr: error.requiresReplacementPr,
-      reviewThreadsStatus: status,
-    });
-  }
-  return new V2RuntimeFailure(
-    error?.message || "GitHub review-thread evidence could not be acquired",
-    {
-      recoveryCode: "wait_then_reconcile",
-      reviewThreadsStatus: status,
-    },
-  );
-}
-
 function reduceV2Evidence({
   headSha,
   baseSha,
@@ -6095,7 +5966,6 @@ function reduceV2Evidence({
   providerErrors,
   deletedCommentEvents,
   headCleanRecovery,
-  reviewThreadEvidence,
   verifierRunCreatedMs,
 }) {
   const deletedBoundaries = (deletedCommentEvents ?? []).map(v2DeletedCommentBoundary);
@@ -6137,12 +6007,6 @@ function reduceV2Evidence({
   if (requestEpoch.error) {
     blockingErrors.push(requestEpoch.error);
     indeterminate += 1;
-  }
-  if (baseEpochMs !== null && generationRequests.length === 0) {
-    blockingErrors.push(
-      `No exact head/base-bound canonical @codex review request is strictly newer than base epoch ` +
-        `${baseEpoch.event.typename}:${baseEpoch.event.id} at ${baseEpoch.event.createdAt}`,
-    );
   }
   const reactionEvidence = buildV2ReactionCleanArtifacts(
     requestEpoch.selected?.headBound === true ? [requestEpoch.selected] : [],
@@ -6307,6 +6171,11 @@ function reduceV2Evidence({
 
   currentArtifacts.sort(compareTerminalArtifactsNewestFirst);
   currentHeadTerminalArtifacts.sort(compareTerminalArtifactsNewestFirst);
+  const directCurrentHeadClean = selectV2DirectCurrentHeadClean({
+    providerArtifacts: currentHeadTerminalArtifacts,
+    headSha,
+    baseEpoch,
+  });
   const scopedProgressArtifacts = scopeV2ProgressArtifactsToCurrentHead({
     headSha,
     progressArtifacts,
@@ -6340,6 +6209,15 @@ function reduceV2Evidence({
     Number.isFinite(verifierRunCreatedMs) &&
     Date.parse(artifact.createdAt) <= verifierRunCreatedMs
   );
+  const priorDirectCurrentHeadClean = baseEpochMs === null
+    ? null
+    : selectV2DirectCurrentHeadClean({
+      providerArtifacts: currentHeadTerminalArtifacts,
+      headSha,
+      baseEpoch: null,
+    });
+  const hasPreEpochCurrentHeadClean = priorDirectCurrentHeadClean !== null &&
+    Date.parse(priorDirectCurrentHeadClean.createdAt) <= baseEpochMs;
   const selectedHeadRecoveryClean = (artifact) =>
     selectedHeadRecoveryRequest &&
     artifact.source === "issue-comment" &&
@@ -6370,7 +6248,9 @@ function reduceV2Evidence({
   const hasUnattributableEpochTerminalClean = baseEpochMs !== null &&
     currentArtifacts.some((artifact) =>
       artifact.kind === "clean" && artifact.source !== "request-reaction" &&
-      !selectedHeadRecoveryClean(artifact)
+      Date.parse(artifact.createdAt) > baseEpochMs &&
+      !selectedHeadRecoveryClean(artifact) &&
+      String(artifact.id) !== String(directCurrentHeadClean?.id)
     );
   const directSelectedGenerationClean = positiveCleans.find((artifact) =>
     artifact.source === "request-reaction" &&
@@ -6382,10 +6262,11 @@ function reduceV2Evidence({
         ...positiveCleans.filter((artifact) => artifact !== directSelectedGenerationClean),
       ]
     : positiveCleans;
-  let selectedClean = null;
+  let selectedClean = directCurrentHeadClean;
   let cleanBlockedByLiveness = false;
   let firstCleanLineageError = null;
   for (const candidate of cleanCandidates) {
+    if (selectedClean) break;
     const lineageError = requestEpoch.selected
       ? v2CleanLineageError({
           clean: candidate,
@@ -6421,7 +6302,12 @@ function reduceV2Evidence({
   }
   const providerFindings = currentArtifacts.filter((artifact) => artifact.kind === "finding");
   for (const error of scopedErrors) {
-    if (!findV2SupersedingGenerationClean({
+    const directHashlessCleanSupersession =
+      error.recoveryProvenance === CODEX_V2_HASHLESS_CLEAN_RECOVERY_PROVENANCE &&
+      directCurrentHeadClean !== null &&
+      Number.isFinite(error.createdMs) &&
+      Date.parse(directCurrentHeadClean.createdAt) > error.createdMs;
+    if (!directHashlessCleanSupersession && !findV2SupersedingGenerationClean({
       evidenceMs: error.createdMs,
       currentRequests: generationRequests,
       currentCleans: positiveCleans,
@@ -6435,7 +6321,10 @@ function reduceV2Evidence({
   }
   let hasUnrecoveredKnownProviderFailure = false;
   for (const failure of knownProviderFailures) {
-    if (!findV2SupersedingGenerationClean({
+    const directCleanSupersession = directCurrentHeadClean !== null &&
+      Number.isFinite(failure.createdMs) &&
+      Date.parse(directCurrentHeadClean.createdAt) > failure.createdMs;
+    if (!directCleanSupersession && !findV2SupersedingGenerationClean({
       evidenceMs: failure.createdMs,
       currentRequests: generationRequests,
       currentCleans: positiveCleans,
@@ -6480,21 +6369,23 @@ function reduceV2Evidence({
       .reduce((total, artifact) => total + normalizedV2FindingCount(artifact), 0),
     indeterminate,
   };
-  const reviewThreads = {
-    unresolved: (reviewThreadEvidence?.threads ?? [])
-      .filter((thread) => thread.isResolved === false).length,
-    resolved: (reviewThreadEvidence?.threads ?? [])
-      .filter((thread) => thread.isResolved === true).length,
-    total: (reviewThreadEvidence?.threads ?? []).length,
-    diagnostics: reviewThreadEvidence?.diagnostics ?? [],
-  };
+  const reviewThreads = { status: "not_read" };
   const latestPhysicalBoundary = generationLineage.generations.at(-1) ?? null;
   const latestBoundaryCannotBeContinued = latestPhysicalBoundary !== null &&
     latestPhysicalBoundary.authorized !== true &&
     latestPhysicalBoundary.physicalOnlyReason !== "post-run-unconfirmed-review-request";
   const headAttestedRecoveryActive = selectedHeadRecoveryRequest &&
     generationLineage.headCleanRecovery?.kind === "current-head-attestation";
-  const requiresReplacementPr = !headAttestedRecoveryActive && (
+  const hasUnrecoverableProviderHistory =
+    (deletedCommentEvents ?? []).length > 0 ||
+    (providerErrors ?? []).length > 0 ||
+    (artifacts ?? []).some((artifact) =>
+      artifact?.source === "issue-comment" &&
+      artifact.edited === true &&
+      ["clean", "finding", "provider-failure", "malformed"].includes(artifact.kind)
+    );
+  const requiresReplacementPr = hasUnrecoverableProviderHistory &&
+    !headAttestedRecoveryActive && (
     generationLineage.gapClosures.some((closure) => closure === null) ||
     latestBoundaryCannotBeContinued
   );
@@ -6523,32 +6414,11 @@ function reduceV2Evidence({
         `${oneLine(blockingErrors[0], "unknown error")}`,
       recoveryCode: "request_clean_generation",
     };
-  } else if (
-    selectedClean &&
-    requestEpoch.selected &&
-    reviewThreads.unresolved === 0
-  ) {
-    decision = {
-      gateOutcome: "success",
-      reason:
-        `Stable current-head Codex clean evidence from ${selectedClean.source} ${selectedClean.id}`,
-      recoveryCode: "none",
-    };
-  } else if (cleanBlockedByLiveness) {
+  } else if (hasPendingProviderReview) {
     decision = {
       gateOutcome: "pending",
-      reason: hasPendingProviderReview
-        ? "An official Codex pull-request review remains pending"
-        : "Codex activity at or after the latest clean evidence indicates review is still in progress",
+      reason: "An official Codex pull-request review remains pending",
       recoveryCode: "wait_provider",
-    };
-  } else if (selectedClean && requestEpoch.selected && reviewThreads.unresolved > 0) {
-    decision = {
-      gateOutcome: "pending",
-      reason:
-        `GitHub reports ${reviewThreads.unresolved} unresolved pull-request review ` +
-        `thread(s); resolve them, then reconcile this exact head`,
-      recoveryCode: "wait_then_reconcile",
     };
   } else if (hasUnattributableEpochTerminalClean) {
     decision = {
@@ -6558,6 +6428,30 @@ function reduceV2Evidence({
         "attributed to the latest exact head/base-bound canonical request; obtain a qualifying " +
         "Codex +1 reaction on that request, then run manual reconcile",
       recoveryCode: "request_clean_generation",
+    };
+  } else if (hasPreEpochCurrentHeadClean) {
+    decision = {
+      gateOutcome: "pending",
+      reason:
+        "The latest current-head Codex clean predates the latest base retarget epoch; " +
+        "obtain a terminal clean strictly newer than base epoch, then reconcile",
+      recoveryCode: "request_clean_generation",
+    };
+  } else if (cleanBlockedByLiveness) {
+    decision = {
+      gateOutcome: "pending",
+      reason: "Codex activity at or after the latest clean evidence indicates review is still in progress",
+      recoveryCode: "wait_provider",
+    };
+  } else if (
+    selectedClean &&
+    (directCurrentHeadClean || requestEpoch.selected)
+  ) {
+    decision = {
+      gateOutcome: "success",
+      reason:
+        `Stable current-head Codex clean evidence from ${selectedClean.source} ${selectedClean.id}`,
+      recoveryCode: "none",
     };
   } else if (waitingForPostRunClean) {
     decision = {
@@ -6583,12 +6477,27 @@ function reduceV2Evidence({
     };
   }
   decision.requiresReplacementPr = requiresReplacementPr;
-  // This is recovery guidance, not positive clean authority. Only known,
-  // unedited request history can use a future fresh head-attested witness;
-  // genuine provider/request errors retain their original repair path.
+  // This changes recovery guidance, never the verdict. Request-only lineage
+  // errors need not be rebuilt when a future exact-head clean can avoid them;
+  // incomplete provider history and provider errors retain their strict paths.
+  if (
+    decision.gateOutcome !== "success" &&
+    !hasUnrecoverableProviderHistory &&
+    scopedErrors.length === 0 &&
+    !hasUnrecoveredKnownProviderFailure
+  ) {
+    decision.requiresReplacementPr = false;
+    if (["request_clean_generation", "wait_provider"].includes(decision.recoveryCode)) {
+      decision.headCleanRecoveryAction = "current-head";
+    } else if (decision.recoveryCode === "fix_findings") {
+      decision.headCleanRecoveryAction = "current-head";
+    }
+  }
+  // Keep the legacy request-bound guidance only for cases that still require
+  // it after the preferred current-head recovery path above was considered.
   if (
     decision.gateOutcome === "pending" &&
-    requiresReplacementPr &&
+    decision.requiresReplacementPr === true &&
     baseEpochMs === null &&
     Number.isFinite(verifierRunCreatedMs) &&
     scopedErrors.length === 0 &&
@@ -7359,6 +7268,24 @@ function isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(
   }
   const window = v2ProviderActivityWindow(artifact);
   return window !== null && window.carrierCreatedMs === window.revisionMs;
+}
+
+function selectV2DirectCurrentHeadClean({ providerArtifacts, headSha, baseEpoch }) {
+  const hasBaseEpoch = baseEpoch?.event !== null && baseEpoch?.event !== undefined;
+  const baseEpochMs = hasBaseEpoch &&
+    isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
+    ? Date.parse(baseEpoch.event.createdAt)
+    : null;
+  if (hasBaseEpoch && baseEpochMs === null) return null;
+  const candidates = (providerArtifacts ?? [])
+    .filter((artifact) =>
+      isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(artifact, headSha)
+    )
+    .filter((artifact) =>
+      baseEpochMs === null || Date.parse(artifact.createdAt) > baseEpochMs
+    )
+    .sort(compareTerminalArtifactsNewestFirst);
+  return candidates[0] ?? null;
 }
 
 function isV2DefaultAnyDuplicateCohortMember(request) {
@@ -8611,6 +8538,24 @@ async function collectV2ProviderEvidence(
         artifact.edited = true;
         artifact.carrierUpdatedAt = revisionAt;
         artifact.revisionAt = revisionAt;
+        if (
+          artifact.kind === "pending" &&
+          artifact.pendingKind === "progress"
+        ) {
+          errors.push({
+            message:
+              `Edited Codex progress issue-comment ${comment.id} has unobservable prior ` +
+              "body history and may hide decision-relevant provider evidence",
+            createdAt: revisionAt,
+            activity: {
+              source: "issue-comment",
+              id: String(comment.id),
+              carrierCreatedAt: comment.created_at,
+              revisionAt,
+              activityKind: "edited-provider-progress",
+            },
+          });
+        }
       }
       artifacts.push(artifact);
       if (artifact.kind === "provider-failure") {

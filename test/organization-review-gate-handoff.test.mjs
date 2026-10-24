@@ -2800,7 +2800,6 @@ test("frozen organization handoff admission remains distinct from current contro
   const frozenVerifierConcurrencyLine = frozenWorkflows.verifier.match(/^  group: .+$/mu)?.[0];
   const currentVerifierJobNameLine = currentWorkflows.verifier.match(/^    name: .+$/mu)?.[0];
   const frozenVerifierJobNameLine = frozenWorkflows.verifier.match(/^    name: .+$/mu)?.[0];
-  const currentVerifierJobIfLine = currentWorkflows.verifier.match(/^    if: .+$/mu)?.[0];
   const currentLifecycleLine = currentWorkflows.verifier.match(/^    types: \[.+\]$/mu)?.[0];
   assert.equal(typeof currentRunnerLine, "string");
   assert.equal(typeof frozenRunnerLine, "string");
@@ -2810,7 +2809,6 @@ test("frozen organization handoff admission remains distinct from current contro
   assert.equal(typeof frozenVerifierConcurrencyLine, "string");
   assert.equal(typeof currentVerifierJobNameLine, "string");
   assert.equal(typeof frozenVerifierJobNameLine, "string");
-  assert.equal(typeof currentVerifierJobIfLine, "string");
   assert.equal(typeof currentLifecycleLine, "string");
   const currentPermissionFrozenVerifier = frozenWorkflows.verifier.replace(
     "permissions:\n  contents: read\n",
@@ -2823,7 +2821,7 @@ test("frozen organization handoff admission remains distinct from current contro
     currentVerifierConcurrencyLine,
   ).replace(
     frozenVerifierJobNameLine,
-    `${currentVerifierJobNameLine}\n${currentVerifierJobIfLine}`,
+    currentVerifierJobNameLine,
   );
   assert.equal(
     currentPermissionFrozenVerifier,
@@ -2856,10 +2854,7 @@ test("frozen organization handoff admission remains distinct from current contro
     .replace(currentLifecycleLine, frozenPullRequestLifecycleLine)
     .replace(currentRunNameLine, frozenRunNameLine)
     .replace(currentVerifierConcurrencyLine, frozenVerifierConcurrencyLine)
-    .replace(
-      `${currentVerifierJobNameLine}\n${currentVerifierJobIfLine}`,
-      frozenVerifierJobNameLine,
-    );
+    .replace(currentVerifierJobNameLine, frozenVerifierJobNameLine);
   const frozenPermissionCurrentWorkflows = {
     ...frozenWorkflows,
     verifier: frozenPermissionCurrentVerifier,

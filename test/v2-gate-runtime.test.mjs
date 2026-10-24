@@ -204,7 +204,7 @@ test("normalizers, profiles, result vocabulary, and production constants are clo
   });
 });
 
-test("review-thread inventory uses non-overlapping 100-node pages until complete", async (context) => {
+test("inline review threads are not inventoried even when the fixture exceeds page limits", async (context) => {
   const threads = Array.from({ length: 201 }, (_, index) => reviewThread({
     id: `PRRT_node_${index + 1}`,
   }));
@@ -219,33 +219,23 @@ test("review-thread inventory uses non-overlapping 100-node pages until complete
 
   assert.equal(result.exitCode, 0, result.report.reason);
   assert.equal(result.report.gateOutcome, "success");
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.status,
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["not_read", "unknown", "unknown", "unknown"],
+  );
   const pages = github.calls.filter(({ method, path, body }) =>
     method === "POST" && path === "/graphql" &&
     body?.query?.includes("CodexReviewGateReviewThreads")
   );
-  assert.equal(pages.length % 3, 0);
-  for (let index = 0; index < pages.length; index += 3) {
-    assert.deepEqual(pages.slice(index, index + 3).map(({ body }) => body.variables.cursor), [
-      null,
-      "review-thread:100",
-      "review-thread:200",
-    ]);
-  }
-  for (const { body } of pages) {
-    assert.deepEqual(body.variables, {
-      owner: OWNER,
-      repo: REPO,
-      number: PR,
-      cursor: body.variables.cursor,
-    });
-    assert.match(body.query, /reviewThreads\(\s*first:\s*100/su);
-    assert.match(body.query, /isResolved/u);
-    assert.match(body.query, /isOutdated/u);
-    assert.doesNotMatch(body.query, /nodes\s*\{\s*id\s+isResolved\s+path\s+url/u);
-  }
+  assert.equal(pages.length, 0);
 });
 
-test("unresolved outdated and human-authored review threads remain blocking", async (context) => {
+test("unresolved outdated and human-authored review threads are delegated to GitHub rules", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     reviewThreads: [
@@ -264,17 +254,26 @@ test("unresolved outdated and human-authored review threads remain blocking", as
   const { result } = await runGate(environment, github);
 
   assert.equal(result.report.executionHealth, "healthy");
-  assert.notEqual(result.report.gateOutcome, "success");
-  assert.equal(result.report.reviewThreads.unresolved, 2);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.status,
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["not_read", "unknown", "unknown", "unknown"],
+  );
   const reviewThreadReads = github.calls.filter(({ method, path, body }) =>
     method === "POST" && path === "/graphql" &&
     body?.query?.includes("CodexReviewGateReviewThreads")
   );
-  assert.equal(reviewThreadReads.length, 2, "summary formatting must not add GraphQL reads");
-  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(reviewThreadReads.length, 0);
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /Inline conversations are not inventoried by this Action; GitHub's required conversation-resolution rule enforces them separately\. Gate success is not merge readiness\./u);
 });
 
-test("resolved review threads are counted without preventing a clean gate", async (context) => {
+test("resolved review threads are also reported as not read, not as a verified zero", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     reviewThreads: [
@@ -288,13 +287,15 @@ test("resolved review threads are counted without preventing a clean gate", asyn
   const { result } = await runGate(environment, github);
 
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
-  assert.deepEqual(result.report.reviewThreads, {
-    status: "complete",
-    unresolved: 0,
-    resolved: 2,
-    total: 2,
-    diagnostics: [],
-  });
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.status,
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["not_read", "unknown", "unknown", "unknown"],
+  );
 });
 
 test("trusted current-head clean with the official About footer remains gate authority", async (context) => {
@@ -408,7 +409,7 @@ test("receipt envelope does not bypass exact provider identity or edit guards", 
   }
 });
 
-test("receipt-wrapped clean does not waive an unresolved inline review thread", async (context) => {
+test("receipt-wrapped clean keeps inline threads outside the Action inventory", async (context) => {
   const clean = cleanIssueComment(HEAD, {
     body: `${CODEX_REVIEW_RECEIPT_ENVELOPE_V1}\n\n${cleanIssueComment(HEAD).body}`,
   });
@@ -422,12 +423,15 @@ test("receipt-wrapped clean does not waive an unresolved inline review thread", 
   const { result } = await runGate(environment, github);
 
   assert.equal(result.report.executionHealth, "healthy");
-  assert.notEqual(result.report.gateOutcome, "success");
-  assert.equal(result.report.reviewThreads.unresolved, 1);
-  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(result.report.reviewThreads.status, "not_read");
+  assert.equal(result.report.reviewThreads.unresolved, "unknown");
+  assert.equal(github.calls.some(({ body }) =>
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ), false);
 });
 
-test("official About footer does not waive unresolved review threads", async (context) => {
+test("official About footer keeps inline threads outside the Action inventory", async (context) => {
   const clean = cleanIssueComment(HEAD, {
     body: [
       "Codex Review: Didn't find any major issues.",
@@ -447,8 +451,9 @@ test("official About footer does not waive unresolved review threads", async (co
   const { result } = await runGate(environment, github);
 
   assert.equal(result.report.executionHealth, "healthy");
-  assert.notEqual(result.report.gateOutcome, "success");
-  assert.equal(result.report.reviewThreads.unresolved, 1);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(result.report.reviewThreads.status, "not_read");
+  assert.equal(result.report.reviewThreads.unresolved, "unknown");
 });
 
 test("an unknown footer stays pending and publishes bounded parser diagnostics", async (context) => {
@@ -485,7 +490,7 @@ test("an unknown footer stays pending and publishes bounded parser diagnostics",
   assert.doesNotMatch(summary, /Untrusted footer text|<script>|@codex review/u);
 });
 
-test("an empty review-thread connection is complete and reports zero inventory", async (context) => {
+test("an empty review-thread fixture does not become a verified zero inventory", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
   });
@@ -495,16 +500,18 @@ test("an empty review-thread connection is complete and reports zero inventory",
   const { result } = await runGate(environment, github);
 
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
-  assert.deepEqual(result.report.reviewThreads, {
-    status: "complete",
-    unresolved: 0,
-    resolved: 0,
-    total: 0,
-    diagnostics: [],
-  });
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.status,
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["not_read", "unknown", "unknown", "unknown"],
+  );
 });
 
-test("review-thread resolution and reopening changes across snapshots fail closed", async (context) => {
+test("review-thread snapshot transitions stay outside Action evidence acquisition", async (context) => {
   for (const [suffix, before, after] of [
     ["resolved-then-reopened", true, false],
     ["unresolved-then-resolved", false, true],
@@ -523,16 +530,16 @@ test("review-thread resolution and reopening changes across snapshots fail close
     });
     const { result } = await runGate(environment, github);
 
-    assert.equal(result.report.gateOutcome, "pending", suffix);
-    assert.equal(
-      github.statusWrites.some(({ state }) => state === "success"),
-      false,
-      suffix,
-    );
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.reviewThreads.status, "not_read", suffix);
+    assert.equal(result.report.reviewThreads.unresolved, "unknown", suffix);
+    assert.equal(github.calls.some(({ body }) =>
+      body?.query?.includes("CodexReviewGateReviewThreads")
+    ), false, suffix);
   }
 });
 
-test("unstable review-thread inventory hides counts from the prior complete snapshot", async (context) => {
+test("unstable thread fixtures remain not-read with unknown counts", async (context) => {
   const resolvedThread = reviewThread({
     id: "PRRT_unstable_pending_counts",
     isResolved: true,
@@ -553,9 +560,9 @@ test("unstable review-thread inventory hides counts from the prior complete snap
     stabilityWindowMs: 5,
   });
 
-  assert.equal(result.report.executionHealth, "unhealthy");
-  assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
   assert.deepEqual(
     [
       result.report.reviewThreads.unresolved,
@@ -564,14 +571,17 @@ test("unstable review-thread inventory hides counts from the prior complete snap
     ],
     ["unknown", "unknown", "unknown"],
   );
-  assert.equal(result.report.reviewThreads.status, "incomplete");
+  assert.equal(result.report.reviewThreads.status, "not_read");
 
   const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
   assert.match(summary, /Review threads: unknown unresolved, unknown resolved, unknown total/u);
-  assert.match(summary, /Review-thread inventory: incomplete/u);
+  assert.match(summary, /Review-thread inventory: not read/u);
+  assert.equal(github.calls.some(({ body }) =>
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ), false);
 });
 
-test("a review-thread resolution transition may pass after stable convergence", async (context) => {
+test("review-thread transitions do not affect a stable current-head clean", async (context) => {
   const unresolved = reviewThread({ id: "PRRT_converges", isResolved: false });
   const resolved = { ...unresolved, isResolved: true };
   const github = createGitHubMock({
@@ -584,9 +594,12 @@ test("a review-thread resolution transition may pass after stable convergence", 
   const { result } = await runGate(environment, github);
 
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(github.calls.some(({ body }) =>
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ), false);
 });
 
-test("same-count thread identity swaps remain unstable", async (context) => {
+test("thread identity changes are outside Action evidence acquisition", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     reviewThreads: [reviewThread({ id: "PRRT_identity_seed", isResolved: true })],
@@ -601,11 +614,14 @@ test("same-count thread identity swaps remain unstable", async (context) => {
   });
   const { result } = await runGate(environment, github);
 
-  assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(result.report.reviewThreads.status, "not_read");
+  assert.equal(github.calls.some(({ body }) =>
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ), false);
 });
 
-test("incomplete review-thread GraphQL histories fail closed", async (context) => {
+test("malformed or unavailable thread fixtures cannot block or imply a verified count", async (context) => {
   const malformed = (response) => {
     response.body.data.repository.pullRequest.reviewThreads.nodes[0].id = "";
     return response;
@@ -666,7 +682,7 @@ test("incomplete review-thread GraphQL histories fail closed", async (context) =
       suffix: `review-thread-incomplete-${label.replaceAll(" ", "-")}`,
     });
     const { result } = await runGate(environment, github);
-    assert.notEqual(result.report.gateOutcome, "success", label);
+    assert.equal(result.report.gateOutcome, "success", label);
     assert.deepEqual(
       [
         result.report.reviewThreads.unresolved,
@@ -676,12 +692,14 @@ test("incomplete review-thread GraphQL histories fail closed", async (context) =
       ["unknown", "unknown", "unknown"],
       label,
     );
-    assert.equal(result.report.reviewThreads.status, "incomplete", label);
-    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, label);
+    assert.equal(result.report.reviewThreads.status, "not_read", label);
+    assert.equal(github.calls.some(({ body }) =>
+      body?.query?.includes("CodexReviewGateReviewThreads")
+    ), false, label);
   }
 });
 
-test("review-thread totals must stay stable across pages", async (context) => {
+test("thread pagination drift is irrelevant because the Action does not query threads", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     reviewThreads: Array.from({ length: 101 }, (_, index) => reviewThread({
@@ -698,11 +716,14 @@ test("review-thread totals must stay stable across pages", async (context) => {
   });
   const { result } = await runGate(environment, github);
 
-  assert.notEqual(result.report.gateOutcome, "success");
-  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(result.report.reviewThreads.status, "not_read");
+  assert.equal(github.calls.some(({ body }) =>
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ), false);
 });
 
-test("duplicate review-thread IDs and inventory budget exhaustion fail closed", async (context) => {
+test("duplicate thread IDs and huge thread lists do not trigger Action inventory reads", async (context) => {
   const duplicateGithub = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     reviewThreads: Array.from({ length: 101 }, (_, index) => reviewThread({
@@ -715,11 +736,8 @@ test("duplicate review-thread IDs and inventory budget exhaustion fail closed", 
     suffix: "review-thread-duplicate-id",
   });
   const duplicate = await runGate(duplicateEnvironment, duplicateGithub);
-  assert.notEqual(duplicate.result.report.gateOutcome, "success");
-  assert.equal(
-    duplicateGithub.statusWrites.some(({ state }) => state === "success"),
-    false,
-  );
+  assert.equal(duplicate.result.report.gateOutcome, "success", duplicate.result.report.reason);
+  assert.equal(duplicate.result.report.reviewThreads.status, "not_read");
 
   const budgetGithub = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
@@ -731,11 +749,14 @@ test("duplicate review-thread IDs and inventory budget exhaustion fail closed", 
     suffix: "review-thread-budget-exhaustion",
   });
   const budget = await runGate(budgetEnvironment, budgetGithub);
-  assert.notEqual(budget.result.report.gateOutcome, "success");
-  assert.equal(budgetGithub.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(budget.result.report.gateOutcome, "success", budget.result.report.reason);
+  assert.equal(budget.result.report.reviewThreads.status, "not_read");
+  assert.equal(budgetGithub.calls.some(({ body }) =>
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ), false);
 });
 
-test("review-thread permission failure keeps permission repair as the primary action", async (context) => {
+test("thread permission failures are not part of Action permission evidence", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     requestInterceptor: ({ method, path, body }) =>
@@ -749,8 +770,8 @@ test("review-thread permission failure keeps permission repair as the primary ac
   });
   const { result } = await runGate(environment, github);
 
-  assert.notEqual(result.report.gateOutcome, "success");
-  assert.equal(result.report.reviewThreads.status, "incomplete");
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(result.report.reviewThreads.status, "not_read");
   assert.deepEqual(
     [
       result.report.reviewThreads.unresolved,
@@ -759,18 +780,14 @@ test("review-thread permission failure keeps permission repair as the primary ac
     ],
     ["unknown", "unknown", "unknown"],
   );
-  assert.equal(result.report.recoveryCode, "repair_permissions");
-  assert.match(
-    readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Steps to unblock: Repair the canonical workflow permissions or installation/u,
-  );
-  assert.ok(github.calls.some(({ method, path, body }) =>
+  assert.equal(result.report.recoveryCode, "none");
+  assert.equal(github.calls.some(({ method, path, body }) =>
     method === "POST" && path === "/graphql" &&
     body?.query?.includes("CodexReviewGateReviewThreads")
-  ));
+  ), false);
 });
 
-test("review-thread inventory budget exhaustion keeps expanded limits as the primary action", async (context) => {
+test("thread-list size does not consume the Action evidence budget", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     reviewThreads: Array.from({ length: 2_001 }, (_, index) => reviewThread({
@@ -782,8 +799,8 @@ test("review-thread inventory budget exhaustion keeps expanded limits as the pri
   });
   const { result } = await runGate(environment, github);
 
-  assert.notEqual(result.report.gateOutcome, "success");
-  assert.equal(result.report.reviewThreads.status, "incomplete");
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(result.report.reviewThreads.status, "not_read");
   assert.deepEqual(
     [
       result.report.reviewThreads.unresolved,
@@ -792,12 +809,7 @@ test("review-thread inventory budget exhaustion keeps expanded limits as the pri
     ],
     ["unknown", "unknown", "unknown"],
   );
-  assert.equal(result.report.recoveryCode, "use_expanded_limits");
-  assert.match(result.report.reason, /soft limit exceeded.*pull-request review threads/iu);
-  assert.match(
-    readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Steps to unblock: Rerun reconcile.*limits\\_profile=expanded.*Thread inventory is incomplete/isu,
-  );
+  assert.equal(result.report.recoveryCode, "none");
 
   const protectedBudgetGithub = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
@@ -811,13 +823,9 @@ test("review-thread inventory budget exhaustion keeps expanded limits as the pri
   });
   const protectedBudget = await runGate(protectedBudgetEnvironment, protectedBudgetGithub);
 
-  assert.notEqual(protectedBudget.result.report.gateOutcome, "success");
-  assert.equal(protectedBudget.result.report.reviewThreads.status, "incomplete");
-  assert.equal(protectedBudget.result.report.recoveryCode, "raise_protected_limit");
-  assert.match(
-    readFileSync(protectedBudgetEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Steps to unblock: Review the evidence volume and raise the protected runtime limit before reconciling.*Thread inventory is incomplete/isu,
-  );
+  assert.equal(protectedBudget.result.report.gateOutcome, "success", protectedBudget.result.report.reason);
+  assert.equal(protectedBudget.result.report.reviewThreads.status, "not_read");
+  assert.equal(protectedBudget.result.report.recoveryCode, "none");
 });
 
 test("canonical workflow request binds repository, PR, head, base epoch, and run exactly", () => {
@@ -909,6 +917,7 @@ test("REST PENDING reviews with omitted submitted_at block pass without reducing
     call.method === "GET" &&
     call.path === `/repos/${REPOSITORY}/pulls/${PR}/reviews/${providerPendingReview.id}`
   ));
+  assert.equal(hasRequestReactionGraphQlCall(github, workflowRequest().id), false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -1168,6 +1177,7 @@ test("a provider PENDING review that reappears after confirmed deletion becomes 
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
   assert.match(result.report.reason, /official Codex pull-request review remains pending/iu);
+  assert.equal(hasRequestReactionGraphQlCall(github, workflowRequest().id), false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -1474,7 +1484,7 @@ test("output failure preserves a proven finding verdict and recovery", async (co
   assert.equal(result.report.gateOutcome, "failure");
   assert.equal(result.report.recoveryCode, "fix_findings");
   assert.equal(result.report.retrySafe, false);
-  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(result.report.requiresReplacementPr, false);
   assert.deepEqual(result.report.counts, {
     unresolved: 1,
     resolved: 0,
@@ -1489,7 +1499,9 @@ test("output failure preserves a proven finding verdict and recovery", async (co
   assert.match(summary, /Recovery code: `fix_findings`/u);
   assert.match(summary, /1 unresolved, 0 resolved, 0 historical, 0 indeterminate/u);
   assert.match(summary, /Fix the unresolved Codex findings/iu);
-  assert.match(summary, /replacement PR/iu);
+  assert.match(summary, /Fix the unresolved Codex findings first/iu);
+  assert.match(summary, /exact current PR head/iu);
+  assert.doesNotMatch(summary, /\b(?:open|create) (?:a )?replacement PR/iu);
   assert.match(summary, /Failed to persist the v2 gate report/iu);
 });
 
@@ -2062,7 +2074,7 @@ test("latest base-ref timeline epoch invalidates older positive evidence on the 
   }
 });
 
-test("post-run retarget recovery needs a fresh request and clean; unresolved old threads block", async (context) => {
+test("post-run retarget recovery requires a post-epoch clean but not request or thread lineage", async (context) => {
   const epoch = baseRefChangedEvent();
   const retargetEvent = pullRequestEvent("edited", {
     changes: { base: { ref: { from: "release" } } },
@@ -2089,6 +2101,9 @@ test("post-run retarget recovery needs a fresh request and clean; unresolved old
   const { result: oldResult } = await runGate(oldEnvironment, oldGitHub);
   assert.equal(oldResult.report.gateOutcome, "pending");
   assert.equal(oldResult.report.recoveryCode, "request_clean_generation");
+  assert.equal(oldResult.report.requiresReplacementPr, false);
+  assert.match(oldResult.nextAction, /trusted, unedited top-level Codex terminal clean.*exact current PR head.*strictly newer than that retarget/u);
+  assert.match(oldResult.nextAction, /does not require another generation or a replacement PR/u);
   assert.equal(oldGitHub.statusWrites.some(({ state }) => state === "success"), false);
 
   const freshRequest = workflowRequest({
@@ -2104,9 +2119,9 @@ test("post-run retarget recovery needs a fresh request and clean; unresolved old
     updated_at: "2026-08-25T08:12:00Z",
     html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
   });
-  for (const [suffix, isResolved, expectedOutcome, expectedRecovery] of [
-    ["resolved-old-thread", true, "success", "none"],
-    ["unresolved-old-thread", false, "pending", "wait_then_reconcile"],
+  for (const [suffix, isResolved] of [
+    ["resolved-old-thread", true],
+    ["unresolved-old-thread", false],
   ]) {
     const github = createGitHubMock({
       baseEpoch: epoch,
@@ -2119,12 +2134,16 @@ test("post-run retarget recovery needs a fresh request and clean; unresolved old
       event: retargetEvent,
     });
     const { result } = await runGate(environment, github);
-    assert.equal(result.exitCode, expectedOutcome === "success" ? 0 : 1, suffix);
-    assert.equal(result.report.gateOutcome, expectedOutcome, `${suffix}: ${result.report.reason}`);
-    assert.equal(result.report.recoveryCode, expectedRecovery, suffix);
+    assert.equal(result.exitCode, 0, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, "success", `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.recoveryCode, "none", suffix);
     assert.equal(result.report.counts.unresolved, 0, suffix);
-    assert.equal(result.report.reviewThreads.unresolved, isResolved ? 0 : 1, suffix);
-    assert.equal(result.report.reviewThreads.resolved, isResolved ? 1 : 0, suffix);
+    assert.equal(result.report.reviewThreads.status, "not_read", suffix);
+    assert.equal(result.report.reviewThreads.unresolved, "unknown", suffix);
+    assert.equal(result.report.reviewThreads.resolved, "unknown", suffix);
+    assert.equal(github.calls.some(({ body }) =>
+      body?.query?.includes("CodexReviewGateReviewThreads")
+    ), false, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 });
@@ -2344,9 +2363,10 @@ test("the only canonical request at the base epoch cannot gain authority from it
   const { result } = await runGate(environment, github);
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.recoveryCode, "wait_provider");
   assert.equal(result.report.requiresReplacementPr, false);
-  assert.match(result.report.reason, /strictly newer than base epoch/iu);
+  assert.match(result.report.reason, /No complete Codex terminal result is bound to the current head/u);
+  assert.match(result.nextAction, /trusted, unedited top-level Codex terminal clean.*exact current PR head/u);
   assert.equal(
     hasRequestReactionGraphQlCall(github, 101),
     true,
@@ -2354,7 +2374,7 @@ test("the only canonical request at the base epoch cannot gain authority from it
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("after a base epoch an exact-head clean can attest the latest request", async (context) => {
+test("after a base epoch an exact-head clean stands independently of later request gaps", async (context) => {
   const epoch = baseRefChangedEvent();
   const generation = workflowRequest({
     created_at: "2026-08-25T08:10:00Z",
@@ -2437,14 +2457,13 @@ test("after a base epoch an exact-head clean can attest the latest request", asy
     providerGapAfterEpochEnvironment,
     providerGapAfterEpochGitHub,
   );
-  assert.equal(providerGapAfterEpoch.exitCode, 1);
-  assert.equal(providerGapAfterEpoch.report.gateOutcome, "pending");
-  assert.equal(providerGapAfterEpoch.report.recoveryCode, "request_clean_generation");
-  assert.match(providerGapAfterEpoch.report.reason, /earlier request 101.*newer request 102/iu);
-  assert.equal(
-    providerGapAfterEpochGitHub.statusWrites.some(({ state }) => state === "success"),
-    false,
-  );
+  assert.equal(providerGapAfterEpoch.exitCode, 0, providerGapAfterEpoch.report.reason);
+  assert.equal(providerGapAfterEpoch.report.gateOutcome, "success");
+  assert.equal(providerGapAfterEpoch.report.recoveryCode, "none");
+  assert.equal(providerGapAfterEpochGitHub.calls.some(({ path, body }) =>
+    path.includes("/reactions") ||
+    String(body?.query || "").includes("CodexReviewGateReaction")
+  ), false, "a post-epoch head clean does not need request-liveness reads");
 
   const directChainAfterEpochGitHub = createGitHubMock({
     baseEpoch: epoch,
@@ -2463,7 +2482,11 @@ test("after a base epoch an exact-head clean can attest the latest request", asy
   );
   assert.equal(directChainAfterEpoch.exitCode, 0);
   assert.equal(directChainAfterEpoch.report.gateOutcome, "success");
-  assert.match(directChainAfterEpoch.report.reason, /request-reaction 505/u);
+  assert.match(directChainAfterEpoch.report.reason, /issue-comment 203/u);
+  assert.equal(directChainAfterEpochGitHub.calls.some(({ path, body }) =>
+    path.includes("/reactions") ||
+    String(body?.query || "").includes("CodexReviewGateReaction")
+  ), false);
 
   const ordinaryBoundary = ordinaryRequest({
     id: 102,
@@ -2653,7 +2676,7 @@ test("same-head stale-base requests preserve a physical gap without a base epoch
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("base-bound workflow markers do not cross base commit epochs", async (context) => {
+test("a stale base-bound workflow marker cannot veto or replace direct current-head clean", async (context) => {
   const request = workflowRequest({
     body: canonicalRequestBody(HEAD, { baseSha: OLD_HEAD }),
     created_at: "2026-08-25T08:10:00Z",
@@ -2670,8 +2693,17 @@ test("base-bound workflow markers do not cross base commit epochs", async (conte
   });
   const environment = runtimeEnvironment(context, { suffix: "marker-base-mismatch" });
   const { result } = await runGate(environment, github);
-  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(hasRequestReactionGraphQlCall(github, request.id), false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+
+  const noCleanGitHub = createGitHubMock({ issueComments: [request] });
+  const noCleanEnvironment = runtimeEnvironment(context, {
+    suffix: "marker-base-mismatch-without-direct-clean",
+  });
+  const { result: noClean } = await runGate(noCleanEnvironment, noCleanGitHub);
+  assert.equal(noClean.report.gateOutcome, "pending");
+  assert.equal(noCleanGitHub.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("a base epoch change between complete reads cannot publish success", async (context) => {
@@ -2833,7 +2865,11 @@ test("a deleted-comment inventory change can stabilize only as pending", async (
     assert.equal(result.report.executionHealth, "healthy", suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
     assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
-    assert.match(result.report.reason, new RegExp(`deleted:CDE_dynamic_${suffix}`, "iu"), suffix);
+    assert.match(
+      result.report.reason,
+      new RegExp(`Deleted comment event CDE_dynamic_${suffix}.*may hide`, "iu"),
+      suffix,
+    );
     assert.deepEqual(sleeps, [1], suffix);
     assert.equal(
       github.statusWrites.some(({ state }) => state === "success"),
@@ -4958,7 +4994,7 @@ test("stacked lifecycle action requires current valid API stack metadata", async
   }
 });
 
-test("pull_request edited accepts a base-ref retarget but rejects title and body edits", async (context) => {
+test("pull_request edited accepts metadata edits and requires confirmed real base retargets", async (context) => {
   const github = createGitHubMock({
     baseEpoch: baseRefChangedEvent(),
     issueComments: [
@@ -5049,8 +5085,31 @@ test("pull_request edited accepts a base-ref retarget but rejects title and body
   for (const [suffix, changes] of [
     ["title", { title: { from: "Before" } }],
     ["body", { body: { from: "Before" } }],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: [cleanIssueComment(HEAD)],
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `pull-request-edited-${suffix}`,
+      event: pullRequestEvent("edited", { changes }),
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, 0, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.requestBodies.length, 0, suffix);
+    assert.equal(github.calls.some(({ path }) => path.includes("/reactions")), false, suffix);
+    assert.equal(github.calls.some(({ path }) =>
+      path.includes("/collaborators/") && path.endsWith("/permission")
+    ), false, suffix);
+  }
+
+  for (const [suffix, changes] of [
     ["same-base", { base: { ref: { from: "main" } } }],
     ["missing-base-ref", { base: { ref: {} } }],
+    ["empty-base-ref-from", { base: { ref: { from: "" } } }],
+    ["invalid-base-ref-from", { base: { ref: { from: 42 } } }],
+    ["missing-base-ref-object", { base: null }],
   ]) {
     const environment = runtimeEnvironment(context, {
       suffix: `pull-request-edited-${suffix}`,
@@ -5061,7 +5120,62 @@ test("pull_request edited accepts a base-ref retarget but rejects title and body
       fetchImpl: async () => { throw new Error("fetch must not run"); },
     });
     assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
     assert.match(result.report.reason, /read-only verifier contract/u, suffix);
+  }
+});
+
+test("a direct clean needs to be strictly newer than an observed base-retarget epoch, not the verifier run", async (context) => {
+  const epoch = baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" });
+  const event = pullRequestEvent("edited", {
+    changes: { base: { ref: { from: "release" } } },
+  });
+  const acceptedGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [cleanIssueComment(HEAD.slice(0, 10), {
+      created_at: "2026-08-25T08:06:00Z",
+      updated_at: "2026-08-25T08:06:00Z",
+    })],
+    commitResolution: () => ({ data: { sha: HEAD } }),
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const acceptedEnvironment = runtimeEnvironment(context, {
+    suffix: "direct-clean-after-retarget-before-verifier",
+    event,
+  });
+  const { result: accepted } = await runGate(acceptedEnvironment, acceptedGitHub);
+  assert.equal(accepted.exitCode, 0, accepted.report.reason);
+  assert.equal(accepted.report.gateOutcome, "success");
+  assert.equal(acceptedGitHub.calls.some(({ path }) => path.includes("/reactions")), false);
+  assert.equal(acceptedGitHub.calls.some(({ path }) =>
+    path.includes("/collaborators/") && path.endsWith("/permission")
+  ), false);
+
+  for (const [suffix, cleanAt] of [
+    ["before-epoch", "2026-08-25T08:04:59Z"],
+    ["same-second-as-epoch", "2026-08-25T08:05:00Z"],
+  ]) {
+    const github = createGitHubMock({
+      baseEpoch: epoch,
+      issueComments: [cleanIssueComment(HEAD, {
+        created_at: cleanAt,
+        updated_at: cleanAt,
+      })],
+      selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `direct-clean-retarget-floor-${suffix}`,
+      event,
+    });
+    const { result } = await runGate(environment, github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.requiresReplacementPr, false, suffix);
+    assert.match(
+      readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
+      /strictly newer than that retarget/u,
+      suffix,
+    );
+    assert.deepEqual(github.statusWrites, [], suffix);
   }
 });
 
@@ -5308,16 +5422,44 @@ test("test-merge drift between complete snapshots invalidates verifier success",
   assert.deepEqual(github.statusWrites, []);
 });
 
-test("terminal clean without an authorized request generation cannot pass", async (context) => {
-  const github = createGitHubMock({ issueComments: [cleanIssueComment(HEAD)] });
-  const environment = runtimeEnvironment(context);
+test("an exact current-head clean passes without request lineage or inline-thread inventory", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [cleanIssueComment(HEAD)],
+    reviewThreads: [reviewThread({ isResolved: false, isOutdated: true })],
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "direct-current-head-clean" });
   const { result } = await runGate(environment, github);
-  assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(result.report.recoveryCode, "none");
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+      result.report.reviewThreads.status,
+    ],
+    ["unknown", "unknown", "unknown", "not_read"],
+  );
+  assert.equal(github.calls.some(({ method, path, body }) =>
+    method === "POST" && path === "/graphql" &&
+    String(body?.query || "").includes("reviewThreads")
+  ), false, "the Action must not query inline review threads");
+  assert.equal(github.calls.some(({ path, body }) =>
+    path.includes("/reactions") ||
+    String(body?.query || "").includes("CodexReviewGateReaction")
+  ), false, "a direct clean must not acquire request reactions");
+  assert.equal(github.calls.some(({ path }) =>
+    path.includes("/collaborators/") && path.endsWith("/permission")
+  ), false, "a direct clean must not query request-author permissions");
+  const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
+  assert.match(summary, /Inline conversations are not inventoried by this Action/u);
+  assert.match(summary, /conversation-resolution rule enforces them separately/u);
+  assert.match(summary, /Gate success is not merge readiness/u);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("a prior clean cannot satisfy a newly created current-head verifier until a fresh request and clean arrive", async (context) => {
+test("a trusted current-head clean predating a newer verifier run remains eligible", async (context) => {
   const cutoff = "2026-08-25T08:10:00Z";
   const prior = [ordinaryRequest(), cleanIssueComment(HEAD)];
   const selfVerifierRun = verifierSelfRun({ created_at: cutoff });
@@ -5329,13 +5471,17 @@ test("a prior clean cannot satisfy a newly created current-head verifier until a
     suffix: "verifier-prior-clean-before-cutoff",
   });
   const { result: initial } = await runGate(initialEnvironment, initialGitHub);
-  assert.equal(initial.exitCode, 1);
-  assert.equal(initial.report.gateOutcome, "pending");
-  assert.notEqual(initial.report.recoveryCode, "none");
+  assert.equal(initial.exitCode, 0, initial.report.reason);
+  assert.equal(initial.report.gateOutcome, "success");
+  assert.equal(initial.report.recoveryCode, "none");
   assert.deepEqual(initialGitHub.statusWrites, []);
   assert.ok(initialGitHub.calls.some(({ method, path }) =>
     method === "GET" && path === `/repos/${REPOSITORY}/actions/runs/123`
   ));
+  assert.equal(initialGitHub.calls.some(({ path }) => path.includes("/reactions")), false);
+  assert.equal(initialGitHub.calls.some(({ path }) =>
+    path.includes("/collaborators/") && path.endsWith("/permission")
+  ), false);
 
   const recoveredGitHub = createGitHubMock({
     issueComments: [
@@ -5397,7 +5543,7 @@ test("a new-head top-level clean recovers across multiple pre-run boundaries and
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("a known prior service failure is cleared only by the latest current-head recovery witness", async (context) => {
+test("a recognized prior service failure is cleared by later exact-head clean despite reruns and inline threads", async (context) => {
   const failureBody = [
     "Codex Review: Something went wrong. Try again later by commenting “@codex review”.",
     "",
@@ -5467,6 +5613,13 @@ test("a known prior service failure is cleared only by the latest current-head r
   assert.equal(result.report.recoveryCode, "none");
   assert.equal(result.report.counts.indeterminate, 0);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(github.calls.some(({ path, body }) =>
+    path.includes("/reactions") ||
+    String(body?.query || "").includes("CodexReviewGateReaction")
+  ), false, "chronologically superseded known failures need no request reactions");
+  assert.equal(github.calls.some(({ path }) =>
+    path.includes("/collaborators/") && path.endsWith("/permission")
+  ), false, "chronologically superseded known failures need no request permissions");
 
   const unresolvedThreadGitHub = createGitHubMock({
     issueComments: recoveryComments,
@@ -5481,11 +5634,27 @@ test("a known prior service failure is cleared only by the latest current-head r
     suffix: "provider-failure-recovery-preserves-unresolved-threads",
   });
   const { result: threadBlocked } = await runGate(threadEnvironment, unresolvedThreadGitHub);
-  assert.equal(threadBlocked.report.gateOutcome, "pending");
-  assert.equal(threadBlocked.report.reviewThreads.unresolved, 1);
+  assert.equal(threadBlocked.report.gateOutcome, "success", threadBlocked.report.reason);
+  assert.equal(threadBlocked.report.reviewThreads.status, "not_read");
+  assert.equal(threadBlocked.report.reviewThreads.unresolved, "unknown");
   assert.equal(threadBlocked.report.counts.indeterminate, 0);
-  assert.match(threadBlocked.report.reason, /unresolved pull-request review thread/u);
   assert.deepEqual(unresolvedThreadGitHub.statusWrites, []);
+
+  const laterVerifierRun = createGitHubMock({
+    issueComments: recoveryComments,
+    selfVerifierRun: verifierSelfRun({ created_at: "2026-10-12T13:10:00Z" }),
+  });
+  const laterVerifierEnvironment = runtimeEnvironment(context, {
+    suffix: "provider-failure-recovery-after-newer-verifier-run",
+  });
+  const { result: laterVerifier } = await runGate(laterVerifierEnvironment, laterVerifierRun);
+  assert.equal(laterVerifier.report.gateOutcome, "success", laterVerifier.report.reason);
+  assert.equal(laterVerifier.report.counts.indeterminate, 0);
+  assert.equal(laterVerifierRun.calls.some(({ path, body }) =>
+    path.includes("/reactions") ||
+    String(body?.query || "").includes("CodexReviewGateReaction")
+  ), false);
+  assert.deepEqual(laterVerifierRun.statusWrites, []);
 
   const unresolvedFindingGitHub = createGitHubMock({
     issueComments: recoveryComments.concat(findingIssueComment(HEAD, {
@@ -5590,7 +5759,7 @@ test("a pre-run request's unclosed eyes activity does not block current-head cle
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("PR 34 User canonical request recovers despite stale metadata with complete evidence", async (context) => {
+test("PR 34 User canonical request recovers despite stale metadata with threads not inventoried", async (context) => {
   const cutoff = "2026-10-09T15:45:43Z";
   const oldRequests = [
     [6081765588, OLD_HEAD, "2026-10-09T13:23:00Z", "2026-10-09T13:24:00Z"],
@@ -5668,8 +5837,8 @@ test("PR 34 User canonical request recovers despite stale metadata with complete
   const blockedEnvironment = environmentFor("unresolved-thread");
   const blocked = await runGate(blockedEnvironment, blockedGitHub);
   assert.equal(blocked.result.report.executionHealth, "healthy");
-  assert.equal(blocked.result.report.gateOutcome, "pending");
-  assert.equal(blocked.result.report.recoveryCode, "wait_then_reconcile");
+  assert.equal(blocked.result.report.gateOutcome, "success", blocked.result.report.reason);
+  assert.equal(blocked.result.report.recoveryCode, "none");
   assert.deepEqual(blocked.result.report.counts, {
     unresolved: 0,
     resolved: 0,
@@ -5683,16 +5852,12 @@ test("PR 34 User canonical request recovers despite stale metadata with complete
       blocked.result.report.reviewThreads.resolved,
       blocked.result.report.reviewThreads.total,
     ],
-    ["complete", 1, 0, 1],
-  );
-  assert.match(
-    blocked.result.nextAction,
-    /^First resolve all 1 unresolved pull-request review thread.*then dispatch reconcile against the exact current head/u,
+    ["not_read", "unknown", "unknown", "unknown"],
   );
   const blockedSummary = readFileSync(blockedEnvironment.GITHUB_STEP_SUMMARY, "utf8");
   assert.match(
     blockedSummary,
-    /Steps to unblock: First resolve all 1 unresolved pull-request review thread.*then dispatch reconcile against the exact current head/u,
+    /Inline conversations are not inventoried by this Action; GitHub's required conversation-resolution rule enforces them separately/u,
   );
   assert.equal(blockedSummary.trimEnd().split("\n").at(-1).startsWith("Steps to unblock: "), true);
 
@@ -5712,7 +5877,7 @@ test("PR 34 User canonical request recovers despite stale metadata with complete
       resolved.result.report.reviewThreads.resolved,
       resolved.result.report.reviewThreads.total,
     ],
-    ["complete", 0, 1, 1],
+    ["not_read", "unknown", "unknown", "unknown"],
   );
   assert.equal(resolved.result.report.requiresReplacementPr, false);
 
@@ -5882,7 +6047,7 @@ test("an inline-parent review cannot replace a post-run current-head top-level c
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("post-run canonical Actions recovery keeps its exact tuple guard and accepts later epoch recovery", async (context) => {
+test("post-run direct clean ignores stale request scope but respects a later base epoch", async (context) => {
   const cutoff = "2026-08-25T08:10:00Z";
   const exact = workflowRequest({
     id: 531,
@@ -5915,7 +6080,8 @@ test("post-run canonical Actions recovery keeps its exact tuple guard and accept
     suffix: "post-run-canonical-stale-base",
   });
   const { result: staleBase } = await runGate(staleBaseEnvironment, staleBaseGithub);
-  assert.notEqual(staleBase.report.gateOutcome, "success");
+  assert.equal(staleBase.report.gateOutcome, "success");
+  assert.equal(hasRequestReactionGraphQlCall(staleBaseGithub, staleBaseRequest.id), false);
   assert.equal(staleBaseGithub.statusWrites.some(({ state }) => state === "success"), false);
 
   const postEpochGithub = createGitHubMock({
@@ -5947,7 +6113,7 @@ test("a fresh ordinary request followed by an exact-head clean recovers without 
   assert.equal(result.report.requiresReplacementPr, false);
 });
 
-test("current-head clean recovery requires strict verifier, request, and clean ordering", async (context) => {
+test("direct current-head clean has no verifier, request, or clean-lineage timestamp floor", async (context) => {
   const cutoff = "2026-08-25T08:10:00Z";
   const cases = [
     {
@@ -6006,12 +6172,21 @@ test("current-head clean recovery requires strict verifier, request, and clean o
       suffix: `post-run-recovery-order-${suffix}`,
     });
     const { result } = await runGate(environment, github);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.gateOutcome, "success", `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.recoveryCode, "none", suffix);
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(github.calls.some(({ path, body }) =>
+      path.includes("/reactions") ||
+      String(body?.query || "").includes("CodexReviewGateReaction")
+    ), false, suffix);
+    assert.equal(github.calls.some(({ path }) =>
+      path.includes("/collaborators/") && path.endsWith("/permission")
+    ), false, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 });
 
-test("edited recovery carriers, ambiguous SHAs, and same-time activity fail closed", async (context) => {
+test("edited requests do not invalidate direct clean, while edited or ambiguous carriers still fail closed", async (context) => {
   const cutoff = "2026-08-25T08:10:00Z";
   const currentRequest = recoveryRequest();
   const currentClean = recoveryClean();
@@ -6027,6 +6202,7 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
         { ...currentRequest, updated_at: "2026-08-25T08:11:30Z" },
         currentClean,
       ],
+      expectSuccess: true,
     },
     {
       suffix: "edited-clean",
@@ -6056,6 +6232,7 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
           updated_at: currentClean.created_at,
         }),
       ],
+      expectSuccess: true,
     },
     {
       suffix: "same-time-opaque-activity",
@@ -6073,6 +6250,7 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
           updated_at: currentClean.created_at,
         }),
       ],
+      expectSuccess: true,
     },
   ];
 
@@ -6120,6 +6298,7 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
       currentClean,
     ],
     baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:11:30Z" }),
+    expectSuccess: true,
   });
   cases.push({
     suffix: "later-request-after-clean",
@@ -6137,9 +6316,10 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
         updated_at: "2026-08-25T08:13:00Z",
       }),
     ],
+    expectSuccess: true,
   });
 
-  for (const { suffix, comments, commitResolution, deletedEvents, baseEpoch } of cases) {
+  for (const { suffix, comments, commitResolution, deletedEvents, baseEpoch, expectSuccess = false } of cases) {
     const github = createGitHubMock({
       issueComments: comments,
       commitResolution,
@@ -6151,12 +6331,19 @@ test("edited recovery carriers, ambiguous SHAs, and same-time activity fail clos
       suffix: `post-run-recovery-unsafe-${suffix}`,
     });
     const { result } = await runGate(environment, github);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.gateOutcome === "success", expectSuccess, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.exitCode, expectSuccess ? 0 : 1, suffix);
+    if (expectSuccess) {
+      assert.equal(github.calls.some(({ path, body }) =>
+        path.includes("/reactions") ||
+        String(body?.query || "").includes("CodexReviewGateReaction")
+      ), false, suffix);
+    }
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 });
 
-test("a pre-run issue-comment clean cannot be bypassed by a pre-run APPROVED review", async (context) => {
+test("a trusted pre-run issue-comment clean stays eligible alongside a pre-run APPROVED review", async (context) => {
   const request = ordinaryRequest();
   const review = approvedReview(HEAD, {
     submitted_at: "2026-08-25T08:05:00Z",
@@ -6190,10 +6377,10 @@ test("a pre-run issue-comment clean cannot be bypassed by a pre-run APPROVED rev
     suffix: "pre-run-comment-plus-approved-review",
   });
   const { result: mixed } = await runGate(mixedEnvironment, mixedGitHub);
-  assert.equal(mixed.exitCode, 1);
+  assert.equal(mixed.exitCode, 0, mixed.report.reason);
   assert.equal(mixed.report.executionHealth, "healthy");
-  assert.equal(mixed.report.gateOutcome, "pending", mixed.report.reason);
-  assert.notEqual(mixed.report.recoveryCode, "none");
+  assert.equal(mixed.report.gateOutcome, "success", mixed.report.reason);
+  assert.equal(mixed.report.recoveryCode, "none");
   assert.deepEqual(mixedGitHub.statusWrites, []);
 });
 
@@ -6239,24 +6426,43 @@ test("historical canonical base tuples do not block a fresh exact-head recovery"
   }
 });
 
-test("verifier clean recovery needs both a fresh request and a newer clean", async (context) => {
+test("an existing exact-head clean survives irrelevant results but rejects invalid provider provenance", async (context) => {
   const prior = [ordinaryRequest(), cleanIssueComment(HEAD)];
   const cases = [
-    ["no-new-request", [...prior, recoveryClean()]],
+    ["no-new-request", [...prior, recoveryClean()], true],
     ["old-head-clean", [...prior, recoveryRequest(), recoveryClean({
       body: cleanIssueComment(OLD_HEAD).body,
-    })]],
-    ["non-provider-clean", [...prior, recoveryRequest(), recoveryClean({ user: HUMAN })]],
+    })], true],
+    ["human-copy", [...prior, recoveryRequest(), recoveryClean({
+      user: HUMAN,
+      performed_via_github_app: null,
+    })], true],
+    ["invalid-provider-provenance", [...prior, recoveryRequest(), recoveryClean({ user: HUMAN })], false],
   ];
-  for (const [suffix, issueComments] of cases) {
+  for (const [suffix, issueComments, expectSuccess] of cases) {
     const github = createGitHubMock({
       issueComments,
       selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
     });
     const environment = runtimeEnvironment(context, { suffix: `recovery-${suffix}` });
     const { result } = await runGate(environment, github);
-    assert.equal(result.exitCode, 1, `${suffix}: ${result.report.reason}`);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.exitCode, expectSuccess ? 0 : 1, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome === "success", expectSuccess, suffix);
+    if (expectSuccess) {
+      assert.equal(result.report.recoveryCode, "none", suffix);
+      if (suffix === "human-copy") {
+        assert.match(result.report.reason, /issue-comment 201\b/u);
+      }
+      assert.equal(github.calls.some(({ path, body }) =>
+        path.includes("/reactions") ||
+        String(body?.query || "").includes("CodexReviewGateReaction")
+      ), false, suffix);
+      assert.equal(github.calls.some(({ path }) =>
+        path.includes("/collaborators/") && path.endsWith("/permission")
+      ), false, suffix);
+    } else {
+      assert.match(result.report.reason, /invalid Bot\/App provenance/u, suffix);
+    }
     assert.deepEqual(github.statusWrites, [], suffix);
   }
 });
@@ -6330,10 +6536,66 @@ test("a later canonical clean can supersede only an otherwise-valid hashless cle
   environment.GITHUB_RUN_ID = String(verifierRunId);
 
   const { result } = await runGate(environment, github);
-  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(
+    result.exitCode,
+    0,
+    `${result.report.gateOutcome}: ${result.report.reason}`,
+  );
   assert.equal(result.report.executionHealth, "healthy");
   assert.equal(result.report.gateOutcome, "success");
   assert.equal(result.report.recoveryCode, "none");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("a later direct exact-head clean supersedes a recognized hashless-clean error after a verifier rerun", async (context) => {
+  const firstRequest = workflowRequest({
+    id: 6298004126,
+    body: canonicalRequestBody(HEAD, { runId: "39473852001" }),
+    user: { ...HUMAN, login: "JoeyTeng-Codex" },
+    created_at: "2026-10-20T18:20:32Z",
+    updated_at: "2026-10-20T18:20:32Z",
+  });
+  const hashlessClean = cleanIssueComment(HEAD, {
+    id: 6298097004,
+    body: [
+      "Codex Review: Didn't find any major issues.",
+      "",
+      ...officialCodexAboutFooter(),
+    ].join("\n"),
+    created_at: "2026-10-20T18:25:13Z",
+    updated_at: "2026-10-20T18:25:13Z",
+  });
+  const recoveryRequest = workflowRequest({
+    id: 6298601972,
+    body: canonicalRequestBody(HEAD, { runId: "39478113977" }),
+    user: { ...HUMAN, login: "JoeyTeng-Codex" },
+    created_at: "2026-10-20T18:49:48Z",
+    updated_at: "2026-10-20T18:49:48Z",
+  });
+  const directClean = cleanIssueComment(HEAD, {
+    id: 6298648788,
+    created_at: "2026-10-20T18:51:59Z",
+    updated_at: "2026-10-20T18:51:59Z",
+  });
+  const verifierRunId = 39473808375;
+  const github = createGitHubMock({
+    issueComments: [firstRequest, hashlessClean, recoveryRequest, directClean],
+    selfVerifierRun: verifierSelfRun({
+      id: verifierRunId,
+      run_attempt: 4,
+      created_at: "2026-10-20T18:53:00Z",
+      run_started_at: "2026-10-20T18:53:30Z",
+      html_url: `https://github.com/${REPOSITORY}/actions/runs/${verifierRunId}`,
+    }),
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "hashless-error-direct-clean-after-rerun",
+  });
+  environment.GITHUB_RUN_ID = String(verifierRunId);
+
+  const { result } = await runGate(environment, github);
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.gateOutcome, "success");
   assert.deepEqual(github.statusWrites, []);
 });
 
@@ -6434,6 +6696,7 @@ test("hashless clean recovery does not relax marker, head, edit, provenance, his
         }),
         recoveryRequest,
       ],
+      expectedOutcome: "success",
     },
     {
       suffix: "wrong-head-clean",
@@ -6487,6 +6750,7 @@ test("hashless clean recovery does not relax marker, head, edit, provenance, his
         { ...recoveryRequest, updated_at: "2026-10-20T18:49:49Z" },
         recoveryClean,
       ],
+      expectedOutcome: "success",
     },
     {
       suffix: "edited-recovery-clean",
@@ -6518,6 +6782,7 @@ test("hashless clean recovery does not relax marker, head, edit, provenance, his
       suffix: "base-epoch-after-request",
       comments: [firstRequest, hashlessClean, recoveryRequest, recoveryClean],
       baseEpoch: baseRefChangedEvent({ createdAt: "2026-10-20T18:50:30Z" }),
+      expectedOutcome: "success",
     },
     {
       suffix: "unresolved-prior-finding",
@@ -6536,8 +6801,8 @@ test("hashless clean recovery does not relax marker, head, edit, provenance, his
           author: { ...CODEX_BOT },
         }] },
       })],
-      expectedOutcome: "pending",
-      expectedRecovery: "wait_then_reconcile",
+      expectedOutcome: "success",
+      expectedRecovery: "none",
     },
   ];
 
@@ -6557,29 +6822,38 @@ test("hashless clean recovery does not relax marker, head, edit, provenance, his
     environment.GITHUB_RUN_ID = String(verifierRunId);
     const { result } = await runGate(environment, github);
 
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    if (expectedOutcome === "success") {
+      assert.equal(result.report.gateOutcome, "success", suffix);
+      assert.equal(result.report.reviewThreads.status, "not_read", suffix);
+      assert.equal(result.report.reviewThreads.unresolved, "unknown", suffix);
+      assert.equal(github.calls.some(({ body }) =>
+        body?.query?.includes("CodexReviewGateReviewThreads")
+      ), false, suffix);
+    } else {
+      assert.notEqual(result.report.gateOutcome, "success", suffix);
+    }
     if (expectedOutcome) assert.equal(result.report.gateOutcome, expectedOutcome, suffix);
     if (expectedRecovery) assert.equal(result.report.recoveryCode, expectedRecovery, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 });
 
-test("a post-run ordinary request without a new clean waits without requiring a replacement PR", async (context) => {
+test("a later ordinary request does not expire an existing exact-head clean", async (context) => {
   const github = createGitHubMock({
     issueComments: [ordinaryRequest(), cleanIssueComment(HEAD), recoveryRequest()],
     selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
   });
   const environment = runtimeEnvironment(context, { suffix: "recovery-wait-for-new-clean" });
   const { result } = await runGate(environment, github);
-  assert.equal(result.exitCode, 1);
+  assert.equal(result.exitCode, 0, result.report.reason);
   assert.equal(result.report.executionHealth, "healthy");
-  assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "wait_provider", result.report.reason);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none", result.report.reason);
   assert.equal(result.report.requiresReplacementPr, false);
   assert.deepEqual(github.statusWrites, []);
 });
 
-test("unresolved threads stay additive unless Codex evidence otherwise qualifies for success", async (context) => {
+test("unresolved thread fixtures never change evidence outcomes or recovery guidance", async (context) => {
   const cutoff = "2026-08-25T08:10:00Z";
   const unresolvedThread = reviewThread({
     id: "PRRT_primary_codex_recovery",
@@ -6597,18 +6871,21 @@ test("unresolved threads stay additive unless Codex evidence otherwise qualifies
           updated_at: "2026-08-25T08:02:00Z",
         }),
       ],
-      expectedRecovery: "request_clean_generation",
-      expectedReason: /current-head Codex clean predates this verifier run/u,
+      expectedOutcome: "success",
+      expectedRecovery: "none",
+      expectedReason: /Stable current-head Codex clean evidence/u,
     },
     {
       suffix: "postrun-request-awaiting-result",
       issueComments: [ordinaryRequest(), cleanIssueComment(HEAD), recoveryRequest()],
-      expectedRecovery: "wait_provider",
-      expectedReason: /new @codex review request exists.*no qualifying.*terminal clean/u,
+      expectedOutcome: "success",
+      expectedRecovery: "none",
+      expectedReason: /Stable current-head Codex clean evidence/u,
     },
     {
       suffix: "no-terminal-result",
       issueComments: [],
+      expectedOutcome: "pending",
       expectedRecovery: "wait_provider",
       expectedReason: /No complete Codex terminal result is bound to the current head/u,
     },
@@ -6626,14 +6903,21 @@ test("unresolved threads stay additive unless Codex evidence otherwise qualifies
     const { result } = await runGate(environment, github);
 
     assert.equal(result.report.executionHealth, "healthy", scenario.suffix);
-    assert.equal(result.report.gateOutcome, "pending", scenario.suffix);
+    assert.equal(result.report.gateOutcome, scenario.expectedOutcome, scenario.suffix);
     assert.equal(result.report.recoveryCode, scenario.expectedRecovery, scenario.suffix);
     assert.match(result.report.reason, scenario.expectedReason, scenario.suffix);
     const summary = readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8");
-    assert.match(
-      summary,
-      /Steps to unblock: First resolve all 1 unresolved pull-request review thread.*; then /u,
-    );
+    assert.equal(result.report.reviewThreads.status, "not_read", scenario.suffix);
+    assert.equal(result.report.reviewThreads.unresolved, "unknown", scenario.suffix);
+    assert.equal(github.calls.some(({ body }) =>
+      body?.query?.includes("CodexReviewGateReviewThreads")
+    ), false, scenario.suffix);
+    if (scenario.expectedOutcome === "success") {
+      assert.match(summary, /Gate success is not merge readiness/u);
+    } else {
+      assert.match(summary, /exact current PR head/u);
+      assert.doesNotMatch(summary, /unresolved pull-request review thread/u);
+    }
   }
 
   const qualifyingGitHub = createGitHubMock({
@@ -6645,16 +6929,17 @@ test("unresolved threads stay additive unless Codex evidence otherwise qualifies
     suffix: "unresolved-thread-otherwise-qualifying-clean",
   });
   const { result: qualifying } = await runGate(qualifyingEnvironment, qualifyingGitHub);
-  assert.equal(qualifying.report.gateOutcome, "pending");
-  assert.equal(qualifying.report.recoveryCode, "wait_then_reconcile");
-  assert.match(qualifying.report.reason, /GitHub reports 1 unresolved pull-request review thread/u);
+  assert.equal(qualifying.report.gateOutcome, "success", qualifying.report.reason);
+  assert.equal(qualifying.report.recoveryCode, "none");
+  assert.equal(qualifying.report.reviewThreads.status, "not_read");
+  assert.equal(qualifying.report.reviewThreads.unresolved, "unknown");
   assert.match(
     readFileSync(qualifyingEnvironment.GITHUB_STEP_SUMMARY, "utf8"),
-    /Steps to unblock: First resolve all 1 unresolved pull-request review thread.*then dispatch reconcile against the exact current head/u,
+    /Gate success is not merge readiness/u,
   );
 });
 
-test("verifier clean recovery requires request and terminal to be strictly after their boundaries", async (context) => {
+test("direct exact-head clean does not use verifier-run or request timestamps as floors", async (context) => {
   const cases = [
     ["request-before-cutoff", "2026-08-25T08:09:00Z", "2026-08-25T08:12:00Z"],
     ["request-at-cutoff", "2026-08-25T08:10:00Z", "2026-08-25T08:12:00Z"],
@@ -6674,8 +6959,9 @@ test("verifier clean recovery requires request and terminal to be strictly after
     });
     const environment = runtimeEnvironment(context, { suffix: `recovery-time-${suffix}` });
     const { result } = await runGate(environment, github);
-    assert.equal(result.exitCode, 1, `${suffix}: ${result.report.reason}`);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.exitCode, 0, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.calls.some(({ path }) => path.includes("/reactions")), false, suffix);
     assert.deepEqual(github.statusWrites, [], suffix);
   }
 });
@@ -6714,35 +7000,35 @@ test("verifier clean recovery rejects a self-run bound to an older feature head"
   assert.deepEqual(github.statusWrites, []);
 });
 
-test("edited recovery carriers cannot turn an earlier clean into verifier success", async (context) => {
+test("edited provider cleans stay invalid while edited request lineage is irrelevant", async (context) => {
   const cases = [
     ["prior-clean", [
       ordinaryRequest(),
       cleanIssueComment(HEAD, { updated_at: "2026-08-25T08:01:01Z" }),
       recoveryRequest(),
       recoveryClean(),
-    ]],
+    ], false],
     ["new-request", recoveryEvidence({
       request: recoveryRequest({ updated_at: "2026-08-25T08:11:01Z" }),
-    })],
+    }), true],
     ["new-clean", recoveryEvidence({
       clean: recoveryClean({ updated_at: "2026-08-25T08:12:01Z" }),
-    })],
+    }), false],
   ];
-  for (const [suffix, issueComments] of cases) {
+  for (const [suffix, issueComments, expectSuccess] of cases) {
     const github = createGitHubMock({
       issueComments,
       selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
     });
     const environment = runtimeEnvironment(context, { suffix: `recovery-edited-${suffix}` });
     const { result } = await runGate(environment, github);
-    assert.equal(result.exitCode, 1, suffix);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.gateOutcome === "success", expectSuccess, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.exitCode, expectSuccess ? 0 : 1, suffix);
     assert.deepEqual(github.statusWrites, [], suffix);
   }
 });
 
-test("later findings and provider activity veto a recovered verifier clean", async (context) => {
+test("newer findings and malformed results veto a direct clean but reactions and progress do not", async (context) => {
   const cases = [
     ["finding", {
       issueComments: [...recoveryEvidence(), findingIssueComment(HEAD, {
@@ -6751,7 +7037,7 @@ test("later findings and provider activity veto a recovered verifier clean", asy
         updated_at: "2026-08-25T08:13:00Z",
         html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
       })],
-    }],
+    }, false],
     ["eyes", {
       issueComments: recoveryEvidence(),
       reactionsByCommentId: new Map([["301", [reaction({
@@ -6759,7 +7045,7 @@ test("later findings and provider activity veto a recovered verifier clean", asy
         content: "eyes",
         created_at: "2026-08-25T08:13:00Z",
       })]]]),
-    }],
+    }, true],
     ["ambiguous-provider-comment", {
       issueComments: [...recoveryEvidence(), opaqueProviderIssueComment({
         id: 501,
@@ -6767,7 +7053,7 @@ test("later findings and provider activity veto a recovered verifier clean", asy
         updated_at: "2026-08-25T08:13:00Z",
         html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
       })],
-    }],
+    }, true],
     ["malformed-provider-result", {
       issueComments: [...recoveryEvidence(), cleanIssueComment(HEAD, {
         id: 501,
@@ -6776,17 +7062,20 @@ test("later findings and provider activity veto a recovered verifier clean", asy
         updated_at: "2026-08-25T08:13:00Z",
         html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-501`,
       })],
-    }],
+    }, false],
   ];
-  for (const [suffix, githubOptions] of cases) {
+  for (const [suffix, githubOptions, expectSuccess] of cases) {
     const github = createGitHubMock({
       ...githubOptions,
       selfVerifierRun: verifierSelfRun({ created_at: "2026-08-25T08:10:00Z" }),
     });
     const environment = runtimeEnvironment(context, { suffix: `recovery-later-${suffix}` });
     const { result } = await runGate(environment, github);
-    assert.equal(result.exitCode, 1, suffix);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.gateOutcome === "success", expectSuccess, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.exitCode, expectSuccess ? 0 : 1, suffix);
+    if (expectSuccess) {
+      assert.equal(github.calls.some(({ path }) => path.includes("/reactions")), false, suffix);
+    }
     assert.deepEqual(github.statusWrites, [], suffix);
   }
 });
@@ -6814,7 +7103,7 @@ test("post-run clean recovery does not supersede an unresolved finding before th
   assert.deepEqual(github.statusWrites, []);
 });
 
-test("unfinished known request history offers same-PR recovery without duplicate request advice", async (context) => {
+test("missing direct clean remains recoverable on the same PR despite old request gaps", async (context) => {
   const oldRequest = ordinaryRequest({
     id: 511,
     created_at: "2026-08-25T07:50:00Z",
@@ -6827,8 +7116,8 @@ test("unfinished known request history offers same-PR recovery without duplicate
     updated_at: "2026-08-25T08:00:00Z",
   });
   for (const [suffix, freshRequest, expectedInstruction] of [
-    ["request", [], /Post one fresh eligible, unedited &#64;codex review/u],
-    ["wait", [recoveryRequest()], /Wait for the latest eligible &#64;codex review/u],
+    ["request", [], /Wait for or obtain a trusted, unedited top-level Codex terminal clean bound uniquely to the exact current PR head/u],
+    ["wait", [recoveryRequest()], /Wait for or obtain a trusted, unedited top-level Codex terminal clean bound uniquely to the exact current PR head/u],
   ]) {
     const github = createGitHubMock({
       issueComments: [oldRequest, oldCanonical, ...freshRequest],
@@ -6873,7 +7162,7 @@ test("head-attested recovery ignores reactions attached to older request boundar
   }
 });
 
-test("head-attested recovery accepts older request lineage but not later requests", async (context) => {
+test("direct current-head clean ignores older and later request lineage", async (context) => {
   const thirdRequest = ordinaryRequest({
     id: 501,
     created_at: "2026-08-25T08:13:00Z",
@@ -6919,8 +7208,10 @@ test("head-attested recovery accepts older request lineage but not later request
     });
     const environment = runtimeEnvironment(context, { suffix: `recovery-lineage-${suffix}` });
     const { result } = await runGate(environment, github);
-    assert.equal(result.exitCode, 1, suffix);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.exitCode, 0, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.requiresReplacementPr, false, suffix);
+    assert.equal(github.calls.some(({ path }) => path.includes("/reactions")), false, suffix);
     assert.deepEqual(github.statusWrites, [], suffix);
   }
 
@@ -6954,10 +7245,10 @@ test("head-attested recovery accepts older request lineage but not later request
     assert.deepEqual(github.statusWrites, []);
   }
 
-  for (const [suffix, epochAt, runAt] of [
-    ["before-base-epoch", "2026-08-25T08:11:30Z", "2026-08-25T08:10:00Z"],
-    ["equal-base-epoch", "2026-08-25T08:11:00Z", "2026-08-25T08:10:00Z"],
-    ["before-verifier-creation", "2026-08-25T08:10:00Z", "2026-08-25T08:11:30Z"],
+  for (const [suffix, epochAt, runAt, expectSuccess] of [
+    ["clean-before-base-epoch", "2026-08-25T08:13:00Z", "2026-08-25T08:10:00Z", false],
+    ["clean-at-base-epoch", "2026-08-25T08:12:00Z", "2026-08-25T08:10:00Z", false],
+    ["clean-after-base-before-verifier", "2026-08-25T08:11:00Z", "2026-08-25T08:13:00Z", true],
   ]) {
     const github = createGitHubMock({
       baseEpoch: baseRefChangedEvent({ createdAt: epochAt }),
@@ -6968,7 +7259,7 @@ test("head-attested recovery accepts older request lineage but not later request
       suffix: `recovery-lineage-request-${suffix}`,
     });
     const { result } = await runGate(environment, github);
-    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.gateOutcome === "success", expectSuccess, suffix);
     assert.deepEqual(github.statusWrites, [], suffix);
   }
 });
@@ -6997,7 +7288,7 @@ test("additional pre-run clean carriers do not invalidate the current-head witne
   assert.equal(result.report.gateOutcome, "success");
 });
 
-test("default-any ordinary requests accept an official terminal clean receipt", async (context) => {
+test("official current-head clean does not require default-any request reactions", async (context) => {
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
     updated_at: "2026-08-25T08:02:00Z",
@@ -7021,7 +7312,7 @@ test("default-any ordinary requests accept an official terminal clean receipt", 
     );
     assert.equal(
       hasRequestReactionGraphQlCall(terminalGitHub, ordinary.id),
-      true,
+      false,
       suffix,
     );
   }
@@ -7099,9 +7390,9 @@ test("default-any ordinary requests accept an official terminal clean receipt", 
     });
     const activeEnvironment = runtimeEnvironment(context, { suffix });
     const { result: activeResult } = await runGate(activeEnvironment, activeGitHub);
-    assert.equal(activeResult.report.gateOutcome, "pending", suffix);
-    assert.equal(activeResult.report.recoveryCode, "wait_provider", suffix);
-    assert.match(activeResult.report.reason, /review is still in progress/u, suffix);
+    assert.equal(activeResult.report.gateOutcome, "success", suffix);
+    assert.equal(activeResult.report.recoveryCode, "none", suffix);
+    assert.equal(hasRequestReactionGraphQlCall(activeGitHub, ordinary.id), false, suffix);
   }
 
   const untrustedEyesGitHub = createGitHubMock({
@@ -7261,7 +7552,7 @@ test("opaque pre-request Codex activity does not veto a later exact-head clean",
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("opaque activity before a later exact-head clean is ignored but a later request still needs a clean", async (context) => {
+test("opaque activity and later requests do not expire a direct exact-head clean", async (context) => {
   const first = ordinaryRequest({ id: 101, user: HUMAN });
   const second = ordinaryRequest({
     id: 102,
@@ -7333,7 +7624,7 @@ test("opaque activity before a later exact-head clean is ignored but a later req
         id: 650,
         created_at: "2026-08-25T08:03:30Z",
       })]]]),
-      false,
+      true,
     ],
   ];
 
@@ -7353,6 +7644,14 @@ test("opaque activity before a later exact-head clean is ignored but a later req
     if (expectedSuccess) {
       assert.equal(result.report.recoveryCode, "none", suffix);
       assert.equal(result.report.requiresReplacementPr, false, suffix);
+      assert.equal(
+        github.calls.some(({ path, body }) =>
+          path.includes("/reactions") ||
+          String(body?.query || "").includes("CodexReviewGateReaction")
+        ),
+        false,
+        `${suffix}: direct clean does not acquire request reactions`,
+      );
       assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
     } else {
       assert.notEqual(result.report.gateOutcome, "success", suffix);
@@ -7493,7 +7792,7 @@ test("a malformed top-level Codex progress before a duplicate cohort vetoes its 
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("a closed same-author duplicate cohort cannot block one later canonical generation", async (context) => {
+test("a direct current-head clean remains valid across duplicate request cohorts", async (context) => {
   const first = ordinaryRequest({ id: 101, user: HUMAN });
   const second = ordinaryRequest({
     id: 102,
@@ -7572,11 +7871,12 @@ test("a closed same-author duplicate cohort cannot block one later canonical gen
     suffix: "duplicate-cohort-canonical-awaits-terminal",
   });
   const { result: incomplete } = await runGate(incompleteEnvironment, incompleteGitHub);
-  assert.notEqual(incomplete.report.gateOutcome, "success");
-  assert.equal(incomplete.report.recoveryCode, "wait_provider");
+  assert.equal(incomplete.report.gateOutcome, "success", incomplete.report.reason);
+  assert.equal(incomplete.report.recoveryCode, "none");
+  assert.equal(hasRequestReactionGraphQlCall(incompleteGitHub, canonical.id), false);
 });
 
-test("duplicate-cohort recovery stays fail-closed when provider activity separates its closure from a canonical successor", async (context) => {
+test("later provider activity does not revoke an already attested direct clean", async (context) => {
   const first = ordinaryRequest({ id: 101, user: HUMAN });
   const second = ordinaryRequest({
     id: 102,
@@ -7629,11 +7929,12 @@ test("duplicate-cohort recovery stays fail-closed when provider activity separat
     });
     const { result } = await runGate(environment, github);
 
-    assert.equal(result.exitCode, 1, suffix);
+    assert.equal(result.exitCode, 0, suffix);
     assert.equal(result.report.executionHealth, "healthy", suffix);
-    assert.equal(result.report.gateOutcome, "pending", suffix);
-    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
-    assert.equal(result.report.requiresReplacementPr, true, suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.recoveryCode, "none", suffix);
+    assert.equal(result.report.requiresReplacementPr, false, suffix);
+    assert.equal(hasRequestReactionGraphQlCall(github, canonical.id), false, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 });
@@ -7715,7 +8016,11 @@ test("duplicate-cohort closure rejects provider errors, invalid provenance, and 
     [
       "provider-reaction-error",
       createGitHubMock({
-        issueComments: [first, second, closure],
+        issueComments: [first, second, cleanIssueComment(OLD_HEAD, {
+          id: closure.id,
+          created_at: closure.created_at,
+          updated_at: closure.updated_at,
+        })],
         reactionsByCommentId: new Map([[String(first.id), [invalidReaction]]]),
       }),
       { executionHealth: "unhealthy", recoveryCode: "wait_then_reconcile" },
@@ -7761,7 +8066,7 @@ test("duplicate-cohort closure rejects provider errors, invalid provenance, and 
   assert.equal(findingGitHub.statusWrites.some(({ state }) => state === "success"), false);
 });
 
-test("head-attested recovery ignores older requests but rejects ambiguous or malformed latest witnesses", async (context) => {
+test("a direct current-head clean is independent of ambiguous request lineage", async (context) => {
   const first = ordinaryRequest({ id: 101, user: HUMAN });
   const second = ordinaryRequest({
     id: 102,
@@ -7799,7 +8104,7 @@ test("head-attested recovery ignores older requests but rejects ambiguous or mal
         html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
       })],
       [],
-      false,
+      true,
     ],
     ["same-time-successor", [second], [successorAt(103, closure.created_at)], true],
     [
@@ -7808,7 +8113,7 @@ test("head-attested recovery ignores older requests but rejects ambiguous or mal
       [successorAt(104, "2026-08-25T08:03:00Z", {
         body: canonicalRequestBody(HEAD, { baseSha: OLD_HEAD, runId: "104" }),
       })],
-      false,
+      true,
     ],
     [
       "noncanonical-successor",
@@ -7829,7 +8134,7 @@ test("head-attested recovery ignores older requests but rejects ambiguous or mal
         updated_at: "2026-08-25T08:03:30Z",
         last_edited_at: "2026-08-25T08:03:30Z",
       })],
-      false,
+      true,
     ],
     [
       "multiple-successors",
@@ -8047,7 +8352,7 @@ test("a base epoch wrong-head clean receipt does not recover a default-any reque
   const { result } = await runGate(environment, github);
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "request_clean_generation");
+  assert.equal(result.report.recoveryCode, "wait_provider");
   assert.equal(result.report.requiresReplacementPr, false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
@@ -8088,22 +8393,19 @@ test("a closed Codex inline-parent review can promote one default-any request wi
   assert.equal(result.report.gateOutcome, "success");
   assert.equal(result.report.recoveryCode, "none");
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
-  assert.deepEqual(result.report.reviewThreads, {
-    status: "complete",
-    unresolved: 0,
-    resolved: 0,
-    total: 0,
-    diagnostics: [],
-  });
+  assert.deepEqual(
+    [
+      result.report.reviewThreads.status,
+      result.report.reviewThreads.unresolved,
+      result.report.reviewThreads.resolved,
+      result.report.reviewThreads.total,
+    ],
+    ["not_read", "unknown", "unknown", "unknown"],
+  );
   const threadInventoryQuery = github.calls.find(({ path, body }) =>
     path === "/graphql" && /reviewThreads/iu.test(String(body?.query || ""))
   );
-  assert.ok(threadInventoryQuery, "the gate must inspect the complete review-thread inventory");
-  assert.doesNotMatch(
-    threadInventoryQuery.body.query,
-    /comments\s*\([^)]*\)\s*\{[\s\S]*?\bbody\b/u,
-    "thread inspection may fetch only a minimal diagnostic URL, not comment bodies",
-  );
+  assert.equal(threadInventoryQuery, undefined, "the Action must not query inline conversations");
 });
 
 test("receipt envelope: historical wrapped and unwrapped inline parents allow a current-head clean", async (context) => {
@@ -8144,17 +8446,19 @@ test("receipt envelope: historical wrapped and unwrapped inline parents allow a 
     assert.equal(result.report.executionHealth, "healthy", suffix);
     assert.equal(result.report.gateOutcome, "success", result.report.reason);
     assert.equal(result.report.counts.indeterminate, 0, suffix);
-    assert.deepEqual(result.report.reviewThreads, {
-      status: "complete",
-      unresolved: 0,
-      resolved: 1,
-      total: 1,
-      diagnostics: [],
-    });
+    assert.deepEqual(
+      [
+        result.report.reviewThreads.status,
+        result.report.reviewThreads.unresolved,
+        result.report.reviewThreads.resolved,
+        result.report.reviewThreads.total,
+      ],
+      ["not_read", "unknown", "unknown", "unknown"],
+    );
   }
 });
 
-test("historical native-parent closed grammar preserves native SHA and thread guards with optional boundary comments", async (context) => {
+test("historical native-parent closed grammar preserves native SHA while threads remain not read", async (context) => {
   const review = historicalNativeParentReviewWithoutBodySha(OLD_HEAD, {
     submitted_at: "2026-08-25T08:02:00Z",
   });
@@ -8219,23 +8523,15 @@ test("historical native-parent closed grammar preserves native SHA and thread gu
     if (suffix === "resolved") {
       assert.equal(result.exitCode, 0, result.report.reason);
       assert.equal(result.report.gateOutcome, "success");
-      assert.deepEqual(result.report.reviewThreads, {
-        status: "complete",
-        unresolved: 0,
-        resolved: 1,
-        total: 1,
-        diagnostics: [],
-      });
     } else {
-      assert.equal(result.exitCode, 1);
-      assert.notEqual(result.report.gateOutcome, "success");
-      assert.equal(result.report.reviewThreads.unresolved, 1);
-      assert.match(result.report.reason, /unresolved pull-request review thread/iu);
-      assert.equal(
-        github.statusWrites.some(({ state }) => state === "success"),
-        false,
-      );
+      assert.equal(result.exitCode, 0, result.report.reason);
+      assert.equal(result.report.gateOutcome, "success", result.report.reason);
     }
+    assert.equal(result.report.reviewThreads.status, "not_read", suffix);
+    assert.equal(result.report.reviewThreads.unresolved, "unknown", suffix);
+    assert.equal(github.calls.some(({ body }) =>
+      body?.query?.includes("CodexReviewGateReviewThreads")
+    ), false, suffix);
   }
 
   for (const [suffix, candidateReview, compatible = false] of receiptCases) {
@@ -8267,7 +8563,7 @@ test("historical native-parent closed grammar preserves native SHA and thread gu
   }
 });
 
-test("receipt envelope: a historical wrapped inline parent cannot waive an unresolved thread", async (context) => {
+test("receipt envelope: historical wrapped inline parent leaves threads outside Action scope", async (context) => {
   const review = receiptWrappedInlineParentReview(OLD_HEAD, {
     submitted_at: "2026-08-25T08:02:00Z",
   });
@@ -8295,11 +8591,13 @@ test("receipt envelope: a historical wrapped inline parent cannot waive an unres
   const { result } = await runGate(environment, github);
 
   assert.equal(result.report.executionHealth, "healthy");
-  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
   assert.equal(result.report.counts.indeterminate, 0);
-  assert.equal(result.report.reviewThreads.unresolved, 1);
-  assert.match(result.report.reason, /unresolved pull-request review thread/iu);
-  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(result.report.reviewThreads.status, "not_read");
+  assert.equal(result.report.reviewThreads.unresolved, "unknown");
+  assert.equal(github.calls.some(({ body }) =>
+    body?.query?.includes("CodexReviewGateReviewThreads")
+  ), false);
 });
 
 test("receipt envelope: current inline-parent provider identity and eligibility remain required", async (context) => {
@@ -8496,7 +8794,7 @@ test("a closed Codex inline-parent review cannot uniquely satisfy multiple defau
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "wait_provider");
-  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(result.report.requiresReplacementPr, false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -8521,7 +8819,7 @@ test("a closed inline-parent review cannot cross a later canonical physical boun
   const { result } = await runGate(environment, github);
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(result.report.requiresReplacementPr, false);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -8542,7 +8840,8 @@ test("a closed Codex inline-parent review cannot promote default-any after a bas
   assert.equal(result.exitCode, 1);
   assert.equal(result.report.gateOutcome, "pending");
   assert.equal(result.report.recoveryCode, "request_clean_generation");
-  assert.equal(result.report.requiresReplacementPr, true);
+  assert.equal(result.report.requiresReplacementPr, false);
+  assert.match(result.nextAction, /trusted, unedited top-level Codex terminal clean.*exact current PR head.*strictly newer than that retarget/u);
   assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
@@ -8599,7 +8898,7 @@ test("a fresh physical request can replace older generation history with an exac
   );
 });
 
-test("an exact-head clean settles the latest default-any request but not later eyes activity", async (context) => {
+test("a direct exact-head clean remains valid across later default-any requests and eyes", async (context) => {
   const generation = workflowRequest({
     created_at: "2026-08-25T08:00:00Z",
     updated_at: "2026-08-25T08:00:00Z",
@@ -8629,9 +8928,13 @@ test("an exact-head clean settles the latest default-any request but not later e
     acknowledgedEnvironment,
     acknowledgedGitHub,
   );
-  assert.equal(acknowledged.exitCode, 1);
-  assert.equal(acknowledged.report.gateOutcome, "pending");
-  assert.equal(acknowledged.report.recoveryCode, "wait_provider");
+  assert.equal(acknowledged.exitCode, 0, acknowledged.report.reason);
+  assert.equal(acknowledged.report.gateOutcome, "success");
+  assert.equal(acknowledged.report.recoveryCode, "none");
+  assert.equal(acknowledgedGitHub.calls.some(({ path, body }) =>
+    path.includes("/reactions") ||
+    String(body?.query || "").includes("CodexReviewGateReaction")
+  ), false);
 
   const laterClean = cleanIssueComment(HEAD, {
     id: 202,
@@ -8671,14 +8974,18 @@ test("an exact-head clean settles the latest default-any request but not later e
       suffix: `default-any-eyes-after-clean-${suffix}`,
     });
     const { result: active } = await runGate(activeEnvironment, activeGitHub);
-    assert.notEqual(active.report.gateOutcome, "success", suffix);
+    assert.equal(active.report.gateOutcome, "success", `${suffix}: ${active.report.reason}`);
     assert.equal(active.report.executionHealth, "healthy", suffix);
-    assert.equal(active.report.recoveryCode, "wait_provider", suffix);
+    assert.equal(active.report.recoveryCode, "none", suffix);
+    assert.equal(activeGitHub.calls.some(({ path, body }) =>
+      path.includes("/reactions") ||
+      String(body?.query || "").includes("CodexReviewGateReaction")
+    ), false, suffix);
     assert.equal(activeGitHub.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 });
 
-test("request-author write policy is opt-in and the default any policy skips collaborator lookup", async (context) => {
+test("a trusted direct clean skips request-author permission lookups", async (context) => {
   const request = ordinaryRequest({ user: READER });
   const terminal = cleanIssueComment(HEAD, {
     created_at: "2026-08-25T08:02:00Z",
@@ -8692,8 +8999,9 @@ test("request-author write policy is opt-in and the default any policy skips col
   const environment = runtimeEnvironment(context, { suffix: "permission-404" });
   environment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result } = await runGate(environment, github);
-  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
   assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.recoveryCode, "none");
   assert.equal(
     hasRequestReactionGraphQlCall(github, request.id),
     false,
@@ -8710,10 +9018,13 @@ test("request-author write policy is opt-in and the default any policy skips col
   const forbiddenEnvironment = runtimeEnvironment(context, { suffix: "permission-403" });
   forbiddenEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: forbiddenResult } = await runGate(forbiddenEnvironment, forbiddenGitHub);
-  assert.equal(forbiddenResult.exitCode, 1);
-  assert.equal(forbiddenResult.report.executionHealth, "unhealthy");
-  assert.equal(forbiddenResult.report.gateOutcome, "pending");
-  assert.equal(forbiddenResult.report.recoveryCode, "repair_permissions");
+  assert.equal(forbiddenResult.exitCode, 0, forbiddenResult.report.reason);
+  assert.equal(forbiddenResult.report.executionHealth, "healthy");
+  assert.equal(forbiddenResult.report.gateOutcome, "success");
+  assert.equal(forbiddenResult.report.recoveryCode, "none");
+  assert.equal(forbiddenGitHub.calls.some(({ path }) =>
+    path === `/repos/${REPOSITORY}/collaborators/${READER.login}/permission`
+  ), false);
   assert.equal(forbiddenGitHub.statusWrites.some(({ state }) => state === "success"), false);
 
   const defaultGitHub = createGitHubMock({
@@ -8741,7 +9052,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
     updated_at: "2026-08-25T08:02:00Z",
     html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
   });
-  const delayedUnboundClean = cleanIssueComment(HEAD, {
+  const delayedUnboundClean = cleanIssueComment(OLD_HEAD, {
     id: 203,
     created_at: "2026-08-25T08:03:00Z",
     updated_at: "2026-08-25T08:03:00Z",
@@ -8761,8 +9072,8 @@ test("a denied exact request remains a lineage boundary without granting clean a
   const { result: ambiguous } = await runGate(ambiguousEnvironment, ambiguousGitHub);
   assert.equal(ambiguous.exitCode, 1);
   assert.equal(ambiguous.report.gateOutcome, "pending");
-  assert.equal(ambiguous.report.recoveryCode, "request_clean_generation");
-  assert.match(ambiguous.report.reason, /newer request 102 already existed/iu);
+  assert.equal(ambiguous.report.recoveryCode, "wait_provider");
+  assert.match(ambiguous.report.reason, /No complete Codex terminal result is bound to the current head/iu);
   assert.equal(
     ambiguousGitHub.statusWrites.some(({ state }) => state === "success"),
     false,
@@ -8867,7 +9178,7 @@ test("a denied exact request remains a lineage boundary without granting clean a
 
 test("provider-triggerable invalid request shapes remain physical-only boundaries", async (context) => {
   const generationA = workflowRequest({ id: 101 });
-  const terminalA = cleanIssueComment(HEAD, {
+  const terminalA = cleanIssueComment(OLD_HEAD, {
     id: 201,
     created_at: "2026-08-25T08:01:00Z",
     updated_at: "2026-08-25T08:01:00Z",
@@ -9026,8 +9337,8 @@ test("provider-triggerable invalid request shapes remain physical-only boundarie
     const { result } = await runGate(environment, github);
     assert.equal(result.exitCode, 1, suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
-    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
-    assert.match(result.report.reason, /predates newer physical review request 102/iu, suffix);
+    assert.equal(result.report.recoveryCode, "wait_provider", suffix);
+    assert.match(result.report.reason, /No complete Codex terminal result is bound to the current head/iu, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 
@@ -9036,7 +9347,7 @@ test("provider-triggerable invalid request shapes remain physical-only boundarie
   mention.created_at = "2026-08-25T08:02:00Z";
   mention.updated_at = "2026-08-25T08:02:00Z";
   const nonExactGitHub = createGitHubMock({
-    issueComments: [generationA, terminalA, mention],
+    issueComments: [generationA, cleanIssueComment(HEAD), mention],
   });
   const nonExactEnvironment = runtimeEnvironment(context, {
     suffix: "non-exact-review-mention-is-not-a-boundary",
@@ -9064,7 +9375,7 @@ test("provider-triggerable invalid request shapes remain physical-only boundarie
   );
   assert.equal(visibleTrailerResult.exitCode, 1);
   assert.equal(visibleTrailerResult.report.gateOutcome, "pending");
-  assert.equal(visibleTrailerResult.report.recoveryCode, "request_clean_generation");
+  assert.equal(visibleTrailerResult.report.recoveryCode, "wait_provider");
   assert.equal(
     visibleTrailerGitHub.calls.some(({ path }) =>
       path === `/repos/${REPOSITORY}/issues/comments/102`
@@ -9140,7 +9451,7 @@ test("exact Codex provider carriers never become request generations", async (co
 
 test("edited-away trusted request comments remain unknown physical boundaries", async (context) => {
   const generationA = workflowRequest({ id: 101 });
-  const terminalA = cleanIssueComment(HEAD, {
+  const terminalA = cleanIssueComment(OLD_HEAD, {
     id: 201,
     created_at: "2026-08-25T08:01:00Z",
     updated_at: "2026-08-25T08:01:00Z",
@@ -9176,7 +9487,13 @@ test("edited-away trusted request comments remain unknown physical boundaries", 
     assert.equal(result.exitCode, 1, suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
     assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
-    assert.match(result.report.reason, /predates newer physical review request 102/iu, suffix);
+    assert.match(
+      result.report.reason,
+      suffix === "github-actions-forged-sticky"
+        ? /Sticky-looking comment 102 lacks immutable canonical Actions provenance/iu
+        : /Edited comment 102.*unobservable prior body history/iu,
+      suffix,
+    );
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
     assert.equal(
       github.calls.some(({ path }) =>
@@ -9190,7 +9507,7 @@ test("edited-away trusted request comments remain unknown physical boundaries", 
 
 test("canonical Actions sticky diagnostics stay outside physical lineage after a timestamp update", async (context) => {
   const generationA = workflowRequest({ id: 101 });
-  const terminalA = cleanIssueComment(HEAD, {
+  const terminalA = cleanIssueComment(OLD_HEAD, {
     id: 201,
     created_at: "2026-08-25T08:01:00Z",
     updated_at: "2026-08-25T08:01:00Z",
@@ -9259,7 +9576,11 @@ test("canonical Actions sticky diagnostics stay outside physical lineage after a
 
   for (const { suffix, comment, expectedOutcome = "pending" } of cases) {
     const github = createGitHubMock({
-      issueComments: [generationA, terminalA, comment],
+      issueComments: [
+        generationA,
+        expectedOutcome === "success" ? cleanIssueComment(HEAD) : terminalA,
+        comment,
+      ],
     });
     const environment = runtimeEnvironment(context, {
       suffix: `sticky-physical-boundary-${suffix}`,
@@ -9274,7 +9595,7 @@ test("canonical Actions sticky diagnostics stay outside physical lineage after a
     assert.equal(result.exitCode, 1, suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
     assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
-    assert.equal(result.report.requiresReplacementPr, true, suffix);
+    assert.equal(result.report.requiresReplacementPr, false, suffix);
     assert.match(
       result.report.reason,
       /physical review request 102|immutable canonical Actions provenance/iu,
@@ -9284,7 +9605,7 @@ test("canonical Actions sticky diagnostics stay outside physical lineage after a
   }
 });
 
-test("opt-in write policy caches permissions and avoids exact-refetch DoS", async (context) => {
+test("direct clean avoids permission fanout while legacy fallback still caches permissions", async (context) => {
   const deniedRequests = Array.from({ length: 70 }, (_, index) => {
     const id = 1_000 + index;
     return ordinaryRequest({
@@ -9308,25 +9629,20 @@ test("opt-in write policy caches permissions and avoids exact-refetch DoS", asyn
   });
   deniedEnvironment.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION = "write";
   const { result: deniedResult } = await runGate(deniedEnvironment, deniedGitHub);
-  assert.equal(deniedResult.exitCode, 1);
+  assert.equal(deniedResult.exitCode, 0);
   assert.equal(deniedResult.report.executionHealth, "healthy");
-  assert.equal(deniedResult.report.gateOutcome, "pending");
-  assert.equal(deniedResult.report.recoveryCode, "wait_provider");
-  assert.equal(deniedResult.report.requiresReplacementPr, true);
+  assert.equal(deniedResult.report.gateOutcome, "success");
+  assert.equal(deniedResult.report.recoveryCode, "none");
+  assert.equal(deniedResult.report.requiresReplacementPr, false);
   const deniedSummary = readFileSync(deniedEnvironment.GITHUB_STEP_SUMMARY, "utf8");
-  assert.match(deniedSummary, /Wait for the latest eligible (?:@|&#64;)codex review request/iu);
-  assert.match(deniedSummary, /request history intact and unedited/iu);
-  assert.match(deniedSummary, /post exactly one fresh eligible, unedited (?:@|&#64;)codex review request/iu);
-  assert.match(deniedSummary, /A missing terminal clean alone does not require a replacement PR/iu);
-  assert.doesNotMatch(deniedSummary, /Do not add another review boundary on the original PR/iu);
-  assert.doesNotMatch(deniedSummary, /Wait for Codex to publish a terminal result/iu);
+  assert.match(deniedSummary, /Stable current-head Codex clean evidence/u);
   assert.equal(deniedGitHub.statusWrites.some(({ state }) => state === "success"), false);
   assert.equal(
     deniedGitHub.calls.filter(({ path }) =>
       path.includes(`/${READER.login}/`) && path.endsWith("/permission")
     ).length,
-    2,
-    "opening and closing each cache more than 61 denied requests in one permission lookup",
+    0,
+    "an independently attested clean does not query request-author permissions",
   );
   for (const denied of deniedRequests) {
     assert.equal(
@@ -9346,8 +9662,8 @@ test("opt-in write policy caches permissions and avoids exact-refetch DoS", asyn
     deniedGitHub.calls.filter(({ path }) =>
       path === `/repos/${REPOSITORY}/issues/comments/${terminalClean.id}`
     ).length,
-    2,
-    "provider terminal evidence remains exact-refetched in opening and closing",
+    4,
+    "provider terminal evidence is exact-refetched in both complete stability snapshots",
   );
 
   const canonical = workflowRequest({
@@ -9728,6 +10044,7 @@ test("a later exact-head clean settles overlapping request history unless a real
   assert.equal(oldHeadProgress.exitCode, 1);
   assert.equal(oldHeadProgress.report.executionHealth, "healthy");
   assert.equal(oldHeadProgress.report.gateOutcome, "pending");
+  assert.match(oldHeadProgress.report.reason, /Edited Codex progress issue-comment 206.*unobservable prior body history/u);
   assert.equal(
     oldHeadProgressGitHub.statusWrites.some(({ state }) => state === "success"),
     false,
@@ -10022,8 +10339,9 @@ test("a later exact-head clean settles overlapping request history unless a real
   assert.equal(providerFirstGapDirectLatest.report.gateOutcome, "success");
   assert.match(
     providerFirstGapDirectLatest.report.reason,
-    /request-reaction 534/u,
+    /issue-comment 203/u,
   );
+  assert.equal(hasRequestReactionGraphQlCall(providerFirstGapDirectLatestGitHub, "102"), false);
 
   const equalBoundaryGitHub = createGitHubMock({
     issueComments: [
@@ -10127,7 +10445,8 @@ test("unbound terminal carriers cannot cross overlapping generations", async (co
   );
   assert.equal(directLatest.exitCode, 0);
   assert.equal(directLatest.report.gateOutcome, "success");
-  assert.match(directLatest.report.reason, /request-reaction 540/u);
+  assert.match(directLatest.report.reason, /issue-comment 203/u);
+  assert.equal(hasRequestReactionGraphQlCall(directLatestGitHub, generationB.id), false);
 
   const generationC = workflowRequest({
     id: 103,
@@ -10156,10 +10475,10 @@ test("unbound terminal carriers cannot cross overlapping generations", async (co
     threeGenerationEnvironment,
     threeGenerationGitHub,
   );
-  assert.equal(threeGeneration.exitCode, 1);
-  assert.equal(threeGeneration.report.gateOutcome, "pending");
-  assert.equal(threeGeneration.report.recoveryCode, "request_clean_generation");
-  assert.match(threeGeneration.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(threeGeneration.exitCode, 0);
+  assert.equal(threeGeneration.report.gateOutcome, "success");
+  assert.equal(threeGeneration.report.recoveryCode, "none");
+  assert.match(threeGeneration.report.reason, /issue-comment 203/u);
   assert.equal(
     threeGenerationGitHub.statusWrites.some(({ state }) => state === "success"),
     false,
@@ -10187,7 +10506,8 @@ test("unbound terminal carriers cannot cross overlapping generations", async (co
   );
   assert.equal(threeGenerationRecovered.exitCode, 0);
   assert.equal(threeGenerationRecovered.report.gateOutcome, "success");
-  assert.match(threeGenerationRecovered.report.reason, /request-reaction 543/u);
+  assert.match(threeGenerationRecovered.report.reason, /issue-comment 203/u);
+  assert.equal(hasRequestReactionGraphQlCall(threeGenerationRecoveredGitHub, generationC.id), false);
 
   const directFirstGapGitHub = createGitHubMock({
     issueComments: [generationA, generationB, delayedTerminalA, generationC],
@@ -10203,17 +10523,18 @@ test("unbound terminal carriers cannot cross overlapping generations", async (co
     directFirstGapEnvironment,
     directFirstGapGitHub,
   );
-  assert.equal(directFirstGap.exitCode, 1);
-  assert.equal(directFirstGap.report.gateOutcome, "pending");
-  assert.equal(directFirstGap.report.recoveryCode, "request_clean_generation");
-  assert.match(directFirstGap.report.reason, /earlier request 102.*newer request 103/iu);
+  assert.equal(directFirstGap.exitCode, 0);
+  assert.equal(directFirstGap.report.gateOutcome, "success");
+  assert.equal(directFirstGap.report.recoveryCode, "none");
+  assert.match(directFirstGap.report.reason, /issue-comment 203/u);
+  assert.equal(hasRequestReactionGraphQlCall(directFirstGapGitHub, generationC.id), false);
   assert.equal(
     directFirstGapGitHub.statusWrites.some(({ state }) => state === "success"),
     false,
   );
 });
 
-test("provider first-gap closure requires a quiet terminal-to-successor window", async (context) => {
+test("direct current-head clean survives later request, eyes, and progress markers", async (context) => {
   const generationA = workflowRequest({ id: 101 });
   const terminalEarly = cleanIssueComment(HEAD, {
     id: 201,
@@ -10247,9 +10568,10 @@ test("provider first-gap closure requires a quiet terminal-to-successor window",
     suffix: "provider-gap-post-terminal-eyes",
   });
   const { result: eyes } = await runGate(eyesEnvironment, eyesGitHub);
-  assert.equal(eyes.exitCode, 1);
-  assert.equal(eyes.report.gateOutcome, "pending");
-  assert.equal(eyes.report.recoveryCode, "request_clean_generation");
+  assert.equal(eyes.exitCode, 0);
+  assert.equal(eyes.report.gateOutcome, "success");
+  assert.equal(eyes.report.recoveryCode, "none");
+  assert.equal(hasRequestReactionGraphQlCall(eyesGitHub, generationA.id), false);
 
   for (const [suffix, progressAt] of [
     ["provider-gap-post-terminal-progress", "2026-08-25T08:01:30Z"],
@@ -10270,9 +10592,10 @@ test("provider first-gap closure requires a quiet terminal-to-successor window",
     });
     const environment = runtimeEnvironment(context, { suffix });
     const { result } = await runGate(environment, github);
-    assert.equal(result.exitCode, 1, suffix);
-    assert.equal(result.report.gateOutcome, "pending", suffix);
-    assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
+    assert.equal(result.exitCode, 0, suffix);
+    assert.equal(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.recoveryCode, "none", suffix);
+    assert.equal(hasRequestReactionGraphQlCall(github, generationA.id), false, suffix);
   }
 
   const terminalLate = cleanIssueComment(HEAD, {
@@ -10304,7 +10627,7 @@ test("provider first-gap closure requires a quiet terminal-to-successor window",
   );
   assert.equal(laterTerminal.exitCode, 0);
   assert.equal(laterTerminal.report.gateOutcome, "success");
-  assert.match(laterTerminal.report.reason, /request-reaction 570/u);
+  assert.match(laterTerminal.report.reason, /issue-comment 202/u);
 
   const physicalOnlyA = ordinaryRequest({ id: 101, user: ACTIONS_BOT });
   const incompleteInventoryGitHub = createGitHubMock({
@@ -10318,9 +10641,9 @@ test("provider first-gap closure requires a quiet terminal-to-successor window",
     incompleteInventoryEnvironment,
     incompleteInventoryGitHub,
   );
-  assert.equal(incompleteInventory.exitCode, 1);
-  assert.equal(incompleteInventory.report.gateOutcome, "pending");
-  assert.equal(incompleteInventory.report.recoveryCode, "request_clean_generation");
+  assert.equal(incompleteInventory.exitCode, 0);
+  assert.equal(incompleteInventory.report.gateOutcome, "success");
+  assert.equal(incompleteInventory.report.recoveryCode, "none");
   assert.equal(
     hasRequestReactionGraphQlCall(incompleteInventoryGitHub, 101),
     false,
@@ -10350,7 +10673,7 @@ test("a later provider clean can supersede an earlier direct candidate", async (
   assert.match(result.report.reason, /issue-comment 201/u);
 });
 
-test("direct gap closure treats provider terminal activity as live work", async (context) => {
+test("a post-retarget direct clean remains valid across later request lineage", async (context) => {
   const epoch = baseRefChangedEvent();
   const generationA = workflowRequest({
     id: 101,
@@ -10381,10 +10704,11 @@ test("direct gap closure treats provider terminal activity as live work", async 
     suffix: "direct-gap-post-clean-provider-terminal",
   });
   const { result } = await runGate(environment, github);
-  assert.equal(result.exitCode, 1);
-  assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "request_clean_generation");
-  assert.match(result.report.reason, /earlier request 101.*newer request 102/iu);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.equal(result.report.recoveryCode, "none");
+  assert.match(result.report.reason, /issue-comment 201/u);
+  assert.equal(hasRequestReactionGraphQlCall(github, generationB.id), false);
 });
 
 test("edited terminal carriers preserve their unknown pre-edit activity interval", async (context) => {
@@ -10511,14 +10835,14 @@ test("malformed and unresolved carriers keep a provider-closed gap live", async 
       body: "Codex Review: Didn't find any major issues.",
       created_at: "2026-08-25T08:01:30Z",
       updated_at: "2026-08-25T08:01:30Z",
-    }), null],
+    }), null, 1],
     ["unresolved", cleanIssueComment(HEAD.slice(0, 10), {
       id: 202,
       created_at: "2026-08-25T08:01:30Z",
       updated_at: "2026-08-25T08:01:30Z",
-    }), () => ({ status: 422, message: "short SHA is ambiguous" })],
+    }), () => ({ status: 422, message: "short SHA is ambiguous" }), 1],
   ];
-  for (const [suffix, badCarrier, commitResolution] of cases) {
+  for (const [suffix, badCarrier, commitResolution, expectedIndeterminate] of cases) {
     const github = createGitHubMock({
       issueComments: [generationA, providerClean, badCarrier, generationB],
       reactionsByCommentId: new Map([["102", [reaction({
@@ -10534,8 +10858,14 @@ test("malformed and unresolved carriers keep a provider-closed gap live", async 
     assert.equal(result.exitCode, 1, suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
     assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
-    assert.equal(result.report.counts.indeterminate, 2, suffix);
-    assert.match(result.report.reason, /earlier request 101.*newer request 102/iu, suffix);
+    assert.equal(result.report.counts.indeterminate, expectedIndeterminate, suffix);
+    assert.match(
+      result.report.reason,
+      suffix === "malformed"
+        ? /exactly one Reviewed commit marker/iu
+        : /Reviewed commit aaaaaaaaaa is unresolved or ambiguous/iu,
+      suffix,
+    );
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
 });
@@ -10705,7 +11035,7 @@ test("GraphQL lastEditedAt makes same-second request history physical-only", asy
     assert.equal(result.exitCode, 1, suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
     assert.equal(result.report.recoveryCode, "request_clean_generation", suffix);
-    assert.equal(result.report.requiresReplacementPr, true, suffix);
+    assert.equal(result.report.requiresReplacementPr, false, suffix);
     assert.match(result.report.reason, /unobservable prior body history|newer request 102/iu, suffix);
     assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
   }
@@ -10724,7 +11054,7 @@ test("GraphQL lastEditedAt makes same-second request history physical-only", asy
   const { result: canonical } = await runGate(canonicalEnvironment, canonicalGitHub);
   assert.equal(canonical.exitCode, 1);
   assert.equal(canonical.report.gateOutcome, "pending");
-  assert.equal(canonical.report.requiresReplacementPr, true);
+  assert.equal(canonical.report.requiresReplacementPr, false);
   assert.match(canonical.report.reason, /invalid binding/iu);
   assert.equal(hasRequestReactionGraphQlCall(canonicalGitHub, 101), false);
 });
@@ -11043,7 +11373,7 @@ test("a globally duplicated reaction identity cannot authorize the latest genera
   const github = createGitHubMock({
     issueComments: [
       generationA,
-      cleanIssueComment(HEAD, {
+      cleanIssueComment(OLD_HEAD, {
         id: 202,
         created_at: "2026-08-25T08:01:00Z",
         updated_at: "2026-08-25T08:01:00Z",
@@ -11345,7 +11675,7 @@ test("malformed provider terminal evidence is indeterminate and cannot pass", as
   assert.equal(result.report.counts.indeterminate > 0, true);
 });
 
-test("PR 50 boundary-comment evidence (synthetic repository adaptation) preserves finding and thread gates", async (context) => {
+test("PR 50 boundary-comment evidence preserves finding gates without Action thread inventory", async (context) => {
   const oldNativeFinding = findingReview(OLD_HEAD, {
     id: 5607082812,
     body: [
@@ -11399,8 +11729,9 @@ test("PR 50 boundary-comment evidence (synthetic repository adaptation) preserve
   );
   assert.equal(positive.report.gateOutcome, "success", positive.report.reason);
   assert.equal(positive.report.counts.indeterminate, 0);
-  assert.equal(positive.report.reviewThreads.unresolved, 0);
-  assert.equal(positive.report.reviewThreads.resolved, 2);
+  assert.equal(positive.report.reviewThreads.status, "not_read");
+  assert.equal(positive.report.reviewThreads.unresolved, "unknown");
+  assert.equal(positive.report.reviewThreads.resolved, "unknown");
   assert.equal(positive.report.counts.historical, 1);
 
   const unresolvedGitHub = makeGitHub({
@@ -11410,8 +11741,9 @@ test("PR 50 boundary-comment evidence (synthetic repository adaptation) preserve
     environmentFor("unresolved-thread"),
     unresolvedGitHub,
   );
-  assert.equal(unresolved.report.gateOutcome, "pending");
-  assert.equal(unresolved.report.reviewThreads.unresolved, 1);
+  assert.equal(unresolved.report.gateOutcome, "success", unresolved.report.reason);
+  assert.equal(unresolved.report.reviewThreads.status, "not_read");
+  assert.equal(unresolved.report.reviewThreads.unresolved, "unknown");
   assert.equal(unresolvedGitHub.statusWrites.some(({ state }) => state === "success"), false);
 
   const liveFinding = findingReview(HEAD, {
@@ -11754,7 +12086,7 @@ test("snapshot closing reread catches late reviews, reactions, and provider edit
   }
 });
 
-test("official review summary comments are diagnostic-only regardless of status, table, or SHA", async (context) => {
+test("official review summary comments are diagnostic-only and threads are not inventoried", async (context) => {
   const summaries = [
     ["completed-current-head", officialReviewSummaryComment({ id: 290 })],
     ["unknown-status-missing-sha", officialReviewSummaryComment({
@@ -11797,8 +12129,9 @@ test("official review summary comments are diagnostic-only regardless of status,
     assert.equal(result.report.gateOutcome, "success", suffix);
     assert.equal(result.report.recoveryCode, "none", suffix);
     assert.equal(result.report.counts.indeterminate, 0, suffix);
-    assert.equal(result.report.reviewThreads.unresolved, 0, suffix);
-    assert.equal(result.report.reviewThreads.resolved, 1, suffix);
+    assert.equal(result.report.reviewThreads.status, "not_read", suffix);
+    assert.equal(result.report.reviewThreads.unresolved, "unknown", suffix);
+    assert.equal(result.report.reviewThreads.resolved, "unknown", suffix);
     assert.equal(
       github.calls.some(({ method, path }) =>
         method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summary.id}`
@@ -12305,9 +12638,9 @@ test("summary provenance cannot hide provider errors or override unresolved thre
     suffix: "official-summary-unresolved-thread-protection",
   });
   const { result: threadResult } = await runGate(threadEnvironment, threadGitHub);
-  assert.notEqual(threadResult.report.gateOutcome, "success");
-  assert.equal(threadResult.report.reviewThreads.unresolved, 1);
-  assert.equal(threadGitHub.statusWrites.some(({ state }) => state === "success"), false);
+  assert.equal(threadResult.report.gateOutcome, "success", threadResult.report.reason);
+  assert.equal(threadResult.report.reviewThreads.status, "not_read");
+  assert.equal(threadResult.report.reviewThreads.unresolved, "unknown");
 });
 
 test("a trusted summary ID cannot waive current REST provenance drift", async (context) => {
@@ -12419,12 +12752,6 @@ test("review carrier failures stay handled while REST issue-comment inventory is
       rejects: ({ method, path }) =>
         method === "GET" && path === `/repos/${REPOSITORY}/pulls/${PR}/reviews`,
     },
-    {
-      suffix: "review-threads",
-      rejects: ({ method, path, body }) =>
-        method === "POST" && path === "/graphql" &&
-        body?.query?.includes("CodexReviewGateReviewThreads"),
-    },
   ];
 
   for (const { suffix, rejects } of cases) {
@@ -12486,7 +12813,7 @@ test("fixed default and expanded profiles fail closed at aggregate snapshot caps
   assert.equal(expandedResult.report.recoveryCode, "raise_protected_limit");
 });
 
-test("default page budget completes snapshots with more than twenty aggregate pages", async (context) => {
+test("direct exact-head clean avoids irrelevant aggregate reaction pages", async (context) => {
   const historicalRequests = Array.from({ length: 5 }, (_, index) =>
     ordinaryRequest({
       id: 1_000 + index,
@@ -12518,8 +12845,7 @@ test("default page budget completes snapshots with more than twenty aggregate pa
 
   assert.equal(result.exitCode, 0, result.report.reason);
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
-  assert.equal(reactionPages.length, 100, "25 nested pages across four fresh carrier passes");
-  assert.ok(reactionPages.length > 20, `expected >20 physical reaction pages, got ${reactionPages.length}`);
+  assert.equal(reactionPages.length, 0, "direct clean does not acquire request reactions");
   for (const { body } of reactionPages) {
     assert.ok(
       Object.keys(body.variables).filter((key) => /^nodeId\d+$/u.test(key)).length <= 8,
@@ -12592,7 +12918,7 @@ test("request reaction reads batch nine exact comments into two measured GraphQL
   assert.ok(reactionCalls.length < requests.length * 2);
 });
 
-test("expanded page budget completes snapshots with more than one hundred aggregate pages", async (context) => {
+test("expanded limits do not add reaction reads to the direct clean basis", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
     reactionsByCommentId: new Map([["101", Array.from({ length: 30 }, (_, index) =>
@@ -12612,13 +12938,12 @@ test("expanded page budget completes snapshots with more than one hundred aggreg
 
   assert.equal(result.exitCode, 0, result.report.reason);
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
-  assert.equal(reactionPages.length, 120, "30 nested pages across four fresh carrier passes");
-  assert.ok(reactionPages.length > 100, `expected >100 physical reaction pages, got ${reactionPages.length}`);
+  assert.equal(reactionPages.length, 0, "direct clean does not acquire request reactions");
 });
 
 test("default page-budget exhaustion recommends expanded limits without writing success", async (context) => {
   const github = createGitHubMock({
-    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    issueComments: [workflowRequest(), cleanIssueComment(OLD_HEAD)],
     reactionsByCommentId: new Map([["101", Array.from({ length: 101 }, (_, index) =>
       reaction({ id: 8_000 + index, user: HUMAN }))]]),
     reactionGraphQlPageSize: 1,
@@ -12636,7 +12961,7 @@ test("default page-budget exhaustion recommends expanded limits without writing 
 
 test("expanded page-budget exhaustion reports the protected limit without writing success", async (context) => {
   const github = createGitHubMock({
-    issueComments: [workflowRequest(), cleanIssueComment(HEAD)],
+    issueComments: [workflowRequest(), cleanIssueComment(OLD_HEAD)],
     reactionsByCommentId: new Map([["101", Array.from({ length: 501 }, (_, index) =>
       reaction({ id: 9_000 + index, user: HUMAN }))]]),
     reactionGraphQlPageSize: 1,
@@ -13458,7 +13783,8 @@ test("auto request adopts an exact-head/base canonical marker from another run",
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.report.gateOutcome, "pending");
-  assert.match(result.report.reason, /review request 101 is adopted/iu);
+  assert.equal(result.report.recoveryCode, "reconcile");
+  assert.match(result.report.reason, /was adopted; no new request was posted.*Reconcile the exact current head/u);
   assert.deepEqual(github.requestBodies, []);
   assert.deepEqual(github.rerunRequests, []);
 });
@@ -13503,7 +13829,8 @@ test("auto request deduplication follows the latest base-epoch identity", async 
   });
   const { result: freshResult } = await runGate(freshEnvironment, freshGitHub);
   assert.equal(freshResult.report.gateOutcome, "pending");
-  assert.match(freshResult.report.reason, /review request 101 is adopted/iu);
+  assert.equal(freshResult.report.recoveryCode, "reconcile");
+  assert.match(freshResult.report.reason, /was adopted; no new request was posted/u);
   assert.deepEqual(freshGitHub.requestBodies, []);
 
   const ambiguousGitHub = createGitHubMock({
@@ -13583,9 +13910,9 @@ test("auto request adopts multiple cross-run markers without a third request", a
   assert.equal(result.exitCode, 0);
   assert.equal(result.report.executionHealth, "healthy");
   assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.recoveryCode, "reconcile");
   assert.equal(result.report.retrySafe, false);
-  assert.match(result.report.reason, /review request 101 is duplicates/iu);
+  assert.match(result.report.reason, /was adopted; no new request was posted/u);
   assert.deepEqual(github.requestBodies, []);
   assert.deepEqual(github.rerunRequests, []);
 });
@@ -14032,11 +14359,14 @@ test("unknown auto-request POST is adopted only on exact readback and never reru
 
     assert.equal(result.exitCode, expectedExit, suffix);
     assert.equal(result.report.gateOutcome, "pending", suffix);
-    assert.equal(result.report.recoveryCode, expectedExit === 0 ? "wait_provider" : "retry_begin");
+    assert.equal(result.report.recoveryCode, expectedExit === 0 ? "reconcile" : "retry_begin");
     assert.equal(result.report.retrySafe, false, suffix);
     assert.equal(github.requestBodies.length, 1, suffix);
     assert.deepEqual(github.rerunRequests, [], suffix);
     assert.deepEqual(github.stickyCreates, [], suffix);
+    if (expectedExit === 0) {
+      assert.match(result.report.reason, /was adopted; no new request was posted/u);
+    }
   }
 });
 
@@ -14059,9 +14389,9 @@ test("unknown auto POST can adopt another run's visible exact-scope marker witho
   assert.equal(result.exitCode, 0);
   assert.equal(result.report.executionHealth, "healthy");
   assert.equal(result.report.gateOutcome, "pending");
-  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.equal(result.report.recoveryCode, "reconcile");
   assert.equal(result.report.retrySafe, false);
-  assert.match(result.report.reason, /review request 101 is adopted-after-unknown/iu);
+  assert.match(result.report.reason, /was adopted; no new request was posted/u);
   assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
   assert.deepEqual(github.rerunRequests, []);
 });
@@ -16084,7 +16414,7 @@ test("recovery diagnostics route request-clean and finding fixes by proven linea
   );
   assert.equal(findingGap.report.gateOutcome, "failure");
   assert.equal(findingGap.report.recoveryCode, "fix_findings");
-  assert.equal(findingGap.report.requiresReplacementPr, true);
+  assert.equal(findingGap.report.requiresReplacementPr, false);
 
   const diagnostics = (result, environment, context = {}) => [
     readFileSync(environment.GITHUB_STEP_SUMMARY, "utf8"),
@@ -16116,55 +16446,55 @@ test("recovery diagnostics route request-clean and finding fixes by proven linea
   assert.equal(pendingLineage.report.executionHealth, "healthy");
   assert.equal(pendingLineage.report.gateOutcome, "pending");
   assert.equal(pendingLineage.report.recoveryCode, "wait_provider");
-  assert.equal(pendingLineage.report.requiresReplacementPr, true);
+  assert.equal(pendingLineage.report.requiresReplacementPr, false);
   assert.equal(
     pendingLineageGitHub.statusWrites.some(({ state }) => state === "success"),
     false,
   );
-  for (const diagnostic of diagnostics(pendingLineage, pendingLineageEnvironment)) {
-    assert.match(diagnostic, /wait for the latest eligible (?:@|&#64;)codex review request.*finish if running/iu);
-    assert.match(diagnostic, /if it yields a trusted, unedited top-level Codex terminal clean uniquely bound to the exact current PR head, reconcile directly/iu);
-    assert.match(diagnostic, /otherwise resolve findings; only with no base epoch.*during this request lineage, all findings resolved/iu);
-    assert.match(diagnostic, /request history intact and unedited/iu);
-    assert.match(diagnostic, /post exactly one fresh eligible, unedited (?:@|&#64;)codex review request/iu);
-    assert.match(diagnostic, /wait for a trusted, unedited top-level Codex terminal clean uniquely bound to the exact current PR head, then reconcile/iu);
-    assert.match(diagnostic, /missing terminal clean alone does not require a replacement PR/iu);
-    assert.match(diagnostic, /a new request or wait does not clear findings or waive request-history validation/iu);
-    assert.match(diagnostic, /a base epoch or edited, deleted, or unclosable history confirmed on reconciliation may still require a replacement PR/iu);
-    assert.doesNotMatch(diagnostic, /Do not add another review boundary on the original PR/iu);
+  for (const diagnostic of diagnostics(pendingLineage, pendingLineageEnvironment, {
+    headCleanRecoveryAction: "current-head",
+  })) {
+    assert.match(
+      diagnostic,
+      /Wait for or obtain a trusted, unedited top-level Codex terminal clean bound uniquely to the exact current PR head/iu,
+    );
+    assert.match(diagnostic, /Older request or reaction lineage alone does not require another generation or a replacement PR/iu);
+    assert.doesNotMatch(diagnostic, /post exactly one fresh eligible, unedited/iu);
+    assert.doesNotMatch(diagnostic, /open a replacement PR/iu);
   }
 
   assert.equal(replacement.report.requiresReplacementPr, false);
   for (const diagnostic of diagnostics(replacement, replacementEnvironment, {
-    headCleanRecoveryAction: "request",
+    headCleanRecoveryAction: "current-head",
   })) {
-    assert.match(diagnostic, /Post one fresh eligible, unedited (?:@|&#64;)codex review/iu);
+    assert.match(diagnostic, /Wait for or obtain a trusted, unedited top-level Codex terminal clean/iu);
     assert.match(diagnostic, /clean.*exact current PR head/iu);
-    assert.doesNotMatch(diagnostic, /replacement PR/iu);
+    assert.doesNotMatch(diagnostic, /\b(?:open|create) (?:a )?replacement PR/iu);
   }
   for (const [result, environment] of [
     [generation, generationEnvironment],
   ]) {
     assert.equal(result.report.requiresReplacementPr, false);
-    for (const diagnostic of diagnostics(result, environment)) {
-      assert.match(diagnostic, /reported request lineage/iu);
-      assert.match(diagnostic, /latest current canonical request/iu);
-      assert.match(diagnostic, /qualifying direct \+1/iu);
-      assert.match(diagnostic, /structured lineage is safe to extend/iu);
-      assert.match(diagnostic, /create exactly one canonical generation/iu);
-      assert.doesNotMatch(diagnostic, /replacement PR/iu);
+    for (const diagnostic of diagnostics(result, environment, {
+      headCleanRecoveryAction: "current-head",
+    })) {
+      assert.match(diagnostic, /trusted, unedited top-level Codex terminal clean/iu);
+      assert.match(diagnostic, /strictly newer than that retarget/iu);
+      assert.doesNotMatch(diagnostic, /create exactly one canonical generation/iu);
+      assert.doesNotMatch(diagnostic, /\b(?:open|create) (?:a )?replacement PR/iu);
     }
   }
   for (const diagnostic of diagnostics(direct, directEnvironment)) {
     assert.match(diagnostic, /No recovery action is required/iu);
     assert.doesNotMatch(diagnostic, /create exactly one canonical generation/iu);
   }
-  for (const diagnostic of diagnostics(findingGap, findingGapEnvironment)) {
+  for (const diagnostic of diagnostics(findingGap, findingGapEnvironment, {
+    headCleanRecoveryAction: "current-head",
+  })) {
     assert.match(diagnostic, /fix the unresolved Codex findings/iu);
-    assert.match(diagnostic, /do not request another generation on the original PR/iu);
-    assert.match(diagnostic, /unclosable historical lineage/iu);
-    assert.match(diagnostic, /open a replacement PR with the fixes/iu);
-    assert.match(diagnostic, /exactly one canonical review generation/iu);
+    assert.match(diagnostic, /fix the unresolved Codex findings first/iu);
+    assert.match(diagnostic, /exact current PR head/iu);
+    assert.doesNotMatch(diagnostic, /\b(?:open|create) (?:a )?replacement PR/iu);
   }
 });
 
@@ -16187,8 +16517,9 @@ test("finding recovery distinguishes authorized ordinary and latest physical-onl
     authorizedEnvironment.GITHUB_STEP_SUMMARY,
     "utf8",
   );
-  assert.match(authorizedSummary, /request a new review generation/iu);
-  assert.doesNotMatch(authorizedSummary, /replacement PR/iu);
+  assert.match(authorizedSummary, /Fix the unresolved Codex findings first/iu);
+  assert.match(authorizedSummary, /exact current PR head/iu);
+  assert.doesNotMatch(authorizedSummary, /open a replacement PR/iu);
 
   const physicalOnly = ordinaryRequest({
     id: 102,
@@ -16219,13 +16550,15 @@ test("finding recovery distinguishes authorized ordinary and latest physical-onl
 
   assert.equal(physical.report.gateOutcome, "failure");
   assert.equal(physical.report.recoveryCode, "fix_findings");
-  assert.equal(physical.report.requiresReplacementPr, true);
+  assert.equal(physical.report.requiresReplacementPr, false);
   const physicalSummary = readFileSync(
     physicalEnvironment.GITHUB_STEP_SUMMARY,
     "utf8",
   );
   assert.match(physicalSummary, /fix the unresolved Codex findings/iu);
-  assert.match(physicalSummary, /replacement PR/iu);
+  assert.match(physicalSummary, /Fix the unresolved Codex findings first/iu);
+  assert.match(physicalSummary, /exact current PR head/iu);
+  assert.doesNotMatch(physicalSummary, /open a replacement PR/iu);
   assert.doesNotMatch(physicalSummary, /request a new review generation/iu);
 });
 

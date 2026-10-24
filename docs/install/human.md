@@ -108,11 +108,12 @@ Copy both canonical workflows unchanged. They own separate event and permission
 boundaries that an Action step cannot define:
 
 - the read-only verifier uses `pull_request` activity types `opened`,
-  `reopened`, `synchronize`, `ready_for_review`, native `stacked`, and
-  `edited` only when `changes.base.ref.from` proves an actual base-ref
-  retarget. Title/body-only edits are filtered before runner allocation; its native
-  `codex/github-review-gate` CheckRun on the exact PR feature-head SHA is
-  required;
+  `reopened`, `synchronize`, `ready_for_review`, native `stacked`, and all
+  `edited` events. Every subscribed event executes the fixed required job
+  `codex/github-review-gate` with the same canonical run title and CheckRun
+  name on the exact PR feature-head SHA. Title/body-only edits still run a
+  full current-evidence reconciliation; they do not by themselves invalidate
+  a valid same-head clean or require a fresh review;
 - controller bot-evidence wake-ups use only the `issue_comment` activity type
   `created`. Editing an existing comment does not allocate a runner; use the
   protected default-branch manual `reconcile` path when an edited carrier needs
@@ -138,13 +139,16 @@ boundaries that an Action step cannot define:
   default branch or a verified native-stack trunk on that branch, still on the source run's current head, and no matching canonical
   request. A verifier triggered by `opened`, `reopened`,
   `synchronize`, `ready_for_review`, or native `stacked` can reach this ordinary
-  failure path. A verified base-ref-retarget `edited` run has a separate
-  current-scope path: the controller rechecks the current head/base/test-merge
-  tuple and reuses only a canonical request after the latest base epoch with
-  that exact tuple, or creates one when eligible. Duplicate verifier events
-  within the same epoch reuse that request. This does not cancel a valid
-  required verifier or publish a skipped verifier as success. It does not
-  immediately rerun the verifier; a later qualifying Codex bot
+  failure path. A verified base-ref-retarget `edited` run also rechecks the
+  current head/base/test-merge tuple and reuses only a canonical request after
+  the latest base epoch with that exact tuple, or creates one when eligible.
+  Duplicate verifier events within the same epoch reuse that request. All
+  `edited` runs retain the same title and fixed required job; there is no
+  metadata-specific request filter or skipped-job success path. An existing
+  same-head clean can satisfy the re-run without a new review request, while a
+  genuinely missing clean may still reach the ordinary failure-only request
+  path. The controller does not immediately rerun the verifier; a later
+  qualifying Codex bot
   `issue_comment` or manual `reconcile` performs the next evaluation. A merge
   conflict that prevents the verifier from running has no automatic request;
   use manual recovery;
@@ -203,12 +207,13 @@ not attest to host integrity or isolation. Linux self-hosted runners are
 supported on this operator-trust basis; Windows and macOS runners remain
 unsupported.
 
-The verifier's read-only permissions include `actions: read`: it must fetch its
-own `pull_request` run's GitHub-server `created_at` through the Actions run
-API. Private repositories need this permission for that read. For existing
-consumers, update the canonical verifier workflow before releasing a floating
-`v2` Action that depends on it; an old installed workflow fails closed, and a
-Git commit date or approximate event time cannot replace the run timestamp.
+The verifier's read-only permissions include `actions: read`: it must validate
+its own `pull_request` run's native metadata through the Actions run API.
+Private repositories need this permission. The run read binds workflow
+identity and current head/ref/test-merge scope and supports legacy
+request-bound recovery; its `created_at` is not a positive-evidence cutoff for
+the primary exact-head clean. Update existing consumers before releasing a
+floating `v2` Action that depends on this read; missing authority fails closed.
 
 The auto-request opt-in adds no GitHub App, ruleset, or Action input/operation.
 Keep it disabled for ordinary consumers until it has been exercised first on
@@ -217,6 +222,33 @@ organisation Actions variable with selected-repository visibility limited to
 that canary, not a repository-level override. The public-repository
 policy against a writable `pull_request_target` auto-request path is why this
 uses the protected `workflow_run` entry.
+
+### Primary head-bound clean evidence
+
+The primary pass evidence is a trusted, unedited top-level terminal clean whose
+explicit reviewed-commit SHA resolves uniquely to the current full PR head.
+It does not need to match a controller-created request or postdate the current
+verifier run's `created_at`; each verifier freshly reacquires and validates
+GitHub evidence rather than inheriting an earlier run result or cache. The
+clean must still pass complete comment/review acquisition, exact refetches,
+stable snapshots, current head/base/test-merge checks, and existing finding
+rules. If the PR has a verified base-ref-retarget epoch, the clean's server
+timestamp must be strictly later than the latest actual retarget, including
+the final event in an A-to-B-to-A sequence. A title/body edit does not
+invalidate an eligible same-head clean or demand a new review by itself. If
+clean evidence is genuinely missing, the ordinary failure-only, first-attempt
+`CODEX_REVIEW_GATE_AUTO_REQUEST` path may still ensure a request. An exact-head
+clean alone never erases a finding; existing request-bound supersession rules
+remain required. The Action verdict covers Codex evidence only; inline
+conversation resolution remains enforced exclusively by the repository's
+required ruleset.
+
+### Legacy request-bound fallback
+
+The following request and reaction rules remain for compatibility paths,
+including legacy hashless receipts and request-bound `+1` lineage. They are
+not prerequisites for the primary exact-head top-level clean above, and they
+do not relax the separate rules for superseding non-inline findings.
 
 By default, an ordinary human-authored exact `@codex review` request is admitted
 as a candidate at any repository permission, not as an immediate
@@ -1650,6 +1682,11 @@ Before continuing, verify that the staged ruleset:
 - blocks non-fast-forward updates to the default branch; and
 - has no bypass actors.
 
+Conversation resolution is enforced by this server-side ruleset, not by a
+duplicate Action scan or a runtime ruleset-discovery query. A successful
+`codex/github-review-gate` result means Codex evidence passed; it does not
+prove that all review threads are resolved or that the PR is merge-ready.
+
 Every preview and apply compares the complete canonical dual-surface inventory
 with the same owner-approved digest. API/schema incompleteness and any drift in
 repository, default branch, ruleset policy, or classic producer binding are
@@ -1911,16 +1948,21 @@ binding input.
 
 There is deliberately no cron, `pull_request_target`, or writable review event.
 The current verifier starts on `opened`, `reopened`, `synchronize`,
-`ready_for_review`, native `stacked`, and only base-ref-retarget `edited`
-events; title/body-only edits are filtered before runner allocation.
+`ready_for_review`, native `stacked`, and all `edited` events. Each event runs
+the fixed `codex/github-review-gate` job with the same canonical run title;
+title/body-only edits are full current-evidence reconciliations, not skipped
+jobs or dynamically renamed checks.
 Controller and verifier have separate concurrency
 namespaces. Associated controller events remain PR-scoped; association-empty
 completion events use a per-run fallback group. With exact
 `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, an eligible
 failed canonical verifier can wake the protected controller through
 `workflow_run` to create the missing canonical request for the current PR
-scope. That auto-start is request-only: it does not immediately rerun the
-verifier. Only this auto path may recognize an existing canonical marker from
+scope when clean evidence is genuinely missing. That auto-start is request-only:
+it does not immediately rerun the verifier. A metadata edit or rerun does not
+invalidate an existing valid same-head clean or demand a new review by itself;
+the normal failure-only first-attempt selector still applies if evidence is
+missing. Only this auto path may recognize an existing canonical marker from
 another controller run when repository, PR, head, and base all match exactly;
 manual `begin-review` keeps its same-run binding. Wait for a qualifying Codex
 bot `issue_comment` or use manual `reconcile` for the next evaluation. Before a
@@ -1928,56 +1970,40 @@ deliberate same-head re-review, run `begin-review` so the new request is read
 back and a strictly newer verifier attempt becomes observable. A direct comment alone
 does not atomically invalidate an older success.
 
-There is one narrower pending-current-head case. Read the exact current
-`pull_request` verifier run's GitHub-server `created_at`; it is a conservative
-cutoff, not the exact PR `synchronize` time, and Git commit dates are not a
-fallback. An official, unedited, current-head top-level clean `C0` at or
-before that cutoff cannot itself pass. The cutoff is specific to this
-top-level issue-comment clean: absent `C0`, an earlier `APPROVED` pull-request
-review keeps its existing first-generation semantics, but cannot override a
-pre-run `C0`. With no base epoch, if one earlier authorised request `R0`
-(ordinary or canonical) had its first-generation gap
-closed by `C0` and there are no other relevant
-physical boundaries or unclosed gaps, recovery may use a **new independent**
-unedited ordinary `@codex review` issue comment `R1` whose creation and
-revision are strictly after the cutoff. Wait for a new official, unedited,
-current-head top-level issue-comment clean `C1` strictly after `R1`, with no
-later boundary; then require a fresh exact-head verifier evaluation through
-the qualifying bot-comment wake-up or protected manual `reconcile` on the
-same verifier run ID. A new PR event creates a new cutoff and does not
-guarantee reuse of `R1/C1`. Do not
-edit the old request, reuse `C0`, use an inline-parent receipt, or overlap an
-automatic/controller-owned request. If that producer already established a
-canonical generation, follow its ordinary request-bound `+1` path. Posting a
-comment does not prove Codex started, and timestamps plus SHA do not prove
-which request caused a clean. Findings, provider errors, liveness and stable
-snapshot checks still block success.
+The primary pass evidence is a trusted, unedited top-level terminal clean whose
+explicit reviewed-commit SHA resolves uniquely to the current full PR head.
+It is independent of controller/request attribution and the verifier run's
+native `created_at`. Every verifier run reacquires current GitHub evidence;
+it may use an existing clean comment but never inherits an earlier run result
+or cross-run cache. If GitHub's timeline contains a verified base-ref-retarget
+epoch, the clean's server timestamp must be strictly later than the latest
+actual retarget, including the final transition in an A-to-B-to-A sequence.
+The request-generation rules above remain available as legacy hashless and
+request/reaction fallbacks; a primary exact-head clean does not erase
+non-inline findings, which remain subject to their existing supersession
+rules. Inline conversation resolution remains the independent server-side
+ruleset condition.
 
-The canonical `edited` verifier path applies only to a real direct-base-ref
-change proved by `changes.base.ref.from`; it is not an `issue_comment.edited`
-trigger. When `CODEX_REVIEW_GATE_AUTO_REQUEST=true` and the existing request
-token configuration is available, the protected default-branch controller
-revalidates the current head/base/test-merge scope and reuses or creates the
-canonical request. The exact opt-in remains necessary; otherwise use the
-existing protected manual request path. A request from before the latest
-base-ref-change or base-force-push boundary cannot be reused, even if an
-A-to-B-to-A retarget returns to the same ref and SHA. Duplicate verifier
-events in the same epoch reuse an exact post-epoch request. A new canonical request
-followed by a trusted, unedited top-level current-head clean whose explicit
-short SHA resolves uniquely to that head and whose timestamp is later than the
-request can satisfy the narrow acceptance policy when no unresolved finding
-remains and all existing gates pass. This timestamp ordering is a temporal
-witness, not proof that the request caused the clean or that either artifact
-attests a particular base SHA. Findings and every existing provider, liveness,
-snapshot, and thread-resolution check remain in force.
+Every `edited` event uses the fixed verifier job, including title/body-only
+edits; it is not an `issue_comment.edited` trigger. With
+`CODEX_REVIEW_GATE_AUTO_REQUEST=true`, a first-attempt verifier failure may
+still reach the existing request path if current clean evidence is genuinely
+missing. A metadata edit alone does not invalidate a valid clean or require a
+new request. For an actual direct-base-ref retarget, the protected controller
+revalidates the current head/base/test-merge scope and may reuse or create a
+canonical request after the latest base epoch. A pre-epoch request cannot be
+reused, even if an A-to-B-to-A retarget returns to the same ref and SHA.
+Duplicate verifier events in the same epoch reuse an exact post-epoch request.
+This request path is opt-in and request-only; it does not immediately rerun the
+verifier. Findings, provider errors, liveness and stable-snapshot checks still
+block success.
 
-If the event cannot be verified or no matching verifier exists, retain the
-draft-to-ready `create_verifier_run` fallback: for a ready PR, convert it to
-draft and mark it ready again; for an already-draft PR, mark it ready. Older
-consumer templates that do not include the filtered `edited` activity also
-need this fallback. Rerunning an old verifier is not valid retarget recovery.
-This describes source support; consumers need the corresponding Action
-release and canonical workflow refresh before the filtered event is available.
+If the retarget event cannot be verified or no matching verifier exists,
+retain the draft-to-ready `create_verifier_run` fallback: for a ready PR,
+convert it to draft and mark it ready again; for an already-draft PR, mark it
+ready. Rerunning an old verifier is not valid retarget recovery. This describes
+source support; consumers need the corresponding Action release and canonical
+workflow refresh before receiving it.
 
 Use `begin-review` when request creation and the newer verifier attempt must be
 coordinated. For example:
