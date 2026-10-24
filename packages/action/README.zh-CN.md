@@ -42,8 +42,10 @@ verifier 都不是决策 authority。
   [disabled ruleset 模板](https://github.com/Joey-Tools/codex-review-gate/blob/master/templates/codex-gated-repo/rulesets/codex-review-gate.json)。
 
 Canonical verifier workflow 授予只读 `actions: read`，让 Action 能通过
-`GET /repos/{owner}/{repo}/actions/runs/{run_id}` 读取自身 `pull_request` run
-由 GitHub 服务器记录的 `created_at`。Private repository 必须具备此权限。
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}` 校验自身 `pull_request` run 的原生
+workflow identity、head/ref/test-merge scope 与 GitHub 服务器记录的 `created_at`。Private
+repository 必须具备此权限。该读取支持执行身份校验、诊断及 legacy request-bound fallback；
+`created_at` 不是 primary exact-head clean 的正向证据 cutoff。
 发布依赖该读取的 floating `v2` runtime 前，先更新所有已安装 consumer 中经逐字校验的
 verifier workflow；缺少权限的旧 workflow 会 fail closed，不能回退使用 Git commit date
 或未经校验的 event timestamp。
@@ -129,13 +131,20 @@ bridge-removal 与 source-only proof 合约仍保持严格。
 
 canonical verifier 只有一个入口：
 
-- activity types 为 `opened`、`reopened`、`synchronize`、`ready_for_review` 与 GitHub
-  原生 `stacked` 的 `pull_request`。
+- activity types 为 `opened`、`reopened`、`synchronize`、`ready_for_review`、GitHub
+  原生 `stacked`，以及 `edited` 的 `pull_request`。六种事件都会执行固定 required job
+  `codex/github-review-gate`，使用相同的 canonical run title，并完整重读当前 evidence；
+  不使用 skipped 或动态改名的 job。
+
+Title/body-only `edited` 会触发完整 reconcile，但不会仅因新 run 而使仍有效的 same-head clean
+失效，也不会单独要求新 review。Base-ref 真正 retarget 时，最新实际 retarget event 仍是
+clean timestamp 的严格下限。若 evidence 确实缺失，现有 failure-only、首次 attempt、opt-in
+`AUTO_REQUEST` 路径仍可按原规则创建或采用 request。
 
 加入原生 stack 时，`stacked` action 提供即时 wake-up。已发布的 `@v2` runtime 可以验证新 scope，
 但已安装 verifier workflow 也必须在 activity types 中包含 `stacked` 才会收到该 wake-up。
-现有只接收四种 action 的 workflow 仍可使用；从 canonical template 更新后即可获得 join-triggered
-即时验证。`stacked` 补充而不替代 `synchronize`。
+此前未接收 `stacked` 或 `edited` 的旧 workflow 仍可运行，但不会收到这些 wake-up；从 canonical
+template 更新到六种 activity 后才能获得完整事件覆盖。`stacked` 补充而不替代 `synchronize`。
 
 受保护 default branch 上的 controller 只有以下入口：
 
@@ -204,14 +213,13 @@ feature-base 链、fork 和 trunk 不同的 stack 均不支持。PR direct base 
 ref/SHA 是不同 binding，均需结合当前 stack membership 检查。每个 PR 有独立 gate，不继承下层
 PR 的 review 结果，也不执行 stack merge。受保护 controller 仍从 default branch 执行。
 
-Canonical `pull_request.edited` 只在 `changes.base.ref.from` 证明 base-ref 确实改变时生成 verifier；
-title/body-only edit 会在分配 runner 前过滤。确认 retarget 后，verifier 与受保护 controller 会按当前
-head/base/test-merge tuple 重新校验；仅在 `CODEX_REVIEW_GATE_AUTO_REQUEST=true` 且既有 request-token
-配置可用时，自动路径才复用或创建 canonical request。较早的 request 不能跨最新 base-ref-change 或
-base-force-push boundary 去重，包括 A→B→A 恢复到相同 ref/SHA 的情况。新 request 之后创建、trusted、未编辑、
-current-head top-level clean 的 short SHA 若能唯一匹配 head，可作为窄范围 temporal witness；这不证明
-request 与 clean 的因果关系，也不是 base-SHA attestation。若 event 或匹配 verifier evidence 不可用，
-仍需 draft-to-ready fallback；未更新的旧 consumer workflow 不会收到 filtered `edited` verifier event。
+所有 canonical `pull_request.edited`（包括 base-ref retarget 与 title/body-only edit）都会执行 verifier。
+验证到真实 retarget 后，最新实际 retarget event 仍形成严格 clean timestamp floor，包括 A→B→A；
+早期 request 不能跨该 epoch 去重，即使最终回到相同 ref/SHA。Title/body-only edit 会完整重读当前
+evidence，但不使已有 same-head clean 失效，也不单独触发新 review。若当前 clean 确实缺失，原有
+failure-only、首次 attempt、opt-in `AUTO_REQUEST` 选择仍可发起或采用 request；该行为不是因 metadata
+edit 本身而触发。固定 required job 与 canonical run title 对所有六种事件不变。未更新的旧 consumer
+workflow 不会收到 `edited` verifier event。
 `issue_comment.edited` 仍不会唤醒 controller。Base-tip 前进与 trunk/membership drift 按各自绑定的当前
 scope 评估；不要假设每次 base advance 都会使 head-bound clean review evidence 失效。GitHub 原生 `stacked` webhook
 action 不同于 top-level pull-request event type，不能视为 `synchronize` 的替代，除非已安装
@@ -285,10 +293,9 @@ current test-merge 的唯一 canonical verifier。
 controller 不提供 verdict，也不改写 CheckRun；只有只读 verifier 收集证据，其 native job
 conclusion 承载 required result。
 
-reducer 读取符合条件的 Codex top-level issue comments 和 PR review bodies。
-另外，每个完整 evidence snapshot 都通过 GitHub GraphQL 读取 PR 的全部 review
-threads，并要求所有 thread 均已 resolved。ruleset 仍须独立要求 “all conversations
-resolved”，作为 server-side merge guard。
+reducer 读取符合条件的 Codex top-level issue comments 和 PR review bodies，不查询 inline review
+threads，也不判断 conversation resolution。Ruleset 必须独立启用 “all conversations resolved”
+server-side merge guard；该条件涵盖所有 inline conversations。
 
 ## Evidence 语义
 
@@ -354,7 +361,22 @@ raw inventory 总数精确一致；它仅作为 opening 计数依据，后续仍
 和 metadata 检查。列表内的每一条非摘要评论仍参与决策。无法解释的计数不匹配、后续
 非摘要变化和 scope 变化仍 fail-closed 或要求重新 snapshot。普通计数匹配路径不增加请求。
 
-### Review generation 与恢复
+### Primary exact-head clean
+
+Primary pass evidence 是一条可信、未编辑的 official top-level terminal clean，其显式 reviewed-commit
+SHA 唯一解析为当前 PR 的 full head。它不依赖 request/controller attribution，也不要求 clean 晚于
+verifier run 的 `created_at`。若 PR timeline 中存在真实 base-ref-retarget epoch，clean 的服务器时间戳
+必须严格晚于最新实际 retarget，包括 A→B→A。完整 comments/reviews acquisition、精确 refetch、两份稳定
+snapshot、当前 test-merge binding 与 finding 规则仍全部适用。每个 verifier run 都重新读取 GitHub 当前
+evidence；不会继承跨 run cache、artifact 或旧 run result。Rerun、ready event 或 title/body metadata
+reconcile 可复用仍有效的 clean，不会仅因此要求新 review。Finding 仍按既有 supersession 规则阻塞，
+primary clean 不会静默清除 finding。缺少 clean 时，应取得可信 current-head top-level clean（若发生真实
+retarget，则必须在其后），而不是仅为填补旧 request-attribution gap 重发 request。
+
+### Legacy request-bound lineage 与恢复
+
+以下 request、reaction、hashless 与 `+1` 规则是兼容 fallback，不是 primary exact-head clean 的前置条件；
+仅在 fallback 被使用时适用。
 
 review generation 始于一条 exact、未编辑的 `@codex review` request。visible first
 line 必须 exact，且不得有其他 visible text。默认 `any` policy 会把 ordinary request
@@ -417,9 +439,10 @@ official 顶层 `issue-comment` provider artifact、finding 或其他 successor 
 要求列出的每项 terminal property；历史 terminal clean/finding 不能仅凭 full-head binding 被保留。
 agent 不得故意创建这类请求对；它只恢复 GitHub immutable snapshot 中已经存在的历史证据。
 
-另有 *current-head clean recovery*（用新请求及其后的 current-head clean 恢复已有 verifier），
-适用于有无 base epoch 的既有 verifier，不需要证明旧请求逐个完成。cutoff `T` 是原始 `pull_request`
-verifier run 的 GitHub-server `created_at`；若存在 base epoch，则取较晚者：`T = max(original verifier created_at, latest base epoch)`。
+Legacy *current-head clean recovery*（request-bound fallback，用新请求及其后的 current-head clean 恢复已有 verifier）
+仅在使用该兼容路径时适用，不是 primary clean 的条件。它不需要证明旧请求逐个完成；cutoff `T` 是原始
+`pull_request` verifier run 的 GitHub-server `created_at`；若存在 base epoch，则取较晚者：
+`T = max(original verifier created_at, latest base epoch)`。
 同一 run 的 retries 固定使用原始 `created_at`，最新 base epoch 则按当前完整 timeline 更新。
 恢复见证由一条新鲜且符合条件、exact、未编辑的 request `R`：
 可为 authorized `User` 发出的 ordinary `@codex review`（包括带 PAT marker 的普通 request），或一条
@@ -452,12 +475,11 @@ drift 或 ambiguous evidence。仍须完成 inventory、exact refetch 和两轮�
 旧请求上未结清的 official `eyes` 不能压过更新的 current-head attestation，旧 request reaction
 变化本身也不能破坏这条恢复路径的稳定性。所选 clean 之后的新相关 activity 或更新的 physical
 request boundary 仍阻止 success。
-成功还要求两轮稳定 snapshot 中的所有 review thread 都已 resolved；GitHub 明确标为 resolved
-的旧 head 或人工 thread 也可接受。provider comment 或手动 `reconcile` 之后仍须 rerun
-exact-head verifier；现有符合条件的 provider event 通常会自动请求该 rerun。
-已有 verifier 的恢复操作就是发一条新 `@codex review`，等待随后出现的 exact-head clean，
-并解决仍未解决的 findings/threads，不要求额外 empty commit。仅发请求不等于 success，也不保证
-Codex 启动。新 verifier run ID 不继承这个 cutoff。
+Inline conversation resolution 不属于 Action 的 evidence reducer，也不会由两轮 snapshot 查询；
+GitHub ruleset 的 Require conversation resolution 条件独立强制执行。Primary exact-head clean 不要求
+request-bound recovery，但本段描述的 legacy fallback 仍须遵循其 `T < R < C` cutoff、history、finding
+与 scope 校验。若确实需要 provider review，request 之后仍须等合格 clean；仅发请求不等于 success，也不
+保证 Codex 启动。新 verifier run ID 不继承 legacy fallback witness。
 
 每个 snapshot 还读取 GitHub PR timeline 中最新的 `BaseRefChangedEvent` 或
 `BaseRefForcePushedEvent`。positive request/clean authority 必须严格晚于该 base
@@ -619,11 +641,10 @@ unsupported_target
 create_verifier_run
 ```
 
-符合条件的 finding 通常得到 `healthy/failure`，而不是 execution error。若 Codex
-证据本来已满足 success 条件，完整的 review-thread 清单中仍有未解决项会阻止
-success，返回 `healthy/pending` 和 `wait_then_reconcile`。若 Codex 证据本身仍需
-request、wait 或修复 finding，则保留该 Codex recovery 为主要动作，并把解决 thread
-及针对 exact head 的 reconcile 作为后续要求；仅解决 thread 不能证明 Codex 证据合格。
+符合条件的 finding 通常得到 `healthy/failure`，而不是 execution error。Action 不扫描 review-thread
+清单，也不会据此返回 `healthy/pending`；所有 conversations 是否已解决由 GitHub ruleset 独立强制。
+若 Codex 证据本身仍需 request、wait 或修复 finding，应按 Codex recovery 指引处理；仅解决 thread
+不能证明 Codex 证据合格。
 `unhealthy/success` 非法。
 在 verifier workflow 中，只有被证明稳定的 `healthy/success` 可以成功结束；findings、
 pending evidence、unsupported scope、cancel、timeout 与全部 unhealthy 结果都保持
@@ -637,13 +658,13 @@ direct status projection 与 `status_projection` 已删除。finding counts 仍�
 
 `healthy/pending` 不能安全授权 success，即使 evaluator 已可信地完成执行；它不是
 弱化的 success。每一种结果（包括 pending 与 not-applicable）都必须按自己的
-`recovery_code` 与具体 next action 前进。`wait_provider` 表示尚无合格的 terminal result，
-不等于必须更换 PR。审查仍在运行时先等待；若审查已结束、其 findings 已解决，且请求历史完整、
-未经编辑，可按上文的 current-head clean recovery，在原 PR 发一条新的合格
-`@codex review`，取得随后出现的可信、未经编辑且显式绑定 exact current head 的 clean，再 reconcile。
-现有 provider 事件通常会自动请求这次 reconcile。单纯缺少 clean 不能证明历史不可闭合；
-编辑、删除或其他确实不可闭合的证据仍须按指引修复或走 replacement 路径。
-这些提示不会改变 pending 判定，也不会豁免 finding 或历史证据检查。
+`recovery_code` 与具体 next action 前进。`wait_provider` 本身不表示必须更换 PR；仅当本次 run 新创建
+request 且尚无合格 terminal result 时使用；controller 采用已有 request 时改报 `reconcile`，不暗示 provider
+仍在运行或已完成。应重读 exact-head verifier，让它消费已发布的合格 clean；若仍缺 primary clean，
+取得可信 current-head top-level clean（真实 retarget 后须晚于最新 retarget）再 reconcile。只有确实需要
+新 review 且触发现有 failure-only、首次 attempt、opt-in 选择时才创建 request。单纯缺少 clean 不能证明
+历史不可闭合；编辑、删除或其他确实不可闭合的证据仍须按指引修复或走 replacement 路径。这些提示不会
+改变 pending 判定，也不会豁免 finding 或历史证据检查。
 
 无需额外 evidence query 即可推导时，sticky diagnostic 和 Actions summary 会报告：
 
@@ -652,37 +673,19 @@ direct status projection 与 `status_projection` 已删除。finding counts 仍�
 - `findings_historical`；
 - `findings_indeterminate`。
 
-Review-thread diagnostics 独立于 findings。`report.reviewThreads.status` 为 `not_read`、`complete` 或
-`incomplete`；只有 `complete` 时 resolved/unresolved/total 才是可信数字，否则均为 `unknown`，不能
-当作已验证的 zero。完整读取确认存在未解决 thread 时，指引优先要求在 GitHub 解决 open conversations，
-并对同一 exact head 运行受保护的手动 `reconcile`，同时保留其他必要的 finding、permission、budget、
-replacement-PR 或 begin-delivery 操作。如果已有合格的 exact-head clean 且 head 未变，单纯解决 threads
-不需要重新请求 provider review；缺少合格 clean 时，仍须执行报告给出的 review 恢复操作。
+Review-thread diagnostics 保持兼容字段；当前 verifier 与 CLI 的 `review_threads.status` 均为
+`not_read`，且 `resolved`、`unresolved` 与 `total` 均为 `unknown`。
+这表示 Action 未检查 thread state，绝不是已验证的 zero。Action 不读取、不计数、不总结，也不因任何
+inline thread 阻塞或输出修复步骤；Finding counts 只覆盖 normalized non-inline findings。
 
-API 读取、pagination 不完整、cap hit 或不稳定 thread state 会使受影响 counts 为 `unknown`，
-绝不能写成 `0`。Finding counts 只覆盖 normalized non-inline findings；thread counts 来自
-GraphQL review-thread state。CLI diagnostic JSON 也会通过独立的 `review_threads` 字段暴露这些计数；
-它不是 Action output。两者都不能替代 branch-protection 对 conversation resolution 的独立要求。
-
-当完整 inventory 中有 unresolved thread 时，Actions Summary 会使用单独的
-`Unresolved review threads` 区块，列出可信的 unresolved/total counts，并最多展示已收集的前五条
-path、first-comment link 和 outdated 标记；显示数与省略数会明确说明这一上限。这些有数量限制的
-诊断提示不是完整 thread inventory。对于 healthy 的 `failure` 或 `pending` 结果，显示的 Reason 会优先
-列出 unresolved thread 数量，以及已知的 unresolved non-inline finding 数量；`Evaluator reason` 会保留
-evaluator 原始说明。Unknown/incomplete inventory 和 diagnostic-only observation 不会把 thread 提示显示为
-当前且已验证的 blocker。这只是展示层变化，使用已有 evidence，不会额外读取 GitHub API。
+所有 inline conversations——包括旧 head、outdated 与人工撰写的评论——由 GitHub ruleset 的
+Require conversation resolution 条件统一强制执行。操作人员应在 GitHub 原生 review UI/API 查看并解决
+对话。该 ruleset 条件与 Action required status 相互独立：`healthy/success` 只代表 Codex evidence pass，
+不代表 PR 已 merge-ready。若 Action 成功而 GitHub 仍阻止 merge，应检查并满足该原生 ruleset 条件。
 
 对于 blocking verifier result，Actions Summary 最后一行是专用的
-`Steps to unblock: ...`；CLI JSON diagnostic 行之后也会输出同一条最终指引。更详细的 bounded
-evidence 留在前面的 summary 内容和 logs 中；最终这行是最重要、最可操作的用户输出，不是新的
-result 或 authority signal。完整 thread inventory 中只要有 unresolved thread，指引就优先处理
-thread：在不改变 head 的情况下解决 PR `#X` 的全部 `N` 条 unresolved review thread，然后针对
-exact current head dispatch `reconcile`。如果修复 finding 会改变 head，应先为新 head 请求一次
-review，再运行 `reconcile`。其他当前 evidence blocker 和 recovery action 仍然有效；解决 threads
-不保证 pass。Thread inventory 不完整时，counts 保持 `unknown`，指引保留已有的 primary recovery action，
-并要求先处理其中指出的权限、limit 或读取问题，再针对 exact current head rerun safe verifier action
-（例如受保护的 `reconcile`）。只有两轮完整稳定 snapshots 后 counts 才可信。Job 不会自动执行这些
-修复或 reconcile 操作。
+`Steps to unblock: ...`；CLI JSON diagnostic 行之后也会输出同一条最终指引。它只报告 Codex evidence
+及其恢复动作，不包含 inline-thread counts 或 thread 修复步骤；Job 不会自动执行修复或 reconcile。
 
 Summary 会链接到当前 Actions run，并提供跳转到 `Steps to unblock` 的目录链接。Canonical native
 `codex/github-review-gate` verifier 已经以非零状态退出时，还会输出一条固定的 GitHub Actions error

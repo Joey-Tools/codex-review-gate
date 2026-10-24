@@ -58,7 +58,11 @@ canonical 只读 PR workflow `Codex Review Gate Verifier` 的首次 attempt
 （`run_attempt=1`）以 failure 完成后，controller 只有在 PR 仍为 open、ready、
 同仓库、指向 default branch，且 current feature head 没有匹配的 canonical request 时，
 才可能为该 head 创建一条 canonical request。它可能发生在 `opened`、`reopened`、
-`synchronize` 或 `ready_for_review` 之后，不仅仅是 push。自动路径只发送 request：
+`synchronize`、`ready_for_review`、GitHub 原生 `stacked` 或 `edited` 之后，不仅仅是 push。
+Verifier 订阅全部六种事件，使用相同固定 required job `codex/github-review-gate` 与 canonical run
+title，每次都完整重读当前 evidence；不会使用 skipped 或动态改名的 job。Title/body-only edit
+不会使仍有效的 same-head clean 失效，也不会仅因 metadata edit 而要求新 review。若合格 evidence 确实
+缺失，原有 failure-only、首次 attempt、opt-in 自动路径仍可按规则请求 review。自动路径只发送 request：
 不会立刻重跑 verifier，也不会使失败的 check 变绿。随后合格的 Codex Bot
 `issue_comment` 会唤醒 controller；否则应针对 exact current head 发起受保护的手动
 `reconcile`。若 merge conflict 导致 verifier 根本没有运行，就不会有自动 request；
@@ -78,10 +82,23 @@ revalidation，而不是完整 per-PR serialization。应先发布兼容 runtime
 run 与 canonical marker，避免尚在进行的自动 request 与 direct 或手动 controller request
 重叠。自动路径不能替代 success 之后有意进行的 same-head re-review。
 
-### 普通低成本 review
+### Primary exact-head clean
 
-只有在 PR 没有 base epoch，且这是第一个物理 generation 时，才使用下面的普通 agent
-path。发送前必须确认 current lineage 中没有任何更早、且未显式绑定其他 full head 的
+Primary pass evidence 是一条可信、未编辑的 official top-level terminal clean，其显式 reviewed-commit
+SHA 唯一解析为当前 PR 的 full head。它不依赖 request/controller attribution，也不要求 clean 晚于
+verifier run 的 `created_at`。若 PR timeline 中存在真实 base-ref-retarget epoch，clean 的服务器时间戳
+必须严格晚于最新实际 retarget，包括 A→B→A。完整 comments/reviews acquisition、exact refetch、两份
+stable snapshots、current test-merge binding 与现有 finding 规则仍全部适用。每个 run 都重新从 GitHub
+重建 decision；不会继承跨-run cache、artifact 或之前 run result。Rerun、ready event 或 title/body
+metadata reconcile 可复用仍有效的 same-head clean。Finding 仍按既有 supersession 规则阻塞；clean 不会
+静默清除 finding。若 clean 缺失，应取得可信 current-head clean（若有真实 retarget，须晚于最新
+retarget），而不是仅为弥补旧 attribution gap 重发 request。
+
+### 普通低成本 review 与 legacy request-bound fallback
+
+只有在确实需要新 request 时，才使用下面的普通 request path；它只适用于 PR 没有 base epoch
+且这是第一个物理 generation。上文 primary exact-head clean 不依赖这些 legacy lineage 条件。
+发送前必须确认 current lineage 中没有任何更早、且未显式绑定其他 full head 的
 provider-confirmed 或其他 physical boundary。既没有 direct receipt、也没有 terminal-clean
 contender 的 default-`any` ordinary candidate 本身不会形成 lineage gap；尝试使用但未满足
 狭窄规则的 terminal-clean receipt 会保留为 fail-closed physical-only boundary：
@@ -120,14 +137,16 @@ fail-closed pending。canonical workflow 固定 `CODEX_REVIEW_GATE_REQUEST_AUTHO
 workflow 添加 strict policy。`write`/`maintain`/`admin` 仅保留给将来可以读取 collaborator
 permission 的 nonstandard verifier identity。
 
-已有 verifier 可使用 current-head clean recovery，不论是否观察到 base epoch：发一条新鲜、exact、未编辑的
+下述 fresh-clean witness 是 legacy request-bound fallback，不是 primary exact-head clean 的前置条件。
+已有 verifier 在使用该 fallback 时可用 current-head clean recovery，不论是否观察到 base epoch：发一条新鲜、exact、未编辑的
 authorized `User` `@codex review`（可包括带 PAT marker 的普通 request），等待随后出现的未编辑 official
 顶层 clean `C`，其显式 full 或无歧义 short SHA 必须解析为 current PR head。无 base epoch 时，`T` 是原始
 verifier run 的 `created_at`；有 base epoch 时，`T` 取原始 verifier `created_at` 与最新 base epoch
 时间中较晚者，即 `T = max(original verifier created_at, latest base epoch)`。request `R` 与 clean `C`
 必须满足 `T < R < C`；不能有更新的 physical request boundary 或后续相关 provider activity。
 旧请求的归因缺口、未结清的旧 `eyes` 不再否决这个见证，也不能间接破坏稳定 snapshot 比较。
-真实 findings、未解决 review threads、provider errors 和 acquisition/history guards 仍独立生效。
+真实 findings、provider errors 和 acquisition/history guards 仍独立生效。Inline conversation resolution
+只由已安装的 GitHub ruleset 强制，Action 不扫描 review threads。
 现有 provider event 通常会请求 verifier rerun；事件未送达时执行一次 scoped `reconcile`。
 不要求 empty commit；发请求不保证 Codex 启动。此例外仅恢复既有 verifier 的 current-head clean，
 不闭合任意 predecessor gap，也不能清除 finding。普通 post-epoch lineage 仍走现有
@@ -260,7 +279,7 @@ ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor �
 | `healthy/success` | 已证明稳定、完整的 current-head clean evidence。 | 执行 final verifier/head/ruleset 重读；全部仍匹配才 merge。 |
 | `healthy/failure` | 已证明符合条件的 findings。 | 按 summary reason 与 finding links 操作。只有 lineage 仍可恢复时，才在原 PR 修复并 reconcile；不可闭合的 historical lineage 必须把修复放到 replacement PR，并在其中只运行一个 canonical generation。 |
 | `unhealthy/failure` | 已证明 findings，但 execution 或 final result handling 同时失败。 | 保持 findings 阻塞，修复指定 execution boundary，再 reconcile。 |
-| `healthy/pending` | evaluation 安全完成，但 current state 尚不能授权 success。 | 按 `recovery_code` 操作；`wait_provider` 表示尚无合格的 terminal result。review 仍在运行时等待，或对已有的合格 exact-head clean 直接 reconcile。 |
+| `healthy/pending` | evaluation 安全完成，但 current state 尚不能授权 success。 | 按 `recovery_code` 操作；本次自动 begin-review 新创建 request 且尚无 terminal result 时才用 `wait_provider`。自动路径采用了已有 request 时应报 `reconcile`，刷新 exact-head verifier 并消费已发布的 clean 或揭示缺失/terminal evidence。 |
 | `unhealthy/pending` | API、pagination、cap 或 stability execution 不完整。 | 按 recovery code 操作；绝不能把它解释为没有 findings。 |
 | `healthy/not_applicable` | delayed automatic event 已不再适用。 | 通常无需操作；仍需 gate decision 时 reconcile current head。 |
 | `unhealthy/not_applicable` | manual target 无效或不受支持。 | 修正 target 或使用 supported scope；不要 bypass ruleset。 |
@@ -298,7 +317,7 @@ current-head recovery。下表中的历史 lineage/replacement 指示仅在该�
 | Code | 安全 next action |
 | --- | --- |
 | `none` | evaluator 无需恢复；执行 exact-head merge closure。 |
-| `wait_provider` | 尚无合格的 terminal result；仅此并不表示必须更换 PR。review 仍在运行时等待；若可信的 exact-head clean 已存在，直接 reconcile。若 review 已结束但没有合格的 current-head clean，先解决所有 findings。只有 request history 完整、未编辑且没有 base epoch 时，才可在原 PR 发出一条新的合格 `@codex review`；等待随后出现的可信、未经编辑的 exact-head clean，再 reconcile。单纯缺少 clean 不能证明 history 无法闭合。新请求或等待不会清除 findings，也不会豁免 history 校验；已编辑、已删除或其他确实无法闭合的 history，仍可能要求按指引修复或使用 replacement PR。这些提示不会改变 pending 判定；不要 spam requests。 |
+| `wait_provider` | 仅表示本次运行新建 request 后仍无合格 terminal result；这本身不表示必须更换 PR。review 仍在运行时等待，之后取得可信 current-head clean 并 reconcile。若自动 controller 采用的是已有 request，则使用 `reconcile`；不要推断 provider 仍在运行或已经完成。若缺少 primary clean，取得可信 exact-head clean（真实 retarget 后须严格晚于最新 retarget），而不是仅为旧归因缺口发 request。新请求或等待不会清除 findings，也不会豁免 history 校验；已编辑、已删除或其他确实无法闭合的 history，仍可能要求按指引修复或使用 replacement PR。这些提示不会改变 pending 判定；不要 spam requests。 |
 | `reconcile` | 重读 exact current head 并运行一次 scoped reconcile。 |
 | `fix_findings` | 按 summary reason 操作。通常先修复报告的 current findings，另行解决 inline conversations，再取得合格 clean evidence 后 reconcile。若 finding 只是 policy-only inline finding，已解决的 conversation 只满足 ruleset 条件；同一 exact head 上已有的 qualified inline-parent receipt 可独立确认 clean，否则仍按 `request_clean_generation` 分流。若 reason 同时指出不可闭合的 historical lineage，应把修复放到 replacement PR，并在其中只运行一个 canonical generation，不得在原 PR 重发。 |
 | `request_clean_generation` | 按 summary reason 与 lineage 分流。可恢复的 latest/current canonical request 留在原 PR：在 summary 指定的 request 上取得 direct `+1`；或者仅限唯一、没有 base epoch、single-flight、未编辑的 default-`any` ordinary candidate，等待其匹配的未编辑 official current-head 顶层 issue-comment terminal clean，或符合 fixed closed grammar 的 official exact-head `COMMENTED` inline-parent review。generic pull-request review clean 不能确认该 candidate。上文 recovery-only duplicate cohort 不是 request path：不得主动创建；若 immutable snapshot 已满足它，应 reconcile；若有 canonical successor，后者仍需自身 direct `+1`。finding 仍独立阻塞，绝不确认它。只有 reason 明确表示仍需新 generation 时，才创建恰好一个更新的 canonical generation。historical gap 只有在每个歧义 predecessor 都显式绑定另一个 full head 时，才能用合法新 head reset。既没有 direct receipt、也没有 terminal-clean contender 的 default-`any` ordinary candidate 不属于这种 predecessor。若 provider-confirmed ordinary、edited、malformed、denied、deleted 或其他 unbound predecessor 使该 gap 不可闭合，不得在该 PR/head 重发；应新建 replacement PR，并在其中只运行一个 canonical generation。 |
@@ -437,7 +456,9 @@ PATCH 为当前 snapshot；若不存在就 POST；若有多条则跳过写入并
 其他 operations 在没有 sticky 时仍可新建，但不会更新已有 comment。当前 controller diagnostic
 格式的可见内容省略 unknown counts 和 thread detail；hidden
 payload 保留类型为 `unknown` 的值，并标明这是 snapshot、不是当前 gate result，还包含
-authoritative verifier CheckRun。v2.1.6 等旧格式（缺少 `reviewThreads`）仍可读取。
+authoritative verifier CheckRun。当前 verifier 的兼容字段为 `review_threads.status: not_read`，
+且 `resolved`、`unresolved`、`total` 均为 `unknown`；这不是 thread inventory，也不是已验证的 zero。
+v2.1.6 等旧格式（缺少 `reviewThreads`）仍可读取。
 
 只有 exact、未编辑、official canonical sticky 才能从 physical request lineage 中排除。
 edited、invalid、forged 或 wrong-provenance 的 marker-looking comment 都会 fail closed，

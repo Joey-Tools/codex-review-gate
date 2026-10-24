@@ -134,9 +134,9 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
   );
   assert.ok(
     templateVerifier.includes(
-      "run-name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-ignored-edit/{0}/{1}', github.event.pull_request.number, github.run_id) || format('codex-review-gate-verifier/{0}/{1}', github.event.pull_request.number, github.sha) }}",
+      "run-name: codex-review-gate-verifier/${{ github.event.pull_request.number }}/${{ github.sha }}",
     ),
-    "only base edits retain the canonical verifier display-title prefix",
+    "all subscribed lifecycle events retain the canonical verifier display-title prefix",
   );
   assert.match(
     templateVerifier,
@@ -149,16 +149,13 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
   assert.match(templateVerifier, /^  codex-review-gate:$/mu);
   assert.ok(
     templateVerifier.includes(
-      "  group: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}",
+      "  group: ${{ format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}",
     ),
-    "non-base edits use a run-unique concurrency group rather than canceling the PR verifier",
+    "all verifier events use the same per-PR concurrency group",
   );
-  assert.ok(
-    templateVerifier.includes(
-      "    name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && 'codex/ignored-review-gate-edit' || 'codex/github-review-gate' }}\n    if: ${{ github.event.action != 'edited' || github.event.changes.base.ref.from }}",
-    ),
-    "only base edits and ordinary lifecycle events can produce the required check name",
-  );
+  assert.match(templateVerifier, /^    name: codex\/github-review-gate$/mu);
+  assert.doesNotMatch(templateVerifier, /^    if:/mu);
+  assert.doesNotMatch(templateVerifier, /ignored-review-gate-edit/u);
 });
 
 test("canonical controller starts runners only for dispatches, Codex comments, or eligible verifier completions", () => {
@@ -225,6 +222,9 @@ test("canonical controller starts runners only for dispatches, Codex comments, o
   assert.match(templateController, /vars\.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'/u);
   assert.match(templateController, /github\.event\.workflow_run\.run_attempt == 1/u);
   assert.match(templateController, /github\.event\.workflow_run\.conclusion == 'failure'/u);
+  assert.doesNotMatch(templateController, /metadata-reconcile/u);
+  assert.match(templateController, /github\.event\.workflow_run\.conclusion == 'failure'.*&& 'begin-review'/u);
+  assert.match(templateController, /github\.event_name == 'workflow_run' && 'report-completion'/u);
 
   const jobIfCount = templateController.match(/^    if:/gmu)?.length ?? 0;
   assert.equal(jobIfCount, 1);
@@ -265,7 +265,7 @@ test("canonical verifier is read-only, latest-wins, and uses the direct Action",
     /^permissions:\n  actions: read\n  contents: read\n  issues: read\n  pull-requests: read$/mu,
   );
   assert.ok(templateVerifier.includes(
-    "  group: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}\n",
+    "  group: ${{ format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}\n",
   ));
   assert.match(templateVerifier, /^  cancel-in-progress: true$/mu);
   assert.ok(templateVerifier.includes(`    runs-on: ${RUNNER_LABELS_EXPRESSION}\n`));

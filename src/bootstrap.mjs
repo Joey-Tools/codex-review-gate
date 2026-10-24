@@ -15,20 +15,26 @@ export const DEFAULT_VERIFIER_RUN_NAME_PREFIX = "codex-review-gate-verifier";
 export const DEFAULT_VERIFIER_RUN_NAME =
   `${DEFAULT_VERIFIER_RUN_NAME_PREFIX}/\${{ github.event.pull_request.number }}/\${{ github.sha }}`;
 const CANONICAL_VERIFIER_RUN_NAME =
-  "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-ignored-edit/{0}/{1}', github.event.pull_request.number, github.run_id) || format('codex-review-gate-verifier/{0}/{1}', github.event.pull_request.number, github.sha) }}";
+  DEFAULT_VERIFIER_RUN_NAME;
 const CANONICAL_VERIFIER_CONCURRENCY_GROUP =
-  "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}";
+  "${{ format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}";
 const PREVIOUS_CANONICAL_VERIFIER_CONCURRENCY_GROUP =
   "codex-review-gate-verifier-${{ github.repository }}-${{ github.event.pull_request.number }}";
 const CANONICAL_VERIFIER_JOB_NAME =
+  DEFAULT_STATUS_CONTEXT;
+const PREVIOUS_EDIT_FILTERED_VERIFIER_RUN_NAME =
+  "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-ignored-edit/{0}/{1}', github.event.pull_request.number, github.run_id) || format('codex-review-gate-verifier/{0}/{1}', github.event.pull_request.number, github.sha) }}";
+const PREVIOUS_EDIT_FILTERED_VERIFIER_CONCURRENCY_GROUP =
+  "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}";
+const PREVIOUS_EDIT_FILTERED_VERIFIER_JOB_NAME =
   "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && 'codex/ignored-review-gate-edit' || 'codex/github-review-gate' }}";
-const CANONICAL_VERIFIER_JOB_IF =
+const PREVIOUS_EDIT_FILTERED_VERIFIER_JOB_IF =
   "${{ github.event.action != 'edited' || github.event.changes.base.ref.from }}";
 const CANONICAL_VERIFIER_PROFILE = Object.freeze({
   runName: CANONICAL_VERIFIER_RUN_NAME,
   concurrencyGroup: CANONICAL_VERIFIER_CONCURRENCY_GROUP,
   jobName: CANONICAL_VERIFIER_JOB_NAME,
-  jobIf: CANONICAL_VERIFIER_JOB_IF,
+  jobIf: null,
 });
 const FROZEN_HANDOFF_VERIFIER_PROFILE = Object.freeze({
   runName: DEFAULT_VERIFIER_RUN_NAME,
@@ -3909,7 +3915,7 @@ function validateV2VerifierWorkflowContent(value, {
     });
     if (jobIfLines.length !== 0) {
       throw new Error(
-        "Frozen handoff verifier workflow must not add a codex-review-gate job.if predicate.",
+        "Canonical verifier workflow must not add a codex-review-gate job.if predicate.",
       );
     }
   } else {
@@ -4668,7 +4674,43 @@ function installedVerifierMatchesCanonicalWithRunnerUpgrade(installed, canonical
 
 function normalizePreviousVerifierWorkflow(value) {
   if (typeof value !== "string") return value;
-  const previousLines = [
+  const previousEditFilteredLines = [
+    [
+      `run-name: ${PREVIOUS_EDIT_FILTERED_VERIFIER_RUN_NAME}`,
+      `run-name: ${CANONICAL_VERIFIER_RUN_NAME}`,
+    ],
+    [
+      `  group: ${PREVIOUS_EDIT_FILTERED_VERIFIER_CONCURRENCY_GROUP}`,
+      `  group: ${CANONICAL_VERIFIER_CONCURRENCY_GROUP}`,
+    ],
+    [
+      `    name: ${PREVIOUS_EDIT_FILTERED_VERIFIER_JOB_NAME}`,
+      `    name: ${CANONICAL_VERIFIER_JOB_NAME}`,
+    ],
+  ];
+  const exactPreviousJobIfLine = `    if: ${PREVIOUS_EDIT_FILTERED_VERIFIER_JOB_IF}`;
+  const currentLifecycle =
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited]";
+  const jobIfLines = value.split("\n").filter((line) => {
+    const mapping = matchSimpleYamlMappingLine(line);
+    return mapping?.indent === 4 && mapping.key === "if";
+  });
+  if (
+    jobIfLines.length === 1 &&
+    jobIfLines[0] === exactPreviousJobIfLine &&
+    value.split(currentLifecycle).length === 2 &&
+    previousEditFilteredLines.every(([previousLine]) =>
+      value.split(previousLine).length === 2
+    )
+  ) {
+    return previousEditFilteredLines.reduce(
+      (normalized, [previousLine, canonicalLine]) =>
+        normalized.replace(previousLine, canonicalLine),
+      value.replace(`${exactPreviousJobIfLine}\n`, ""),
+    );
+  }
+
+  const previousStaticLines = [
     [
       `run-name: ${DEFAULT_VERIFIER_RUN_NAME}`,
       `run-name: ${CANONICAL_VERIFIER_RUN_NAME}`,
@@ -4682,30 +4724,21 @@ function normalizePreviousVerifierWorkflow(value) {
       `    name: ${CANONICAL_VERIFIER_JOB_NAME}`,
     ],
   ];
-  const jobIfLines = value.split("\n").filter((line) => {
-    const mapping = matchSimpleYamlMappingLine(line);
-    return mapping?.indent === 4 && mapping.key === "if";
-  });
   const previousLifecycleLines = [
     "    types: [opened, reopened, synchronize, ready_for_review]",
     "    types: [opened, reopened, synchronize, ready_for_review, stacked]",
   ];
   if (
     jobIfLines.length !== 0 ||
-    previousLines.some(([previousLine]) => value.split(previousLine).length !== 2) ||
+    previousStaticLines.some(([previousLine]) => value.split(previousLine).length !== 2) ||
     !previousLifecycleLines.some((previousLine) => value.split(previousLine).length === 2)
   ) {
     return value;
   }
-  const previousJobName = `    name: ${DEFAULT_STATUS_CONTEXT}`;
-  if (value.split(previousJobName).length !== 2) return value;
-  return previousLines.reduce(
+  return previousStaticLines.reduce(
     (normalized, [previousLine, canonicalLine]) =>
       normalized.replace(previousLine, canonicalLine),
-    value.replace(
-      previousJobName,
-      `${previousLines[2][1]}\n    if: ${CANONICAL_VERIFIER_JOB_IF}`,
-    ),
+    value,
   );
 }
 

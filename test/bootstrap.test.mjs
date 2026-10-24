@@ -266,16 +266,12 @@ function previousCanonicalVerifierWorkflow(lifecycle) {
   const currentJobNameLine = CANONICAL_WORKFLOW.split("\n").find(
     (line) => line.startsWith("    name: "),
   );
-  const currentJobIfLine = CANONICAL_WORKFLOW.split("\n").find(
-    (line) => line.startsWith("    if: "),
-  );
   const currentLifecycleLine = CANONICAL_WORKFLOW.split("\n").find(
     (line) => line.startsWith("    types: [") && line.endsWith(", edited]"),
   );
   assert.equal(typeof currentRunNameLine, "string");
   assert.equal(typeof currentGroupLine, "string");
   assert.equal(typeof currentJobNameLine, "string");
-  assert.equal(typeof currentJobIfLine, "string");
   assert.equal(typeof currentLifecycleLine, "string");
   return CANONICAL_WORKFLOW
     .replace(currentRunNameLine, `run-name: ${DEFAULT_VERIFIER_RUN_NAME}`)
@@ -283,11 +279,40 @@ function previousCanonicalVerifierWorkflow(lifecycle) {
       currentGroupLine,
       "  group: codex-review-gate-verifier-${{ github.repository }}-${{ github.event.pull_request.number }}",
     )
-    .replace(
-      `${currentJobNameLine}\n${currentJobIfLine}`,
-      "    name: codex/github-review-gate",
-    )
+    .replace(currentJobNameLine, "    name: codex/github-review-gate")
     .replace(currentLifecycleLine, lifecycle);
+}
+function previousEditFilteredVerifierWorkflow() {
+  const currentRunNameLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("run-name: "),
+  );
+  const currentGroupLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("  group: "),
+  );
+  const currentJobNameLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("    name: "),
+  );
+  const currentLifecycleLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("    types: [") && line.endsWith(", edited]"),
+  );
+  assert.equal(typeof currentRunNameLine, "string");
+  assert.equal(typeof currentGroupLine, "string");
+  assert.equal(typeof currentJobNameLine, "string");
+  assert.equal(typeof currentLifecycleLine, "string");
+  return CANONICAL_WORKFLOW
+    .replace(
+      currentRunNameLine,
+      "run-name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-ignored-edit/{0}/{1}', github.event.pull_request.number, github.run_id) || format('codex-review-gate-verifier/{0}/{1}', github.event.pull_request.number, github.sha) }}",
+    )
+    .replace(
+      currentGroupLine,
+      "  group: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}",
+    )
+    .replace(
+      currentJobNameLine,
+      "    name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && 'codex/ignored-review-gate-edit' || 'codex/github-review-gate' }}\n    if: ${{ github.event.action != 'edited' || github.event.changes.base.ref.from }}",
+    )
+    .replace(currentLifecycleLine, "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited]");
 }
 function controllerWithoutReviewRequestToken(workflow) {
   const reviewRequestTokenLine =
@@ -2491,7 +2516,7 @@ test("fixed frozen handoff inventory accepts only the recorded immutable workflo
   );
   assert.throws(
     () => validateCanonicalV2WorkflowContent(FROZEN_HANDOFF_VERIFIER_WORKFLOW),
-    /exactly one top-level run-name/u,
+    /unexpected concurrency\.group/u,
     "the immutable handoff does not gain the current verifier envelope",
   );
   const frozenVerifierWithCurrentRunner = FROZEN_HANDOFF_VERIFIER_WORKFLOW
@@ -7219,7 +7244,7 @@ test("installed verifier narrowly upgrades the previous pull request lifecycle",
     [
       "changed job name",
       CANONICAL_WORKFLOW.replace(
-        "    name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && 'codex/ignored-review-gate-edit' || 'codex/github-review-gate' }}",
+        "    name: codex/github-review-gate",
         "    name: codex/other-check",
       ),
     ],
@@ -7297,6 +7322,59 @@ test("installed verifier admits only the exact four- and five-event pre-retarget
     CANONICAL_WORKFLOW.includes(currentLifecycle),
     true,
   );
+});
+
+test("installed verifier upgrades the exact prior ignored-edit profile without retaining a skipped required job", () => {
+  const cleanInventory = [
+    { path: DEFAULT_WORKFLOW_PATH, content: CANONICAL_WORKFLOW },
+    {
+      path: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+      content: CANONICAL_CONTROLLER_WORKFLOW,
+    },
+  ];
+  const previousVerifier = previousEditFilteredVerifierWorkflow();
+  assert.notEqual(previousVerifier, CANONICAL_WORKFLOW);
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      cleanInventory.map((file) =>
+        file.path === DEFAULT_WORKFLOW_PATH
+          ? { ...file, content: previousVerifier }
+          : file,
+      ),
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "the precise previous ignored-edit deployment remains an upgrade target",
+  );
+
+  const unsafeProfiles = [
+    previousVerifier.replace(
+      "    if: ${{ github.event.action != 'edited' || github.event.changes.base.ref.from }}",
+      "    if: true",
+    ),
+    previousVerifier.replace(
+      "format('codex-review-gate-ignored-edit/{0}/{1}', github.event.pull_request.number, github.run_id)",
+      "format('codex-review-gate-other-edit/{0}/{1}', github.event.pull_request.number, github.run_id)",
+    ),
+    previousVerifier.replace(
+      "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited]",
+      "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited, closed]",
+    ),
+  ];
+  for (const [index, unsafeVerifier] of unsafeProfiles.entries()) {
+    assert.throws(
+      () => validateCanonicalV2WorkflowInventory(
+        cleanInventory.map((file) =>
+          file.path === DEFAULT_WORKFLOW_PATH
+            ? { ...file, content: unsafeVerifier }
+            : file,
+        ),
+        CANONICAL_WORKFLOWS,
+      ),
+      /run-name|concurrency\.group|job name|job\.if|pull_request lifecycle types|missing required fragment/u,
+      `unsafe previous profile ${index} is not an upgrade alias`,
+    );
+  }
 });
 
 test("post-merge inventory rejects an extra default-branch v1 caller", () => {
@@ -15163,10 +15241,10 @@ syncBuiltinESMExports();
 `;
 }
 
-// Two focused installed-verifier compatibility cases raise the prior 170 count.
+// Three focused installed-verifier compatibility cases raise the prior 170 count.
 assert.equal(
   test.registeredCount,
-  172,
+  173,
   "bootstrap test shard registration inventory drift",
 );
 
