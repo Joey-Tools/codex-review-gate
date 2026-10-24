@@ -31,7 +31,7 @@ for the ruleset's server-side “all conversations resolved” requirement.
 ## Architecture and trust boundaries
 
 ```text
-pull_request opened/reopened/synchronize/ready_for_review
+pull_request opened/reopened/synchronize/ready_for_review/stacked
                                 |
                                 v
           copied read-only canonical verifier
@@ -129,13 +129,27 @@ the CheckRun. Exact bytes, complete workflow inventory, CODEOWNERS, Code Owner
 review, strict freshness, no bypass and canary collision readback provide the
 adopted compound boundary.
 
-The verifier admits only `pull_request` `opened`, `reopened`, `synchronize` and
-`ready_for_review`. It fails closed outside same-repository, open, ready,
-default-base scope. `edited` is deliberately absent: after a base retarget, a
+The verifier admits `pull_request` `opened`, `reopened`, `synchronize`,
+`ready_for_review`, and GitHub-native `stacked`. The `stacked` action provides
+immediate verification when a PR joins a native stack; it supplements and does
+not replace `synchronize`. The `@v2` runtime accepts the new action, but an
+installed four-action verifier workflow must be refreshed to include it for
+that immediate wake-up. It requires same-repository, open, ready PRs whose direct
+base is the current default branch, with one exception: authenticated GitHub
+native stacked-PR metadata must bind the stack trunk to that same default
+branch. It rejects arbitrary manual feature-base chains, forks, and stacks
+with another trunk. The direct PR base ref/SHA and stack trunk ref/SHA are
+distinct exact bindings, and current stack membership is revalidated. Each PR
+has its own verifier; lower-PR review results are not inherited. The protected
+controller and ruleset remain default-branch-rooted. `edited` is deliberately
+absent: after a base retarget, a
 ready PR must be converted to draft and marked ready again, while an
 already-draft PR is marked ready. The new `ready_for_review` event creates a
 verifier for the current exact head/base/test-merge scope; rerunning the old
-event does not. A failed verifier from any of these four admitted events can
+event does not. GitHub's stack object exposes stack number, size, position, and
+base ref/SHA. The gate binds current stack identity/position and trunk ref/SHA;
+a size-only increase when a PR is added above this one does not change its
+scope. A failed verifier from any admitted event can
 feed the optional `workflow_run` ingress.
 
 GitHub records the verifier run/job/native CheckRun against the exact PR
@@ -147,7 +161,8 @@ and repository: event `merge_commit_sha` may be missing or historical and is
 not a binding input. The protected top-level `run-name`
 provides a second receipt: the run `display_title` must be
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>`, and its sole PR
-binding must carry the current feature head and default-branch base SHA. This
+binding must carry the current feature head and exact direct-base ref/SHA. For
+a native stack, the current trunk ref/SHA is separately validated. This
 is the execution binding that lets a successful feature-head CheckRun prove
 evaluation of the exact current test-merge. The CheckRun itself does not
 belong to the test-merge SHA.
@@ -284,7 +299,8 @@ that must establish a newer verifier generation.
 A failed first attempt (`run_attempt=1`) of the canonical
 `Codex Review Gate Verifier` is a trigger, not authority for a review request.
 The protected `workflow_run` path rereads the completed failed verifier and PR,
-and requires the same-repository PR to remain open, ready, on the default base
+and requires the same-repository PR to remain open and ready, with a default-
+branch direct base or an authenticated native-stack trunk bound to that branch,
 and at the verifier's exact current head. It requests exact `@codex review`
 with the canonical marker only when no matching canonical request already
 exists for that repository/PR/head/base scope; missing or ambiguous evidence
@@ -1084,13 +1100,16 @@ merge outside this closure is unsupported.
 
 Current v2 releases support GitHub.com public and private repositories, an open
 non-draft PR from an ordinary same-repository branch to the default branch,
-Linux runners in GitHub-hosted or self-hosted environments, and ordinary
+plus GitHub-native stacked PRs whose authenticated stack metadata binds their
+trunk to that default branch, Linux runners in GitHub-hosted or self-hosted
+environments, and ordinary
 merge/squash/rebase methods. The default runner selection remains
 `ubuntu-slim`, with `ubuntu-latest` as the adopted fallback. An installed
 workflow's explicit `runs-on` expression remains authoritative; these defaults
 apply only when its configured selection falls back to them.
 
-It fails closed for GHES, forks, merge queues, non-default bases, drafts,
+It fails closed for GHES, forks, merge queues, arbitrary non-default bases,
+manual feature-base chains and stacks with a non-default trunk, drafts,
 bot-owned PRs, Windows/macOS runners and new operations on closed or merged
 PRs. A selected self-hosted Linux runner is trusted by operator assumption;
 the Action does not prove host integrity or isolation, and separate GitHub jobs

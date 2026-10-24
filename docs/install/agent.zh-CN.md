@@ -10,6 +10,13 @@
 approvals。`integration_id: 15368` 标识的是整个 GitHub Actions App，不是任一 workflow，
 因此不能替代两份 workflow byte verification 与 CODEOWNERS 控制面。
 
+普通 PR 仍须直接以 `DEFAULT_BRANCH` 为 base。GitHub 原生 stacked PR 也受支持，但仅限经验证的
+metadata 将 stack trunk 绑定到同一分支；任意 feature-base 链和其他 trunk 均不在范围内。原生
+stack 会逐层传递 trunk protection，但每个 PR 仍需要自己的 Codex gate。floating `@v2` runtime
+接受 stacked scope；stack join 时即时验证还要求 canonical verifier workflow 包含 `stacked`
+activity type。现有四-action workflow 仍可使用，可通过常规 workflow 更新流程刷新。Ruleset 继续
+以 `DEFAULT_BRANCH` 为根；不要给 feature branch 新建独立 ruleset。
+
 ## 输入与停止条件
 
 先解析并记录：
@@ -1110,7 +1117,7 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   fresh-fixture 两种形态；两者都不是 installation 或 activation path；
 - verifier path `.github/workflows/codex-review-gate.yml`、workflow name
   `Codex Review Gate Verifier`、`pull_request` types `opened`、`reopened`、
-  `synchronize`、`ready_for_review`，以及 exact PR feature-head SHA 上的 required job
+  `synchronize`、`ready_for_review`、`stacked`，以及 exact PR feature-head SHA 上的 required job
   `codex/github-review-gate`；
 - controller path `.github/workflows/codex-review-gate-controller.yml`、workflow
   name `Codex Review Gate Controller`、exact Codex `issue_comment` `created`、
@@ -1142,10 +1149,11 @@ workflow name 订阅，而不要在 job 条件里将 `workflow_run.name` 与静�
 `run-name` 会使每次 run 的 name 动态变化。Action 仍校验 canonical workflow ID、path、run 和
 PR scope。公开仓库的
 policy 不允许使用可写的 `pull_request_target` handler。controller 只接受 open、ready
-（非 draft）、same-repository、base 指向当前 default branch 的 PR；失败的 verifier 必须
+（非 draft）、same-repository、direct base 指向当前 default branch 或经验证的 native-stack
+trunk 绑定该 branch 的 PR；失败的 verifier 必须
 绑定其当前 exact head，且不能已有 matching canonical request，包括先前 controller run 中与
 相同 repository、PR、head 和 base 匹配的 canonical marker。`opened`、`reopened`、
-`synchronize` 或 `ready_for_review` 后的 verifier failure 都可能符合条件。仅当
+`synchronize`、`ready_for_review` 或原生 `stacked` 后的 verifier failure 都可能符合条件。仅当
 `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确等于 `true`，才用现有 `begin-review` operation 和
 `request_review=true` 进入 request-only mode（只发送请求，不立刻重跑 verifier）。之后由合格的
 Codex bot

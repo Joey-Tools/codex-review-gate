@@ -14,6 +14,22 @@ The ordinary single-repository rollout has two pull requests:
 
 The canary is closed without merging.
 
+### GitHub-native stacked PRs
+
+An ordinary PR still targets the repository default branch directly. A
+GitHub-native stacked PR is additionally supported when verified stack
+metadata binds its trunk to that same default branch; arbitrary manually
+chained feature branches and other trunks are not. GitHub carries trunk
+protection through every native stack layer, so keep the installed ruleset on
+the default branch. Each PR needs its own Codex gate; no lower-PR review result
+is inherited. Runtime support arrives through the floating `@v2` Action, but
+immediate verification when a PR joins a stack requires the updated canonical
+verifier workflow with the `stacked` activity type. Existing four-activity
+workflow copies remain usable and can be refreshed through the ordinary
+workflow update path. The new `stacked` wake-up supplements `synchronize`.
+See GitHub's [stack metadata](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests)
+and [stacked CI guidance](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/optimizing-ci-for-stacked-pull-requests).
+
 The controlled organization handoff has a fixed active ten-repository v2
 cohort. Its old v1 organization ruleset retains the original eleven-repository
 legacy selector. The narrow source-repository self-hosting exception is
@@ -91,8 +107,8 @@ fixture forms; neither is consumer installation.
 Copy both canonical workflows unchanged. They own separate event and permission
 boundaries that an Action step cannot define:
 
-- the read-only verifier uses only `pull_request` activity types `opened`,
-  `reopened`, `synchronize`, and `ready_for_review`; its native
+- the read-only verifier uses `pull_request` activity types `opened`,
+  `reopened`, `synchronize`, `ready_for_review`, and native `stacked`; its native
   `codex/github-review-gate` CheckRun on the exact PR feature-head SHA is
   required;
 - controller bot-evidence wake-ups use only the `issue_comment` activity type
@@ -116,10 +132,10 @@ boundaries that an Action step cannot define:
   name because the verifier's `run-name` makes individual run names dynamic.
   Runtime still verifies the canonical workflow ID, path, run, and PR scope.
   An authorized request also requires a verified canonical source run and a
-  fresh same-repository, open, non-draft PR targeting the current default
-  branch, still on the source run's current head, and no matching canonical
+  fresh same-repository, open, non-draft PR with a direct base on the current
+  default branch or a verified native-stack trunk on that branch, still on the source run's current head, and no matching canonical
   request. A verifier triggered by `opened`, `reopened`,
-  `synchronize`, or `ready_for_review` can reach this path. It does not
+  `synchronize`, `ready_for_review`, or native `stacked` can reach this path. It does not
   immediately rerun the verifier; a later qualifying Codex bot
   `issue_comment` or manual `reconcile` performs the next evaluation. A merge
   conflict that prevents the verifier from running has no automatic request;
@@ -1876,8 +1892,9 @@ executes on `refs/pull/N/merge`; inside the Action it strictly checks
 whose test-merge matches the runtime SHA. Its protected top-level `run-name`
 also makes GitHub expose the exact
 `codex-review-gate-verifier/<PR>/<current test-merge SHA>` as `display_title`;
-the run's sole PR binding must carry the current feature head and
-default-branch base SHA. A successful feature-head CheckRun is therefore
+the run's sole PR binding must carry the current feature head and exact direct-
+base ref/SHA; for a native stack, the current trunk ref/SHA is separately
+validated. A successful feature-head CheckRun is therefore
 execution-bound to the exact current test-merge.
 
 Event validation is limited to the PR head/base SHA, ref, and repository. Its
@@ -1885,8 +1902,8 @@ Event validation is limited to the PR head/base SHA, ref, and repository. Its
 binding input.
 
 There is deliberately no cron, `pull_request_target`, or writable review event.
-The verifier starts on `opened`, `reopened`, `synchronize`, and
-`ready_for_review`; controller and verifier have separate concurrency
+The current verifier starts on `opened`, `reopened`, `synchronize`,
+`ready_for_review`, and native `stacked`; controller and verifier have separate concurrency
 namespaces. Associated controller events remain PR-scoped; association-empty
 completion events use a per-run fallback group. With exact
 `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, an eligible

@@ -1369,6 +1369,54 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
   }
 });
 
+test("pull_request verifier accepts an exact same-repository stacked base", async (context) => {
+  const event = pullRequestEvent();
+  event.pull_request.base.ref = "feature-base";
+  const github = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2 }),
+    },
+    issueComments: [workflowRequest({
+      body: canonicalRequestBody(HEAD, { baseRef: "feature-base" }),
+    })],
+    reactionsByCommentId: new Map([["101", [reaction()]]]),
+  });
+  const environment = runtimeEnvironment(context, { suffix: "stacked-verifier", event });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.gateOutcome, "success");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("native stack bottom and middle PRs use their API-confirmed actual bases", async (context) => {
+  for (const [position, baseRef] of [[1, "main"], [2, "feature-base"], [2, "main"]]) {
+    const event = pullRequestEvent();
+    event.pull_request.base.ref = baseRef;
+    const github = createGitHubMock({
+      pullRequestOverrides: {
+        base: { ref: baseRef },
+        stack: nativeStack({ position, futureField: "ignored-additive-metadata" }),
+      },
+      issueComments: [workflowRequest({
+        body: canonicalRequestBody(HEAD, { baseRef }),
+      })],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `native-stack-verifier-${position}`,
+      event,
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, `${position}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, "success", `position ${position}`);
+  }
+});
+
 test("Linux self-hosted verifier reaches healthy success for stable clean evidence", async (context) => {
   const github = createGitHubMock({
     issueComments: [workflowRequest()],
@@ -1786,6 +1834,179 @@ test("reconcile pins the initial default branch and base ref across every snapsh
   assert.equal(renamedResult.report.gateOutcome, "pending");
   assert.equal(renamedResult.report.recoveryCode, "wait_then_reconcile");
   assert.equal(renamedTogether.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("reconcile accepts a stable same-repository stacked base", async (context) => {
+  const github = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2 }),
+    },
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+  });
+  const event = pullRequestEvent();
+  event.pull_request.base.ref = "feature-base";
+  const environment = runtimeEnvironment(context, { suffix: "stacked-reconcile", event });
+
+  const { result } = await runGate(environment, github, { stabilityWindowMs: 4 });
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(result.report.gateOutcome, "success");
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("nondefault base requires valid API stack metadata and default-branch trunk", async (context) => {
+  for (const [suffix, overrides] of [
+    ["missing", { base: { ref: "feature-base" } }],
+    ["null", { base: { ref: "feature-base" }, stack: null }],
+    ["malformed", {
+      base: { ref: "feature-base" },
+      stack: { number: 1, size: 2, position: 3, base: { ref: "main", sha: BASE } },
+    }],
+    ["wrong-trunk", {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ base: { ref: "release", sha: BASE } }),
+    }],
+    ["wrong-base-repository", {
+      base: { ref: "feature-base", repo: { id: REPO_ID + 1 } },
+      stack: nativeStack(),
+    }],
+  ]) {
+    const github = createGitHubMock({ pullRequestOverrides: overrides });
+    const environment = runtimeEnvironment(context, { suffix: `stack-reject-${suffix}` });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.equal(result.report.recoveryCode, "unsupported_target", suffix);
+    assert.deepEqual(github.statusWrites, [], suffix);
+  }
+  for (const [suffix, stack] of [
+    ["malformed-bottom", { number: 1, size: 2, position: 3, base: { ref: "main", sha: BASE } }],
+    ["wrong-trunk-bottom", nativeStack({ base: { ref: "release", sha: BASE } })],
+  ]) {
+    const github = createGitHubMock({ pullRequestOverrides: { stack } });
+    const environment = runtimeEnvironment(context, { suffix: `stack-bottom-reject-${suffix}` });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.equal(result.report.recoveryCode, "unsupported_target", suffix);
+  }
+});
+
+test("manual begin-review rejects a nondefault base without native stack metadata", async (context) => {
+  for (const [suffix, stack] of [["missing", undefined], ["null", null]]) {
+    const github = createGitHubMock({
+      pullRequestOverrides: {
+        base: { ref: "feature-base" },
+        ...(stack === undefined ? {} : { stack }),
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `manual-nondefault-base-${suffix}`,
+      operation: "begin-review",
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "not_applicable", suffix);
+    assert.equal(result.report.recoveryCode, "unsupported_target", suffix);
+    assert.deepEqual(github.requestBodies, [], suffix);
+  }
+});
+
+test("stack membership and trunk changes invalidate a reconcile snapshot", async (context) => {
+  for (const [suffix, changedStack] of [
+    ["membership", nativeStack({ position: 3 })],
+    ["membership-disappeared", null],
+    ["trunk-ref", nativeStack({ base: { ref: "release", sha: BASE } })],
+    ["trunk-sha", nativeStack({ base: { ref: "main", sha: NEXT_HEAD } })],
+  ]) {
+    const github = createGitHubMock({
+      pullRequestOverrides: {
+        base: { ref: "feature-base" },
+        stack: nativeStack({ position: 2 }),
+      },
+      pullRequestSequence: [{}, {}, { stack: changedStack }],
+      issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    });
+    const event = pullRequestEvent();
+    event.pull_request.base.ref = "feature-base";
+    const environment = runtimeEnvironment(context, {
+      suffix: `stack-snapshot-${suffix}`,
+      event,
+    });
+
+    const { result } = await runGate(environment, github, { stabilityWindowMs: 4 });
+
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", `${suffix}: ${result.report.reason}`);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+  for (const [suffix, changedBase] of [
+    ["actual-base-ref", { ref: "replacement-base" }],
+    ["actual-base-sha", { sha: NEXT_HEAD }],
+  ]) {
+    const github = createGitHubMock({
+      pullRequestOverrides: {
+        base: { ref: "feature-base" },
+        stack: nativeStack({ position: 2 }),
+      },
+      pullRequestSequence: [{}, {}, { base: changedBase }],
+      issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+    });
+    const event = pullRequestEvent();
+    event.pull_request.base.ref = "feature-base";
+    const environment = runtimeEnvironment(context, {
+      suffix: `stack-actual-base-${suffix}`,
+      event,
+    });
+
+    const { result } = await runGate(environment, github, { stabilityWindowMs: 4 });
+
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(result.report.recoveryCode, "wait_then_reconcile", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+  const grewGithub = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2, size: 3 }),
+    },
+    pullRequestSequence: [{}, {}, { stack: nativeStack({ position: 2, size: 4 }) }],
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+  });
+  const grewEvent = pullRequestEvent();
+  grewEvent.pull_request.base.ref = "feature-base";
+  const grewEnvironment = runtimeEnvironment(context, {
+    suffix: "stack-snapshot-size-growth",
+    event: grewEvent,
+  });
+  const { result: grewResult } = await runGate(grewEnvironment, grewGithub);
+  assert.equal(grewResult.report.gateOutcome, "success", grewResult.report.reason);
+  const renamedDefaultGithub = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2 }),
+    },
+    repositorySequence: [{}, { default_branch: "release" }],
+    issueComments: [ordinaryRequest(), cleanIssueComment(HEAD)],
+  });
+  const renamedDefaultEvent = pullRequestEvent();
+  renamedDefaultEvent.pull_request.base.ref = "feature-base";
+  const renamedDefaultEnvironment = runtimeEnvironment(context, {
+    suffix: "stack-default-branch-renamed",
+    event: renamedDefaultEvent,
+  });
+  const { result: renamedDefaultResult } = await runGate(
+    renamedDefaultEnvironment,
+    renamedDefaultGithub,
+  );
+  assert.notEqual(renamedDefaultResult.report.gateOutcome, "success");
+  assert.equal(renamedDefaultResult.report.recoveryCode, "wait_then_reconcile");
+  assert.deepEqual(renamedDefaultGithub.statusWrites, []);
 });
 
 test("reconcile pins head ref, head repository, and base SHA throughout a snapshot", async (context) => {
@@ -4630,9 +4851,13 @@ test("base-epoch GraphQL accepts unrelated timeline items with no filtered event
   assert.equal(result.report.gateOutcome, "success");
 });
 
-test("pull_request verifier admits only the four canonical lifecycle actions", async (context) => {
-  for (const action of ["opened", "reopened", "synchronize", "ready_for_review"]) {
-    const github = createGitHubMock();
+test("pull_request verifier admits supported lifecycle actions including native stacked", async (context) => {
+  for (const action of ["opened", "reopened", "synchronize", "ready_for_review", "stacked"]) {
+    const github = createGitHubMock({
+      ...(action === "stacked"
+        ? { pullRequestOverrides: { stack: nativeStack({ position: 1 }) } }
+        : {}),
+    });
     const environment = runtimeEnvironment(context, {
       suffix: `pull-request-${action}`,
       event: pullRequestEvent(action),
@@ -4640,6 +4865,29 @@ test("pull_request verifier admits only the four canonical lifecycle actions", a
     const { result } = await runGate(environment, github);
     assert.equal(result.report.gateOutcome, "pending", action);
     assert.equal(result.report.recoveryCode, "wait_provider", action);
+  }
+});
+
+test("stacked lifecycle action requires current valid API stack metadata", async (context) => {
+  for (const stack of [undefined, null, {
+    number: 1,
+    size: 2,
+    position: 3,
+    base: { ref: "main", sha: BASE },
+  }]) {
+    const github = createGitHubMock({
+      ...(stack === undefined ? {} : { pullRequestOverrides: { stack } }),
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `stacked-event-no-api-stack-${stack === undefined ? "missing" : stack === null ? "null" : "malformed"}`,
+      event: pullRequestEvent("stacked"),
+    });
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "not_applicable");
+    assert.equal(result.report.recoveryCode, "unsupported_target");
+    assert.deepEqual(github.statusWrites, []);
   }
 });
 
@@ -4766,7 +5014,7 @@ test("pull_request verifier fails closed for altered launch or target bindings",
       label: "fresh-nondefault-base",
       githubOptions: { pullRequestOverrides: { base: { ref: "release" } } },
       expectedReason:
-        "Action v2 requires the repository default branch as the pull-request base",
+        "Action v2 requires the repository default branch or a valid native stacked pull request",
       expectedReadCount: 2,
     },
     {
@@ -12338,6 +12586,70 @@ test("begin-review posts one exact same-run marker, adopts it on rerun, and supp
   assert.deepEqual(disabledGitHub.requestBodies, []);
 });
 
+test("manual stacked begin-review binds the actual base and reconciles without drift", async (context) => {
+  const github = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2 }),
+    },
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "manual-stacked-begin",
+    operation: "begin-review",
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(parseCanonicalV2ReviewRequestBody(github.requestBodies[0]), {
+    version: 2,
+    repositoryId: String(REPO_ID),
+    prNumber: String(PR),
+    headSha: HEAD,
+    baseSha: BASE,
+    baseRef: "feature-base",
+    baseRepositoryId: String(REPO_ID),
+    runId: "123",
+  });
+  const reconcileEvent = pullRequestEvent();
+  reconcileEvent.pull_request.base.ref = "feature-base";
+  const reconcileEnvironment = runtimeEnvironment(context, {
+    suffix: "manual-stacked-reconcile",
+    event: reconcileEvent,
+  });
+  const { result: reconciled } = await runGate(
+    reconcileEnvironment,
+    github,
+    { stabilityWindowMs: 1 },
+  );
+  assert.equal(reconciled.report.gateOutcome, "pending", reconciled.report.reason);
+  assert.equal(reconciled.report.executionHealth, "healthy");
+});
+
+test("native stacked PR controllers reject nondefault workflow launches", async (context) => {
+  for (const eventName of ["workflow_dispatch", "workflow_run"]) {
+    const github = createGitHubMock({
+      pullRequestOverrides: {
+        base: { ref: "feature-base" },
+        stack: nativeStack({ position: 2 }),
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `native-stack-nondefault-controller-${eventName}`,
+      eventName,
+      operation: "begin-review",
+    });
+    environment.GITHUB_REF_NAME = "feature";
+    environment.GITHUB_REF = "refs/heads/feature";
+
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.gateOutcome, "not_applicable", eventName);
+    assert.equal(result.report.recoveryCode, "unsupported_target", eventName);
+    assert.deepEqual(github.requestBodies, [], eventName);
+  }
+});
+
 test("review-request token scopes User identity resolution and request posting to manual and auto controllers", async (context) => {
   for (const eventName of ["workflow_dispatch", "workflow_run"]) {
     const github = createGitHubMock({
@@ -13057,6 +13369,98 @@ test("auto request rechecks branch and default-base scope immediately before POS
     assert.deepEqual(github.requestBodies, [], suffix);
     assert.deepEqual(github.rerunRequests, [], suffix);
   }
+});
+
+test("auto request accepts the exact stacked base again immediately before POST", async (context) => {
+  const verifier = verifierRun();
+  verifier.pull_requests[0].base.ref = "feature-base";
+  const github = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2 }),
+    },
+    verifierRuns: [verifier],
+    verifierRunAttempts: [verifier],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "auto-stacked-base-pre-post",
+    eventName: "workflow_run",
+    operation: "begin-review",
+    event: workflowRunEvent(verifier),
+  });
+
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(parseCanonicalV2ReviewRequestBody(github.requestBodies[0]), {
+    version: 2,
+    repositoryId: String(REPO_ID),
+    prNumber: String(PR),
+    headSha: HEAD,
+    baseSha: BASE,
+    baseRef: "feature-base",
+    baseRepositoryId: String(REPO_ID),
+    runId: "123",
+  });
+});
+
+test("auto request rejects stack or actual-base drift before POST", async (context) => {
+  for (const [suffix, sequenceChange] of [
+    ["membership", { stack: nativeStack({ position: 3 }) }],
+    ["trunk-ref", { stack: nativeStack({ base: { ref: "release", sha: BASE } }) }],
+    ["trunk-sha", { stack: nativeStack({ base: { ref: "main", sha: NEXT_HEAD } }) }],
+    ["actual-base-ref", { base: { ref: "replacement-base" } }],
+    ["actual-base-sha", { base: { sha: NEXT_HEAD } }],
+  ]) {
+    const verifier = verifierRun();
+    verifier.pull_requests[0].base.ref = "feature-base";
+    const github = createGitHubMock({
+      pullRequestOverrides: {
+        base: { ref: "feature-base" },
+        stack: nativeStack({ position: 2 }),
+      },
+      pullRequestSequence: [{}, sequenceChange],
+      verifierRuns: [verifier],
+      verifierRunAttempts: [verifier],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `auto-stacked-drift-${suffix}`,
+      eventName: "workflow_run",
+      operation: "begin-review",
+      event: workflowRunEvent(verifier),
+    });
+
+    const { result } = await runGate(environment, github);
+
+    const actualBaseDrift = suffix.startsWith("actual-base-");
+    assert.equal(result.report.gateOutcome, actualBaseDrift ? "not_applicable" : "pending", suffix);
+    assert.equal(
+      result.report.recoveryCode,
+      actualBaseDrift ? "refresh_head" : "wait_then_reconcile",
+      `${suffix}: ${result.report.reason}`,
+    );
+    assert.deepEqual(github.requestBodies, [], suffix);
+  }
+  const grownVerifier = verifierRun();
+  grownVerifier.pull_requests[0].base.ref = "feature-base";
+  const grownGithub = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2, size: 3 }),
+    },
+    pullRequestSequence: [{}, { stack: nativeStack({ position: 2, size: 4 }) }],
+    verifierRuns: [grownVerifier],
+    verifierRunAttempts: [grownVerifier],
+  });
+  const grownEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-stacked-size-growth",
+    eventName: "workflow_run",
+    operation: "begin-review",
+    event: workflowRunEvent(grownVerifier),
+  });
+  const { result: grownResult } = await runGate(grownEnvironment, grownGithub);
+  assert.equal(grownResult.report.gateOutcome, "pending", grownResult.report.reason);
+  assert.equal(grownGithub.requestBodies.length, 1);
 });
 
 test("auto request requires a protected default-branch controller launch", async (context) => {
@@ -15984,6 +16388,16 @@ function issueCommentEvent(action, comment, overrides = {}) {
     repository: { full_name: REPOSITORY, default_branch: "main" },
     ...overrides,
   };
+}
+
+function nativeStack({
+  number = 1,
+  size = 3,
+  position = 2,
+  base = { ref: "main", sha: BASE },
+  ...extra
+} = {}) {
+  return { number, size, position, base: { ...base }, ...extra };
 }
 
 function pullRequestEvent(action = "synchronize", overrides = {}) {

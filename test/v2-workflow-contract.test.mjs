@@ -138,7 +138,7 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
   );
   assert.match(
     templateVerifier,
-    /^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review\]$/mu,
+    /^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review, stacked\]$/mu,
   );
   assert.doesNotMatch(
     templateVerifier,

@@ -70,9 +70,12 @@ Actions compares strings case-insensitively in the job condition, so a case
 variant such as `TRUE` can still allocate a controller runner before the
 runtime rejects it without posting. A repository value overrides the
 organisation value. After the verifier runs for `opened`,
-`reopened`, `synchronize` or `ready_for_review`, a completed failed run can
-trigger the protected controller for an open, ready, same-repository PR on the
-current default base and exact current head. It verifies the run and may post
+`reopened`, `synchronize`, `ready_for_review` or native `stacked`, a completed failed run can
+trigger the protected controller for an eligible open, ready, same-repository
+PR and exact current head. The current verifier also admits native `stacked`
+events; four-action installed workflows remain usable but need the updated
+canonical verifier workflow for immediate stack-join wake-up. It verifies the
+run and may post
 or adopt a canonical current-scope `@codex review` request; uncertain outcomes
 remain pending. This automatic
 path does not rerun the verifier: a later Codex bot comment or protected manual
@@ -190,6 +193,18 @@ See [the human installation guide](docs/install/human.md) or
 [the agent execution runbook](docs/install/agent.md). Both implement the same
 two-PR rollout: one migration PR removes v1 and installs v2, then a separate
 harmless canary PR proves the live gate and is closed unmerged.
+
+## Native stacked pull requests
+
+A GitHub-native stacked PR may qualify when authenticated stack metadata binds
+it to the repository's current default-branch trunk. Ordinary PRs still target
+the default branch directly; arbitrary manual feature-branch chains and stacks
+with another trunk are unsupported. The PR's direct base ref/SHA and the
+stack's trunk ref/SHA remain separately bound. Every PR gets its own Codex
+gate; lower-stack review results are not inherited. The protected controller
+and installed ruleset remain rooted on the default branch. See GitHub's
+[stack metadata](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests)
+and [stacked CI optimisation](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/optimizing-ci-for-stacked-pull-requests).
 
 ## Bootstrap
 

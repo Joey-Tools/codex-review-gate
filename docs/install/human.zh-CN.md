@@ -11,6 +11,18 @@
 
 Canary 验证完成后关闭、不合并。
 
+### GitHub 原生 stacked PR
+
+普通 PR 仍须直接以 repository default branch 为 base。GitHub 原生 stacked PR 也受支持，但必须
+由已验证的 stack metadata 将 trunk 绑定到同一 default branch；任意手工 feature-branch 链及其他
+trunk 均不支持。GitHub 会把 trunk protection 沿原生 stack 传递到每一层，因此 ruleset 仍只需
+覆盖 default branch。每个 PR 都需要自己的 Codex gate，不继承下层 PR 的 review 结果。runtime
+支持随 floating `@v2` Action 提供；PR 加入 stack 时即时验证还要求更新 canonical verifier
+workflow，加入 `stacked` activity type。现有四-action workflow 仍可使用，可通过常规 workflow
+更新流程刷新。新的 `stacked` wake-up 补充而不替代 `synchronize`。参见 GitHub 的
+[stack metadata](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests) 与
+[stacked CI 指南](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/optimizing-ci-for-stacked-pull-requests)。
+
 活动 v2 10 仓组织级 handoff 是针对 shared organization ruleset 的受控例外；旧 v1
 organization ruleset 仍保留原始 11 仓 legacy selector。下方另有窄范围的 source repository
 self-hosting 例外，它不属于该 cohort。修改任一例外 scope 前，必须先阅读对应 section。
@@ -73,8 +85,8 @@ uses: JoeyTeng/codex-review-gate-action@v2
 必须逐字复制两份 canonical workflows。Action step 无法定义的不同 event 与 permission
 边界由它们分别负责：
 
-- read-only verifier 只接受 `pull_request` 的 `opened`、`reopened`、`synchronize`
-  与 `ready_for_review`；它在 exact PR feature-head SHA 上的 native
+- read-only verifier 接受 `pull_request` 的 `opened`、`reopened`、`synchronize`、
+  `ready_for_review` 与原生 `stacked`；它在 exact PR feature-head SHA 上的 native
   `codex/github-review-gate` CheckRun 是 required signal；
 - controller 的 bot evidence 自动 wake-up 只接受 `issue_comment` 的 `created`。编辑既有 comment 不会分配 runner；
   若该 edited carrier 需要重新评估，走受保护 default branch 的手动 `reconcile`。它刻意不订阅
@@ -91,8 +103,8 @@ uses: JoeyTeng/codex-review-gate-action@v2
   `run-name` 会使单次 run name 动态变化，因此 controller 不再将 `workflow_run.name` 与静态名称
   比较。运行时仍会校验 canonical workflow ID、path、run 和 PR scope。它必须验证来源是 canonical run，并重新读取 same-repository、open、
   non-draft、target 为当前 default branch 的 PR，确认仍位于 source run 的 current head，且
-  不存在匹配的 canonical request。由 `opened`、`reopened`、`synchronize` 或
-  `ready_for_review` 启动的 verifier 失败后都可能触发此路径。此路径不会立即 rerun verifier；
+  不存在匹配的 canonical request。由 `opened`、`reopened`、`synchronize`、
+  `ready_for_review` 或原生 `stacked` 启动的 verifier 失败后都可能触发此路径。此路径不会立即 rerun verifier；
   后续合格的 Codex bot `issue_comment` 或手动 `reconcile` 才执行下一次评估。若 merge conflict
   导致 verifier 无法运行，就不会自动发送 request；应使用手动恢复流程；
 - 对于 `issue_comment` wake-up，runner 分配前，event sender 与 comment author 都必须精确等于
