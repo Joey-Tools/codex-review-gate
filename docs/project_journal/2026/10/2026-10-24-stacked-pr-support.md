@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-24
 updated: 2026-10-24
 branch: wip/stacked-pr-support
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/142
 supersedes: []
 superseded_by:
 ---
@@ -37,16 +37,24 @@ superseded_by:
   43 and 42 unique callbacks (171 total), with zero failures or cancellations.
   The logs are `.codex-local/stacked-bootstrap-full-1-of-4.log` through
   `stacked-bootstrap-full-4-of-4.log`.
-- Node.js 24.15.0 runtime-focused validation passed 16/16 tests. The final
-  combined core/v2/receipt/workflow/security/scanner/CI-contract run passed
-  967/967 tests, with zero failures, cancellations or skips. Together with the
-  bootstrap partitions, 1,138 tests passed. `npm run check`, project-journal
-  validation and `git diff --check` also passed.
+- Node.js 24.15.0 runtime-focused validation passed 16/16 tests. The initial
+  combined core/v2/receipt/workflow/security/scanner/CI-contract run
+  passed 967/967 tests. After the handoff fixture correction below, the
+  complete actual CI core file set passed 1,305/1,305 tests, with zero failures,
+  cancellations or skips. These runs overlap and are not added together.
+  `npm run check`, project-journal validation and `git diff --check` also passed.
 - The wider run exposed obsolete bootstrap registration/distribution
   assertions after adding the compatibility regression. Both inventory
   assertions now retain exact coverage for 171 callbacks and the partition
   distribution 43/43/43/42; they were not disabled. Earlier failed logs are
   retained alongside the final pass in the task-local evidence directory.
+- The complete remote core matrix exposed an additional stale handoff test
+  projection: the permission-boundary fixture still supplied the historical
+  four-event lifecycle to the current five-event validator, masking the
+  intended permission assertion. The test now projects only the exact known
+  lifecycle line in each direction, asserts both original profiles, and keeps
+  the frozen workflow bytes, identities and original permission assertions
+  unchanged. No production validator or admission rule was relaxed.
 - These are local/fixture-backed checks, not a claim of a live native-stack
   canary or downstream deployment.
 
