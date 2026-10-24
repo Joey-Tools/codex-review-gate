@@ -115,8 +115,9 @@ required check 的 `integration_id: 15368` 标识整个 GitHub Actions App，因
 CODEOWNERS、Code Owner review、strict freshness、no bypass 与 canary collision readback
 共同构成 adopted compound boundary。
 
-verifier 接收 `pull_request` `opened`、`reopened`、`synchronize`、`ready_for_review` 与 GitHub
-原生 `stacked`。PR 加入原生 stack 时，`stacked` action 提供即时验证；它补充而不替代
+verifier 接收 `pull_request` `opened`、`reopened`、`synchronize`、`ready_for_review`、GitHub
+原生 `stacked`，以及仅当 `changes.base.ref.from` 证明真实 base-ref retarget 时的 `edited`。
+title/body-only edit 会在分配 runner 前过滤。PR 加入原生 stack 时，`stacked` action 提供即时验证；它补充而不替代
 `synchronize`。`@v2` runtime 接受新 action，但已安装的四-action verifier workflow 必须更新并
 加入 `stacked` 才能获得即时 wake-up。Verifier 要求 same-repository、open、ready PR 的 direct base 是 current
 default branch；唯一例外是经验证的 GitHub 原生 stacked-PR metadata 将 stack trunk 绑定到同一
@@ -125,10 +126,11 @@ ref/SHA 与 stack trunk ref/SHA 是不同的 exact binding，且会重新验证�
 及 trunk。GitHub 的 stack object 还提供 size，但把新 PR 加到本 PR 上方造成的 size-only 增长不
 改变本 PR 的 scope。
 每个 PR 独立运行 verifier，不继承下层 PR 的 review 结果。受保护 controller 和 ruleset 仍以
-default branch 为根。`edited` 被明确排除：base retarget 后，ready PR 必须转为 draft 再 mark ready，
-已经是 draft 的 PR 直接 mark ready。新的 `ready_for_review` event 会为 current exact
-head/base/test-merge scope 创建 verifier；旧 event rerun 不能代替。这些 event 产生的
-failed verifier 都可能进入可选 `workflow_run` 路径。
+default branch 为根。base-ref retarget 的 opt-in `CODEX_REVIEW_GATE_AUTO_REQUEST=true` 路径会先按
+current head/base/test-merge scope 重新校验，再复用或创建 canonical request。去重依据最新 base epoch
+与 exact current tuple，而不是每个 verifier event；同一 epoch 的重复 event 会复用 post-epoch request。
+新 request 之后的 trusted、未编辑 top-level current-head clean 若显式 short SHA 能唯一解析为该 head、且时间晚于 request，可满足窄范围时间戳接受策略；时间戳不证明因果关系或 base-SHA 覆盖。Consumer 可用性还需要对应 Action release 与 canonical workflow refresh。若 filtered event 或 verifier evidence 不可用，使用
+draft-to-ready fallback。GitHub stack object 的其余字段和绑定保持不变。
 
 GitHub 会把 verifier run/job/native CheckRun 记录在 exact PR feature-head SHA 上，尽管
 canonical `pull_request` workflow 在 `refs/pull/N/merge` 上执行。Action 内部要求

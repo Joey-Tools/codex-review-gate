@@ -1318,7 +1318,9 @@ The canonical workflows must have this contract after the merge:
   activation path;
 - verifier path `.github/workflows/codex-review-gate.yml`, workflow name
   `Codex Review Gate Verifier`, `pull_request` types `opened`, `reopened`,
-  `synchronize`, `ready_for_review`, `stacked`, and required job
+  `synchronize`, `ready_for_review`, `stacked`, and `edited` only when
+  `changes.base.ref.from` proves a real base-ref retarget; title/body-only
+  edits are filtered before runner allocation. It has required job
   `codex/github-review-gate` on the exact PR feature-head SHA;
 - controller path `.github/workflows/codex-review-gate-controller.yml`, workflow
   name `Codex Review Gate Controller`, exact Codex `issue_comment` `created`,
@@ -1347,28 +1349,47 @@ The canonical workflows must have this contract after the merge:
 
 The optional automatic request path keeps the canonical `pull_request`
 verifier read-only and runs in the existing protected controller workflow via
-`workflow_run` on a failed first canonical verifier attempt. Rerunning an old
-verifier attempt does not start this path. Match the static verifier workflow
+`workflow_run`. Ordinary events retain the failed first-attempt gate. A
+verified base-ref-retarget event uses a separate current-scope check; title/body-only
+edits are ineligible. Rerunning an old verifier attempt does not start this
+path. Match the static verifier workflow
 in `on.workflow_run.workflows`, not by comparing `workflow_run.name` in the job
 condition: the verifier's `run-name` gives each run a dynamic name. The Action
 still verifies the exact canonical workflow ID, path, run, and PR scope.
 Public-repository policy rules
 out a writable `pull_request_target` handler. The controller accepts only an
 open, ready (non-draft), same-repository PR with a direct base on the current
-default branch or a verified native-stack trunk on that branch, with the failed verifier bound to its current exact head and no
-matching canonical request already present, including a marker from an earlier
-controller run that matches the same repository, PR, head, and base. A failure
-after `opened`,
-`reopened`, `synchronize`, `ready_for_review`, or native `stacked` can qualify. With
+default branch or a verified native-stack trunk on that branch, with the
+verifier bound to its current exact head and no matching canonical request
+already present. For retarget deduplication, only requests after the latest
+base-ref-change or base-force-push boundary with the exact current head/base
+tuple are eligible, including when A-to-B-to-A returns to the same head and
+base SHA. Duplicate verifier events in one epoch reuse that matching request.
+A failure after `opened`,
+`reopened`, `synchronize`, `ready_for_review`, or native `stacked` can qualify.
+A verified base-ref-retarget event can also qualify. With
 `CODEX_REVIEW_GATE_AUTO_REQUEST` exactly `true`, it uses the existing
 `begin-review` operation with `request_review=true` in request-only mode
-(post the request without immediately rerunning the verifier). A later
+(post the request without immediately rerunning the verifier), and still
+requires the existing request-token configuration. A later
 qualifying Codex bot
 `issue_comment` event or protected manual exact-head `reconcile` updates the
 gate. A merge conflict that prevents the verifier from running has no failed
 verifier `workflow_run` to consume: resolve the conflict or use the documented
 manual recovery path. This opt-in adds no third workflow, new Action input,
 runtime App, or ruleset.
+
+For a retarget, a new canonical request followed by a trusted, unedited
+top-level current-head clean whose explicit short SHA resolves uniquely to the
+head and whose timestamp is later than the request can satisfy the narrow
+acceptance policy when no unresolved finding remains and all existing gates
+pass. This timestamp ordering is a temporal witness, not proof that the
+request caused the clean or that either artifact attests a particular base
+SHA. If the filtered event or matching verifier is unavailable, use the
+draft-to-ready `create_verifier_run` fallback; older consumer workflows that
+do not include the filtered `edited` activity also need that fallback. This is
+source support; consumers need the corresponding Action release and canonical
+workflow refresh before the event is available.
 
 Canonical workflows set
 `CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION=any` directly. This accepts an
@@ -1884,12 +1905,13 @@ Otherwise leave it unset; the ordinary direct-request procedure below applies.
    `+1` or replacement-PR path named by the summary. A new PR event creates a
    new cutoff and does not guarantee reuse of `R1/C1`.
 
-   If a base retarget leaves no verifier for the current exact
-   head/base/test-merge scope, follow
+   If a base retarget cannot be verified from the filtered `edited` event, or
+   no verifier exists for the current exact head/base/test-merge scope, follow
    `create_verifier_run`: for a ready PR, convert it to draft and mark it ready
    again; for an already-draft PR, mark it ready. Require a new
    `ready_for_review` verifier for that exact scope before reconciling.
-   Rerunning the old event is not valid retarget recovery.
+   Rerunning the old event is not valid retarget recovery. Older consumer
+   workflows without the filtered `edited` activity use this fallback too.
 
    If the controller summary reports a base epoch, base retarget, or
    `request_clean_generation`, do not treat the code alone as permission to

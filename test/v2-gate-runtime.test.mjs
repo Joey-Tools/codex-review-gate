@@ -2062,6 +2062,73 @@ test("latest base-ref timeline epoch invalidates older positive evidence on the 
   }
 });
 
+test("post-run retarget recovery needs a fresh request and clean; unresolved old threads block", async (context) => {
+  const epoch = baseRefChangedEvent();
+  const retargetEvent = pullRequestEvent("edited", {
+    changes: { base: { ref: { from: "release" } } },
+  });
+  const oldEvidence = [
+    workflowRequest({
+      created_at: "2026-08-25T08:00:00Z",
+      updated_at: "2026-08-25T08:00:00Z",
+    }),
+    cleanIssueComment(HEAD.slice(0, 10), {
+      created_at: "2026-08-25T08:02:00Z",
+      updated_at: "2026-08-25T08:02:00Z",
+    }),
+  ];
+  const oldGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: oldEvidence,
+    commitResolution: () => ({ data: { sha: HEAD } }),
+  });
+  const oldEnvironment = runtimeEnvironment(context, {
+    suffix: "retarget-old-clean",
+    event: retargetEvent,
+  });
+  const { result: oldResult } = await runGate(oldEnvironment, oldGitHub);
+  assert.equal(oldResult.report.gateOutcome, "pending");
+  assert.equal(oldResult.report.recoveryCode, "request_clean_generation");
+  assert.equal(oldGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const freshRequest = workflowRequest({
+    id: 102,
+    body: canonicalRequestBody(HEAD, { runId: "124" }),
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-102`,
+  });
+  const freshClean = cleanIssueComment(HEAD.slice(0, 10), {
+    id: 202,
+    created_at: "2026-08-25T08:12:00Z",
+    updated_at: "2026-08-25T08:12:00Z",
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-202`,
+  });
+  for (const [suffix, isResolved, expectedOutcome, expectedRecovery] of [
+    ["resolved-old-thread", true, "success", "none"],
+    ["unresolved-old-thread", false, "pending", "wait_then_reconcile"],
+  ]) {
+    const github = createGitHubMock({
+      baseEpoch: epoch,
+      issueComments: [freshRequest, freshClean],
+      commitResolution: () => ({ data: { sha: HEAD } }),
+      reviewThreads: [reviewThread({ isResolved })],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `retarget-${suffix}`,
+      event: retargetEvent,
+    });
+    const { result } = await runGate(environment, github);
+    assert.equal(result.exitCode, expectedOutcome === "success" ? 0 : 1, suffix);
+    assert.equal(result.report.gateOutcome, expectedOutcome, `${suffix}: ${result.report.reason}`);
+    assert.equal(result.report.recoveryCode, expectedRecovery, suffix);
+    assert.equal(result.report.counts.unresolved, 0, suffix);
+    assert.equal(result.report.reviewThreads.unresolved, isResolved ? 0 : 1, suffix);
+    assert.equal(result.report.reviewThreads.resolved, isResolved ? 1 : 0, suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
 test("same-second base-epoch requests remain physical without gaining positive authority", async (context) => {
   const epoch = baseRefChangedEvent();
   const generationB = workflowRequest({
@@ -4891,17 +4958,111 @@ test("stacked lifecycle action requires current valid API stack metadata", async
   }
 });
 
-test("pull_request edited is rejected before GitHub API access", async (context) => {
-  const environment = runtimeEnvironment(context, {
-    suffix: "pull-request-edited",
-    event: pullRequestEvent("edited"),
+test("pull_request edited accepts a base-ref retarget but rejects title and body edits", async (context) => {
+  const github = createGitHubMock({
+    baseEpoch: baseRefChangedEvent(),
+    issueComments: [
+      workflowRequest({
+        created_at: "2026-08-25T08:10:00Z",
+        updated_at: "2026-08-25T08:10:00Z",
+      }),
+      cleanIssueComment(HEAD.slice(0, 10), {
+        created_at: "2026-08-25T08:12:00Z",
+        updated_at: "2026-08-25T08:12:00Z",
+      }),
+    ],
+    reviewThreads: [reviewThread({ isResolved: true })],
   });
-  const result = await runV2GateCli({
-    environment,
-    fetchImpl: async () => { throw new Error("fetch must not run"); },
+  const retargetEnvironment = runtimeEnvironment(context, {
+    suffix: "pull-request-edited-base-retarget",
+    event: pullRequestEvent("edited", {
+      changes: { base: { ref: { from: "release" } } },
+    }),
   });
-  assert.equal(result.exitCode, 1);
-  assert.match(result.report.reason, /read-only verifier contract/u);
+  const retarget = await runGate(retargetEnvironment, github);
+  assert.equal(retarget.result.exitCode, 0, retarget.result.report.reason);
+  assert.equal(retarget.result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+
+  const laggedGitHub = createGitHubMock({
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T07:58:00Z" }),
+    issueComments: [
+      workflowRequest({
+        created_at: "2026-08-25T08:10:00Z",
+        updated_at: "2026-08-25T08:10:00Z",
+      }),
+      cleanIssueComment(HEAD.slice(0, 10), {
+        created_at: "2026-08-25T08:12:00Z",
+        updated_at: "2026-08-25T08:12:00Z",
+      }),
+    ],
+    commitResolution: () => ({ data: { sha: HEAD } }),
+  });
+  const laggedEnvironment = runtimeEnvironment(context, {
+    suffix: "pull-request-edited-base-epoch-lagged",
+    event: pullRequestEvent("edited", {
+      changes: { base: { ref: { from: "release" } } },
+    }),
+  });
+  const { result: laggedResult } = await runGate(laggedEnvironment, laggedGitHub);
+  assert.equal(laggedResult.report.gateOutcome, "pending");
+  assert.equal(laggedResult.report.recoveryCode, "wait_then_reconcile");
+  assert.match(laggedResult.report.reason, /not yet confirmed by the latest base-ref timeline epoch/u);
+  assert.equal(laggedGitHub.statusWrites.some(({ state }) => state === "success"), false);
+
+  const stackedGitHub = createGitHubMock({
+    pullRequestOverrides: {
+      base: { ref: "feature-base" },
+      stack: nativeStack({ position: 2 }),
+    },
+    baseEpoch: baseRefChangedEvent({
+      previousRefName: "main",
+      currentRefName: "feature-base",
+    }),
+    issueComments: [
+      workflowRequest({
+        body: canonicalRequestBody(HEAD, {
+          baseRef: "feature-base",
+          runId: "124",
+        }),
+        created_at: "2026-08-25T08:10:00Z",
+        updated_at: "2026-08-25T08:10:00Z",
+      }),
+      cleanIssueComment(HEAD.slice(0, 10), {
+        created_at: "2026-08-25T08:12:00Z",
+        updated_at: "2026-08-25T08:12:00Z",
+      }),
+    ],
+    commitResolution: () => ({ data: { sha: HEAD } }),
+  });
+  const stackedEvent = pullRequestEvent("edited", {
+    changes: { base: { ref: { from: "main" } } },
+  });
+  stackedEvent.pull_request.base.ref = "feature-base";
+  const stackedEnvironment = runtimeEnvironment(context, {
+    suffix: "pull-request-edited-native-stack-retarget",
+    event: stackedEvent,
+  });
+  const { result: stackedResult } = await runGate(stackedEnvironment, stackedGitHub);
+  assert.equal(stackedResult.report.gateOutcome, "success", stackedResult.report.reason);
+
+  for (const [suffix, changes] of [
+    ["title", { title: { from: "Before" } }],
+    ["body", { body: { from: "Before" } }],
+    ["same-base", { base: { ref: { from: "main" } } }],
+    ["missing-base-ref", { base: { ref: {} } }],
+  ]) {
+    const environment = runtimeEnvironment(context, {
+      suffix: `pull-request-edited-${suffix}`,
+      event: pullRequestEvent("edited", { changes }),
+    });
+    const result = await runV2GateCli({
+      environment,
+      fetchImpl: async () => { throw new Error("fetch must not run"); },
+    });
+    assert.equal(result.exitCode, 1, suffix);
+    assert.match(result.report.reason, /read-only verifier contract/u, suffix);
+  }
 });
 
 test("pull_request verifier fails closed for altered launch or target bindings", async (context) => {
@@ -13302,6 +13463,108 @@ test("auto request adopts an exact-head/base canonical marker from another run",
   assert.deepEqual(github.rerunRequests, []);
 });
 
+test("auto request deduplication follows the latest base-epoch identity", async (context) => {
+  const epoch = baseRefChangedEvent({
+    id: "BRE_current_base_epoch",
+    createdAt: "2026-08-25T08:05:00Z",
+  });
+  const oldRequest = workflowRequest({
+    body: canonicalRequestBody(HEAD, { runId: "77" }),
+    created_at: "2026-08-25T08:00:00Z",
+    updated_at: "2026-08-25T08:00:00Z",
+  });
+  const staleGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [oldRequest],
+  });
+  const staleEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-request-same-tuple-old-epoch",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+  const { result: staleResult } = await runGate(staleEnvironment, staleGitHub);
+  assert.equal(staleResult.report.gateOutcome, "pending");
+  assert.deepEqual(staleGitHub.requestBodies, [canonicalRequestBody()]);
+  assert.doesNotMatch(staleResult.report.reason, /request 101 is adopted/u);
+
+  const freshRequest = workflowRequest({
+    body: canonicalRequestBody(HEAD, { runId: "88" }),
+    created_at: "2026-08-25T08:10:00Z",
+    updated_at: "2026-08-25T08:10:00Z",
+  });
+  const freshGitHub = createGitHubMock({
+    baseEpochSequence: [epoch, epoch],
+    issueComments: [freshRequest],
+  });
+  const freshEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-request-same-tuple-new-epoch-generation",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+  const { result: freshResult } = await runGate(freshEnvironment, freshGitHub);
+  assert.equal(freshResult.report.gateOutcome, "pending");
+  assert.match(freshResult.report.reason, /review request 101 is adopted/iu);
+  assert.deepEqual(freshGitHub.requestBodies, []);
+
+  const ambiguousGitHub = createGitHubMock({
+    baseEpoch: epoch,
+    issueComments: [workflowRequest({
+      body: canonicalRequestBody(HEAD, { runId: "90" }),
+      created_at: epoch.createdAt,
+      updated_at: epoch.createdAt,
+    })],
+  });
+  const ambiguousEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-request-same-second-epoch-boundary",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+  const { result: ambiguousResult } = await runGate(ambiguousEnvironment, ambiguousGitHub);
+  assert.equal(ambiguousResult.report.gateOutcome, "pending");
+  assert.equal(ambiguousResult.report.recoveryCode, "request_clean_generation");
+  assert.match(ambiguousResult.report.reason, /Do not retry this begin-review invocation.*fresh unedited ordinary/iu);
+  assert.match(ambiguousResult.nextAction, /after the current verifier run settles.*fresh unedited ordinary.*after the latest base epoch.*exact-head clean/iu);
+  assert.deepEqual(ambiguousGitHub.requestBodies, []);
+
+  const laterEpoch = baseRefChangedEvent({
+    id: "BRE_returned_to_same_base",
+    createdAt: "2026-08-25T08:08:00Z",
+  });
+  const driftingGitHub = createGitHubMock({
+    baseEpochSequence: [epoch, laterEpoch],
+    issueComments: [workflowRequest({
+      body: canonicalRequestBody(HEAD, { runId: "99" }),
+      created_at: "2026-08-25T08:06:00Z",
+      updated_at: "2026-08-25T08:06:00Z",
+    })],
+  });
+  const driftingEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-request-same-tuple-epoch-drift",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+  const { result: driftingResult } = await runGate(driftingEnvironment, driftingGitHub);
+  assert.equal(driftingResult.report.gateOutcome, "pending");
+  assert.equal(driftingResult.report.recoveryCode, "wait_then_reconcile");
+  assert.match(driftingResult.report.reason, /base epoch changed before request adoption/iu);
+  assert.deepEqual(driftingGitHub.requestBodies, []);
+
+  const prePostDriftGitHub = createGitHubMock({
+    baseEpochSequence: [epoch, laterEpoch],
+    issueComments: [oldRequest],
+  });
+  const prePostDriftEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-request-same-tuple-epoch-drift-before-post",
+    eventName: "workflow_run",
+    operation: "begin-review",
+  });
+  const { result: prePostDriftResult } = await runGate(prePostDriftEnvironment, prePostDriftGitHub);
+  assert.equal(prePostDriftResult.report.gateOutcome, "pending");
+  assert.equal(prePostDriftResult.report.recoveryCode, "wait_then_reconcile");
+  assert.match(prePostDriftResult.report.reason, /base epoch changed before review-request POST/iu);
+  assert.deepEqual(prePostDriftGitHub.requestBodies, []);
+});
+
 test("auto request adopts multiple cross-run markers without a third request", async (context) => {
   const github = createGitHubMock({
     issueComments: [
@@ -13703,6 +13966,56 @@ test("newer verifier appearing only in the pre-POST inventory suppresses auto re
   assert.deepEqual(github.rerunRequests, []);
 });
 
+test("auto verifier selection ignores newer noncanonical ignored-edit runs", async (context) => {
+  const canonical = verifierRun();
+  const ignoredEdit = verifierRun({
+    id: 7002,
+    run_number: 42,
+    display_title: `codex-review-gate-ignored-edit/${PR}/${TEST_MERGE}`,
+    conclusion: "skipped",
+    html_url: `https://github.com/${REPOSITORY}/actions/runs/7002`,
+  });
+  const canonicalGitHub = createGitHubMock({
+    verifierRuns: [canonical, ignoredEdit],
+    verifierRunAttempts: [canonical],
+  });
+  const canonicalEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-ignored-edit-does-not-replace-canonical",
+    eventName: "workflow_run",
+    operation: "begin-review",
+    event: workflowRunEvent(canonical),
+  });
+  const { result: canonicalResult } = await runGate(canonicalEnvironment, canonicalGitHub);
+  assert.equal(canonicalResult.report.gateOutcome, "pending");
+  assert.deepEqual(canonicalGitHub.requestBodies, [canonicalRequestBody()]);
+  assert.equal(
+    canonicalGitHub.calls.some(({ path }) =>
+      path === `/repos/${REPOSITORY}/actions/runs/7002/attempts/1/jobs`
+    ),
+    false,
+  );
+
+  const ignoredGitHub = createGitHubMock({
+    verifierRuns: [canonical, ignoredEdit],
+    verifierRunAttempts: [ignoredEdit],
+  });
+  const ignoredEnvironment = runtimeEnvironment(context, {
+    suffix: "auto-ignored-edit-does-not-trigger-request",
+    eventName: "workflow_run",
+    operation: "begin-review",
+    event: workflowRunEvent(ignoredEdit),
+  });
+  const { result: ignoredResult } = await runGate(ignoredEnvironment, ignoredGitHub);
+  assert.equal(ignoredResult.report.gateOutcome, "not_applicable");
+  assert.deepEqual(ignoredGitHub.requestBodies, []);
+  assert.equal(
+    ignoredGitHub.calls.some(({ path }) =>
+      path === `/repos/${REPOSITORY}/actions/runs/7002/attempts/1/jobs`
+    ),
+    false,
+  );
+});
+
 test("unknown auto-request POST is adopted only on exact readback and never reruns", async (context) => {
   for (const [suffix, postUnknownReread, expectedExit] of [
     ["visible", "visible", 0],
@@ -13924,7 +14237,9 @@ test("begin-review cannot replace a previously observed deletion identity", asyn
             if (
               method !== "POST" ||
               path !== "/graphql" ||
-              !body?.query?.includes("CodexReviewGateDeletedComments")
+              !body?.query?.includes("CodexReviewGateDeletedComments") ||
+              (body.variables?.includeDeleted === false &&
+                body.variables?.includeComments === false)
             ) {
               return undefined;
             }
@@ -14013,7 +14328,9 @@ test("begin-review latches created exact-refetch content before history transpor
       if (
         method !== "POST" ||
         path !== "/graphql" ||
-        !body?.query?.includes("CodexReviewGateDeletedComments")
+        !body?.query?.includes("CodexReviewGateDeletedComments") ||
+        (body.variables?.includeDeleted === false &&
+          body.variables?.includeComments === false)
       ) {
         return undefined;
       }
@@ -14071,7 +14388,9 @@ test("begin-review cannot replace a known created id with another same-run marke
       if (
         method !== "POST" ||
         path !== "/graphql" ||
-        !body?.query?.includes("CodexReviewGateDeletedComments")
+        !body?.query?.includes("CodexReviewGateDeletedComments") ||
+        (body.variables?.includeDeleted === false &&
+          body.variables?.includeComments === false)
       ) {
         return undefined;
       }
@@ -16406,6 +16725,7 @@ function pullRequestEvent(action = "synchronize", overrides = {}) {
     number: PR,
     pull_request: {
       number: PR,
+      updated_at: "2026-08-25T08:05:00Z",
       merge_commit_sha: TEST_MERGE,
       head: {
         sha: HEAD,
@@ -17103,7 +17423,9 @@ function createGitHubMock({
           typeof baseEpochResponseMutator === "function"
         ? baseEpochResponseMutator(response.body)
         : response.body;
-      const mutated = typeof deletedCommentResponseMutator === "function"
+      const hasCommentHistory = body.variables?.includeDeleted !== false ||
+        body.variables?.includeComments !== false;
+      const mutated = hasCommentHistory && typeof deletedCommentResponseMutator === "function"
         ? deletedCommentResponseMutator(baseEpochMutated, {
             cursor,
             commentCursor: body.variables?.commentCursor ?? null,
@@ -17112,7 +17434,7 @@ function createGitHubMock({
             snapshotIndex: deletedCommentSnapshotIndex,
           })
         : baseEpochMutated;
-      if (!response.hasNext) deletedCommentSnapshotIndex += 1;
+      if (hasCommentHistory && !response.hasNext) deletedCommentSnapshotIndex += 1;
       return jsonResponse(mutated);
     }
     if (method === "GET" && path === `/repos/${REPOSITORY}/issues/${PR}/comments`) {

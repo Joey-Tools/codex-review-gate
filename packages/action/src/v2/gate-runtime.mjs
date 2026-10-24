@@ -1170,7 +1170,7 @@ function recoveryInstruction(
     return `Wait for the exact same-run request marker to settle${target}; if it remains absent, rerun the original workflow run instead of dispatching a new generation.`;
   }
   if (code === "create_verifier_run") {
-    return `Create a fresh verifier for the current test-merge commit${target}: convert a ready PR to draft and mark it ready again, or mark an existing draft ready, then reconcile again.`;
+    return `Create a fresh verifier for the current test-merge commit${target}. Base retargets now start a verifier automatically; if this workflow version predates that trigger, convert a ready PR to draft and mark it ready again, or mark an existing draft ready, then reconcile again.`;
   }
   return `Move the PR to a supported v2 target shape before retrying${target}.`;
 }
@@ -1240,6 +1240,16 @@ function formatV2UnresolvedReviewThreadSummary(reviewThreads) {
 function v2ReportNextAction(report, context = {}) {
   if (context.diagnosticObservation === true) {
     return "This verifier observation is a diagnostic snapshot, not the current gating result; PR Checks and the verifier summary are authoritative.";
+  }
+  if (
+    report.recoveryCode === "request_clean_generation" &&
+    report.reason.includes("ambiguous same-second ordering with the latest base epoch")
+  ) {
+    const target = Number.isSafeInteger(Number(context.prNumber)) &&
+      Number(context.prNumber) > 0
+      ? ` on PR #${context.prNumber}`
+      : "";
+    return `Do not retry begin-review${target}; after the current verifier run settles, post exactly one fresh unedited ordinary @codex review after the latest base epoch, wait for a trusted unedited exact-head clean, then reconcile.`;
   }
   const reviewThreads = report.reviewThreads;
   const primaryAction = context.verifierRunId
@@ -3585,6 +3595,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
   });
   const observedDeletedCommentEvents = new Map();
   const observedIssueCommentEdits = new Map();
+  const observedBaseEpoch = new Map();
   if (!config.requestReview) {
     await assertV2BeginReviewScope(client, config, initialPr, budget);
     return { kind: "disabled", commentId: null };
@@ -3597,7 +3608,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     ? await loadV2ReviewRequestAuthor(requestClient, budget)
     : null;
 
-  const comments = await loadV2IssueCommentsWithEditHistory(
+  const { comments, baseEpoch } = await loadV2IssueCommentsWithEditHistory(
     client,
     config,
     budget,
@@ -3606,6 +3617,8 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       expectedCount: initialPr.comments,
       observedDeletedCommentEvents,
       observedIssueCommentEdits,
+      observedBaseEpoch,
+      includeBaseEpoch: true,
     },
   );
   context.issueComments = comments;
@@ -3616,16 +3629,34 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     );
   }
 
-  const matching = controllerV2RequestComments(comments, requestAuthor).filter(({ binding }) =>
+  const matchingScope = controllerV2RequestComments(comments, requestAuthor).filter(({ binding }) =>
     matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
+  );
+  const matching = matchingScope.filter(({ comment }) =>
+    isV2ReviewRequestAfterBaseEpoch(comment, baseEpoch) === "newer"
   );
   if (matching.length > 0) {
     await assertV2BeginReviewScope(client, config, initialPr, budget);
+    const adoptionBaseEpoch = await loadV2LatestBaseEpoch(
+      client,
+      config,
+      budget,
+      observedBaseEpoch,
+    );
+    assertV2BaseEpochUnchanged(baseEpoch, adoptionBaseEpoch, "before request adoption");
     return {
       kind: matching.length === 1 ? "adopted" : "duplicates",
       commentId: canonicalPositiveId(matching[0].comment.id),
       duplicateCount: matching.length,
     };
+  }
+  if (matchingScope.some(({ comment }) =>
+    isV2ReviewRequestAfterBaseEpoch(comment, baseEpoch) === "ambiguous"
+  )) {
+    throw new V2RuntimeFailure(
+      "A same-scope canonical review request has ambiguous same-second ordering with the latest base epoch. Do not retry this begin-review invocation; after the current verifier run settles, post exactly one fresh unedited ordinary @codex review after the latest base epoch, wait for a trusted unedited exact-head clean, then reconcile",
+      { gateOutcome: "pending", recoveryCode: "request_clean_generation", retrySafe: false },
+    );
   }
 
   const prePostPr = await loadV2PullRequest(client, config, budget);
@@ -3654,6 +3685,14 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     }
     await assertV2AutoVerifierStillCurrent(client, config, prePostPr, budget);
   }
+
+  const prePostBaseEpoch = await loadV2LatestBaseEpoch(
+    client,
+    config,
+    budget,
+    observedBaseEpoch,
+  );
+  assertV2BaseEpochUnchanged(baseEpoch, prePostBaseEpoch, "before review-request POST");
 
   const requestBody = buildCanonicalV2ReviewRequestBody({
     repositoryId: context.repositoryId,
@@ -3700,14 +3739,21 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         observedIssueCommentEdits,
         [...comments, refetched],
       );
-      const { deletedCommentEvents, issueCommentEdits } = await loadV2CommentHistory(
+      const { baseEpoch: postBaseEpoch, deletedCommentEvents, issueCommentEdits } = await loadV2CommentHistory(
         client,
         config,
         budget,
         observedDeletedCommentEvents,
         observedIssueCommentEdits,
-        { diagnosticSummaryIds },
+        { diagnosticSummaryIds, includeBaseEpoch: true, observedBaseEpoch },
       );
+      assertV2BaseEpochUnchanged(baseEpoch, postBaseEpoch, "after review-request POST");
+      if (isV2ReviewRequestAfterBaseEpoch(refetched, postBaseEpoch) !== "newer") {
+        throw new V2RuntimeFailure(
+          "Created review request does not have an unambiguous timestamp after the latest base epoch",
+          { recoveryCode: "retry_begin", retrySafe: false },
+        );
+      }
       retainV2ObservedDeletedCommentEvents(
         deletedCommentEvents,
         observedDeletedCommentEvents,
@@ -3729,6 +3775,19 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
 
       const postRequestPr = await loadV2PullRequest(client, config, budget);
       assertV2BeginReviewScopeSnapshot(postRequestPr, config, initialPr);
+      const finalBaseEpoch = await loadV2LatestBaseEpoch(
+        client,
+        config,
+        budget,
+        observedBaseEpoch,
+      );
+      assertV2BaseEpochUnchanged(baseEpoch, finalBaseEpoch, "before accepting request creation");
+      if (isV2ReviewRequestAfterBaseEpoch(refetched, finalBaseEpoch) !== "newer") {
+        throw new V2RuntimeFailure(
+          "Created review request is not strictly newer than the latest base epoch",
+          { recoveryCode: "retry_begin", retrySafe: false },
+        );
+      }
       mayHaveCommitted = false;
       return { kind: "created", commentId: createdId };
     } catch (postError) {
@@ -3753,23 +3812,28 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
             label: "post-unknown review-request comments",
             observedDeletedCommentEvents,
             observedIssueCommentEdits,
+            observedBaseEpoch,
+            includeBaseEpoch: true,
           },
         );
-        context.issueComments = reread;
-        const sameRun = controllerV2RequestComments(reread, requestAuthor).filter(({ binding }) =>
+        context.issueComments = reread.comments;
+        const sameRun = controllerV2RequestComments(reread.comments, requestAuthor).filter(({ binding }) =>
           matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
         );
-        visible = postReturnedSuccessfully
+        const visibleSameRun = postReturnedSuccessfully
           ? sameRun.filter(({ comment }) =>
               canonicalPositiveId(comment.id) === createdId
             )
           : sameRun;
+        visible = visibleSameRun.filter(({ comment }) =>
+          isV2ReviewRequestAfterBaseEpoch(comment, reread.baseEpoch) === "newer"
+        );
         if (visible.length > 0) {
           await exactRefetchV2RelevantObjects(
             client,
             config,
             budget,
-            reread,
+            reread.comments,
             [],
             visible,
             observedIssueCommentEdits,
@@ -3799,6 +3863,25 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
         visibilityError = error;
       }
       await assertV2BeginReviewScope(client, config, initialPr, budget);
+      try {
+        const finalBaseEpoch = await loadV2LatestBaseEpoch(
+          client,
+          config,
+          budget,
+          observedBaseEpoch,
+        );
+        assertV2BaseEpochUnchanged(baseEpoch, finalBaseEpoch, "before unknown-POST adoption");
+        if (visible.some(({ comment }) =>
+          isV2ReviewRequestAfterBaseEpoch(comment, finalBaseEpoch) !== "newer"
+        )) {
+          throw new V2RuntimeFailure(
+            "Visible review request has ambiguous ordering with the latest base epoch",
+            { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+          );
+        }
+      } catch (error) {
+        visibilityError ??= error;
+      }
       if (visible.length > 0 && visibilityError === null) {
         mayHaveCommitted = false;
         return {
@@ -3925,6 +4008,8 @@ async function loadV2IssueCommentsWithEditHistory(
     expectedCount = null,
     observedDeletedCommentEvents = null,
     observedIssueCommentEdits = null,
+    observedBaseEpoch = null,
+    includeBaseEpoch = false,
   },
 ) {
   const previouslyObservedSummaryIds = rememberV2OfficialSummaryIds(
@@ -3972,14 +4057,15 @@ async function loadV2IssueCommentsWithEditHistory(
     previouslyObservedAndCurrentSummaryIds,
     observedIssueCommentEdits,
   );
-  const { deletedCommentEvents, issueCommentEdits } = await loadV2CommentHistory(
+  const history = await loadV2CommentHistory(
     client,
     config,
     budget,
     observedDeletedCommentEvents,
     observedIssueCommentEdits,
-    { diagnosticSummaryIds },
+    { diagnosticSummaryIds, includeBaseEpoch, observedBaseEpoch },
   );
+  const { deletedCommentEvents, issueCommentEdits } = history;
   retainV2ObservedDeletedCommentEvents(
     deletedCommentEvents,
     observedDeletedCommentEvents,
@@ -3990,7 +4076,7 @@ async function loadV2IssueCommentsWithEditHistory(
     observedIssueCommentEdits,
     diagnosticSummaryIds,
   );
-  return comments;
+  return { comments, baseEpoch: history.baseEpoch };
 }
 
 function requireExactV2CreatedReviewRequest(
@@ -4097,6 +4183,24 @@ async function runV2Reconcile(client, config, context, {
     if (current?.selfConsistent === true) {
       latestComplete = current;
       if (current.decision.gateOutcome !== "success") {
+        return publishV2SnapshotDecision(client, config, context, current, 1);
+      }
+      if (
+        isV2PullRequestBaseRetargetEvent(config.event) &&
+        !v2EditedRetargetHasObservedBaseEpoch(
+          config.event,
+          current.baseEpoch,
+        )
+      ) {
+        current.decision = {
+          ...current.decision,
+          gateOutcome: "pending",
+          reason:
+            "The pull_request edited base-retarget event is not yet confirmed by the latest " +
+            "base-ref timeline epoch; wait for matching base history and reconcile again",
+          recoveryCode: "wait_then_reconcile",
+          requiresReplacementPr: false,
+        };
         return publishV2SnapshotDecision(client, config, context, current, 1);
       }
       if (
@@ -4445,6 +4549,40 @@ function readV2Config(environment) {
   };
 }
 
+function isV2PullRequestBaseRetargetEvent(event) {
+  const previousRef = event?.changes?.base?.ref?.from;
+  const currentRef = event?.pull_request?.base?.ref;
+  return event?.action === "edited" &&
+    typeof previousRef === "string" && previousRef !== "" &&
+    typeof currentRef === "string" && currentRef !== "" &&
+    previousRef !== currentRef &&
+    isCanonicalUtcTimestamp(event?.pull_request?.updated_at);
+}
+
+function v2EditedRetargetHasObservedBaseEpoch(event, baseEpoch) {
+  if (!isV2PullRequestBaseRetargetEvent(event)) return true;
+  const previousRef = event.changes.base.ref.from;
+  const currentRef = event.pull_request.base.ref;
+  const epoch = baseEpoch?.event;
+  // PR.updated_at is only a conservative lower bound, never the base event's timestamp.
+  const editedLowerBoundMs = Date.parse(event.pull_request.updated_at);
+  if (
+    !epoch ||
+    !isCanonicalUtcTimestamp(epoch.createdAt) ||
+    Date.parse(epoch.createdAt) < editedLowerBoundMs
+  ) return false;
+  if (
+    epoch.typename === "BaseRefChangedEvent" &&
+    epoch.previousRefName === previousRef &&
+    epoch.currentRefName === currentRef
+  ) {
+    return true;
+  }
+  return (epoch.typename === "BaseRefChangedEvent" &&
+      epoch.currentRefName === currentRef) ||
+    (epoch.typename === "BaseRefForcePushedEvent" && epoch.refName === currentRef);
+}
+
 function validateV2Trigger(config) {
   const eventName = String(config.environment.GITHUB_EVENT_NAME || "");
   if (
@@ -4469,8 +4607,9 @@ function validateV2Trigger(config) {
     ]);
     const eventPr = event?.pull_request;
     const eventHead = String(eventPr?.head?.sha || "").toLowerCase();
+    const editedBaseRetarget = isV2PullRequestBaseRetargetEvent(event);
     if (
-      !allowedActions.has(event?.action) ||
+      (!allowedActions.has(event?.action) && !editedBaseRetarget) ||
       !isPlainRecord(eventPr) ||
       Number(event?.number) !== config.prNumber ||
       Number(eventPr?.number) !== config.prNumber ||
@@ -4887,6 +5026,7 @@ async function loadCompleteV2Snapshot(client, config, {
     baseSha: after.base.sha.toLowerCase(),
     fingerprint: fingerprintV2Snapshot(fingerprintPayload),
     issueComments: closing.issueComments,
+    baseEpoch: closing.decisionEvidence.baseEpoch,
     reviewThreads: closing.decisionEvidence.reviewThreads,
     counts: closing.decisionEvidence.counts,
     decision: closing.decisionEvidence.decision,
@@ -6507,7 +6647,7 @@ function reduceV2Evidence({
         selected: Boolean(currentGeneration),
       },
     }));
-  return { counts, reviewThreads, decision, carrierDiagnostics };
+  return { counts, reviewThreads, decision, carrierDiagnostics, baseEpoch };
 }
 
 function selectCurrentV2RequestGenerations({
@@ -8954,6 +9094,74 @@ async function loadV2CommentHistory(
       BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0
     ),
   };
+}
+
+async function loadV2LatestBaseEpoch(client, config, budget, observedBaseEpoch) {
+  const { data } = await client.request(
+    "POST",
+    "/graphql",
+    {
+      query: V2_DELETED_COMMENTS_QUERY,
+      variables: {
+        owner: config.owner,
+        repo: config.repo,
+        number: config.prNumber,
+        cursor: null,
+        commentCursor: null,
+        includeDeleted: false,
+        includeComments: false,
+        includeBaseEpoch: true,
+      },
+    },
+    { budget, safeRead: true },
+  );
+  budget.consumePage("pull-request latest base epoch");
+  const pullRequest = data?.data?.repository?.pullRequest;
+  const epochRead = inspectV2BaseEpochConnection(
+    pullRequest?.baseEpochTimelineItems,
+    observedBaseEpoch,
+  );
+  if (epochRead.error) throw epochRead.error;
+  if (
+    !isPlainRecord(data) ||
+    (data.errors !== undefined &&
+      (!Array.isArray(data.errors) || data.errors.length > 0)) ||
+    !isPlainRecord(data.data) ||
+    !isPlainRecord(data.data.repository) ||
+    data.data.repository.nameWithOwner !== config.repository ||
+    !isPlainRecord(pullRequest) ||
+    pullRequest.number !== config.prNumber
+  ) {
+    throw new V2RuntimeFailure(
+      "GitHub GraphQL latest base-epoch response was incomplete or inconsistent",
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+  budget.consumeObjects(2 + epochRead.nodeCount, "pull-request latest base epoch");
+  return epochRead.value;
+}
+
+function assertV2BaseEpochUnchanged(expected, observed, boundary) {
+  if (canonicalJson(expected) !== canonicalJson(observed)) {
+    throw new V2RuntimeFailure(
+      `The latest base epoch changed ${boundary}; refusing to reuse or duplicate a review request`,
+      { gateOutcome: "pending", recoveryCode: "wait_then_reconcile", retrySafe: false },
+    );
+  }
+}
+
+function isV2ReviewRequestAfterBaseEpoch(comment, baseEpoch) {
+  if (baseEpoch?.event === null || baseEpoch?.event === undefined) return "newer";
+  const requestAt = isCanonicalUtcTimestamp(comment?.created_at)
+    ? Date.parse(comment.created_at)
+    : null;
+  const epochAt = isCanonicalUtcTimestamp(baseEpoch.event.createdAt)
+    ? Date.parse(baseEpoch.event.createdAt)
+    : null;
+  if (requestAt === null || epochAt === null) return "ambiguous";
+  if (requestAt > epochAt) return "newer";
+  if (requestAt < epochAt) return "older";
+  return "ambiguous";
 }
 
 function latchV2VisibleCommentHistoryNodes({

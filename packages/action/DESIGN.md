@@ -130,7 +130,9 @@ review, strict freshness, no bypass and canary collision readback provide the
 adopted compound boundary.
 
 The verifier admits `pull_request` `opened`, `reopened`, `synchronize`,
-`ready_for_review`, and GitHub-native `stacked`. The `stacked` action provides
+`ready_for_review`, GitHub-native `stacked`, and `edited` only when
+`changes.base.ref.from` proves a real base-ref retarget. Title/body-only edits
+are filtered before runner allocation. The `stacked` action provides
 immediate verification when a PR joins a native stack; it supplements and does
 not replace `synchronize`. The `@v2` runtime accepts the new action, but an
 installed four-action verifier workflow must be refreshed to include it for
@@ -141,12 +143,18 @@ branch. It rejects arbitrary manual feature-base chains, forks, and stacks
 with another trunk. The direct PR base ref/SHA and stack trunk ref/SHA are
 distinct exact bindings, and current stack membership is revalidated. Each PR
 has its own verifier; lower-PR review results are not inherited. The protected
-controller and ruleset remain default-branch-rooted. `edited` is deliberately
-absent: after a base retarget, a
-ready PR must be converted to draft and marked ready again, while an
-already-draft PR is marked ready. The new `ready_for_review` event creates a
-verifier for the current exact head/base/test-merge scope; rerunning the old
-event does not. GitHub's stack object exposes stack number, size, position, and
+controller and ruleset remain default-branch-rooted. For a verified base-ref
+retarget, the optional `CODEX_REVIEW_GATE_AUTO_REQUEST=true` path revalidates
+the current head/base/test-merge scope before reusing or creating a canonical
+request. Deduplication uses the latest base epoch and exact current tuple, not
+each verifier event, so duplicate events in one epoch reuse the post-epoch
+request. A new request and a trusted, unedited top-level current-head clean
+whose explicit short SHA resolves uniquely to that head and whose timestamp
+is later can satisfy the narrow timestamp-based acceptance policy; timestamps
+do not prove causality or base-SHA coverage. Consumer availability requires a
+corresponding Action release and canonical workflow refresh. If
+the filtered event or verifier evidence is unavailable, use the draft-to-ready
+fallback. GitHub's stack object exposes stack number, size, position, and
 base ref/SHA. The gate binds current stack identity/position and trunk ref/SHA;
 a size-only increase when a PR is added above this one does not change its
 scope. A failed verifier from any admitted event can

@@ -93,8 +93,8 @@ const expectedSuites = [
 const expectedReleaseSynchronousTestCalls = 106;
 const expectedReleaseRegistrationCount = 162;
 const expectedReleaseShardDistribution = [41, 41, 40, 40];
-const expectedBootstrapSynchronousTestCalls = 171;
-const expectedBootstrapShardDistribution = [43, 43, 43, 42];
+const expectedBootstrapSynchronousTestCalls = 172;
+const expectedBootstrapShardDistribution = [43, 43, 43, 43];
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");

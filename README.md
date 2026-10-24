@@ -70,11 +70,14 @@ Actions compares strings case-insensitively in the job condition, so a case
 variant such as `TRUE` can still allocate a controller runner before the
 runtime rejects it without posting. A repository value overrides the
 organisation value. After the verifier runs for `opened`,
-`reopened`, `synchronize`, `ready_for_review` or native `stacked`, a completed failed run can
-trigger the protected controller for an eligible open, ready, same-repository
-PR and exact current head. The current verifier also admits native `stacked`
+`reopened`, `synchronize`, `ready_for_review`, native `stacked`, or an `edited`
+event that proves a real base-ref retarget, a completed failed run can trigger
+the protected controller for an eligible open, ready, same-repository PR and
+exact current head. The current verifier also admits native `stacked`
 events; four-action installed workflows remain usable but need the updated
-canonical verifier workflow for immediate stack-join wake-up. It verifies the
+canonical verifier workflow for immediate stack-join wake-up. Five-action
+copies already have that wake-up; both older profiles need the guarded
+`edited` update for automatic base-retarget verification. The controller verifies the
 run and may post
 or adopt a canonical current-scope `@codex review` request; uncertain outcomes
 remain pending. This automatic
@@ -85,6 +88,26 @@ if needed. For the Joey-Tools rollout, set the organisation variable's
 selected-repository visibility first to only `codex-private-workflows` as a
 canary before expanding it; do not set a repository-level override for that
 canary.
+
+For a verified base-ref retarget, the verifier and controller revalidate the
+current head, direct base, and test-merge scope before the opt-in path reuses
+or creates a canonical request. Title/body-only edits are filtered before a
+runner is allocated. Deduplication is after the latest base-ref-change or
+base-force-push boundary and requires the exact current head/base tuple, so an
+earlier same-head request cannot be reused, including after an A-to-B-to-A
+retarget. Duplicate verifier events in the same epoch reuse that matching
+post-epoch request. A new request followed by a trusted, unedited top-level
+current-head clean whose explicit short SHA resolves uniquely to that head and
+whose timestamp is later than the request can meet the narrow acceptance policy
+when no unresolved finding remains and all existing gates pass. This policy does
+not prove provider causality or coverage of a particular base SHA. If the
+retarget or verifier evidence cannot be verified, use the existing
+draft-to-ready fallback. This describes source support; consumer availability
+requires the corresponding Action release and canonical workflow refresh.
+Automatic requests remain opt-in and retain the existing request-token
+configuration; the controller remains on the protected default branch, and
+its `issue_comment` trigger still accepts only `created`,
+not `edited`.
 
 The append-only v2.2 controller contract can optionally receive a separate
 `review_request_token` for
