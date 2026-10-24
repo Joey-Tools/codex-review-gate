@@ -1117,8 +1117,10 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   fresh-fixture 两种形态；两者都不是 installation 或 activation path；
 - verifier path `.github/workflows/codex-review-gate.yml`、workflow name
   `Codex Review Gate Verifier`、`pull_request` types `opened`、`reopened`、
-  `synchronize`、`ready_for_review`、`stacked`，以及 exact PR feature-head SHA 上的 required job
-  `codex/github-review-gate`；
+  `synchronize`、`ready_for_review`、`stacked`，以及仅在
+  `changes.base.ref.from` 证明真实 base-ref retarget 时接收的 `edited`；title/body-only edit
+  会在分配 runner 前过滤。Exact PR feature-head SHA 上的 required job
+  为 `codex/github-review-gate`；
 - controller path `.github/workflows/codex-review-gate-controller.yml`、workflow
   name `Codex Review Gate Controller`、exact Codex `issue_comment` `created`、
   canonical `Codex Review Gate Verifier` 首次 attempt（`run_attempt=1`）failure
@@ -1143,24 +1145,32 @@ epoch。Deadline 到期或 evidence 改变时，结论为 inconclusive、不允�
   `pull_request_review`、status bridge、runtime App 或 ledger。
 
 可选的自动请求路径让 canonical `pull_request` verifier 保持只读，并通过现有受保护的
-controller workflow，在 canonical verifier 首次 attempt 失败后的 `workflow_run` 事件上运行。
-重跑旧 verifier attempt 不会启动此路径。应在 `on.workflow_run.workflows` 使用静态 verifier
+controller workflow 的 `workflow_run` 运行。普通 event 仍要求 verifier 首次 attempt 失败；已验证的
+base-ref-retarget event 使用独立的 current-scope 检查，title/body-only edit 不符合条件。重跑旧 verifier
+attempt 不会启动此路径。应在 `on.workflow_run.workflows` 使用静态 verifier
 workflow name 订阅，而不要在 job 条件里将 `workflow_run.name` 与静态名称比较：verifier 的
 `run-name` 会使每次 run 的 name 动态变化。Action 仍校验 canonical workflow ID、path、run 和
 PR scope。公开仓库的
 policy 不允许使用可写的 `pull_request_target` handler。controller 只接受 open、ready
 （非 draft）、same-repository、direct base 指向当前 default branch 或经验证的 native-stack
-trunk 绑定该 branch 的 PR；失败的 verifier 必须
-绑定其当前 exact head，且不能已有 matching canonical request，包括先前 controller run 中与
-相同 repository、PR、head 和 base 匹配的 canonical marker。`opened`、`reopened`、
-`synchronize`、`ready_for_review` 或原生 `stacked` 后的 verifier failure 都可能符合条件。仅当
+trunk 绑定该 branch 的 PR；verifier 必须绑定当前 exact head，且不能已有 matching canonical request。
+Retarget 去重只接受最新 base-ref-change 或 base-force-push boundary 之后、exact current head/base tuple
+匹配的 request；即使 A→B→A 后回到相同 head/base SHA 也一样。同一 epoch 的重复 verifier event 会复用该
+matching request。`opened`、`reopened`、`synchronize`、`ready_for_review` 或原生 `stacked` 后的 verifier
+failure 都可能符合条件；真实 base-ref-retarget event 也可能符合条件。仅当
 `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确等于 `true`，才用现有 `begin-review` operation 和
-`request_review=true` 进入 request-only mode（只发送请求，不立刻重跑 verifier）。之后由合格的
+`request_review=true` 进入 request-only mode（只发送请求，不立刻重跑 verifier），并要求既有
+request-token 配置。之后由合格的
 Codex bot
 `issue_comment` event 或受保护的手动 exact-head `reconcile` 更新 gate。若 merge conflict
-使 verifier 无法运行，就没有可消费的 failed-verifier `workflow_run`：先解决冲突，或按文档走
-手动恢复路径。`CODEX_REVIEW_GATE_AUTO_REQUEST` 这项 opt-in 本身不增加第三个 workflow、新
+使 verifier 无法运行，就没有可消费的 `workflow_run`：先解决冲突，或按文档走手动恢复路径。Retarget
+后的新 canonical request 与其后 trusted、未编辑的 top-level current-head clean，若显式 short SHA
+能唯一解析为 current head 且 timestamp 晚于 request，可在没有未解决 finding、其他 gate 均通过时满足
+窄范围接受策略。时间顺序是 temporal witness，不证明 request 导致 clean 或 artifact 覆盖某个 base SHA。
+若 filtered event 或匹配 verifier 不可用，使用 draft-to-ready `create_verifier_run` fallback；未更新
+filtered `edited` activity 的旧 consumer workflow 也需要该 fallback。`CODEX_REVIEW_GATE_AUTO_REQUEST` 这项 opt-in 本身不增加第三个 workflow、新
 Action input、runtime App 或 ruleset；v2.2 的独立 request-token input 只用于显式选择请求 comment 作者。
+这是源码支持；consumer 还需对应 Action release 并刷新 canonical workflow 后才能收到该 event。
 
 controller Action step 的 underscore inputs 只有 `github_token`、`pr_number`、
 `expected_head_sha`、`operation`、`request_comment_id` 与 `request_review`。两份 Action
@@ -1569,10 +1579,10 @@ variable `CODEX_REVIEW_GATE_AUTO_REQUEST=true`，并将 selected-repository visi
    无法证明这些条件时，此例外不可用；按 summary 指示走普通 request-bound `+1`
    或 replacement-PR 路径。新的 PR 事件会创建新 cutoff，不保证 `R1/C1` 可复用。
 
-   若 base retarget 后 current exact head/base/test-merge scope 没有 verifier，按
-   `create_verifier_run` 恢复：ready PR 先转 draft 再标记 ready；already-draft PR 直接标记
-   ready。Reconcile 前必须要求该 exact scope 出现新的 `ready_for_review` verifier；
-   rerun 旧 event 不是有效的 retarget recovery。
+   若无法从 filtered `edited` event 验证 base retarget，或 current exact head/base/test-merge scope 没有
+   verifier，按 `create_verifier_run` 恢复：ready PR 先转 draft 再标记 ready；already-draft PR 直接标记
+   ready。Reconcile 前必须要求该 exact scope 出现新的 `ready_for_review` verifier；rerun 旧 event 不是有效的
+   retarget recovery。未包含 filtered `edited` activity 的旧 consumer workflow 也使用此 fallback。
 
    如果 controller summary 报告 base epoch、base retarget 或
    `request_clean_generation`，不能仅凭该 code 就发送 request；先读取具体 reason、lineage

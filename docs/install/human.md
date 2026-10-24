@@ -108,7 +108,9 @@ Copy both canonical workflows unchanged. They own separate event and permission
 boundaries that an Action step cannot define:
 
 - the read-only verifier uses `pull_request` activity types `opened`,
-  `reopened`, `synchronize`, `ready_for_review`, and native `stacked`; its native
+  `reopened`, `synchronize`, `ready_for_review`, native `stacked`, and
+  `edited` only when `changes.base.ref.from` proves an actual base-ref
+  retarget. Title/body-only edits are filtered before runner allocation; its native
   `codex/github-review-gate` CheckRun on the exact PR feature-head SHA is
   required;
 - controller bot-evidence wake-ups use only the `issue_comment` activity type
@@ -135,7 +137,13 @@ boundaries that an Action step cannot define:
   fresh same-repository, open, non-draft PR with a direct base on the current
   default branch or a verified native-stack trunk on that branch, still on the source run's current head, and no matching canonical
   request. A verifier triggered by `opened`, `reopened`,
-  `synchronize`, `ready_for_review`, or native `stacked` can reach this path. It does not
+  `synchronize`, `ready_for_review`, or native `stacked` can reach this ordinary
+  failure path. A verified base-ref-retarget `edited` run has a separate
+  current-scope path: the controller rechecks the current head/base/test-merge
+  tuple and reuses only a canonical request after the latest base epoch with
+  that exact tuple, or creates one when eligible. Duplicate verifier events
+  within the same epoch reuse that request. This does not cancel a valid
+  required verifier or publish a skipped verifier as success. It does not
   immediately rerun the verifier; a later qualifying Codex bot
   `issue_comment` or manual `reconcile` performs the next evaluation. A merge
   conflict that prevents the verifier from running has no automatic request;
@@ -1903,7 +1911,9 @@ binding input.
 
 There is deliberately no cron, `pull_request_target`, or writable review event.
 The current verifier starts on `opened`, `reopened`, `synchronize`,
-`ready_for_review`, and native `stacked`; controller and verifier have separate concurrency
+`ready_for_review`, native `stacked`, and only base-ref-retarget `edited`
+events; title/body-only edits are filtered before runner allocation.
+Controller and verifier have separate concurrency
 namespaces. Associated controller events remain PR-scoped; association-empty
 completion events use a per-run fallback group. With exact
 `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, an eligible
@@ -1943,19 +1953,31 @@ comment does not prove Codex started, and timestamps plus SHA do not prove
 which request caused a clean. Findings, provider errors, liveness and stable
 snapshot checks still block success.
 
-If a base retarget leaves no verifier for the current exact
-head/base/test-merge scope, follow
-`create_verifier_run`: for a ready PR, convert it to draft and mark it ready
-again; for an already-draft PR, mark it ready. Verify that a new
-`ready_for_review` verifier exists for the current exact head/base/test-merge scope, then
-reconcile. Rerunning the old verifier is not valid retarget recovery.
+The canonical `edited` verifier path applies only to a real direct-base-ref
+change proved by `changes.base.ref.from`; it is not an `issue_comment.edited`
+trigger. When `CODEX_REVIEW_GATE_AUTO_REQUEST=true` and the existing request
+token configuration is available, the protected default-branch controller
+revalidates the current head/base/test-merge scope and reuses or creates the
+canonical request. The exact opt-in remains necessary; otherwise use the
+existing protected manual request path. A request from before the latest
+base-ref-change or base-force-push boundary cannot be reused, even if an
+A-to-B-to-A retarget returns to the same ref and SHA. Duplicate verifier
+events in the same epoch reuse an exact post-epoch request. A new canonical request
+followed by a trusted, unedited top-level current-head clean whose explicit
+short SHA resolves uniquely to that head and whose timestamp is later than the
+request can satisfy the narrow acceptance policy when no unresolved finding
+remains and all existing gates pass. This timestamp ordering is a temporal
+witness, not proof that the request caused the clean or that either artifact
+attests a particular base SHA. Findings and every existing provider, liveness,
+snapshot, and thread-resolution check remain in force.
 
-After a base retarget or a detected base force-push epoch, always use
-`begin-review` with `request_review=true`, then reconcile after Codex places a
-qualifying `+1` directly on that canonical request. GitHub terminal clean
-payloads do not identify the request/base snapshot that produced them, so in
-this recovery mode a later terminal clean by itself deliberately remains
-pending. Findings still block immediately.
+If the event cannot be verified or no matching verifier exists, retain the
+draft-to-ready `create_verifier_run` fallback: for a ready PR, convert it to
+draft and mark it ready again; for an already-draft PR, mark it ready. Older
+consumer templates that do not include the filtered `edited` activity also
+need this fallback. Rerunning an old verifier is not valid retarget recovery.
+This describes source support; consumers need the corresponding Action
+release and canonical workflow refresh before the filtered event is available.
 
 Use `begin-review` when request creation and the newer verifier attempt must be
 coordinated. For example:

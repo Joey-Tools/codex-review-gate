@@ -61,15 +61,29 @@ trunk ref/SHA 会分别绑定。每个 PR 都有自己的 Codex gate，不继承
 自动 controller job，其他值均不能发出请求。GitHub Actions 的 job 条件不区分字符串大小写，
 因此 `TRUE` 等大小写变体仍可能分配 controller runner，但 runtime 会在发帖前拒绝。
 repository 值会覆盖 organisation 值。`opened`、`reopened`、`synchronize`、
-`ready_for_review` 或原生 `stacked` 触发 verifier 后，一次完成且失败的 run 可以让受保护
+`ready_for_review`、原生 `stacked`，或能证明 base ref 确实重定向的 `edited` event
+触发 verifier 后，符合条件的 run 可以让受保护
 controller 处理符合 scope 的 same-repository、open、ready PR，且 head 仍精确匹配。它校验该
 run，可能发送或采用当前 scope 的 canonical `@codex review` request；
+title 或 body 等其他 `edited` 变更会在分配 runner 前忽略。
 结果不确定时保持 pending。
 自动路径不会立即 rerun verifier；之后由 Codex bot comment 或受保护的 manual
 `reconcile` 处理结果。如果 merge conflict 阻止 verifier 运行，就不会触发自动请求；
 应先解决冲突，必要时再使用 manual recovery。Joey-Tools rollout 应先把 organisation
 variable 的 selected-repository visibility 仅设为 `codex-private-workflows` 作为
 canary，不设置 repository-level override；通过后再扩大范围。
+
+确认 base-ref retarget 后，verifier 和 controller 会先重新验证 current head、direct base 与
+test-merge scope，再由 opt-in 路径复用或创建 canonical request。title/body-only edit 会在分配
+runner 前过滤。去重只考虑最新 base-ref-change 或 base-force-push 边界之后、且 exact current
+head/base tuple 匹配的 request；因此更早的同 head request 不能复用，包括 A→B→A 重定向。同一 epoch
+中的重复 verifier event 会复用该匹配的 post-epoch request。新 request 之后创建、trusted 且未编辑的
+顶层 current-head clean 若显式 short SHA 能唯一解析为该 head、时间晚于 request，则在没有未解决 finding 且所有既有 gate 均通过时，可满足窄范围接受策略。这是基于
+时间戳的策略，不证明 provider 因果关系，也不证明 artifact 覆盖某个 base SHA。若无法验证重定向或
+verifier evidence，则使用既有 draft-to-ready fallback。这描述的是源码支持；consumer 可用性还需要对应
+Action release 与 canonical workflow refresh。自动 request 仍为 opt-in，且需要既有
+request-token 配置；controller 仍在受保护 default branch 运行，`issue_comment` 触发器仍只接受
+`created`，不接受 `edited`。
 
 Append-only v2.2 controller contract 可选接收独立的 `review_request_token`，仅用于
 `begin-review` 请求中的认证用户身份查询与请求 comment 创建。留空保留当前

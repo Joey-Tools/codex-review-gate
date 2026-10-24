@@ -1496,11 +1496,17 @@ runtime SHA 相同的 fresh PR read。受保护的 top-level `run-name` 还让 G
 唯一的 PR binding 必须携带 current feature head 与 default-branch base SHA。因此
 successful feature-head CheckRun 会在执行语义上绑定 exact current test-merge。为了避免 idle PR 消耗
 minutes，没有 cron、`pull_request_target` 或可写 review event。verifier 在 `opened`、
-`reopened`、`synchronize` 与 `ready_for_review` 上启动；controller 与 verifier 使用独立
+`reopened`、`synchronize`、`ready_for_review`、原生 `stacked`，以及仅限
+`changes.base.ref.from` 证明真实 base-ref retarget 的 `edited` event 上启动；title/body-only edit
+会在分配 runner 前过滤。controller 与 verifier 使用独立
 concurrency namespaces；已关联事件按 PR 分组，空关联 completion event 使用 per-run fallback
 group。生效的 `CODEX_REVIEW_GATE_AUTO_REQUEST` 精确等于 `true` 时，
 合格的失败 canonical verifier 可通过 `workflow_run` 唤醒受保护 controller，为当前 PR scope
-创建缺失的 canonical request。自动启动只创建 request，不会立即 rerun verifier。只有该自动路径
+创建缺失的 canonical request。该条件适用于普通失败路径；已验证的 base-ref-retarget `edited` run
+使用独立 current-scope 路径：controller 重新验证 current head/base/test-merge tuple，只复用最新
+base epoch 之后且 exact tuple 匹配的 canonical request，否则在符合条件时创建 request。同一 epoch 的重复
+verifier event 会复用该 request。它不会取消有效的 required verifier，也不会把 skipped verifier 发布成 success。
+自动启动只创建 request，不会立即 rerun verifier。只有该自动路径
 可识别其他 controller run 留下、repository/PR/head/base 全部精确匹配的 canonical marker；
 手动 `begin-review` 保持 same-run binding。等待后续合格 Codex bot `issue_comment`，或手动
 `reconcile` 执行下一次评估。若要对同一 head deliberate re-review，先运行 `begin-review`，
@@ -1529,16 +1535,20 @@ issue-comment clean `C1`，且其后没有 boundary；再通过合格 bot-commen
 事件校验仅限 PR head/base 的 SHA、ref 与 repository；其 `merge_commit_sha` 可以缺失或来自
 历史快照，明确不作为 binding input。
 
-若 base retarget 后 current exact head/base/test-merge scope 没有 verifier，遵循
-`create_verifier_run`：ready PR 先转为 draft 再 mark ready；already-draft PR 直接 mark
-ready。确认 current exact head/base/test-merge scope 出现新的 `ready_for_review` verifier 后再
-reconcile。rerun 旧 verifier 不是有效 retarget recovery。
+Canonical `edited` verifier path 只处理 `changes.base.ref.from` 能证明的 direct-base-ref 变更；
+它不是 `issue_comment.edited` trigger。仅当 `CODEX_REVIEW_GATE_AUTO_REQUEST=true` 且既有
+request-token 配置可用时，受保护 default-branch controller 才会重新验证 current head/base/test-merge
+scope 并复用或创建 canonical request。该精确 opt-in 仍是必要条件；未启用时使用既有受保护手动请求路径。
+最新 base-ref-change 或 base-force-push boundary 之前的 request 不能复用，即使 A→B→A 后 ref 与 SHA
+恢复原样。新 canonical request 之后，若 trusted、未编辑的顶层 current-head clean 显式携带的 short SHA
+能唯一解析为该 head，且时间晚于 request，则在没有未解决 finding 且所有既有 gate 均通过时，可满足窄范围
+接受策略。这个时间顺序只是 temporal witness（时间见证），不证明 request 导致 clean，也不证明任一
+artifact 证明了某个 base SHA。Finding 以及既有 provider、liveness、snapshot 与 thread-resolution 检查仍有效。
 
-base retarget 或检测到 base force-push epoch 后，必须使用
-`request_review=true` 的 `begin-review`；等 Codex 在该 canonical request 上直接留下
-合格 `+1` 后再 reconcile。GitHub terminal clean payload 不会标明产生它的 request/base
-snapshot，因此在这个 recovery mode 中，单独的 later terminal clean 会有意保持
-pending。finding 仍会立即阻塞。
+若 event 无法验证或没有匹配 verifier，仍使用 draft-to-ready `create_verifier_run` fallback：ready PR
+先转为 draft 再标记 ready；already-draft PR 直接标记 ready。未包含 filtered `edited` activity 的旧
+consumer template 也需要此 fallback。Rerun 旧 verifier 不是有效的 retarget recovery。这描述的是源码支持；
+consumer 还需等待对应 Action release 并刷新 canonical workflow，才可使用 filtered event。
 
 需要协调 fresh request 与更新 verifier attempt 时，使用默认 `request_review=true` 的
 `begin-review`：

@@ -204,10 +204,16 @@ feature-base 链、fork 和 trunk 不同的 stack 均不支持。PR direct base 
 ref/SHA 是不同 binding，均需结合当前 stack membership 检查。每个 PR 有独立 gate，不继承下层
 PR 的 review 结果，也不执行 stack merge。受保护 controller 仍从 default branch 执行。
 
-`pull_request.edited` 被明确排除，所以 base-ref retarget 不会生成 current verifier。应使用现有
-draft-to-ready 恢复流程刷新新 scope；若 report 要求，再发送新的 `@codex review`。native rerun
-旧 event 不能代替。base-tip 前进与 trunk/membership drift 按各自绑定的当前 scope 评估；不要假设
-每次 base advance 都会使 head-bound clean review evidence 失效。GitHub 原生 `stacked` webhook
+Canonical `pull_request.edited` 只在 `changes.base.ref.from` 证明 base-ref 确实改变时生成 verifier；
+title/body-only edit 会在分配 runner 前过滤。确认 retarget 后，verifier 与受保护 controller 会按当前
+head/base/test-merge tuple 重新校验；仅在 `CODEX_REVIEW_GATE_AUTO_REQUEST=true` 且既有 request-token
+配置可用时，自动路径才复用或创建 canonical request。较早的 request 不能跨最新 base-ref-change 或
+base-force-push boundary 去重，包括 A→B→A 恢复到相同 ref/SHA 的情况。新 request 之后创建、trusted、未编辑、
+current-head top-level clean 的 short SHA 若能唯一匹配 head，可作为窄范围 temporal witness；这不证明
+request 与 clean 的因果关系，也不是 base-SHA attestation。若 event 或匹配 verifier evidence 不可用，
+仍需 draft-to-ready fallback；未更新的旧 consumer workflow 不会收到 filtered `edited` verifier event。
+`issue_comment.edited` 仍不会唤醒 controller。Base-tip 前进与 trunk/membership drift 按各自绑定的当前
+scope 评估；不要假设每次 base advance 都会使 head-bound clean review evidence 失效。GitHub 原生 `stacked` webhook
 action 不同于 top-level pull-request event type，不能视为 `synchronize` 的替代，除非已安装
 workflow 明确接收并验证它。
 

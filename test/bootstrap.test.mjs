@@ -136,6 +136,9 @@ const CANONICAL_WORKFLOW = readFileSync(
   ),
   "utf8",
 );
+const CANONICAL_VERIFIER_RUN_NAME_LINE = CANONICAL_WORKFLOW
+  .split("\n")
+  .find((line) => line.startsWith("run-name: "));
 const CANONICAL_CONTROLLER_WORKFLOW = readFileSync(
   new URL(
     "../templates/codex-gated-repo/.github/workflows/codex-review-gate-controller.yml",
@@ -213,11 +216,16 @@ const CANONICAL_WORKFLOWS_WITH_LEGACY_BRIDGE = {
   ...CANONICAL_WORKFLOWS,
   legacyBridge: CANONICAL_LEGACY_BRIDGE_WORKFLOW,
 };
-function previousCanonicalControllerWorkflow() {
-  const currentGroupLine =
+function previousCanonicalControllerWorkflow(profile = "older") {
+  const currentGroupLine = CANONICAL_CONTROLLER_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("  group: "),
+  );
+  const previousGroupWithRunIdLine =
     "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id }}";
   const previousGroupLine =
-    "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}";
+    profile === "current"
+      ? previousGroupWithRunIdLine
+      : "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number }}";
   const currentPathFilter = [
     "            github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||",
     "            (",
@@ -229,17 +237,57 @@ function previousCanonicalControllerWorkflow() {
     "            github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml' ||",
     "            startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@')",
   ].join("\n");
+  const displayTitleFilter =
+    "          startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/') &&\n";
+  assert.equal(CANONICAL_CONTROLLER_WORKFLOW.split(currentGroupLine).length, 2);
+  assert.equal(CANONICAL_CONTROLLER_WORKFLOW.split(displayTitleFilter).length, 2);
   const withPreviousGroup = CANONICAL_CONTROLLER_WORKFLOW.replace(
     currentGroupLine,
     previousGroupLine,
   );
   assert.notEqual(withPreviousGroup, CANONICAL_CONTROLLER_WORKFLOW);
-  const previousController = withPreviousGroup.replace(
-    currentPathFilter,
-    previousPathFilter,
+  const withoutDisplayTitleFilter = withPreviousGroup.replace(
+    displayTitleFilter,
+    "",
   );
-  assert.notEqual(previousController, withPreviousGroup);
+  const previousController = profile === "current"
+    ? withoutDisplayTitleFilter
+    : withoutDisplayTitleFilter.replace(currentPathFilter, previousPathFilter);
+  assert.notEqual(previousController, CANONICAL_CONTROLLER_WORKFLOW);
   return previousController;
+}
+function previousCanonicalVerifierWorkflow(lifecycle) {
+  const currentRunNameLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("run-name: "),
+  );
+  const currentGroupLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("  group: "),
+  );
+  const currentJobNameLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("    name: "),
+  );
+  const currentJobIfLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("    if: "),
+  );
+  const currentLifecycleLine = CANONICAL_WORKFLOW.split("\n").find(
+    (line) => line.startsWith("    types: [") && line.endsWith(", edited]"),
+  );
+  assert.equal(typeof currentRunNameLine, "string");
+  assert.equal(typeof currentGroupLine, "string");
+  assert.equal(typeof currentJobNameLine, "string");
+  assert.equal(typeof currentJobIfLine, "string");
+  assert.equal(typeof currentLifecycleLine, "string");
+  return CANONICAL_WORKFLOW
+    .replace(currentRunNameLine, `run-name: ${DEFAULT_VERIFIER_RUN_NAME}`)
+    .replace(
+      currentGroupLine,
+      "  group: codex-review-gate-verifier-${{ github.repository }}-${{ github.event.pull_request.number }}",
+    )
+    .replace(
+      `${currentJobNameLine}\n${currentJobIfLine}`,
+      "    name: codex/github-review-gate",
+    )
+    .replace(currentLifecycleLine, lifecycle);
 }
 function controllerWithoutReviewRequestToken(workflow) {
   const reviewRequestTokenLine =
@@ -2443,8 +2491,8 @@ test("fixed frozen handoff inventory accepts only the recorded immutable workflo
   );
   assert.throws(
     () => validateCanonicalV2WorkflowContent(FROZEN_HANDOFF_VERIFIER_WORKFLOW),
-    /exact supported runs-on expression/u,
-    "the immutable handoff does not gain the current runner contract",
+    /exactly one top-level run-name/u,
+    "the immutable handoff does not gain the current verifier envelope",
   );
   const frozenVerifierWithCurrentRunner = FROZEN_HANDOFF_VERIFIER_WORKFLOW
     .replace(
@@ -2453,7 +2501,19 @@ test("fixed frozen handoff inventory accepts only the recorded immutable workflo
     )
     .replace(
       "    types: [opened, reopened, synchronize, ready_for_review]",
-      "    types: [opened, reopened, synchronize, ready_for_review, stacked]",
+      "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited]",
+    )
+    .replace(
+      /^run-name: .+$/mu,
+      CANONICAL_VERIFIER_RUN_NAME_LINE,
+    )
+    .replace(
+      /^  group: .+$/mu,
+      CANONICAL_WORKFLOW.split("\n").find((line) => line.startsWith("  group: ")),
+    )
+    .replace(
+      "    name: codex/github-review-gate",
+      `${CANONICAL_WORKFLOW.split("\n").find((line) => line.startsWith("    name: "))}\n${CANONICAL_WORKFLOW.split("\n").find((line) => line.startsWith("    if: "))}`,
     );
   assert.throws(
     () => validateCanonicalV2WorkflowContent(frozenVerifierWithCurrentRunner),
@@ -6373,6 +6433,11 @@ test("parent revalidation ignores benign child-entry churn", () => {
 
 test("validates exact canonical v2 workflow shape and remote bytes", () => {
   const canonical = canonicalWorkflowFixture();
+  const canonicalControllerConcurrencyGroupLine =
+    CANONICAL_CONTROLLER_WORKFLOW.split("\n").find((line) =>
+      line.startsWith("  group: "),
+    );
+  assert.equal(typeof canonicalControllerConcurrencyGroupLine, "string");
   assert.equal(validateCanonicalV2WorkflowContent(canonical), canonical);
   for (const [name, invalid] of [
     [
@@ -6401,17 +6466,20 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
   for (const [name, invalid] of [
     [
       "omitted run-name",
-      canonical.replace(`run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n`, ""),
+      canonical.replace(`${CANONICAL_VERIFIER_RUN_NAME_LINE}\n`, ""),
     ],
     [
       "tampered run-name",
-      canonical.replace(DEFAULT_VERIFIER_RUN_NAME, "attacker/${{ github.sha }}"),
+      canonical.replace(
+        CANONICAL_VERIFIER_RUN_NAME_LINE,
+        "run-name: attacker/${{ github.sha }}",
+      ),
     ],
     [
       "duplicate quoted run-name",
       canonical.replace(
-        `run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n`,
-        `run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n'run-name': attacker\n`,
+        `${CANONICAL_VERIFIER_RUN_NAME_LINE}\n`,
+        `${CANONICAL_VERIFIER_RUN_NAME_LINE}\n'run-name': attacker\n`,
       ),
     ],
   ]) {
@@ -6804,8 +6872,11 @@ test("validates exact canonical v2 workflow shape and remote bytes", () => {
     () =>
       validateCanonicalV2ControllerWorkflowContent(
         CANONICAL_CONTROLLER_WORKFLOW.replace(
-          "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id }}",
-          "  group: codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.id }}",
+          canonicalControllerConcurrencyGroupLine,
+          canonicalControllerConcurrencyGroupLine.replace(
+            "format('codex-review-gate-controller-{0}-{1}'",
+            "format('codex-review-gate-controller-altered-{0}-{1}'",
+          ),
         ),
       ),
     /unexpected concurrency\.group/u,
@@ -7037,9 +7108,9 @@ test("validates the exact closed temporary legacy bridge envelope", () => {
 
 test("installed verifier narrowly upgrades the previous pull request lifecycle", () => {
   const canonicalLifecycle =
-    "    types: [opened, reopened, synchronize, ready_for_review, stacked]";
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited]";
   const previousLifecycle =
-    "    types: [opened, reopened, synchronize, ready_for_review]";
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked]";
   const cleanInventory = [
     { path: DEFAULT_WORKFLOW_PATH, content: CANONICAL_WORKFLOW },
     {
@@ -7148,7 +7219,7 @@ test("installed verifier narrowly upgrades the previous pull request lifecycle",
     [
       "changed job name",
       CANONICAL_WORKFLOW.replace(
-        "    name: codex/github-review-gate",
+        "    name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && 'codex/ignored-review-gate-edit' || 'codex/github-review-gate' }}",
         "    name: codex/other-check",
       ),
     ],
@@ -7166,10 +7237,66 @@ test("installed verifier narrowly upgrades the previous pull request lifecycle",
         ),
         CANONICAL_WORKFLOWS,
       ),
-      /pull_request lifecycle types|cancel superseded attempts|missing required fragment|unexpected top-level permissions mapping|differs from the canonical v2 verifier workflow bytes/u,
+      /pull_request lifecycle types|cancel superseded attempts|missing required fragment|unexpected codex-review-gate job name|unexpected top-level permissions mapping|differs from the canonical v2 verifier workflow bytes/u,
       name,
     );
   }
+});
+
+test("installed verifier admits only the exact four- and five-event pre-retarget profiles", () => {
+  const currentLifecycle =
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited]";
+  const previousFiveEventLifecycle =
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked]";
+  const previousFourEventLifecycle =
+    "    types: [opened, reopened, synchronize, ready_for_review]";
+  const cleanInventory = [
+    { path: DEFAULT_WORKFLOW_PATH, content: CANONICAL_WORKFLOW },
+    {
+      path: DEFAULT_CONTROLLER_WORKFLOW_PATH,
+      content: CANONICAL_CONTROLLER_WORKFLOW,
+    },
+  ];
+
+  for (const [name, lifecycle] of [
+    ["previous five-event lifecycle", previousFiveEventLifecycle],
+    ["previous four-event lifecycle", previousFourEventLifecycle],
+  ]) {
+    const installedVerifier = previousCanonicalVerifierWorkflow(lifecycle);
+    assert.notEqual(installedVerifier, CANONICAL_WORKFLOW, name);
+    assert.equal(
+      validateCanonicalV2WorkflowInventory(
+        cleanInventory.map((file) =>
+          file.path === DEFAULT_WORKFLOW_PATH
+            ? { ...file, content: installedVerifier }
+            : file,
+        ),
+        CANONICAL_WORKFLOWS,
+      ),
+      CANONICAL_WORKFLOWS,
+      `${name} remains an exact installed-upgrade target`,
+    );
+  }
+
+  const unsafeEditedLegacyVerifier = previousCanonicalVerifierWorkflow(
+    previousFiveEventLifecycle.replace("]", ", edited]"),
+  );
+  assert.throws(
+    () => validateCanonicalV2WorkflowInventory(
+      cleanInventory.map((file) =>
+        file.path === DEFAULT_WORKFLOW_PATH
+          ? { ...file, content: unsafeEditedLegacyVerifier }
+          : file,
+      ),
+      CANONICAL_WORKFLOWS,
+    ),
+    /run-name|concurrency\.group|job name|job\.if/u,
+    "an edited trigger without the guarded current envelope is not a compatibility profile",
+  );
+  assert.equal(
+    CANONICAL_WORKFLOW.includes(currentLifecycle),
+    true,
+  );
 });
 
 test("post-merge inventory rejects an extra default-branch v1 caller", () => {
@@ -7398,6 +7525,20 @@ test("post-merge inventory rejects an extra default-branch v1 caller", () => {
     ),
     CANONICAL_WORKFLOWS,
     "the exact previously installed controller remains recognizable for upgrade",
+  );
+  const previousNarrowController = previousCanonicalControllerWorkflow("current");
+  const previousNarrowControllerInventory = cleanInventory.map((file) =>
+    file.path === DEFAULT_CONTROLLER_WORKFLOW_PATH
+      ? { ...file, content: previousNarrowController }
+      : file,
+  );
+  assert.equal(
+    validateCanonicalV2WorkflowInventory(
+      previousNarrowControllerInventory,
+      CANONICAL_WORKFLOWS,
+    ),
+    CANONICAL_WORKFLOWS,
+    "the exact previous narrow-path controller profile remains recognizable for upgrade",
   );
   const customControllerInventory = previousCanonicalInventory.map((file) =>
     file.path === DEFAULT_CONTROLLER_WORKFLOW_PATH
@@ -10386,7 +10527,7 @@ test("activation update refuses default-branch and workflow drift between securi
                 encoding: "base64",
                 content: Buffer.from(
                   CANONICAL_WORKFLOW.replace(
-                    `run-name: ${DEFAULT_VERIFIER_RUN_NAME}\n`,
+                    `${CANONICAL_VERIFIER_RUN_NAME_LINE}\n`,
                     "",
                   ),
                   "utf8",
@@ -10410,7 +10551,7 @@ test("activation update refuses default-branch and workflow drift between securi
                 encoding: "base64",
                 content: Buffer.from(
                   CANONICAL_WORKFLOW.replace(
-                    DEFAULT_VERIFIER_RUN_NAME,
+                    CANONICAL_VERIFIER_RUN_NAME_LINE,
                     "attacker/${{ github.sha }}",
                   ),
                   "utf8",
@@ -15022,10 +15163,10 @@ syncBuiltinESMExports();
 `;
 }
 
-// One focused installed-verifier compatibility case raises the prior 170 count.
+// Two focused installed-verifier compatibility cases raise the prior 170 count.
 assert.equal(
   test.registeredCount,
-  171,
+  172,
   "bootstrap test shard registration inventory drift",
 );
 

@@ -2781,7 +2781,7 @@ test("frozen organization handoff admission remains distinct from current contro
   const frozenPullRequestLifecycleLine =
     "    types: [opened, reopened, synchronize, ready_for_review]";
   const currentPullRequestLifecycleLine =
-    "    types: [opened, reopened, synchronize, ready_for_review, stacked]";
+    "    types: [opened, reopened, synchronize, ready_for_review, stacked, edited]";
   assert.equal(
     frozenWorkflows.verifier.split(frozenPullRequestLifecycleLine).length,
     2,
@@ -2790,18 +2790,48 @@ test("frozen organization handoff admission remains distinct from current contro
   assert.equal(
     currentWorkflows.verifier.split(currentPullRequestLifecycleLine).length,
     2,
-    "the current verifier fixture has its exact five-event lifecycle",
+    "the current verifier fixture has its exact six-event lifecycle",
   );
   const currentRunnerLine = currentWorkflows.verifier.match(/^    runs-on: .+$/mu)?.[0];
   const frozenRunnerLine = frozenWorkflows.verifier.match(/^    runs-on: .+$/mu)?.[0];
+  const currentRunNameLine = currentWorkflows.verifier.match(/^run-name: .+$/mu)?.[0];
+  const frozenRunNameLine = frozenWorkflows.verifier.match(/^run-name: .+$/mu)?.[0];
+  const currentVerifierConcurrencyLine = currentWorkflows.verifier.match(/^  group: .+$/mu)?.[0];
+  const frozenVerifierConcurrencyLine = frozenWorkflows.verifier.match(/^  group: .+$/mu)?.[0];
+  const currentVerifierJobNameLine = currentWorkflows.verifier.match(/^    name: .+$/mu)?.[0];
+  const frozenVerifierJobNameLine = frozenWorkflows.verifier.match(/^    name: .+$/mu)?.[0];
+  const currentVerifierJobIfLine = currentWorkflows.verifier.match(/^    if: .+$/mu)?.[0];
+  const currentLifecycleLine = currentWorkflows.verifier.match(/^    types: \[.+\]$/mu)?.[0];
   assert.equal(typeof currentRunnerLine, "string");
   assert.equal(typeof frozenRunnerLine, "string");
+  assert.equal(typeof currentRunNameLine, "string");
+  assert.equal(typeof frozenRunNameLine, "string");
+  assert.equal(typeof currentVerifierConcurrencyLine, "string");
+  assert.equal(typeof frozenVerifierConcurrencyLine, "string");
+  assert.equal(typeof currentVerifierJobNameLine, "string");
+  assert.equal(typeof frozenVerifierJobNameLine, "string");
+  assert.equal(typeof currentVerifierJobIfLine, "string");
+  assert.equal(typeof currentLifecycleLine, "string");
   const currentPermissionFrozenVerifier = frozenWorkflows.verifier.replace(
     "permissions:\n  contents: read\n",
     "permissions:\n  actions: read\n  contents: read\n",
   ).replace(frozenRunnerLine, currentRunnerLine).replace(
     frozenPullRequestLifecycleLine,
     currentPullRequestLifecycleLine,
+  ).replace(frozenRunNameLine, currentRunNameLine).replace(
+    frozenVerifierConcurrencyLine,
+    currentVerifierConcurrencyLine,
+  ).replace(
+    frozenVerifierJobNameLine,
+    `${currentVerifierJobNameLine}\n${currentVerifierJobIfLine}`,
+  );
+  assert.equal(
+    currentPermissionFrozenVerifier,
+    currentWorkflows.verifier.replace(
+      "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any",
+      "CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}",
+    ),
+    "the known historical verifier is fully projected to current policy except for its request-author setting",
   );
   const currentPermissionFrozenWorkflows = {
     ...frozenWorkflows,
@@ -2820,11 +2850,19 @@ test("frozen organization handoff admission remains distinct from current contro
     ),
     /CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any/u,
   );
+  const frozenPermissionCurrentVerifier = currentWorkflows.verifier
+    .replace("  actions: read\n", "")
+    .replace(currentRunnerLine, frozenRunnerLine)
+    .replace(currentLifecycleLine, frozenPullRequestLifecycleLine)
+    .replace(currentRunNameLine, frozenRunNameLine)
+    .replace(currentVerifierConcurrencyLine, frozenVerifierConcurrencyLine)
+    .replace(
+      `${currentVerifierJobNameLine}\n${currentVerifierJobIfLine}`,
+      frozenVerifierJobNameLine,
+    );
   const frozenPermissionCurrentWorkflows = {
-    ...currentWorkflows,
-    verifier: currentWorkflows.verifier.replace("  actions: read\n", "")
-      .replace(currentRunnerLine, frozenRunnerLine)
-      .replace(currentPullRequestLifecycleLine, frozenPullRequestLifecycleLine),
+    ...frozenWorkflows,
+    verifier: frozenPermissionCurrentVerifier,
   };
   assert.throws(
     () => validateFrozenHandoffV2WorkflowInventory(

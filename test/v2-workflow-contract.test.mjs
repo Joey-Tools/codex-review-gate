@@ -132,21 +132,33 @@ test("canonical verifier owns the native required CheckRun on selected pull-requ
     templateVerifier.match(/^run-name:/gmu)?.length ?? 0,
     1,
   );
-  assert.match(
-    templateVerifier,
-    /^run-name: codex-review-gate-verifier\/\$\{\{ github\.event\.pull_request\.number \}\}\/\$\{\{ github\.sha \}\}$/mu,
+  assert.ok(
+    templateVerifier.includes(
+      "run-name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-ignored-edit/{0}/{1}', github.event.pull_request.number, github.run_id) || format('codex-review-gate-verifier/{0}/{1}', github.event.pull_request.number, github.sha) }}",
+    ),
+    "only base edits retain the canonical verifier display-title prefix",
   );
   assert.match(
     templateVerifier,
-    /^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review, stacked\]$/mu,
+    /^  pull_request:\n    types: \[opened, reopened, synchronize, ready_for_review, stacked, edited\]$/mu,
   );
   assert.doesNotMatch(
     templateVerifier,
     /^  (?:issue_comment|workflow_dispatch|pull_request_target|repository_dispatch|schedule|pull_request_review|pull_request_review_comment):/mu,
   );
   assert.match(templateVerifier, /^  codex-review-gate:$/mu);
-  assert.match(templateVerifier, /^    name: codex\/github-review-gate$/mu);
-  assert.equal(templateVerifier.match(/^    if:/gmu)?.length ?? 0, 0);
+  assert.ok(
+    templateVerifier.includes(
+      "  group: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}",
+    ),
+    "non-base edits use a run-unique concurrency group rather than canceling the PR verifier",
+  );
+  assert.ok(
+    templateVerifier.includes(
+      "    name: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && 'codex/ignored-review-gate-edit' || 'codex/github-review-gate' }}\n    if: ${{ github.event.action != 'edited' || github.event.changes.base.ref.from }}",
+    ),
+    "only base edits and ordinary lifecycle events can produce the required check name",
+  );
 });
 
 test("canonical controller starts runners only for dispatches, Codex comments, or eligible verifier completions", () => {
@@ -189,6 +201,7 @@ test("canonical controller starts runners only for dispatches, Codex comments, o
     "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/')",
     "endsWith(github.event.workflow_run.path, '/merge')",
     "github.event.workflow_run.event == 'pull_request'",
+    "startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/')",
     "!github.event.workflow_run.pull_requests[1]",
   ]) {
     assert.ok(templateController.includes(required), `missing completion filter: ${required}`);
@@ -197,6 +210,12 @@ test("canonical controller starts runners only for dispatches, Codex comments, o
     templateController,
     /startsWith\(github\.event\.workflow_run\.path, '\.github\/workflows\/codex-review-gate\.yml@'\)/u,
     "the controller must not admit arbitrary workflow path suffixes",
+  );
+  assert.ok(
+    templateController.includes(
+      "group: ${{ github.event_name == 'workflow_run' && !startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/') && format('codex-review-gate-controller-ignored-{0}', github.run_id) || format('codex-review-gate-controller-{0}-{1}', github.repository, github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id) }}",
+    ),
+    "ignored completion events cannot occupy or replace the canonical controller pending slot",
   );
   const jobIf = templateController.match(/    if: >-[\s\S]*?    runs-on:/u)?.[0] ?? "";
   assert.doesNotMatch(
@@ -245,10 +264,9 @@ test("canonical verifier is read-only, latest-wins, and uses the direct Action",
     templateVerifier,
     /^permissions:\n  actions: read\n  contents: read\n  issues: read\n  pull-requests: read$/mu,
   );
-  assert.match(
-    templateVerifier,
-    /group: codex-review-gate-verifier-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.pull_request\.number \}\}/u,
-  );
+  assert.ok(templateVerifier.includes(
+    "  group: ${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}\n",
+  ));
   assert.match(templateVerifier, /^  cancel-in-progress: true$/mu);
   assert.ok(templateVerifier.includes(`    runs-on: ${RUNNER_LABELS_EXPRESSION}\n`));
   assert.match(templateVerifier, /^    timeout-minutes: 14$/mu);
@@ -290,10 +308,9 @@ test("canonical controller has only the adopted write authority and ledgerless i
     templateController,
     /^permissions:\n  actions: write\n  checks: read\n  contents: read\n  pull-requests: write$/mu,
   );
-  assert.match(
-    templateController,
-    /group: codex-review-gate-controller-\$\{\{ github\.repository \}\}-\$\{\{ github\.event\.workflow_run\.pull_requests\[0\]\.number \|\| github\.event\.issue\.number \|\| inputs\.pr_number \|\| github\.event\.workflow_run\.id \|\| github\.run_id \}\}/u,
-  );
+  assert.ok(templateController.includes(
+    "  group: ${{ github.event_name == 'workflow_run' && !startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/') && format('codex-review-gate-controller-ignored-{0}', github.run_id) || format('codex-review-gate-controller-{0}-{1}', github.repository, github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id) }}\n",
+  ));
   assert.match(templateController, /^  cancel-in-progress: false$/mu);
   assert.match(templateController, /^    name: codex\/review-gate-controller$/mu);
   assert.ok(templateController.includes(`    runs-on: ${RUNNER_LABELS_EXPRESSION}\n`));

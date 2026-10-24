@@ -155,13 +155,22 @@ lets an agent perform that same installation for a person.
 The canonical verifier has one entry:
 
 - `pull_request` with activity types `opened`, `reopened`, `synchronize`,
-  `ready_for_review`, and GitHub-native `stacked`.
+  `ready_for_review`, GitHub-native `stacked`, and `edited` only when
+  `changes.base.ref.from` proves an actual base-ref retarget. Title/body-only
+  edits are filtered before a verifier runner is allocated.
+
+Install this change by refreshing both canonical workflows, not by appending
+`edited` to an older verifier's event list alone. The paired templates isolate
+ignored edits from required-check names, verifier selection, and both
+concurrency groups; a skipped ignored job is not a required-check success.
 
 The `stacked` action is the immediate wake-up when a PR joins a native stack.
 The released `@v2` runtime can validate the new scope, but an installed verifier
 workflow must also include `stacked` in its activity types to receive that
 wake-up. Existing four-action workflow copies remain usable; refresh them from
-the canonical template to get immediate join-triggered verification. The
+the canonical template to get immediate join-triggered verification. Five-action
+copies already receive that event; both older profiles need the guarded
+`edited` update for automatic base-retarget verification. The
 `stacked` action supplements, and does not replace, `synchronize`.
 
 The protected-default-branch controller has only these entries:
@@ -216,6 +225,26 @@ ruleset is needed. For the Joey-Tools rollout, set the organisation variable's
 selected-repository visibility first to only `codex-private-workflows` as a
 canary, without a repository-level override, before expanding it.
 
+For a verified base-ref retarget, the verifier binds the current head, direct
+base, and test-merge tuple; the existing `workflow_run` controller revalidates
+that scope before the opt-in path reuses or creates a canonical request.
+Deduplication is scoped after the latest base-ref-change or base-force-push
+boundary and requires the exact current head/base tuple, so a pre-boundary
+request cannot be reused even if an A-to-B-to-A retarget returns to the same
+ref and SHA. Duplicate verifier events within one epoch reuse the matching
+post-epoch request. A new request followed by a trusted, unedited top-level
+current-head clean whose explicit short SHA resolves uniquely to that head and
+whose timestamp is later can meet the narrow acceptance policy when no
+unresolved finding remains and all existing gates pass. Timestamps define this policy only; they
+do not prove provider causality or coverage of a particular base SHA. This
+still requires `CODEX_REVIEW_GATE_AUTO_REQUEST=true` and retains the existing
+request-token configuration. This describes source support; availability
+requires the corresponding Action release and canonical workflow refresh.
+If event evidence is absent or invalid, or there is no matching verifier, the
+existing draft-to-ready fallback remains available.
+This adds no `issue_comment.edited` controller trigger, consumer rollout,
+release, protection, or token-permission change.
+
 If a completed run has no PR association in GitHub's run metadata, the
 controller accepts only an empty association list and derives PR/test-merge
 from the exact canonical verifier `display_title`. The internal `pr_number: 0`
@@ -258,13 +287,23 @@ stack membership. Each PR receives its own gate; no lower PR's review result is
 inherited and no stack merge is performed. The protected controller still
 executes from the default branch.
 
-A base-ref retarget does not create a current verifier because
-`pull_request.edited` is intentionally absent. Refresh verifier evidence for
-the new scope with the existing draft-to-ready recovery; if the report requests
-it, post a fresh `@codex review`. A native rerun of the old event is not a
-substitute. Base-tip movement and trunk/membership drift are evaluated against
-their separately bound current scope; do not assume every base advance
-invalidates head-bound clean review evidence. GitHub's native `stacked` webhook
+A base-ref retarget creates a verifier only when the `edited` payload proves
+that the base ref changed; title/body-only edits do not allocate a runner. The
+verified retarget is rechecked against the current head/base/test-merge tuple
+before the protected controller can reuse or create a canonical request. A
+request from before the latest base-ref-change or base-force-push boundary
+cannot satisfy deduplication, even if an A-to-B-to-A retarget returns to the
+same ref and SHA; duplicate verifier events within the same epoch reuse the
+matching post-epoch request. A new request and trusted, unedited top-level
+current-head clean whose explicit short SHA uniquely resolves to that head and
+whose timestamp is later can satisfy the narrow acceptance policy when no
+unresolved finding remains and the existing gates pass. Timestamps are an
+acceptance policy, not proof of provider causality or base-SHA coverage. If
+event or matching verifier evidence is unavailable, use the existing
+draft-to-ready fallback; a native rerun of an old verifier is not a substitute.
+Base-tip movement and trunk/membership drift are evaluated against their
+separately bound current scope; do not assume every base advance invalidates
+head-bound clean review evidence. GitHub's native `stacked` webhook
 action is a `pull_request` activity type, not a top-level webhook event, and
 must not be treated as a substitute for `synchronize`.
 

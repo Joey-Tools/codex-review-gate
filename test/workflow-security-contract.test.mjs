@@ -163,6 +163,7 @@ const CLOSED_JOB_IF = [
   "endsWith(github.event.workflow_run.path, '/merge')",
   ")",
   ") &&",
+  "startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/') &&",
   "github.event.workflow_run.event == 'pull_request' &&",
   "!github.event.workflow_run.pull_requests[1]",
   ")",
@@ -262,7 +263,7 @@ test("automatic runner admission separates read-only PR verification from verifi
   const workflow = parseControllerWorkflow(templateController);
   assert.deepEqual(blockDirectKeys(verifier.events), ["pull_request"]);
   assert.deepEqual(blockScalarMapping(verifier.pullRequest), {
-    types: "[opened, reopened, synchronize, ready_for_review, stacked]",
+    types: "[opened, reopened, synchronize, ready_for_review, stacked, edited]",
   });
   assert.deepEqual(blockDirectKeys(workflow.events), ["issue_comment", "workflow_run", "workflow_dispatch"]);
   assert.deepEqual(blockScalarMapping(workflow.issueComment), {
@@ -289,6 +290,7 @@ test("automatic runner admission separates read-only PR verification from verifi
     "github.event.workflow_run.path == '.github/workflows/codex-review-gate.yml'",
     "startsWith(github.event.workflow_run.path, '.github/workflows/codex-review-gate.yml@refs/pull/')",
     "endsWith(github.event.workflow_run.path, '/merge')",
+    "startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/')",
     "github.event.workflow_run.event == 'pull_request'",
     "!github.event.workflow_run.pull_requests[1]",
   ]) {
@@ -2690,13 +2692,11 @@ test("verifier cancellation stays PR-scoped while empty-association controller r
   const verifier = parseVerifierWorkflow(templateConsumer);
   const controller = parseControllerWorkflow(templateController);
   assert.deepEqual(blockScalarMapping(verifier.concurrency), {
-    group:
-      "codex-review-gate-verifier-${{ github.repository }}-${{ github.event.pull_request.number }}",
+    group: "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-verifier-ignored-{0}-{1}', github.repository, github.run_id) || format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}",
     "cancel-in-progress": "true",
   });
   assert.deepEqual(blockScalarMapping(controller.concurrency), {
-    group:
-      "codex-review-gate-controller-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id }}",
+    group: "${{ github.event_name == 'workflow_run' && !startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/') && format('codex-review-gate-controller-ignored-{0}', github.run_id) || format('codex-review-gate-controller-{0}-{1}', github.repository, github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.id || github.run_id) }}",
     "cancel-in-progress": "false",
   });
 });
@@ -3186,7 +3186,7 @@ function parseVerifierWorkflow(source) {
   assert.equal(blockScalar(root, "name"), "Codex Review Gate Verifier");
   assert.equal(
     blockScalar(root, "run-name"),
-    "codex-review-gate-verifier/${{ github.event.pull_request.number }}/${{ github.sha }}",
+    "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && format('codex-review-gate-ignored-edit/{0}/{1}', github.event.pull_request.number, github.run_id) || format('codex-review-gate-verifier/{0}/{1}', github.event.pull_request.number, github.sha) }}",
   );
 
   const events = blockChild(root, "on");
@@ -3213,11 +3213,19 @@ function parseVerifierWorkflow(source) {
   const job = blockChild(jobs, "codex-review-gate");
   assert.deepEqual(blockDirectKeys(job), [
     "name",
+    "if",
     "runs-on",
     "timeout-minutes",
     "steps",
   ]);
-  assert.equal(blockScalar(job, "name"), "codex/github-review-gate");
+  assert.equal(
+    blockScalar(job, "name"),
+    "${{ github.event.action == 'edited' && !github.event.changes.base.ref.from && 'codex/ignored-review-gate-edit' || 'codex/github-review-gate' }}",
+  );
+  assert.equal(
+    blockScalar(job, "if"),
+    "${{ github.event.action != 'edited' || github.event.changes.base.ref.from }}",
+  );
   const actionStep = parseClosedActionStep(job, [
     "github_token",
     "pr_number",
