@@ -14,6 +14,16 @@ The ordinary single-repository rollout has two pull requests:
 
 The canary is closed without merging.
 
+### Installation in a fork
+
+An operator-maintained fork is supported for its own same-repository PRs. Use
+that fork's repository ID/full name, default branch, maintainer and protection;
+do not substitute its upstream parent. Both head and base must belong to the
+installed fork. Enable and configure Actions, Codex review and any required
+request token/variables there; upstream settings are not copied by this Action.
+External fork PRs remain unsupported. Existing canonical workflows need only
+the supporting floating `@v2` runtime, not additional permissions or an opt-in.
+
 ### GitHub-native stacked PRs
 
 An ordinary PR still targets the repository default branch directly. A

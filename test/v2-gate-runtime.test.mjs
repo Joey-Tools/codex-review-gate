@@ -1379,6 +1379,168 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
   }
 });
 
+test("fork installations admit exact internal ordinary and stacked PR verifiers", async (context) => {
+  for (const stacked of [false, true]) {
+    const event = pullRequestEvent(stacked ? "stacked" : "synchronize");
+    event.repository.fork = true;
+    event.pull_request.head.repo.fork = true;
+    event.pull_request.base.repo.fork = true;
+    if (stacked) event.pull_request.base.ref = "feature-base";
+    const github = createGitHubMock({
+      repositoryOverrides: {
+        fork: true,
+        parent: { id: 99, full_name: "upstream/project", default_branch: "upstream-main" },
+      },
+      pullRequestOverrides: {
+        head: { repo: { fork: true } },
+        base: { ref: stacked ? "feature-base" : "main", repo: { fork: true } },
+        ...(stacked ? { stack: nativeStack({ position: 2 }) } : {}),
+      },
+      issueComments: [cleanIssueComment(HEAD)],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `fork-internal-verifier-${stacked ? "stacked" : "ordinary"}`,
+      event,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, result.report.reason);
+    assert.equal(result.report.executionHealth, "healthy");
+    assert.equal(result.report.gateOutcome, "success");
+    assert.deepEqual(github.statusWrites, []);
+    assert.deepEqual(github.requestBodies, []);
+    assert.deepEqual(github.rerunRequests, []);
+    assert.equal(github.calls.some(({ path }) => path.includes("/upstream/")), false);
+  }
+});
+
+test("fork installations retain internal manual and automatic controller paths", async (context) => {
+  for (const [label, options] of [
+    ["manual-reconcile", { eventName: "workflow_dispatch" }],
+    ["provider-reconcile", {
+      eventName: "issue_comment",
+      expectedHeadSha: "",
+      requestCommentId: "201",
+      event: issueCommentEvent("created", cleanIssueComment(HEAD)),
+    }],
+    ["manual-begin", { eventName: "workflow_dispatch", operation: "begin-review" }],
+    ["auto-begin", { eventName: "workflow_run", operation: "begin-review" }],
+  ]) {
+    const requestsReview = options.operation === "begin-review";
+    const github = createGitHubMock({
+      repositoryOverrides: {
+        fork: true,
+        parent: { id: 99, full_name: "upstream/project", default_branch: "upstream-main" },
+      },
+      pullRequestOverrides: {
+        head: { repo: { fork: true } },
+        base: { repo: { fork: true } },
+      },
+      issueComments: requestsReview ? [] : [cleanIssueComment(HEAD)],
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `fork-internal-${label}`,
+      ...options,
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 0, `${label}: ${result.report.reason}`);
+    assert.equal(result.report.executionHealth, "healthy", label);
+    assert.equal(result.report.gateOutcome, "pending", label);
+    assert.deepEqual(github.statusWrites, []);
+    assert.deepEqual(github.requestBodies, requestsReview ? [canonicalRequestBody()] : [], label);
+    if (requestsReview) {
+      const marker = parseCanonicalV2ReviewRequestBody(github.requestBodies[0]);
+      assert.equal(marker.repositoryId, String(REPO_ID));
+      assert.equal(marker.baseRepositoryId, String(REPO_ID));
+      assert.equal(marker.baseRef, "main");
+      assert.equal(marker.headSha, HEAD);
+    }
+    if (label === "auto-begin") assert.deepEqual(github.rerunRequests, []);
+    else assert.deepEqual(github.rerunRequests, ["7001"], label);
+    assert.equal(github.calls.some(({ path }) => path.includes("/upstream/")), false);
+  }
+});
+
+test("fork installations retain exact diagnostic completion reporting", async (context) => {
+  const fixture = completionRuntimeFixture({ repositoryOverrides: { fork: true } });
+  const environment = runtimeEnvironment(context, {
+    suffix: "fork-internal-completion",
+    operation: "report-completion",
+    eventName: "workflow_run",
+    requestReview: "false",
+    prNumber: 0,
+    event: fixture.event,
+  });
+  const { result } = await runGate(environment, fixture.github);
+
+  assert.equal(result.exitCode, 0, result.report.reason);
+  assert.equal(result.report.executionHealth, "healthy");
+  assert.equal(fixture.github.stickyCreates.length, 1);
+  assert.match(fixture.github.stickyCreates[0], /Diagnostic-only verifier observation/u);
+  assert.deepEqual(fixture.github.requestBodies, []);
+  assert.deepEqual(fixture.github.rerunRequests, []);
+  assert.deepEqual(fixture.github.statusWrites, []);
+});
+
+test("fork installations still reject external PR head and base identities", async (context) => {
+  for (const [label, overrides] of [
+    ["foreign-head-id", { head: { repo: { id: 99 } } }],
+    ["foreign-head-name", { head: { repo: { full_name: "someone/fork" } } }],
+    ["upstream-head", { head: { repo: { id: 99, full_name: "upstream/project" } } }],
+    ["foreign-base-id", { base: { repo: { id: 99 } } }],
+    ["foreign-base-name", { base: { repo: { full_name: "upstream/project" } } }],
+  ]) {
+    for (const eventName of ["pull_request", "workflow_dispatch", "workflow_run"]) {
+      const github = createGitHubMock({
+        repositoryOverrides: { fork: true },
+        pullRequestOverrides: overrides,
+      });
+      const environment = runtimeEnvironment(context, {
+        suffix: `fork-internal-reject-${label}-${eventName}`,
+        eventName,
+        ...(eventName === "workflow_run" ? { operation: "begin-review" } : {}),
+      });
+      const { result } = await runGate(environment, github);
+
+      assert.equal(result.exitCode, 1, `${label}/${eventName}: ${result.report.reason}`);
+      assert.equal(result.report.executionHealth, "unhealthy", `${label}/${eventName}`);
+      if (label === "foreign-base-name") {
+        assert.equal(result.report.gateOutcome, "unknown");
+        assert.match(result.report.reason, /pull-request response was incomplete or inconsistent/u);
+      } else {
+        assert.equal(result.report.gateOutcome, "not_applicable", `${label}/${eventName}: ${result.report.reason}`);
+        assert.equal(result.report.recoveryCode, "unsupported_target");
+        assert.match(result.report.reason, label.includes("head")
+          ? /does not support fork pull requests/u
+          : /requires a same-repository pull-request base/u);
+      }
+      assert.deepEqual(github.requestBodies, []);
+      assert.deepEqual(github.rerunRequests, []);
+      assert.deepEqual(github.statusWrites, []);
+      assert.deepEqual(github.stickyCreates, []);
+    }
+  }
+});
+
+test("fork installations still require boolean fork metadata", async (context) => {
+  for (const fork of [undefined, null, "true"]) {
+    const github = createGitHubMock({ repositoryOverrides: { fork } });
+    const environment = runtimeEnvironment(context, {
+      suffix: `fork-internal-invalid-metadata-${String(fork)}`,
+      operation: "begin-review",
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.report.executionHealth, "unhealthy");
+    assert.match(result.report.reason, /repository response was incomplete or inconsistent/u);
+    assert.deepEqual(github.requestBodies, []);
+    assert.deepEqual(github.rerunRequests, []);
+    assert.deepEqual(github.statusWrites, []);
+  }
+});
+
 test("pull_request verifier accepts an exact same-repository stacked base", async (context) => {
   const event = pullRequestEvent();
   event.pull_request.base.ref = "feature-base";
@@ -17261,6 +17423,7 @@ function completionRuntimeFixture({
   jobCount = 1,
   pullRequests = [],
   issueComments = [],
+  repositoryOverrides = {},
   pullRequestSequence = null,
   currentRunOverrides = {},
   attemptOverrides = {},
@@ -17278,6 +17441,7 @@ function completionRuntimeFixture({
   const attemptRun = { ...sourceRun, ...attemptOverrides };
   const github = createGitHubMock({
     issueComments,
+    repositoryOverrides,
     pullRequestSequence,
     verifierRuns: [currentRun],
     verifierRunAttempts: [attemptRun],

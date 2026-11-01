@@ -155,6 +155,15 @@ operator 仍须自行信任共用 GitHub Actions App 的其他 workflows。此�
 migration PR 移除 v1 并安装 v2，然后用独立无害 canary PR 证明 live gate，最后关闭
 canary、不合并。
 
+## 在自己维护的 fork 内安装
+
+自己维护的 fork 可以安装 gate，但 PR 的 head 和 base 必须都属于该 fork。以 fork 自身的
+repository identity、default branch、受保护 controller 和 ruleset 为准，不使用上游 parent
+仓库的配置。外部 fork 向上游提交的 PR，以及其他 cross-repository PR，仍不支持。
+需要在 fork 中自行启用或配置 Actions、Codex review，以及所需的 request-token/variables；
+不会复制上游设置，也不会向外部 PR 暴露 secrets。已有 canonical workflows 可通过 floating
+`@v2` 获得 runtime 支持，不增加 event、permission 或 fork-trust input。
+
 ## GitHub 原生 stacked PR
 
 GitHub 原生 stacked PR 可在经验证的 stack metadata 证明 trunk 是仓库当前 default branch 时

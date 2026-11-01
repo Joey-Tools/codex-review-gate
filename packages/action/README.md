@@ -292,8 +292,8 @@ with direct callers, but that is not a canonical automatic ingress.
 The verifier requires a same-repository, open, ready PR whose direct base is
 the current default branch, except for a GitHub-native stacked PR whose
 authenticated stack metadata proves that its trunk is the repository's current
-default branch. Arbitrary manually chained feature-base PRs, forks, and stacks
-with another trunk remain unsupported. The PR's direct base ref/SHA and the
+default branch. Arbitrary manually chained feature-base PRs, external fork PRs,
+and stacks with another trunk remain unsupported. The PR's direct base ref/SHA and the
 stack trunk ref/SHA are distinct bindings and are both checked with current
 stack membership. Each PR receives its own gate; no lower PR's review result is
 inherited and no stack merge is performed. The protected controller still
@@ -997,8 +997,17 @@ ordinary merge, squash and rebase methods. The default runner selection remains
 workflow's explicit `runs-on` expression remains authoritative; these defaults
 apply only when its configured selection falls back to them.
 
-It fails closed for GHES, forks, merge queues, arbitrary non-default bases,
-manual feature-branch chains, and stacks with a non-default trunk, as well as drafts,
+An operator-maintained fork may install the Action for its own internal PRs.
+Both PR head and base must identify that installed fork by repository ID and
+full name; its own default branch and protected configuration remain
+authoritative. Upstream parent/source repositories are not alternate targets,
+and no additional fork-trust flag or privileged token is required. Enable and
+configure Actions, Codex review, variables, secrets and protection in the fork
+itself as applicable; the Action does not copy them from upstream. Existing
+canonical workflows may obtain this runtime support through floating `@v2`.
+
+It fails closed for GHES, external fork PRs, merge queues, arbitrary non-default
+bases, manual feature-branch chains, and stacks with a non-default trunk, as well as drafts,
 bot-owned PRs, Windows/macOS runners, and new operations on closed or merged
 PRs.
 
