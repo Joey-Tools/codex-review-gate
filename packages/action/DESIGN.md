@@ -146,7 +146,7 @@ installed four-action verifier workflow must be refreshed to include it for
 that immediate wake-up. It requires same-repository, open, ready PRs whose direct
 base is the current default branch, with one exception: authenticated GitHub
 native stacked-PR metadata must bind the stack trunk to that same default
-branch. It rejects arbitrary manual feature-base chains, forks, and stacks
+branch. It rejects arbitrary manual feature-base chains, external fork PRs, and stacks
 with another trunk. The direct PR base ref/SHA and stack trunk ref/SHA are
 distinct exact bindings, and current stack membership is revalidated. Each PR
 has its own verifier; lower-PR review results are not inherited. The protected
@@ -1095,7 +1095,14 @@ merge/squash/rebase methods. The default runner selection remains
 workflow's explicit `runs-on` expression remains authoritative; these defaults
 apply only when its configured selection falls back to them.
 
-It fails closed for GHES, forks, merge queues, arbitrary non-default bases,
+The installation repository may itself be an operator-maintained fork. Its own
+repository ID/full name and default branch remain the scope authority, and
+both PR head and base must belong to that fork. Upstream parent/source
+metadata does not grant another target or configuration authority. Existing
+verifier and protected-controller checks remain unchanged; this adds no new
+permissions, workflow events, trust input or upstream configuration copying.
+
+It fails closed for GHES, external fork PRs, merge queues, arbitrary non-default bases,
 manual feature-base chains and stacks with a non-default trunk, drafts,
 bot-owned PRs, Windows/macOS runners and new operations on closed or merged
 PRs. A selected self-hosted Linux runner is trusted by operator assumption;

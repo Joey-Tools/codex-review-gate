@@ -37,6 +37,9 @@ superseded_by:
 - The source change, offline verifier/controller regressions and current
   English/Chinese support/installation documentation cover fork-owned internal
   PRs without expanding the external-PR trust boundary.
+- The packaged English/Chinese README and DESIGN support boundaries also
+  distinguish a fork-owned installation from an external fork PR; historical
+  release/grilling journals remain unmodified evidence of their older scope.
 - A separate release intent and human-approved publisher remain required;
   this source implementation does not itself bump a version or publish tags.
 - Mocked API tests demonstrate runtime behaviour, not a live fork deployment
