@@ -209,7 +209,7 @@ edited Codex comment 不会自动启动 canonical controller；应使用受保�
 但这不是 canonical automatic ingress。
 verifier 要求 same-repository、open、ready PR 的 direct base 是 current default branch；唯一例外是
 经验证的 GitHub 原生 stacked PR metadata 证明 trunk 为 repository 当前 default branch。任意手工
-feature-base 链、fork 和 trunk 不同的 stack 均不支持。PR direct base ref/SHA 与 stack trunk
+feature-base 链、外部 fork PR 和 trunk 不同的 stack 均不支持。PR direct base ref/SHA 与 stack trunk
 ref/SHA 是不同 binding，均需结合当前 stack membership 检查。每个 PR 有独立 gate，不继承下层
 PR 的 review 结果，也不执行 stack merge。受保护 controller 仍从 default branch 执行。
 
@@ -731,7 +731,13 @@ stacked PR；GitHub-hosted 或 self-hosted
 选择仍是 `ubuntu-slim`，采用 `ubuntu-latest` fallback。已安装 workflow 中显式配置的
 `runs-on` expression 仍然有效；这些默认值只在该配置采用默认选择时生效。
 
-GHES、forks、merge queues、任意非 default base、手工 feature-branch 链、non-default trunk
+自己维护的 fork 可安装 Action 来处理内部 PR，但 PR head/base 都必须以 repository ID 和 full
+name 匹配该 fork。以 fork 自身的 default branch 和受保护配置为准，不把 upstream parent/source
+当作其他目标；不需要额外的 fork-trust flag 或 privileged token。按需在 fork 配置 Actions、Codex
+review、variables、secrets 和 protection；Action 不复制上游设置。已有 canonical workflows
+可通过 floating `@v2` 获得这项 runtime 支持。
+
+GHES、外部 fork PR、merge queues、任意非 default base、手工 feature-branch 链、non-default trunk
 stack、drafts、bot-owned PRs、Windows/macOS
 runners，以及对 closed/merged PR 发起的新 operation 都会 fail closed。
 

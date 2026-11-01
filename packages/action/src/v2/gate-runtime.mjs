@@ -4855,7 +4855,8 @@ function classifyUnsupportedV2Target(repository, pullRequest, config) {
   ) {
     return `Action v2 requires a known Linux runner environment (github-hosted or self-hosted; received RUNNER_ENVIRONMENT=${config.environment.RUNNER_ENVIRONMENT ?? "missing"})`;
   }
-  if (repository.fork) return "Action v2 does not support installation on a fork repository";
+  // A fork may own this installation. The head/base repository identities below,
+  // not its upstream parent or fork flag, define the supported PR boundary.
   if (!isOpenV2PullRequest(pullRequest)) {
     return "Action v2 requires an open, unmerged pull request";
   }

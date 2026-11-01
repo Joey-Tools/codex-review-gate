@@ -125,7 +125,7 @@ PR 加入原生 stack 时，`stacked` action 提供即时验证；它补充而�
 `synchronize`。`@v2` runtime 接受新 action，但已安装的四-action verifier workflow 必须更新并
 加入 `stacked` 才能获得即时 wake-up。Verifier 要求 same-repository、open、ready PR 的 direct base 是 current
 default branch；唯一例外是经验证的 GitHub 原生 stacked-PR metadata 将 stack trunk 绑定到同一
-default branch。任意手工 feature-base 链、fork 和其他 trunk 的 stack 均拒绝。PR direct base
+default branch。任意手工 feature-base 链、外部 fork PR 和其他 trunk 的 stack 均拒绝。PR direct base
 ref/SHA 与 stack trunk ref/SHA 是不同的 exact binding，且会重新验证当前 stack identity/position
 及 trunk。GitHub 的 stack object 还提供 size，但把新 PR 加到本 PR 上方造成的 size-only 增长不
 改变本 PR 的 scope。
@@ -864,7 +864,12 @@ runner 选择仍是 `ubuntu-slim`，采用 `ubuntu-latest` fallback。
 已安装 workflow 中显式配置的 `runs-on` expression 仍然有效；这些默认值仅在该配置采用
 默认选择时生效。
 
-GHES、forks、merge queues、任意非 default base、手工 feature-base 链和 non-default trunk
+安装仓库本身可以是自己维护的 fork；scope authority 仍为该 fork 自身的 repository ID/full name
+和 default branch，PR head/base 都必须属于该 fork。Upstream parent/source metadata 不授予
+其他目标或配置的 authority。Verifier 与受保护 controller 的既有检查保持不变；不新增 permissions、
+workflow events、trust input，也不复制上游配置。
+
+GHES、外部 fork PR、merge queues、任意非 default base、手工 feature-base 链和 non-default trunk
 stack、drafts、bot-owned PRs、Windows/macOS
 runners，以及对 closed/merged PR 发起的新 operation 都会 fail closed。选择
 self-hosted Linux runner 是基于 operator 信任的假设；Action 不会证明 host integrity

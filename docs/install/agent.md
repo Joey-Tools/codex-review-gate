@@ -25,6 +25,15 @@ remain usable and can be refreshed through the ordinary workflow update path.
 Keep the ruleset rooted on `DEFAULT_BRANCH`; do not create per-feature-branch
 rulesets.
 
+For an authorised fork-owned installation, resolve `REPO` and `DEFAULT_BRANCH`
+from the fork itself, not its upstream parent/source. Require both PR head and
+base to match the installed fork's exact repository ID and full name. Ordinary
+same-repository installation, canary and protected-controller rules are
+unchanged; configure Actions, Codex review, variables and optional request
+secrets in the fork as needed. External fork PRs remain a stop condition.
+Existing canonical workflow bytes need no new events, permissions or trust
+input for this runtime-only support through floating `@v2`.
+
 ## Inputs and stop conditions
 
 Resolve these values first:

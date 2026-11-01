@@ -233,6 +233,17 @@ See [the human installation guide](docs/install/human.md) or
 two-PR rollout: one migration PR removes v1 and installs v2, then a separate
 harmless canary PR proves the live gate and is closed unmerged.
 
+## Fork-owned installations
+
+An operator-maintained fork may install the gate for PRs whose head and base
+both belong to that same fork. Its own repository identity, default branch,
+protected controller and ruleset are authoritative, not the upstream parent.
+External fork-to-upstream or cross-repository PRs remain unsupported. Configure
+Actions, Codex review and any request-token/variable settings in the fork itself;
+this support does not copy upstream settings or expose secrets to external PRs.
+Existing canonical consumers receive the runtime change through floating `@v2`;
+no new event, permission or fork-trust input is introduced.
+
 ## Native stacked pull requests
 
 A GitHub-native stacked PR may qualify when authenticated stack metadata binds

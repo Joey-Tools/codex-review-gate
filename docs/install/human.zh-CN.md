@@ -11,6 +11,14 @@
 
 Canary 验证完成后关闭、不合并。
 
+### 在 fork 中安装
+
+自己维护的 fork 可处理其内部 same-repository PR。使用该 fork 自身的 repository ID/full
+name、default branch、维护者和 protection，不得改用 upstream parent；PR head/base 都必须
+属于该 fork。需要在 fork 自行启用或配置 Actions、Codex review 和所需的 request token/variables，
+Action 不会复制上游设置。外部 fork PR 仍不支持。已有 canonical workflows 只需支持该能力的
+floating `@v2` runtime，不需要增加 permissions 或 opt-in。
+
 ### GitHub 原生 stacked PR
 
 普通 PR 仍须直接以 repository default branch 为 base。GitHub 原生 stacked PR 也受支持，但必须

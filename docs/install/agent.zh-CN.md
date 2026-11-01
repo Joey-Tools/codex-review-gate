@@ -17,6 +17,12 @@ stack 会逐层传递 trunk protection，但每个 PR 仍需要自己的 Codex g
 activity type。现有四-action workflow 仍可使用，可通过常规 workflow 更新流程刷新。Ruleset 继续
 以 `DEFAULT_BRANCH` 为根；不要给 feature branch 新建独立 ruleset。
 
+对已授权的 fork 内安装，从 fork 本身解析 `REPO` 和 `DEFAULT_BRANCH`，不得改用 upstream
+parent/source。PR head/base 都必须匹配该 fork 的 exact repository ID 和 full name。
+既有 same-repository 安装、canary 和 protected-controller 规则不变；按需在 fork 配置
+Actions、Codex review、variables 和可选 request secret。外部 fork PR 仍须停止。
+这项 runtime-only 支持随 floating `@v2` 提供，不增加 workflow events、permissions 或 trust input。
+
 ## 输入与停止条件
 
 先解析并记录：
