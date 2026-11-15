@@ -12338,13 +12338,19 @@ test("a completed official summary without a terminal clean remains pending", as
 });
 
 test("native review completion passes without a manual request after repeated exact snapshots", async (context) => {
+  // Replay captured identity/types; the scenario owns its body, URL and clock.
+  const identity = JSON.parse(readFileSync(new URL(
+    "./fixtures/native-completion-identity.json", import.meta.url,
+  ), "utf8")).node;
   const summary = nativeReviewCompletionComment({
-    id: 6564802861, updated_at: "2026-08-25T08:02:00Z",
+    id: Number(identity.databaseId), node_id: identity.id,
+    user: { ...CODEX_BOT, id: CODEX_BOT_DATABASE_ID, node_id: identity.author.id },
+    updated_at: "2026-08-25T08:02:00Z",
   });
   for (const existingRequest of [false, true]) {
     const github = createGitHubMock({ issueComments: [
       ...(existingRequest ? [workflowRequest()] : []), summary,
-    ] });
+    ], nativeCompletionResponseMutator: (node) => ({ ...node, ...identity }) });
     const { result } = await runGate(runtimeEnvironment(context), github);
     assert.equal(result.report.gateOutcome, "success", result.report.reason);
     assert.ok(result.report.reason.includes(`native-review-state ${summary.id}`));

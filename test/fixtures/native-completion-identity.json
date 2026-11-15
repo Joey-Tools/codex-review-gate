@@ -1,0 +1,19 @@
+{
+  "source_url": "https://github.com/Joey-Tools/codex-review-gate/pull/150#issuecomment-6564802861",
+  "captured_on": "2026-11-15",
+  "node": {
+    "__typename": "IssueComment",
+    "id": "IC_kwDOScx_l88AAAABh0rxLQ",
+    "databaseId": "6564802861",
+    "author": {
+      "__typename": "Bot",
+      "login": "chatgpt-codex-connector",
+      "id": "BOT_kgDOC98s_g"
+    },
+    "editor": {
+      "__typename": "Bot",
+      "login": "chatgpt-codex-connector",
+      "id": "BOT_kgDOC98s_g"
+    }
+  }
+}
