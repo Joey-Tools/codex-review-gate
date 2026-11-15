@@ -548,6 +548,9 @@ The verifier accepts it as supplemental exact-head clean evidence only when
 both `has_any_findings` and `has_unresolved_findings` are boolean `false`.
 Display text, short SHAs, competing summaries, unknown versions and malformed
 frames cannot supply this authority. A genuine ordinary clean needs no frame.
+The existing evidence decision runs first. A valid legacy pass, including the
+request-reaction fallback, never requires native-state API reads and cannot be
+downgraded by an invalid or unavailable optional summary proof.
 
 The selected code-review fields and carrier provenance are reread by exact ID
 and participate in every complete carrier fingerprint and both stable snapshots.

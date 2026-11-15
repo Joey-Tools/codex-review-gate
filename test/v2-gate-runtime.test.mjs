@@ -12339,14 +12339,18 @@ test("a completed official summary without a terminal clean remains pending", as
 
 test("native review completion passes without a manual request after repeated exact snapshots", async (context) => {
   const summary = nativeReviewCompletionComment({ updated_at: "2026-08-25T08:02:00Z" });
-  const github = createGitHubMock({ issueComments: [summary] });
-  const { result } = await runGate(runtimeEnvironment(context), github);
-  assert.equal(result.report.gateOutcome, "success", result.report.reason);
-  assert.match(result.report.reason, /native-review-state 290/u);
-  assert.deepEqual(github.requestBodies, []);
-  assert.ok(github.calls.filter(({ method, path }) =>
-    method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/290`
-  ).length >= 4, "each independently acquired carrier pass rereads the selected state");
+  for (const existingRequest of [false, true]) {
+    const github = createGitHubMock({ issueComments: [
+      ...(existingRequest ? [workflowRequest()] : []), summary,
+    ] });
+    const { result } = await runGate(runtimeEnvironment(context), github);
+    assert.equal(result.report.gateOutcome, "success", result.report.reason);
+    assert.match(result.report.reason, /native-review-state 290/u);
+    assert.deepEqual(github.requestBodies, []);
+    assert.ok(github.calls.filter(({ method, path }) =>
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/290`
+    ).length >= 4, "each independently acquired carrier pass rereads the selected state");
+  }
 });
 
 test("native review completion requires exact typed no-findings state and unique provenance", async (context) => {
@@ -12430,6 +12434,32 @@ test("native review completion does not replace an independent clean or relax or
   ] });
   const { result: blocked } = await runGate(runtimeEnvironment(context), edited);
   assert.notEqual(blocked.report.gateOutcome, "success");
+});
+
+test("native review completion cannot veto independently valid reaction fallback", async (context) => {
+  for (const withSummary of [false, true]) {
+    const github = createGitHubMock({
+      issueComments: [workflowRequest(), ...(withSummary ? [nativeReviewCompletionComment()] : [])],
+      reactionsByCommentId: new Map([["101", [reaction()]]]),
+      nativeCompletionResponseMutator: (node) => ({ ...node,
+        editor: { __typename: "User", login: "maintainer" } }),
+    });
+    const { result } = await runGate(runtimeEnvironment(context), github);
+    assert.equal(result.report.gateOutcome, "success", result.report.reason);
+    assert.equal(github.calls.some(({ body }) =>
+      body?.query?.includes("CodexReviewGateNativeCompletion")), false);
+  }
+});
+
+test("native review completion retains a non-summary observed in the editor readback", async (context) => {
+  let reads = 0;
+  const github = createGitHubMock({ issueComments: [nativeReviewCompletionComment()],
+    nativeCompletionResponseMutator: (node) => ++reads === 1
+      ? { ...node, body: findingIssueComment().body } : node,
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
 });
 
 test("native review completion tolerates display and edit-clock churn", async (context) => {

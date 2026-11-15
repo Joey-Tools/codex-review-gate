@@ -5309,40 +5309,6 @@ async function loadV2DecisionCarriers(
     diagnosticSummaryIds,
   );
   let nativeCompletion = null;
-  const ordinaryDirectClean = selectV2DirectCurrentHeadClean({
-    providerArtifacts: providerEvidence.artifacts, headSha, baseEpoch,
-  });
-  if (
-    ordinaryDirectClean === null &&
-    providerEvidence.errors.length === 0 &&
-    providerEvidence.opaqueTopLevelProviderActivities.length === 0 &&
-    deletedCommentEvents.length === 0 &&
-    !providerEvidence.artifacts.some((artifact) =>
-      artifact.orderingError || artifact.resolutionError || artifact.edited === true ||
-      ["malformed", "provider-failure"].includes(artifact.kind) ||
-      (artifact.kind === "finding" && artifact.resolvedHeadSha === headSha)
-    )
-  ) {
-    nativeCompletion = selectV2NativeReviewCompletion(issueComments, headSha, baseEpoch);
-    if (nativeCompletion) {
-      await exactRefetchV2NativeReviewCompletion(
-        client, config, budget, nativeCompletion, observedIssueCommentEdits,
-      );
-      providerEvidence.artifacts.push({
-        source: "native-review-state",
-        id: nativeCompletion.id,
-        kind: "clean",
-        headSha,
-        resolvedHeadSha: headSha,
-        createdAt: nativeCompletion.comment.created_at,
-        carrierCreatedAt: nativeCompletion.comment.created_at,
-        carrierUpdatedAt: nativeCompletion.comment.updated_at,
-        revisionAt: nativeCompletion.comment.updated_at,
-        nativeCompletion: true,
-        htmlUrl: nativeCompletion.comment.html_url,
-      });
-    }
-  }
   const directCurrentHeadClean = selectV2DirectCurrentHeadClean({
     providerArtifacts: providerEvidence.artifacts,
     headSha,
@@ -5487,7 +5453,7 @@ async function loadV2DecisionCarriers(
     prNumber: config.prNumber,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
     });
-  const decisionEvidence = reduceV2Evidence({
+  const decisionInputs = {
     headSha,
     baseSha,
     baseRef: pullRequest.base.ref,
@@ -5506,7 +5472,42 @@ async function loadV2DecisionCarriers(
     deletedCommentEvents,
     headCleanRecovery: effectiveRequestAuthority.headCleanRecovery,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
-  });
+  };
+  let decisionEvidence = reduceV2Evidence(decisionInputs);
+  // An optional new basis must never downgrade independently valid legacy
+  // evidence or require its additional API reads for an existing pass.
+  if (
+    decisionEvidence.decision.gateOutcome !== "success" &&
+    providerEvidence.errors.length === 0 &&
+    providerEvidence.opaqueTopLevelProviderActivities.length === 0 &&
+    deletedCommentEvents.length === 0 &&
+    !providerEvidence.artifacts.some((artifact) =>
+      artifact.orderingError || artifact.resolutionError || artifact.edited === true ||
+      ["malformed", "provider-failure"].includes(artifact.kind) ||
+      (artifact.kind === "finding" && artifact.resolvedHeadSha === headSha)
+    )
+  ) {
+    nativeCompletion = selectV2NativeReviewCompletion(issueComments, headSha, baseEpoch);
+    if (nativeCompletion) {
+      await exactRefetchV2NativeReviewCompletion(
+        client, config, budget, nativeCompletion, observedIssueCommentEdits,
+      );
+      providerEvidence.artifacts.push({
+        source: "native-review-state",
+        id: nativeCompletion.id,
+        kind: "clean",
+        headSha,
+        resolvedHeadSha: headSha,
+        createdAt: nativeCompletion.comment.created_at,
+        carrierCreatedAt: nativeCompletion.comment.created_at,
+        carrierUpdatedAt: nativeCompletion.comment.updated_at,
+        revisionAt: nativeCompletion.comment.updated_at,
+        nativeCompletion: true,
+        htmlUrl: nativeCompletion.comment.html_url,
+      });
+      decisionEvidence = reduceV2Evidence(decisionInputs);
+    }
+  }
   const carrierPayload = {
     headSha,
     baseSha,
@@ -10835,9 +10836,18 @@ async function exactRefetchV2NativeReviewCompletion(
     node.url !== current.html_url ||
     !isCanonicalUtcTimestamp(node.createdAt) ||
     Date.parse(node.createdAt) !== Date.parse(current.created_at) ||
-    !officialActor(node.author) || !(officialActor(node.editor) || unedited)
+    !officialActor(node.author)
   ) {
     throw new V2RuntimeFailure("Native Codex completion lacks trustworthy current editor provenance", {
+      recoveryCode: "wait_then_reconcile",
+    });
+  }
+  if (!hasV2OfficialSummaryMarkerBody(node.body)) {
+    throw poisonV2ObservedHistory(observedIssueCommentEdits,
+      `Native Codex summary ${completion.id} lost its marker in the editor readback`);
+  }
+  if (!(officialActor(node.editor) || unedited)) {
+    throw new V2RuntimeFailure("Native Codex completion has an unauthenticated current editor", {
       recoveryCode: "wait_then_reconcile",
     });
   }

@@ -41,6 +41,11 @@ superseded_by:
   evidence, unknown deletion history or request-generation gaps. A reused
   summary created before a base retarget cannot use an edit time to cross it.
   GitHub's separate conversation-resolution policy remains mandatory.
+- Evaluate existing evidence first. A valid ordinary or request-reaction pass
+  never needs optional native proof and cannot be downgraded by it. The added
+  compatibility regression initially reproduced such a veto and now covers
+  both legacy-only and untrusted-summary cases. Preserve non-summary evidence
+  observed in either REST or the new exact GraphQL readback.
 - A controller that finds this completion posts nothing and reruns only the
   protected verifier. It cannot publish a positive gate. Keep existing
   consumer events, permissions, variables, token scopes and request-only paths.
@@ -57,7 +62,7 @@ superseded_by:
 - Replaying the new no-request regression against unchanged source
   `6e3e2dcd78f5b7e13a2b9019886f907a8f84efd0` fails as expected: the old gate
   remains pending despite the authenticated exact-head no-findings frame.
-- Node.js 24.15.0: all 16 focused regressions and all 541 related
+- Node.js 24.15.0: all 18 focused regressions and all 543 related
   v2/core/evidence-budget tests pass, without failures, cancellations or skips.
   Cases cover actual findings, pending
   reviews, identity/flags/SHA validation, competing summaries, exact-read

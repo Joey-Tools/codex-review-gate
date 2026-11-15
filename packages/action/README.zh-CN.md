@@ -368,6 +368,8 @@ raw inventory 总数精确一致；它仅作为 opening 计数依据，后续仍
 `status` 是 `completed`，且 `has_any_findings` 与 `has_unresolved_findings` 都是
 boolean `false`，才提供补充的 exact-head clean authority。展示文字、短 SHA、多个竞争摘要、
 未知版本或格式无效的 frame 均不提供该 authority；普通可信 clean 不需要这个 frame。
+始终先执行既有 evidence 判定。已经有效的 legacy pass（包括 request-reaction fallback）
+不依赖额外原生状态 API，也不会被无效或不可读的可选摘要证明降级。
 
 选中的 code-review 字段与 carrier provenance 必须按 exact ID 回读，并进入每次完整
 carrier fingerprint 和两次稳定 snapshot。展示文字与 aggregate 编辑时钟变化不改变该状态；
