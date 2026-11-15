@@ -62,7 +62,9 @@ canonical 只读 PR workflow `Codex Review Gate Verifier` 的首次 attempt
 Verifier 订阅全部六种事件，使用相同固定 required job `codex/github-review-gate` 与 canonical run
 title，每次都完整重读当前 evidence；不会使用 skipped 或动态改名的 job。Title/body-only edit
 不会使仍有效的 same-head clean 失效，也不会仅因 metadata edit 而要求新 review。若合格 evidence 确实
-缺失，原有 failure-only、首次 attempt、opt-in 自动路径仍可按规则请求 review。自动路径只发送 request：
+缺失，原有 failure-only、首次 attempt、opt-in 自动路径仍可按规则请求 review。如果已有符合条件的
+原生 exact-head no-findings 完成状态，controller 复用它并重跑受保护的 verifier，不补发请求。
+否则自动请求分支只发送 request：
 不会立刻重跑 verifier，也不会使失败的 check 变绿。随后合格的 Codex Bot
 `issue_comment` 会唤醒 controller；否则应针对 exact current head 发起受保护的手动
 `reconcile`。若 merge conflict 导致 verifier 根本没有运行，就不会有自动 request；

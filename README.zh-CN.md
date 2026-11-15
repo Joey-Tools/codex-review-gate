@@ -73,6 +73,12 @@ title 或 body 等其他 `edited` 变更会在分配 runner 前忽略。
 variable 的 selected-repository visibility 仅设为 `codex-private-workflows` 作为
 canary，不设置 repository-level override；通过后再扩大范围。
 
+controller 在补发请求前可复用可信的原生 `codex-review-state:v1` 完成状态：完整当前 head、
+code review 已完成，且两个 findings 标志均为 boolean `false`。随后只重跑受保护的 verifier，
+由后者独立获取完整稳定证据。该可选 frame 也可提供直接 clean 依据；单独的 `Completed` 展示
+文字不能放行。在途请求复用与既有 consumer workflow 订阅保持兼容。
+详见[原生完成状态](packages/action/README.zh-CN.md#可选的原生-code-review-完成状态)。
+
 确认 base-ref retarget 后，verifier 和 controller 会先重新验证 current head、direct base 与
 test-merge scope，再由 opt-in 路径复用或创建 canonical request。title/body-only edit 会在分配
 runner 前过滤。去重只考虑最新 base-ref-change 或 base-force-push 边界之后、且 exact current
@@ -94,7 +100,7 @@ controller Action step 传入
 配置与凭据建议见[安装指南](docs/install/human.zh-CN.md#可选的-review-request-用户-token)。
 
 受保护的 `workflow_run` completion path 会在 canonical verifier 完成后运行仅用于诊断的
-operation，包括成功的 rerun，以及自动请求关闭时的完成事件。既有自动 request 行为保持不变：
+operation，包括成功的 rerun，以及自动请求关闭时的完成事件。既有 request-only 分支保留以下触发条件：
 只有 PR association 唯一的首次失败、且 opt-in variable 精确匹配时，才使用
 `begin-review` 并请求评审。其他 eligible completion 不会扫描 provider evidence、reconcile、
 rerun verifier 或发送 request。额外的 controller run 会消耗可计费 runner minutes。

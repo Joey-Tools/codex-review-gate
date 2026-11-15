@@ -280,6 +280,10 @@ dispatch 才执行 reconcile。如果 merge conflict 阻止 verifier 运行，�
 `workflow_run` failure，必须 manual recovery。只有上述 variable 精确启用时，此功能才
 生效。
 
+进入 request-only 分支前，controller 可复用[可选原生完成状态](README.zh-CN.md#可选的原生-code-review-完成状态)，
+只重跑受保护的 verifier，不补发请求。该状态只提供 exact-head authority，不是 physical request
+receipt，不能清除真实 finding、不完整历史或跳过稳定性检查。
+
 ### `report-completion`
 
 除了保留的自动 request 路径外，每个 eligible canonical verifier completion 都选择

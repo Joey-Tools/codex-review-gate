@@ -90,13 +90,21 @@ Five-action copies already have that wake-up; both older profiles need the
 updated `edited` subscription for automatic base-retarget verification. The
 controller verifies the run and may post or adopt a canonical current-scope
 `@codex review` request; uncertain outcomes remain pending. This automatic
-path does not rerun the verifier: a later Codex bot comment or protected manual
+request-only branch does not rerun the verifier: a later Codex bot comment or protected manual
 `reconcile` handles the result. A merge conflict that prevents a verifier run
 cannot start this path; resolve the conflict and use the manual recovery path
 if needed. For the Joey-Tools rollout, set the organisation variable's
 selected-repository visibility first to only `codex-private-workflows` as a
 canary before expanding it; do not set a repository-level override for that
 canary.
+
+Before posting a request, the controller can reuse a verified native
+`codex-review-state:v1` code-review completion for the exact current full head
+with both findings flags boolean `false`. It then reruns the protected verifier,
+which independently acquires complete, stable evidence. The same optional frame
+can supply direct clean evidence there; display-only `Completed` cannot. Existing
+in-flight request adoption and consumer workflow subscriptions remain compatible.
+See [native completion](packages/action/README.md#optional-native-code-review-completion).
 
 For a verified base-ref retarget, the verifier and controller revalidate the
 current head, direct base, and test-merge scope before the opt-in path reuses

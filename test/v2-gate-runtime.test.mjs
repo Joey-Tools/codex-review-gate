@@ -12337,6 +12337,245 @@ test("a completed official summary without a terminal clean remains pending", as
   );
 });
 
+test("native review completion passes without a manual request after repeated exact snapshots", async (context) => {
+  const summary = nativeReviewCompletionComment({ updated_at: "2026-08-25T08:02:00Z" });
+  const github = createGitHubMock({ issueComments: [summary] });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.match(result.report.reason, /native-review-state 290/u);
+  assert.deepEqual(github.requestBodies, []);
+  assert.ok(github.calls.filter(({ method, path }) =>
+    method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/290`
+  ).length >= 4, "each independently acquired carrier pass rereads the selected state");
+});
+
+test("native review completion requires exact typed no-findings state and unique provenance", async (context) => {
+  const cases = [
+    ["running", { review: { status: "in_progress" } }],
+    ["findings", { review: { has_any_findings: true } }],
+    ["unresolved", { review: { has_unresolved_findings: true } }],
+    ["unknown-findings", { review: { has_any_findings: null } }],
+    ["string-boolean", { review: { has_unresolved_findings: "false" } }],
+    ["old-head", { review: { commit_sha: OLD_HEAD } }],
+    ["short-head", { review: { commit_sha: HEAD.slice(0, 10) } }],
+    ["wrong-app", { app: { slug: "other" } }],
+    ["human", { user: HUMAN }],
+    ["backwards-clock", { updated_at: "2026-08-25T07:00:00Z" }],
+    ["malformed-frame", { body: `${CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER}\n<!-- codex-review-state:v1 { -->` }],
+    ["unknown-version", { body: nativeReviewCompletionComment().body.replace("state:v1", "state:v2") }],
+    ["quoted-frame", { body: nativeReviewCompletionComment().body.replace("\n<!-- codex-review-state", "\n```\n<!-- codex-review-state") + "\n```" }],
+    ["duplicate-frame", { body: nativeReviewCompletionComment().body + "\n" + nativeReviewCompletionComment().body.split("\n")[1] }],
+  ];
+  for (const [suffix, overrides] of cases) {
+    const github = createGitHubMock({ issueComments: [nativeReviewCompletionComment(overrides)] });
+    const { result } = await runGate(runtimeEnvironment(context, { suffix }), github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+  const github = createGitHubMock({ issueComments: [
+    nativeReviewCompletionComment(), nativeReviewCompletionComment({ id: 291 }),
+  ] });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.notEqual(result.report.gateOutcome, "success", "competing native summaries are ambiguous");
+});
+
+test("native review completion never clears a real current-head finding or pending review", async (context) => {
+  for (const [comments, reviews] of [
+    [[findingIssueComment()], []], [[], [findingReview()]],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: [nativeReviewCompletionComment(), ...comments], reviews,
+    });
+    const { result } = await runGate(runtimeEnvironment(context), github);
+    assert.equal(result.report.gateOutcome, "failure", result.report.reason);
+    assert.ok(result.report.counts.unresolved > 0);
+  }
+  const github = createGitHubMock({
+    issueComments: [nativeReviewCompletionComment()],
+    reviews: [{ ...findingReview(), state: "PENDING", submitted_at: null, body: "" }],
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "pending");
+});
+
+test("native review completion cannot hide opaque provider evidence", async (context) => {
+  const github = createGitHubMock({ issueComments: [
+    nativeReviewCompletionComment(),
+    cleanIssueComment(HEAD, { body: "Unrecognised provider result; coverage is unknown." }),
+  ] });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.notEqual(result.report.gateOutcome, "success");
+});
+
+test("native review completion is invalidated by a later in-progress snapshot", async (context) => {
+  const completed = nativeReviewCompletionComment();
+  const pending = nativeReviewCompletionComment({ review: { status: "in_progress" } });
+  const github = createGitHubMock({
+    issueCommentSnapshots: [[completed], [completed], [pending], [pending]],
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
+test("native review completion does not replace an independent clean or relax ordinary edit guards", async (context) => {
+  const summary = nativeReviewCompletionComment({ review: { status: "in_progress" } });
+  const github = createGitHubMock({ issueComments: [summary, cleanIssueComment()] });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(github.calls.some(({ path }) => path === `/repos/${REPOSITORY}/issues/comments/290`), false);
+  const edited = createGitHubMock({ issueComments: [
+    nativeReviewCompletionComment(),
+    cleanIssueComment(HEAD, { updated_at: "2026-08-25T08:03:00Z" }),
+  ] });
+  const { result: blocked } = await runGate(runtimeEnvironment(context), edited);
+  assert.notEqual(blocked.report.gateOutcome, "success");
+});
+
+test("native review completion tolerates display and edit-clock churn", async (context) => {
+  let readbacks = 0;
+  const github = createGitHubMock({
+    issueComments: [nativeReviewCompletionComment()],
+    commentRefetchMutator: (comment) => comment.id === 290
+      ? { ...comment, body: comment.body + `\nDisplay ${++readbacks}`,
+        updated_at: "2026-08-25T08:10:00Z" }
+      : comment,
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.ok(readbacks >= 4);
+});
+
+test("native review completion authenticates the current editor and exact GraphQL carrier", async (context) => {
+  const cases = [
+    ["human-editor", (node) => ({ ...node, editor: { __typename: "User", login: "maintainer" } })],
+    ["other-bot-editor", (node) => ({ ...node, editor: { __typename: "Bot", login: "other-app" } })],
+    ["wrong-bot-identity", (node) => ({ ...node, editor: { ...node.editor, id: "BOT_other" } })],
+    ["missing-editor", (node) => ({ ...node, editor: undefined })],
+    ["missing-node", () => null],
+    ["wrong-node", (node) => ({ ...node, id: "IC_other" })],
+    ["wrong-database-id", (node) => ({ ...node, databaseId: 999 })],
+    ["wrong-pr", (node) => ({ ...node, url: node.url.replace("/17#", "/18#") })],
+    ["changed-creation", (node) => ({ ...node, createdAt: "2026-08-25T07:00:00Z" })],
+    ["changed-body", (node) => ({ ...node, body: nativeReviewCompletionComment({
+      review: { has_any_findings: true },
+    }).body })],
+  ];
+  for (const [suffix, mutate] of cases) {
+    const github = createGitHubMock({ issueComments: [nativeReviewCompletionComment()],
+      nativeCompletionResponseMutator: mutate });
+    const { result } = await runGate(runtimeEnvironment(context, { suffix }), github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("native review completion accepts a provably unedited original Bot body", async (context) => {
+  const github = createGitHubMock({ issueComments: [nativeReviewCompletionComment()],
+    nativeCompletionResponseMutator: (node) => ({ ...node,
+      editor: null, lastEditedAt: null, updatedAt: node.createdAt }),
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+});
+
+test("native review completion cannot pass changing, missing or unmarked readbacks", async (context) => {
+  for (const mode of ["changed", "missing", "unmarked"]) {
+    const github = createGitHubMock({
+      issueComments: [nativeReviewCompletionComment()],
+      requestInterceptor: ({ method, path }) => mode === "missing" && method === "GET" &&
+        path === `/repos/${REPOSITORY}/issues/comments/290`
+        ? jsonResponse({ message: "Not found" }, 404) : undefined,
+      commentRefetchMutator: (comment) => comment.id !== 290 ? comment : ({
+        ...comment,
+        body: mode === "unmarked" ? findingIssueComment().body :
+          nativeReviewCompletionComment({ review: { status: "in_progress" } }).body,
+      }),
+    });
+    const { result } = await runGate(runtimeEnvironment(context), github);
+    assert.notEqual(result.report.gateOutcome, "success", mode);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, mode);
+  }
+});
+
+test("native review completion cannot use a later aggregate edit to cross a base retarget", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [nativeReviewCompletionComment({ updated_at: "2026-08-25T08:10:00Z" })],
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.notEqual(result.report.gateOutcome, "success");
+});
+
+test("native review completion created after a retarget retains the exact-head path", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [nativeReviewCompletionComment({
+      created_at: "2026-08-25T08:06:00Z", updated_at: "2026-08-25T08:07:00Z",
+    })],
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+});
+
+test("native review completion suppresses controller POST and reruns only the protected verifier", async (context) => {
+  for (const eventName of ["workflow_dispatch", "workflow_run"]) {
+    for (const existingRequest of [false, true]) {
+      const github = createGitHubMock({ issueComments: [
+        ...(existingRequest ? [workflowRequest()] : []), nativeReviewCompletionComment(),
+      ] });
+      const environment = runtimeEnvironment(context, { operation: "begin-review", eventName });
+      environment.REVIEW_REQUEST_TOKEN = REVIEW_REQUEST_TOKEN_FIXTURES.accessA;
+      const { result } = await runGate(environment, github);
+      assert.equal(result.report.gateOutcome, "pending", result.report.reason);
+      assert.deepEqual(github.requestBodies, [], `${eventName}: no additional review request`);
+      assert.equal(github.authCalls.some(({ path }) => path === "/user"), false,
+        "adoption does not resolve or use the optional request-author token");
+      assert.equal(github.rerunRequests.length, 1, result.report.reason);
+    }
+  }
+});
+
+test("native review completion leaves in-flight canonical request adoption unchanged", async (context) => {
+  const github = createGitHubMock({ issueComments: [
+    workflowRequest(), nativeReviewCompletionComment({ review: { status: "in_progress" } }),
+  ] });
+  const { result } = await runGate(runtimeEnvironment(context, {
+    eventName: "workflow_run", operation: "begin-review",
+  }), github);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("native review completion changing during controller adoption never posts", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [nativeReviewCompletionComment()],
+    commentRefetchMutator: (comment) => comment.id === 290
+      ? { ...comment, body: nativeReviewCompletionComment({
+        review: { status: "in_progress" },
+      }).body } : comment,
+  });
+  const { result } = await runGate(runtimeEnvironment(context, {
+    eventName: "workflow_run", operation: "begin-review",
+  }), github);
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.deepEqual(github.requestBodies, []);
+  assert.deepEqual(github.rerunRequests, []);
+});
+
+test("native review completion cannot erase an observed non-summary finding", async (context) => {
+  const native = nativeReviewCompletionComment();
+  const finding = findingIssueComment(HEAD, { id: native.id,
+    html_url: native.html_url, created_at: native.created_at });
+  const github = createGitHubMock({
+    issueCommentSnapshots: [[native], [finding], [native], [native]],
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.notEqual(result.report.gateOutcome, "success");
+  assert.equal(github.statusWrites.some(({ state }) => state === "success"), false);
+});
+
 test("summary creation, edits, and disappearance do not destabilize complete snapshots", async (context) => {
   const request = workflowRequest();
   const clean = cleanIssueComment(HEAD);
@@ -16910,6 +17149,19 @@ function officialCodexAboutFooter() {
   ];
 }
 
+function nativeReviewCompletionComment({ review = {}, ...overrides } = {}) {
+  const state = { code_review: {
+    commit_sha: HEAD, status: "completed",
+    has_any_findings: false, has_unresolved_findings: false, ...review,
+  }, security_review: { commit_sha: null, status: null,
+    has_any_findings: null, has_unresolved_findings: null } };
+  return officialReviewSummaryComment({
+    body: `${CODEX_PULL_REQUEST_REVIEW_SUMMARY_MARKER}\n<!-- codex-review-state:v1 ${JSON.stringify(state)} -->\nCompleted`,
+    user: { ...CODEX_BOT, id: CODEX_BOT_DATABASE_ID, node_id: "BOT_official_codex" },
+    ...overrides,
+  });
+}
+
 function officialReviewSummaryComment({
   id = 290,
   status = "Completed",
@@ -17555,6 +17807,7 @@ function createGitHubMock({
   reactionSnapshotsByCommentId = new Map(),
   reactionGraphQlPageSize = 100,
   reactionGraphQlResponseMutator = null,
+  nativeCompletionResponseMutator = null,
   officialReactionAccount = null,
   authenticatedUser = null,
   pullRequestOverrides = {},
@@ -17891,6 +18144,20 @@ function createGitHubMock({
             })
           : response,
       );
+    }
+    if (method === "POST" && path === "/graphql" &&
+      body?.query?.includes("CodexReviewGateNativeCompletion")) {
+      const comment = activeComments.find((value) => value.node_id === body.variables?.id);
+      const actor = { __typename: "Bot", login: "chatgpt-codex-connector",
+        id: comment?.user?.node_id };
+      const node = comment ? {
+        __typename: "IssueComment", id: comment.node_id, databaseId: comment.id,
+        url: comment.html_url, body: comment.body,
+        createdAt: comment.created_at, updatedAt: comment.updated_at,
+        lastEditedAt: comment.updated_at, author: actor, editor: actor,
+      } : null;
+      return jsonResponse({ data: { node: typeof nativeCompletionResponseMutator === "function"
+        ? nativeCompletionResponseMutator(node) : node } });
     }
     if (
       method === "POST" &&
