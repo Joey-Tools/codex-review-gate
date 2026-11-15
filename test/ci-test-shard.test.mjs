@@ -13,6 +13,7 @@ import { dirname, join, relative, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import * as shardTestSupport from "./support/ci-test-shard.mjs";
+import { hasSuccessfulBaseCi, isVersionOnlyRelease } from "../scripts/select-ci-scope.mjs";
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const bootstrapTestRelativePath = "test/bootstrap.test.mjs";
@@ -189,6 +190,8 @@ function matrixRootEntries(jobSource) {
 }
 
 function assertCiJobContract(jobId, jobSource, nodeVersion, displayVersion) {
+  assert.ok(jobSource.includes("    needs: select-ci\n"));
+  assert.ok(jobSource.includes("    if: ${{ !cancelled() && needs.select-ci.outputs.release_only != 'true' }}\n"));
   assert.match(
     jobSource,
     new RegExp(
@@ -275,8 +278,8 @@ function assertCiWorkflowContract(source) {
   const jobs = parseCiJobs(source);
   assert.deepEqual(
     [...jobs.keys()],
-    ["test-node-20", "test-node-24"],
-    "CI workflow must contain only the two declared Node matrix jobs",
+    ["select-ci", "test-node-20", "test-node-24", "release-intent"],
+    "CI workflow must route between the full matrices and release-intent validation",
   );
   assertCiJobContract("test-node-20", jobs.get("test-node-20").source, "20", "");
   assertCiJobContract("test-node-24", jobs.get("test-node-24").source, "24", " 24");
@@ -289,8 +292,47 @@ function assertCiWorkflowContract(source) {
     ].sort(),
     "the CI test inventory must assign every discoverable test file exactly once",
   );
-  assert.doesNotMatch(source, /\bneeds:|\balways\(\)|aggregate/u);
+  const release = jobs.get("release-intent").source;
+  assert.ok(release.includes("    needs: select-ci\n"));
+  assert.ok(release.includes("    if: ${{ !cancelled() && needs.select-ci.outputs.release_only == 'true' }}\n"));
+  assert.match(release, /node: \["20", "24"\]/u);
+  for (const command of ["plan", "candidate", "verify-candidate"]) {
+    assert.ok(release.includes(`scripts/generate-action-release-provenance.mjs ${command} `));
+  }
+  assert.doesNotMatch(source, /\balways\(\)|aggregate/u);
 }
+
+test("release-only CI accepts version, manifest and journal changes", () => {
+  const before = { name: "action", version: "2.2.15", scripts: { check: "node --check src.mjs" } };
+  const after = { ...before, version: "2.2.16" };
+  const paths = ["packages/action/package.json", "release-manifest.json",
+    "docs/project_journal/2026/11/release.md"];
+  assert.equal(isVersionOnlyRelease(paths, before, after), true);
+  assert.equal(isVersionOnlyRelease(paths.slice(1), before, after), false);
+});
+
+test("release-only CI rejects runtime, test, control and other package changes", () => {
+  const paths = ["packages/action/package.json", "release-manifest.json"];
+  const before = { name: "action", version: "2.2.15" };
+  const after = { ...before, version: "2.2.16" };
+  for (const path of ["packages/action/src/core.mjs", "test/core.test.mjs", ".github/workflows/ci.yml"]) {
+    assert.equal(isVersionOnlyRelease([...paths, path], before, after), false);
+  }
+  assert.equal(isVersionOnlyRelease(paths, before, { ...after, scripts: { test: "changed" } }), false);
+  assert.equal(isVersionOnlyRelease(paths, before, before), false);
+});
+
+test("release-only CI needs a successful master push CI for the exact base", () => {
+  const base = "a".repeat(40);
+  const run = { head_sha: base, head_branch: "master", event: "push",
+    status: "completed", conclusion: "success" };
+  assert.equal(hasSuccessfulBaseCi(run, base), true);
+  for (const change of [{ head_sha: "b".repeat(40) }, { head_branch: "topic" },
+    { event: "pull_request" }, { status: "in_progress" }, { conclusion: "failure" }]) {
+    assert.equal(hasSuccessfulBaseCi({ ...run, ...change }, base), false);
+  }
+  assert.equal(hasSuccessfulBaseCi(undefined, base), false);
+});
 
 function mutateCiJob(source, jobId, original, replacement) {
   const job = parseCiJobs(source).get(jobId);

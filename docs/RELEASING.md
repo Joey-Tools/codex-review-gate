@@ -36,6 +36,15 @@ release-intent change must not modify publisher workflow/scripts or their
 control tests. This keeps newly introduced privileged code from immediately
 receiving production credentials to publish itself.
 
+Version-only PRs can use the two Node.js 20/24 release-intent CI jobs instead
+of the full test matrices. Selection requires successful master-push CI for
+the exact base SHA, an Action package version-only change, and changes limited
+to that package file, the manifest and journal Markdown. The existing release
+planner must accept the exact head; both jobs then build and verify its actual
+candidate. Missing base evidence or an unsupported intent shape keeps full CI.
+Master pushes, workflow dispatches and all code/test/control changes retain full
+CI. The independent publisher validation and production approval are unchanged.
+
 ## Release intent
 
 When present in a later release-intent PR, `release-manifest.json` is the
