@@ -2135,12 +2135,17 @@ async function runV2ControllerAction(client, config, context, {
       initialPr,
       { now },
     );
-    if (config.requestReview && !canonicalPositiveId(reviewRequest.commentId)) {
+    if (
+      config.requestReview &&
+      !canonicalPositiveId(reviewRequest.commentId) &&
+      !(reviewRequest.kind === "native-completed" &&
+        canonicalPositiveId(reviewRequest.summaryId))
+    ) {
       throw new V2RuntimeFailure(
         "The adopted or created review request has no canonical comment identity",
       );
     }
-    if (config.triggerSource === "auto") {
+    if (config.triggerSource === "auto" && reviewRequest.kind !== "native-completed") {
       const adoptedRequest = new Set([
         "adopted",
         "duplicates",
@@ -3605,13 +3610,6 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
     return { kind: "disabled", commentId: null };
   }
 
-  const requestClient = config.reviewRequestToken
-    ? new V2GitHubClient({ ...config, token: config.reviewRequestToken }, client.fetchImpl)
-    : client;
-  const requestAuthor = config.reviewRequestToken
-    ? await loadV2ReviewRequestAuthor(requestClient, budget)
-    : null;
-
   const { comments, baseEpoch } = await loadV2IssueCommentsWithEditHistory(
     client,
     config,
@@ -3632,6 +3630,32 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
       { recoveryCode: "wait_then_reconcile" },
     );
   }
+
+  const nativeCompletion = selectV2NativeReviewCompletion(
+    comments,
+    config.expectedHeadSha,
+    baseEpoch,
+  );
+  if (nativeCompletion) {
+    await exactRefetchV2NativeReviewCompletion(
+      client, config, budget, nativeCompletion, observedIssueCommentEdits,
+    );
+    await assertV2BeginReviewScope(client, config, initialPr, budget);
+    const adoptionBaseEpoch = await loadV2LatestBaseEpoch(
+      client, config, budget, observedBaseEpoch,
+    );
+    assertV2BaseEpochUnchanged(baseEpoch, adoptionBaseEpoch, "before native review adoption");
+    // Adoption suppresses a request, never supplies the verifier's verdict.
+    // The controller reruns the protected verifier for a complete fresh read.
+    return { kind: "native-completed", commentId: null, summaryId: nativeCompletion.id };
+  }
+
+  const requestClient = config.reviewRequestToken
+    ? new V2GitHubClient({ ...config, token: config.reviewRequestToken }, client.fetchImpl)
+    : client;
+  const requestAuthor = config.reviewRequestToken
+    ? await loadV2ReviewRequestAuthor(requestClient, budget)
+    : null;
 
   const matchingScope = controllerV2RequestComments(comments, requestAuthor).filter(({ binding }) =>
     matchesV2BeginReviewRequestScope(binding, config, context, initialPr)
@@ -5284,6 +5308,7 @@ async function loadV2DecisionCarriers(
     reviews,
     diagnosticSummaryIds,
   );
+  let nativeCompletion = null;
   const directCurrentHeadClean = selectV2DirectCurrentHeadClean({
     providerArtifacts: providerEvidence.artifacts,
     headSha,
@@ -5428,7 +5453,7 @@ async function loadV2DecisionCarriers(
     prNumber: config.prNumber,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
     });
-  const decisionEvidence = reduceV2Evidence({
+  const decisionInputs = {
     headSha,
     baseSha,
     baseRef: pullRequest.base.ref,
@@ -5447,10 +5472,49 @@ async function loadV2DecisionCarriers(
     deletedCommentEvents,
     headCleanRecovery: effectiveRequestAuthority.headCleanRecovery,
     verifierRunCreatedMs: config.verifierRunCreatedMs,
-  });
+  };
+  let decisionEvidence = reduceV2Evidence(decisionInputs);
+  // An optional new basis must never downgrade independently valid legacy
+  // evidence or require its additional API reads for an existing pass.
+  if (
+    decisionEvidence.decision.gateOutcome !== "success" &&
+    providerEvidence.errors.length === 0 &&
+    providerEvidence.opaqueTopLevelProviderActivities.length === 0 &&
+    deletedCommentEvents.length === 0 &&
+    !providerEvidence.artifacts.some((artifact) =>
+      artifact.orderingError || artifact.resolutionError || artifact.edited === true ||
+      ["malformed", "provider-failure"].includes(artifact.kind) ||
+      (artifact.kind === "finding" && artifact.resolvedHeadSha === headSha)
+    )
+  ) {
+    nativeCompletion = selectV2NativeReviewCompletion(issueComments, headSha, baseEpoch);
+    if (nativeCompletion) {
+      await exactRefetchV2NativeReviewCompletion(
+        client, config, budget, nativeCompletion, observedIssueCommentEdits,
+      );
+      providerEvidence.artifacts.push({
+        source: "native-review-state",
+        id: nativeCompletion.id,
+        kind: "clean",
+        headSha,
+        resolvedHeadSha: headSha,
+        createdAt: nativeCompletion.comment.created_at,
+        carrierCreatedAt: nativeCompletion.comment.created_at,
+        carrierUpdatedAt: nativeCompletion.comment.updated_at,
+        revisionAt: nativeCompletion.comment.updated_at,
+        nativeCompletion: true,
+        htmlUrl: nativeCompletion.comment.html_url,
+      });
+      decisionEvidence = reduceV2Evidence(decisionInputs);
+    }
+  }
   const carrierPayload = {
     headSha,
     baseSha,
+    nativeReviewCompletion: nativeCompletion && {
+      id: nativeCompletion.id,
+      fingerprint: nativeCompletion.fingerprint,
+    },
     baseRef: pullRequest.base.ref,
     baseRepositoryId: String(pullRequest.base.repo.id),
     issueComments: issueComments
@@ -6192,7 +6256,10 @@ function reduceV2Evidence({
   ];
   const generationLineage = buildV2GenerationLineage({
     currentRequests: boundaryScope.currentRequests,
-    currentArtifacts: currentHeadTerminalArtifacts,
+    // Mutable aggregate state is head authority only, never a request receipt.
+    currentArtifacts: currentHeadTerminalArtifacts.filter((artifact) =>
+      artifact.source !== "native-review-state"
+    ),
     requestReactions,
     providerActivityArtifacts,
     livenessFloorMs: baseEpochMs,
@@ -6225,6 +6292,7 @@ function reduceV2Evidence({
     String(artifact.id) === String(headCleanRecovery.cleanId);
   const positiveCleans = currentArtifacts.filter((artifact) =>
     artifact.kind === "clean" &&
+    artifact.source !== "native-review-state" &&
     (
       artifact.source !== "issue-comment" ||
       !Number.isFinite(verifierRunCreatedMs) ||
@@ -7280,7 +7348,9 @@ function selectV2DirectCurrentHeadClean({ providerArtifacts, headSha, baseEpoch 
   if (hasBaseEpoch && baseEpochMs === null) return null;
   const candidates = (providerArtifacts ?? [])
     .filter((artifact) =>
-      isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(artifact, headSha)
+      isV2TopLevelTerminalCleanReceiptForDefaultAnyDuplicateCohort(artifact, headSha) ||
+      (artifact.source === "native-review-state" && artifact.nativeCompletion === true &&
+        artifact.kind === "clean" && artifact.resolvedHeadSha === headSha)
     )
     .filter((artifact) =>
       baseEpochMs === null || Date.parse(artifact.createdAt) > baseEpochMs
@@ -10644,6 +10714,151 @@ function hasV2OfficialSummaryMarkerBody(body) {
 function isV2OfficialPullRequestReviewSummary(comment) {
   return hasExactProviderIdentity(comment) &&
     hasV2OfficialSummaryMarkerBody(comment?.body);
+}
+
+function selectV2NativeReviewCompletion(comments, headSha, baseEpoch) {
+  const summaries = (comments ?? []).filter(isV2OfficialPullRequestReviewSummary);
+  if (summaries.length !== 1 || !FULL_SHA.test(headSha)) return null;
+  const comment = summaries[0];
+  const id = canonicalPositiveId(comment.id);
+  if (
+    !id || !isCanonicalUtcTimestamp(comment.created_at) ||
+    !isCanonicalUtcTimestamp(comment.updated_at) ||
+    Date.parse(comment.updated_at) < Date.parse(comment.created_at)
+  ) return null;
+  // The typed v1 frame is optional supplemental evidence. Display prose,
+  // unknown versions and malformed frames retain diagnostic-only treatment.
+  const frames = [...comment.body.matchAll(
+    /^<!-- codex-review-state:v1 (.+) -->\r?$/gmu,
+  )];
+  if (frames.length !== 1 || frames[0].index !== comment.body.indexOf("\n") + 1) {
+    return null;
+  }
+  let state;
+  try {
+    state = JSON.parse(frames[0][1]);
+  } catch {
+    return null;
+  }
+  const review = isPlainRecord(state) && state.code_review;
+  if (
+    !isPlainRecord(review) || review.commit_sha !== headSha ||
+    review.status !== "completed" || review.has_any_findings !== false ||
+    review.has_unresolved_findings !== false
+  ) return null;
+  if (baseEpoch?.event != null) {
+    const epochAt = baseEpoch.event.createdAt;
+    // An aggregate can be edited without another review. Its edit time cannot
+    // attest a new review after a base retarget; preserve the existing path.
+    if (!isCanonicalUtcTimestamp(epochAt) ||
+      Date.parse(comment.created_at) <= Date.parse(epochAt)) return null;
+  }
+  // Protect code-review state and carrier provenance. Display/footer updates,
+  // security-review activity and the aggregate's edit clock are not that state.
+  const appIdentity = (app) => app == null ? null : ({
+    id: app.id ?? null, slug: app.slug,
+    owner: app.owner == null ? null : { id: app.owner.id, login: app.owner.login },
+  });
+  const fingerprint = canonicalJson({
+    id, headSha, createdAt: comment.created_at, url: comment.html_url,
+    user: { id: comment.user.id ?? null, login: comment.user.login, type: comment.user.type },
+    app: appIdentity(comment.app),
+    performedViaApp: appIdentity(comment.performed_via_github_app),
+    codeReview: {
+      commitSha: review.commit_sha, status: review.status,
+      hasAnyFindings: review.has_any_findings,
+      hasUnresolvedFindings: review.has_unresolved_findings,
+    },
+  });
+  return { id, headSha, comment, fingerprint };
+}
+
+async function exactRefetchV2NativeReviewCompletion(
+  client, config, budget, completion, observedIssueCommentEdits,
+) {
+  let current;
+  try {
+    ({ data: current } = await client.request(
+      "GET", `${config.repoPath}/issues/comments/${completion.id}`, undefined,
+      { budget, safeRead: true },
+    ));
+  } catch (error) {
+    if (error?.httpStatus !== 404) throw error;
+    throw new V2RuntimeFailure("Native Codex completion disappeared during readback", {
+      recoveryCode: "wait_then_reconcile",
+    });
+  }
+  budget.consumeObjects(1, `native review completion readback ${completion.id}`);
+  requireV2IssueCommentShape(current, "native review completion readback");
+  if (
+    canonicalPositiveId(current.id) !== completion.id ||
+    !isV2OfficialPullRequestReviewSummary(current)
+  ) {
+    throw poisonV2ObservedHistory(
+      observedIssueCommentEdits,
+      `Native Codex summary ${completion.id} changed identity or lost its current marker`,
+    );
+  }
+  const reread = selectV2NativeReviewCompletion([current], completion.headSha, null);
+  if (reread?.fingerprint !== completion.fingerprint) {
+    throw new V2RuntimeFailure("Native Codex completion changed during readback", {
+      recoveryCode: "wait_then_reconcile",
+    });
+  }
+  // Original authorship survives maintainer edits. Independently authenticate
+  // the current body/editor before using this deliberately mutable carrier.
+  const { data } = await client.request("POST", "/graphql", {
+    query: `query CodexReviewGateNativeCompletion($id: ID!) {
+      node(id: $id) { __typename ... on IssueComment {
+        id databaseId: fullDatabaseId url body createdAt updatedAt lastEditedAt
+        author { __typename login ... on Bot { id } }
+        editor { __typename login ... on Bot { id } }
+      } }
+    }`,
+    variables: { id: current.node_id },
+  }, { budget, safeRead: true });
+  budget.consumePage("native review completion editor");
+  budget.consumeObjects(3, "native review completion and author/editor");
+  const node = data?.data?.node;
+  const officialActor = (actor) => actor?.__typename === "Bot" &&
+    actor.login === OFFICIAL_CODEX_APP_SLUG &&
+    typeof current.user.node_id === "string" && current.user.node_id !== "" &&
+    actor.id === current.user.node_id;
+  const unedited = node?.lastEditedAt === null && node?.editor === null &&
+    isCanonicalUtcTimestamp(node?.createdAt) &&
+    isCanonicalUtcTimestamp(node?.updatedAt) &&
+    Date.parse(node.createdAt) === Date.parse(node.updatedAt);
+  if (
+    (Array.isArray(data?.errors) && data.errors.length > 0) ||
+    typeof current.node_id !== "string" || !current.node_id ||
+    node?.__typename !== "IssueComment" || node.id !== current.node_id ||
+    canonicalPositiveId(node.databaseId) !== completion.id ||
+    node.url !== current.html_url ||
+    !isCanonicalUtcTimestamp(node.createdAt) ||
+    Date.parse(node.createdAt) !== Date.parse(current.created_at) ||
+    !officialActor(node.author)
+  ) {
+    throw new V2RuntimeFailure("Native Codex completion lacks trustworthy current editor provenance", {
+      recoveryCode: "wait_then_reconcile",
+    });
+  }
+  if (!hasV2OfficialSummaryMarkerBody(node.body)) {
+    throw poisonV2ObservedHistory(observedIssueCommentEdits,
+      `Native Codex summary ${completion.id} lost its marker in the editor readback`);
+  }
+  if (!(officialActor(node.editor) || unedited)) {
+    throw new V2RuntimeFailure("Native Codex completion has an unauthenticated current editor", {
+      recoveryCode: "wait_then_reconcile",
+    });
+  }
+  const authenticated = selectV2NativeReviewCompletion([{
+    ...current, body: node.body, updated_at: node.updatedAt,
+  }], completion.headSha, null);
+  if (authenticated?.fingerprint !== completion.fingerprint) {
+    throw new V2RuntimeFailure("Native Codex completion changed in the editor readback", {
+      recoveryCode: "wait_then_reconcile",
+    });
+  }
 }
 
 function rememberV2OfficialSummaryIds(observed, comments) {

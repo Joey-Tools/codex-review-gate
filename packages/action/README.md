@@ -218,8 +218,11 @@ a first-attempt failure (`run_attempt=1`) with a unique PR association. The
 protected controller re-fetches the completed verifier and current eligible
 same-repository, open, ready PR. It posts a canonical
 request if no exact repository/PR/head/base match exists, or adopts an existing
-match. The request is the entire automatic operation: there is no immediate
-verifier rerun. A later exact Codex bot comment or protected manual
+match. Before that request path, a verified native no-findings completion for
+the current head is reused without posting; the controller reruns the protected
+verifier to acquire its own complete evidence. Request creation and canonical
+request adoption remain request-only operations, with no immediate verifier
+rerun. A later exact Codex bot comment or protected manual
 `reconcile` performs that rerun. This path may follow `opened`, `reopened`,
 `synchronize`, `ready_for_review` when acceptable evidence is missing, or
 native `stacked`, not just a push. A merge
@@ -502,8 +505,8 @@ recognising a non-inline parent receipt does not supply thread state.
 
 An issue comment with the exact first-line marker
 `<!-- codex-pull-request-review-summary -->` and the verified official Codex
-Bot/App identity is a diagnostic activity summary, not review evidence. Its
-body, status, SHA text, edits, or absence do not authorize or block the gate.
+Bot/App identity is a diagnostic activity summary by default. Its display
+body, status, SHA text, edits, or absence do not themselves authorize or block the gate.
 In particular, `Completed` is not terminal-clean evidence and cannot clear a
 finding or resolve a review thread.
 
@@ -515,7 +518,7 @@ be proved. A real finding cannot inherit an earlier summary's exemption.
 Likewise, adding the marker later cannot erase a non-summary carrier already
 observed during the same acquisition or controller recovery attempt.
 
-These identified summaries are excluded from request attribution, provider
+Diagnostic-only summaries are excluded from request attribution, provider
 activity, edit-history decision inputs, decision fingerprints, and targeted
 comment rereads. They remain part of complete raw comment acquisition and its
 pagination budgets; this exception does not waive API health or inventory
@@ -535,6 +538,40 @@ the ordinary closing inventory and metadata checks. Every non-summary comment
 in that inventory is still evaluated. Unexplained count mismatches, subsequent
 non-summary changes, and scope changes remain fail-closed or require a fresh
 snapshot. A normal matching opening count adds no metadata request.
+
+#### Optional native code-review completion
+
+One current, authenticated summary can additionally carry the optional
+`codex-review-state:v1` JSON frame immediately after its reserved first line.
+The verifier accepts it as supplemental exact-head clean evidence only when
+`code_review.commit_sha` is the full current SHA, `status` is `completed`, and
+both `has_any_findings` and `has_unresolved_findings` are boolean `false`.
+Display text, short SHAs, competing summaries, unknown versions and malformed
+frames cannot supply this authority. A genuine ordinary clean needs no frame.
+The existing evidence decision runs first. A valid legacy pass, including the
+request-reaction fallback, never requires native-state API reads and cannot be
+downgraded by an invalid or unavailable optional summary proof.
+
+The selected code-review fields and carrier provenance are reread by exact ID
+and participate in every complete carrier fingerprint and both stable snapshots.
+An independent GraphQL read binds the exact comment, current body and author;
+its editor must also be the official Bot, or it must be provably unedited.
+Original Bot/App authorship alone cannot authenticate a maintainer-edited frame.
+Display text and aggregate edit-clock changes are benign; a selected state
+change restarts acquisition. Losing its identity or current marker cannot hide real
+provider evidence. This basis cannot clear a current-head finding, opaque or
+edited provider evidence, or unknown deletion history. It never acts as a
+request-generation receipt. After a base retarget, the original summary must
+have been created after that epoch; a later aggregate edit is insufficient.
+GitHub's separate conversation-resolution requirement remains in force.
+
+The controller checks this completion before posting or adopting a canonical
+request, then reruns only the protected verifier. That rerun independently
+checks all evidence; controller adoption cannot turn a check green. In-flight
+requests keep the existing adoption and completion path. Summary events remain
+diagnostic no-ops, so existing consumer subscriptions remain compatible. Use
+the existing manual `reconcile` if no subscribed completion comment follows.
+Request/comment counts describe triggers, not backend executions or charges.
 
 ### Legacy request-bound lineage and recovery
 

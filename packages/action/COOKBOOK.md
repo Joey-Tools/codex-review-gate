@@ -71,7 +71,9 @@ evidence each time; no skipped or dynamically renamed job is used.
 Title/body-only edits do not invalidate an existing valid same-head clean and
 do not by themselves require a fresh review. The existing failure-only,
 first-attempt opt-in path may still request review when acceptable evidence is
-genuinely missing. The automatic path is request-only: it does not immediately rerun the verifier or turn the failed
+genuinely missing. If the optional exact-head native no-findings completion is
+already available, the controller reuses it and reruns the protected verifier
+without posting. Otherwise the automatic request path is request-only: it does not immediately rerun the verifier or turn the failed
 check green. A qualifying Codex Bot `issue_comment` later wakes the controller;
 otherwise dispatch a protected manual `reconcile` for the exact current head.
 If a merge conflict prevents any verifier run, there is no automatic request;

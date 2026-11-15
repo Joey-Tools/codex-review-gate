@@ -3,11 +3,11 @@ id: 20261006-official-summary-diagnostics
 title: Official Codex Summary Is Diagnostic Only
 status: completed
 created: 2026-10-06
-updated: 2026-10-06
+updated: 2026-11-15
 branch: codex/official-summary-diagnostics
 pr: https://github.com/Joey-Tools/codex-review-gate/pull/106
 supersedes: []
-superseded_by:
+superseded_by: 20261115-native-review-completion
 ---
 
 # Official Codex Summary Is Diagnostic Only

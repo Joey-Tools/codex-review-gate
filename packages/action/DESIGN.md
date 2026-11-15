@@ -339,6 +339,12 @@ prevents the verifier from running, there is no `workflow_run` failure to
 consume, so recovery is manual. The feature is off unless explicitly enabled
 by the exact variable value above.
 
+Before that request-only branch, the controller may reuse the
+[optional native completion](README.md#optional-native-code-review-completion)
+and rerun the protected verifier without posting. Native state is exact-head
+authority only; it cannot close a physical request generation or bypass real
+findings, incomplete history, or stable acquisition.
+
 ### `report-completion`
 
 Every eligible canonical verifier completion other than the preserved

@@ -337,8 +337,8 @@ issue comment 仍须显式声明 commit，识别 parent receipt 也不会豁免�
 ### Codex 活动摘要只供诊断
 
 同时满足首行 exact marker `<!-- codex-pull-request-review-summary -->` 和
-verified official Codex Bot/App identity 的 issue comment 是活动摘要，不是 review
-证据。其正文、状态、SHA 文本、编辑或缺失均不提供 pass 或 blocking authority。
+verified official Codex Bot/App identity 的 issue comment 默认只作为活动摘要。
+其展示正文、状态、SHA 文本、编辑或缺失本身均不提供 pass 或 blocking authority。
 尤其是 `Completed` 不等于 terminal clean，不能清除 finding 或 resolve review thread。
 
 摘要豁免要求当前正文仍保留首行 exact marker。缓存过摘要 ID 并不豁免当前 marker 被删除或
@@ -347,7 +347,7 @@ verified official Codex Bot/App identity 的 issue comment 是活动摘要，不
 反过来，后加 marker 也不能清除同一次 acquisition 或 controller recovery attempt 中已观察到的
 非摘要 carrier 证据。
 
-这类已识别摘要不参与 request attribution、provider activity、edit-history 决策输入、
+仅用于诊断的摘要不参与 request attribution、provider activity、edit-history 决策输入、
 decision fingerprint 或 targeted comment reread。完整 raw comment acquisition 仍读取
 它们，并计入 pagination budget；此例外不豁免 API 健康或 inventory 完整性检查。真正的
 clean/finding comment 仍受原有保护。已识别摘要的 provider event 直接跳过，不定向回读
@@ -360,6 +360,30 @@ clean/finding comment 仍受原有保护。已识别摘要的 provider event 直
 raw inventory 总数精确一致；它仅作为 opening 计数依据，后续仍执行原有 closing inventory
 和 metadata 检查。列表内的每一条非摘要评论仍参与决策。无法解释的计数不匹配、后续
 非摘要变化和 scope 变化仍 fail-closed 或要求重新 snapshot。普通计数匹配路径不增加请求。
+
+#### 可选的原生 code-review 完成状态
+
+唯一、可信的当前摘要可在保留首行 marker 后，紧接一行可选的
+`codex-review-state:v1` JSON。只有 `code_review.commit_sha` 是精确当前完整 SHA、
+`status` 是 `completed`，且 `has_any_findings` 与 `has_unresolved_findings` 都是
+boolean `false`，才提供补充的 exact-head clean authority。展示文字、短 SHA、多个竞争摘要、
+未知版本或格式无效的 frame 均不提供该 authority；普通可信 clean 不需要这个 frame。
+始终先执行既有 evidence 判定。已经有效的 legacy pass（包括 request-reaction fallback）
+不依赖额外原生状态 API，也不会被无效或不可读的可选摘要证明降级。
+
+选中的 code-review 字段与 carrier provenance 必须按 exact ID 回读，并进入每次完整
+carrier fingerprint 和两次稳定 snapshot。展示文字与 aggregate 编辑时钟变化不改变该状态；
+另外必须通过独立 GraphQL 回读核实 exact comment、当前正文与原作者；编辑者必须也是官方 Bot，
+或可证明该正文从未编辑。保留 Bot/App 原作者信息但由人工修改的摘要不能提供原生 authority。
+被选字段变化则重新 acquisition。身份或当前 marker 丢失不能掩盖真实 provider
+evidence。该依据不能清除当前 head finding、不透明或已编辑的 provider evidence，以及未知删除
+历史，也不是 request-generation receipt。base retarget 后，必须是原始摘要创建时间晚于该 epoch；
+后续编辑时间不能替代新的 review。GitHub 独立的 conversation-resolution 要求继续生效。
+
+controller 在创建或复用 canonical request 前检查该原生完成状态；满足条件时直接复用并重跑
+受保护的 verifier，不再补发 request。verifier 仍独立读取完整证据，controller 不会直接将 check
+置绿。在途请求沿用现有复用与完成路径。摘要事件仍只供诊断，兼容既有 consumer 订阅；如果没有
+后续已订阅的完成评论，使用现有 manual `reconcile`。request/comment 数量不代表后端执行或收费次数。
 
 ### Primary exact-head clean
 
