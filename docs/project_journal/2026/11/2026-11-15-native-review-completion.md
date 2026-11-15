@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-15
 updated: 2026-11-15
 branch: wip/native-review-state
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/151
 supersedes: [20261006-official-summary-diagnostics]
 superseded_by:
 ---
@@ -70,6 +70,11 @@ superseded_by:
   and edit-clock churn, observed-finding retention and controller request
   suppression. Header-position checks exclude quoted frames from authority.
 - `npm run check`, project-journal validation and `git diff --check` pass.
+- PR 151's independent Codex review caught the native editor query using the
+  deprecated 32-bit `databaseId` field. Alias `fullDatabaseId` consistently
+  with existing comment queries. The native success regression now uses the
+  observed large ID `6564802861` and a string BigInt response, and rejects the
+  old query before the fix. A live GraphQL read confirms the large ID.
 - Release delivery remains separately reviewed and uses the installed
   released controls outside this candidate. Publication requires the normal
   release-intent and human production approval; no publication or live new-

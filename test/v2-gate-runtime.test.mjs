@@ -12338,17 +12338,19 @@ test("a completed official summary without a terminal clean remains pending", as
 });
 
 test("native review completion passes without a manual request after repeated exact snapshots", async (context) => {
-  const summary = nativeReviewCompletionComment({ updated_at: "2026-08-25T08:02:00Z" });
+  const summary = nativeReviewCompletionComment({
+    id: 6564802861, updated_at: "2026-08-25T08:02:00Z",
+  });
   for (const existingRequest of [false, true]) {
     const github = createGitHubMock({ issueComments: [
       ...(existingRequest ? [workflowRequest()] : []), summary,
     ] });
     const { result } = await runGate(runtimeEnvironment(context), github);
     assert.equal(result.report.gateOutcome, "success", result.report.reason);
-    assert.match(result.report.reason, /native-review-state 290/u);
+    assert.ok(result.report.reason.includes(`native-review-state ${summary.id}`));
     assert.deepEqual(github.requestBodies, []);
     assert.ok(github.calls.filter(({ method, path }) =>
-      method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/290`
+      method === "GET" && path === `/repos/${REPOSITORY}/issues/comments/${summary.id}`
     ).length >= 4, "each independently acquired carrier pass rereads the selected state");
   }
 });
@@ -18177,11 +18179,12 @@ function createGitHubMock({
     }
     if (method === "POST" && path === "/graphql" &&
       body?.query?.includes("CodexReviewGateNativeCompletion")) {
+      assert.match(body.query, /databaseId:\s*fullDatabaseId/u);
       const comment = activeComments.find((value) => value.node_id === body.variables?.id);
       const actor = { __typename: "Bot", login: "chatgpt-codex-connector",
         id: comment?.user?.node_id };
       const node = comment ? {
-        __typename: "IssueComment", id: comment.node_id, databaseId: comment.id,
+        __typename: "IssueComment", id: comment.node_id, databaseId: String(comment.id),
         url: comment.html_url, body: comment.body,
         createdAt: comment.created_at, updatedAt: comment.updated_at,
         lastEditedAt: comment.updated_at, author: actor, editor: actor,

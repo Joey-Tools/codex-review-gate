@@ -10810,7 +10810,7 @@ async function exactRefetchV2NativeReviewCompletion(
   const { data } = await client.request("POST", "/graphql", {
     query: `query CodexReviewGateNativeCompletion($id: ID!) {
       node(id: $id) { __typename ... on IssueComment {
-        id databaseId url body createdAt updatedAt lastEditedAt
+        id databaseId: fullDatabaseId url body createdAt updatedAt lastEditedAt
         author { __typename login ... on Bot { id } }
         editor { __typename login ... on Bot { id } }
       } }
