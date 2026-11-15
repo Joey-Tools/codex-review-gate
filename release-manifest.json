@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:4",
   "schema_version": 4,
-  "version": "2.2.14",
+  "version": "2.2.15",
   "contract_versions": {
     "toolchain": "node24",
     "release_schema": 4,
@@ -12,42 +12,42 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "1c6a2b7663399b7a14dceeccd33239caaf2dc13c"
+    "tree": "b053aeb77188bf9e6885c7dec753795e3d4d1fac"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "e965263162351e61ceb8cecc725f6327eab3a8c3",
-    "previous_version": "2.2.13"
+    "expected_head": "20bec03fd7d5dc94f257a797859d1f3ed5fafcda",
+    "previous_version": "2.2.14"
   },
   "files": [
     {
       "path": "COOKBOOK.md",
       "type": "file",
       "mode": "100644",
-      "size": 40475,
-      "sha256": "cd70a47e71e944e0d85d7677d164931f3c6cb87f7725489e78328019f52fc8dc"
+      "size": 40648,
+      "sha256": "934b42de8b05d7daf0f5d6a77932f54fd40d5a14e4b5678e57e20c598e836043"
     },
     {
       "path": "COOKBOOK.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 40085,
-      "sha256": "d5209f13797fc928bc429babb762f358d94cf947cd665f17f7a6c61442fc6416"
+      "size": 40242,
+      "sha256": "406d88ca56e0adcea021b34e89d3b94c01d88002b8eae42d4f9c07ce79578835"
     },
     {
       "path": "DESIGN.md",
       "type": "file",
       "mode": "100644",
-      "size": 68836,
-      "sha256": "69436716d80cbcbe0ef2e71ed99f81a4657288c6f4cea91d26ff4b4b6f114481"
+      "size": 69185,
+      "sha256": "43a28bb3854b9c9d4adfec7ce0d2f7b3ce5a13bcf536d5518876f16d0bad0bed"
     },
     {
       "path": "DESIGN.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 66210,
-      "sha256": "71f177b5a87866af223fc14cc683c91193687598f60eaba93656c3bce3b714e0"
+      "size": 66550,
+      "sha256": "583a9260ce62df45ecafaef7fe3b034b3c3a017710a9f7cf6625bdd033501a72"
     },
     {
       "path": "EULA.md",
@@ -67,15 +67,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 64009,
-      "sha256": "b50365257ebec2c49cf49a59da6dc4954841082c1d5a0b4306eaa024963e2c8f"
+      "size": 66516,
+      "sha256": "ef09efc5e2d9e78b66ea24576d382b78d9b801889e3ad68c0867237b3f7a9eed"
     },
     {
       "path": "README.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 57424,
-      "sha256": "463ccbfc76518da8e7bdff02ab0ac25560b256dd6a6421cba1073b53f1ffa617"
+      "size": 59571,
+      "sha256": "bbb1af4c253d624958bb1538f1de475bb848666d39b98d42420a6b839e21c3e0"
     },
     {
       "path": "SECURITY.md",
@@ -110,7 +110,7 @@
       "type": "file",
       "mode": "100644",
       "size": 482,
-      "sha256": "2b029ad9105c648e082346d95a9a4737f23e691f0665ac30fda4541a0a11171f"
+      "sha256": "003f3931ce3cfa391d8542f92ffe501c632cda36ecee47defe219be771dafa78"
     },
     {
       "path": "producer-receipt.schema.json",
@@ -144,8 +144,8 @@
       "path": "src/v2/gate-runtime.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 384743,
-      "sha256": "3ad1d75bfd2d195afe93d42196d196a07f3fa3b8ae51d3bde3d73c11fcae9167"
+      "size": 394180,
+      "sha256": "f49d4c0fcf30bba2d0d8fa58064f8c281de9cf3328b694294e436a05ec75761b"
     }
   ],
   "entrypoint": {
