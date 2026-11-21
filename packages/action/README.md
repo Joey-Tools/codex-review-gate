@@ -561,12 +561,26 @@ Display text and aggregate edit-clock changes are benign; a selected state
 change restarts acquisition. Losing its identity or current marker cannot hide real
 provider evidence. This basis cannot clear a current-head finding, opaque or
 edited provider evidence, or unknown deletion history. It never acts as a
-request-generation receipt. After a base retarget, the original summary must
-have been created after that epoch; a later aggregate edit is insufficient.
+request-generation receipt. After a base retarget, an original summary
+created after that epoch still works as before. The verifier can also use an
+older summary if its Code Review table row gives an explicit, matching completion
+time strictly after the retarget's second and the official connector account
+left a thumbs-up on the PR body in the completion second or later, with no
+same-time or newer official eyes reaction. The full SHA and both no-findings
+flags still come from the machine frame. The completion timestamp and exact
+reaction are checked again in the stable snapshots. A later aggregate edit,
+a human thumbs-up, or the Security Review row cannot supply this proof.
+An exact, unedited official Security Review no-findings receipt can coexist
+with native Code Review evidence. It cannot pass Code Review by itself.
+Edited receipts, security findings, and unknown provider bodies remain subject
+to the existing evidence guards.
+The time floor does not attest review coverage of a particular base SHA.
 GitHub's separate conversation-resolution requirement remains in force.
 
-The controller checks this completion before posting or adopting a canonical
-request, then reruns only the protected verifier. That rerun independently
+The controller checks native state using the original summary creation time
+before posting or adopting a canonical request, then reruns only the protected
+verifier. Only the verifier reads PR-body reactions with its existing
+`issues: read` permission. That rerun independently
 checks all evidence; controller adoption cannot turn a check green. In-flight
 requests keep the existing adoption and completion path. Summary events remain
 diagnostic no-ops, so existing consumer subscriptions remain compatible. Use

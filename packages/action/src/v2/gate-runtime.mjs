@@ -3638,7 +3638,7 @@ async function ensureV2ControllerReviewRequest(client, config, context, initialP
   );
   if (nativeCompletion) {
     await exactRefetchV2NativeReviewCompletion(
-      client, config, budget, nativeCompletion, observedIssueCommentEdits,
+      client, config, budget, nativeCompletion, baseEpoch, observedIssueCommentEdits,
     );
     await assertV2BeginReviewScope(client, config, initialPr, budget);
     const adoptionBaseEpoch = await loadV2LatestBaseEpoch(
@@ -5479,7 +5479,9 @@ async function loadV2DecisionCarriers(
   if (
     decisionEvidence.decision.gateOutcome !== "success" &&
     providerEvidence.errors.length === 0 &&
-    providerEvidence.opaqueTopLevelProviderActivities.length === 0 &&
+    providerEvidence.opaqueTopLevelProviderActivities.every((activity) =>
+      activity.cleanSecurityReceipt === true
+    ) &&
     deletedCommentEvents.length === 0 &&
     !providerEvidence.artifacts.some((artifact) =>
       artifact.orderingError || artifact.resolutionError || artifact.edited === true ||
@@ -5487,22 +5489,24 @@ async function loadV2DecisionCarriers(
       (artifact.kind === "finding" && artifact.resolvedHeadSha === headSha)
     )
   ) {
-    nativeCompletion = selectV2NativeReviewCompletion(issueComments, headSha, baseEpoch);
+    nativeCompletion = await loadV2NativeReviewCompletion(
+      client, config, budget, issueComments, headSha, baseEpoch, observedIssueCommentEdits,
+    );
     if (nativeCompletion) {
-      await exactRefetchV2NativeReviewCompletion(
-        client, config, budget, nativeCompletion, observedIssueCommentEdits,
-      );
+      const completedAt = nativeCompletion.completedAt;
+      const completedAtIso = completedAt === null ? null : new Date(completedAt).toISOString();
       providerEvidence.artifacts.push({
         source: "native-review-state",
         id: nativeCompletion.id,
         kind: "clean",
         headSha,
         resolvedHeadSha: headSha,
-        createdAt: nativeCompletion.comment.created_at,
+        createdAt: completedAtIso ?? nativeCompletion.comment.created_at,
         carrierCreatedAt: nativeCompletion.comment.created_at,
         carrierUpdatedAt: nativeCompletion.comment.updated_at,
-        revisionAt: nativeCompletion.comment.updated_at,
+        revisionAt: completedAtIso ?? nativeCompletion.comment.updated_at,
         nativeCompletion: true,
+        nativeCompletedAt: completedAt,
         htmlUrl: nativeCompletion.comment.html_url,
       });
       decisionEvidence = reduceV2Evidence(decisionInputs);
@@ -5514,6 +5518,7 @@ async function loadV2DecisionCarriers(
     nativeReviewCompletion: nativeCompletion && {
       id: nativeCompletion.id,
       fingerprint: nativeCompletion.fingerprint,
+      reaction: nativeCompletion.reaction ?? null,
     },
     baseRef: pullRequest.base.ref,
     baseRepositoryId: String(pullRequest.base.repo.id),
@@ -6519,7 +6524,10 @@ function reduceV2Evidence({
     decision = {
       gateOutcome: "success",
       reason:
-        `Stable current-head Codex clean evidence from ${selectedClean.source} ${selectedClean.id}`,
+        `Stable current-head Codex clean evidence from ${selectedClean.source} ${selectedClean.id}` +
+        (selectedClean.nativeCompletedAt
+          ? `; completed ${selectedClean.nativeCompletedAt}, corroborated by an official PR thumbs-up`
+          : ""),
       recoveryCode: "none",
     };
   } else if (waitingForPostRunClean) {
@@ -8661,6 +8669,7 @@ async function collectV2ProviderEvidence(
         id: String(comment.id),
         carrierCreatedAt: comment.created_at,
         revisionAt,
+        cleanSecurityReceipt: isV2KnownCleanSecurityReceipt(comment.body),
       });
     }
   }
@@ -10716,7 +10725,37 @@ function isV2OfficialPullRequestReviewSummary(comment) {
     hasV2OfficialSummaryMarkerBody(comment?.body);
 }
 
-function selectV2NativeReviewCompletion(comments, headSha, baseEpoch) {
+function isV2KnownCleanSecurityReceipt(body) {
+  // Called only for an unedited official Bot/App comment. This exact receipt
+  // is neutral for native Code Review evidence, never positive on its own.
+  const footer = [
+    "<details> <summary>ℹ️ About Codex security reviews in GitHub</summary>",
+    "<br/>",
+    "",
+    "This is an experimental Codex feature. Security reviews are triggered when:",
+    '- You comment "@codex security review"',
+    '- A regular code review gets triggered (for example, "@codex review" or when a PR is opened), and you’re opted in so security review runs alongside code review',
+    "",
+    "Once complete, Codex will leave suggestions, or a comment if no findings are found.",
+    "",
+    "",
+    "</details>",
+  ].join("\n");
+  const normalized = body.replaceAll("\r\n", "\n").trimEnd();
+  const suffix = `\n\n${footer}`;
+  if (!normalized.endsWith(suffix)) return false;
+  const lines = normalized.slice(0, -suffix.length).split("\n");
+  return lines.length === 11 &&
+    lines[0] === "<!-- codex-review-receipt:v1 -->" &&
+    lines[2] === "### 🛡️ Codex Security Review · _Automatically triggered_" &&
+    lines[4] === "Security review completed. No security issues were found in this pull request." &&
+    /^\*\*Reviewed commit:\*\* `[0-9a-f]{7,40}`$/u.test(lines[6]) &&
+    /^\[View security finding report\]\(https:\/\/chatgpt\.com\/codex\/cloud\/tasks\/task_[a-zA-Z0-9_]+\)$/u.test(lines[8]) &&
+    lines[10] === "_Only the user who started this review can view the report in Codex._" &&
+    [1, 3, 5, 7, 9].every((index) => lines[index] === "");
+}
+
+function selectV2NativeReviewCompletion(comments, headSha, baseEpoch, { timed = false } = {}) {
   const summaries = (comments ?? []).filter(isV2OfficialPullRequestReviewSummary);
   if (summaries.length !== 1 || !FULL_SHA.test(headSha)) return null;
   const comment = summaries[0];
@@ -10746,12 +10785,25 @@ function selectV2NativeReviewCompletion(comments, headSha, baseEpoch) {
     review.status !== "completed" || review.has_any_findings !== false ||
     review.has_unresolved_findings !== false
   ) return null;
+  let completedAt = null;
   if (baseEpoch?.event != null) {
     const epochAt = baseEpoch.event.createdAt;
-    // An aggregate can be edited without another review. Its edit time cannot
-    // attest a new review after a base retarget; preserve the existing path.
-    if (!isCanonicalUtcTimestamp(epochAt) ||
-      Date.parse(comment.created_at) <= Date.parse(epochAt)) return null;
+    if (!isCanonicalUtcTimestamp(epochAt)) return null;
+    if (timed) {
+      completedAt = readV2NativeCodeReviewCompletedAt(comment, headSha);
+      // The timeline can be second-resolution. Do not order two events in
+      // the same second using the extra precision of only one of them.
+      if (completedAt === null ||
+        Math.floor(Date.parse(completedAt) / 1_000) * 1_000 <= Date.parse(epochAt)) {
+        return null;
+      }
+    } else if (Date.parse(comment.created_at) <= Date.parse(epochAt)) {
+      // An aggregate edit is not a new review. The old path only trusts the
+      // original creation time; the timed path needs a separate PR reaction.
+      return null;
+    }
+  } else if (timed) {
+    return null;
   }
   // Protect code-review state and carrier provenance. Display/footer updates,
   // security-review activity and the aggregate's edit clock are not that state.
@@ -10764,17 +10816,76 @@ function selectV2NativeReviewCompletion(comments, headSha, baseEpoch) {
     user: { id: comment.user.id ?? null, login: comment.user.login, type: comment.user.type },
     app: appIdentity(comment.app),
     performedViaApp: appIdentity(comment.performed_via_github_app),
+    ...(timed ? { completedAt } : {}),
     codeReview: {
       commitSha: review.commit_sha, status: review.status,
       hasAnyFindings: review.has_any_findings,
       hasUnresolvedFindings: review.has_unresolved_findings,
     },
   });
-  return { id, headSha, comment, fingerprint };
+  return { id, headSha, comment, fingerprint, completedAt };
+}
+
+function readV2NativeCodeReviewCompletedAt(comment, headSha) {
+  const lines = comment.body.split(/\r?\n/u);
+  const header = "| Review | Status | Commit | Review trigger |";
+  const table = lines.indexOf(header);
+  if (table < 0 || table !== lines.lastIndexOf(header) ||
+    lines[table + 1] !== "| --- | --- | --- | --- |") return null;
+  const rows = [];
+  for (let index = table + 2; index < lines.length && lines[index].startsWith("|"); index += 1) {
+    if (lines[index].startsWith("| 📝 **Code Review** |")) rows.push(lines[index]);
+  }
+  if (rows.length !== 1) return null;
+  const match = /^\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\* <relative-time datetime="([^"]+)">\1<\/relative-time> \| `([a-f0-9]{7,40})` \| [^|]+ \|$/u.exec(rows[0]);
+  if (!match || !headSha.startsWith(match[2])) return null;
+  const completedAt = match[1];
+  const timestamp = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/u.exec(completedAt);
+  if (!timestamp || !isCanonicalUtcTimestamp(`${timestamp[1]}.${(timestamp[2] ?? "").slice(0, 3).padEnd(3, "0")}Z`)) {
+    return null;
+  }
+  const completedMs = Date.parse(completedAt);
+  if (!Number.isFinite(completedMs) || completedMs < Date.parse(comment.created_at) ||
+    completedMs >= Math.floor(Date.parse(comment.updated_at) / 1_000) * 1_000 + 1_000) return null;
+  return completedAt;
+}
+
+async function loadV2NativeReviewCompletion(
+  client, config, budget, comments, headSha, baseEpoch, observedIssueCommentEdits,
+) {
+  let completion = selectV2NativeReviewCompletion(comments, headSha, baseEpoch);
+  if (!completion) {
+    completion = selectV2NativeReviewCompletion(comments, headSha, baseEpoch, { timed: true });
+    if (!completion) return null;
+    const botId = canonicalPositiveId(completion.comment.user.id);
+    if (!botId) return null;
+    // Only the verifier has issues: read. Keep controller adoption on its
+    // existing summarized-state path, with no extra permissions or triggers.
+    const reactions = await client.paginate(
+      `${config.repoPath}/issues/${config.prNumber}/reactions`,
+      { budget, label: "pull-request body reactions", validate: requireV2ReactionShape },
+    );
+    // The PR-reaction endpoint can label the real connector as User. Bind
+    // the immutable account ID to the authenticated summary author instead.
+    const official = reactions.filter(({ user }) =>
+      user.login === OFFICIAL_CODEX_BOT_LOGIN && canonicalPositiveId(user.id) === botId
+    );
+    const thumbs = official.filter(({ content }) => content === "+1");
+    const plusOne = thumbs.length === 1 ? thumbs[0] : null;
+    if (!plusOne ||
+      Date.parse(plusOne.created_at) < Math.floor(Date.parse(completion.completedAt) / 1_000) * 1_000 ||
+      official.some(({ content, created_at }) =>
+        content === "eyes" && Date.parse(created_at) >= Date.parse(plusOne.created_at))) return null;
+    completion.reaction = fingerprintReaction(plusOne);
+  }
+  await exactRefetchV2NativeReviewCompletion(
+    client, config, budget, completion, baseEpoch, observedIssueCommentEdits,
+  );
+  return completion;
 }
 
 async function exactRefetchV2NativeReviewCompletion(
-  client, config, budget, completion, observedIssueCommentEdits,
+  client, config, budget, completion, baseEpoch, observedIssueCommentEdits,
 ) {
   let current;
   try {
@@ -10799,7 +10910,8 @@ async function exactRefetchV2NativeReviewCompletion(
       `Native Codex summary ${completion.id} changed identity or lost its current marker`,
     );
   }
-  const reread = selectV2NativeReviewCompletion([current], completion.headSha, null);
+  const mode = { timed: completion.completedAt !== null };
+  const reread = selectV2NativeReviewCompletion([current], completion.headSha, baseEpoch, mode);
   if (reread?.fingerprint !== completion.fingerprint) {
     throw new V2RuntimeFailure("Native Codex completion changed during readback", {
       recoveryCode: "wait_then_reconcile",
@@ -10853,7 +10965,7 @@ async function exactRefetchV2NativeReviewCompletion(
   }
   const authenticated = selectV2NativeReviewCompletion([{
     ...current, body: node.body, updated_at: node.updatedAt,
-  }], completion.headSha, null);
+  }], completion.headSha, baseEpoch, mode);
   if (authenticated?.fingerprint !== completion.fingerprint) {
     throw new V2RuntimeFailure("Native Codex completion changed in the editor readback", {
       recoveryCode: "wait_then_reconcile",

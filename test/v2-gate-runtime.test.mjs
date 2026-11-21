@@ -12554,6 +12554,198 @@ test("native review completion created after a retarget retains the exact-head p
   });
   const { result } = await runGate(runtimeEnvironment(context), github);
   assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(github.calls.some(({ path }) => path === PR_BODY_REACTIONS_PATH), false);
+});
+
+const PR_BODY_REACTIONS_PATH = `/repos/${REPOSITORY}/issues/${PR}/reactions`;
+const TIMED_REVIEW_COMPLETED_AT = "2026-08-25T08:06:47.057773Z";
+
+function timedNativeReviewComment({
+  completedAt = TIMED_REVIEW_COMPLETED_AT,
+  rowSha = HEAD.slice(0, 7),
+  review = {},
+} = {}) {
+  const summary = nativeReviewCompletionComment({
+    review, updated_at: "2026-08-25T08:06:47Z",
+  });
+  const row = `| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="${completedAt}">${completedAt}</relative-time> | \`${rowSha}\` | Manual request |`;
+  return { ...summary, body: [
+    ...summary.body.split("\n").slice(0, 2),
+    '<!-- codex-security-review:v1 {"status":"running"} -->',
+    "<details>",
+    "<summary><strong>Codex Review Summary</strong>: 🔄 Running</summary>",
+    "",
+    "| Review | Status | Commit | Review trigger |",
+    "| --- | --- | --- | --- |",
+    row,
+    `| 🔒 **Security Review** | 🔄 **Running** since <relative-time datetime="2026-08-25T08:06:00Z">2026-08-25T08:06:00Z</relative-time> | \`${HEAD.slice(0, 7)}\` | Manual request |`,
+    "",
+    "</details>",
+  ].join("\n") };
+}
+
+function officialPrBodyThumb(overrides = {}) {
+  return reaction({
+    created_at: "2026-08-25T08:06:47Z",
+    user: { ...CODEX_BOT, id: CODEX_BOT_DATABASE_ID, type: "User" },
+    ...overrides,
+  });
+}
+
+test("an official PR-body thumbs-up and timed exact-head summary pass after retarget", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [timedNativeReviewComment()],
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+    requestInterceptor: ({ method, path, url }) => {
+      if (method !== "GET" || path !== PR_BODY_REACTIONS_PATH) return undefined;
+      const page = url.searchParams.get("page");
+      // The official signal must be found beyond the first full page.
+      return jsonResponse(page === "1" ? Array.from({ length: 100 }, (_, index) =>
+        officialPrBodyThumb({ id: 1000 + index, user: HUMAN })
+      ) : [officialPrBodyThumb()]);
+    },
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.match(result.report.reason, /completed 2026-08-25T08:06:47\.057773Z.*official PR thumbs-up/u);
+  const reads = github.calls.filter(({ path }) => path === PR_BODY_REACTIONS_PATH);
+  assert.ok(reads.filter(({ search }) => search.endsWith("&page=2")).length >= 2);
+  assert.deepEqual(github.requestBodies, []);
+});
+
+test("PR-body thumbs-up cannot replace a clean, current, fresh and authenticated review", async (context) => {
+  const cases = [
+    ["missing", {}, []],
+    ["user", {}, [officialPrBodyThumb({ user: HUMAN })]],
+    ["wrong-connector-account", {}, [officialPrBodyThumb({
+      user: { ...CODEX_BOT, id: CODEX_BOT_DATABASE_ID + 1 },
+    })]],
+    ["stale-thumb", {}, [officialPrBodyThumb({ created_at: "2026-08-25T08:06:46Z" })]],
+    ["newer-eyes", {}, [officialPrBodyThumb(), officialPrBodyThumb({
+      id: 441, content: "eyes", created_at: "2026-08-25T08:06:48Z",
+    })]],
+    ["same-epoch-second", { completedAt: "2026-08-25T08:05:00.999999Z" }],
+    ["earlier-review", { completedAt: "2026-08-25T08:04:59Z" }],
+    ["future-review", { completedAt: "2026-08-25T08:06:48Z" }],
+    ["invalid-date", { completedAt: "2026-02-31T08:06:47.057773Z" }],
+    ["row-sha-mismatch", { rowSha: OLD_HEAD.slice(0, 7) }],
+    ["state-sha-mismatch", { review: { commit_sha: OLD_HEAD } }],
+    ["findings", { review: { has_any_findings: true, has_unresolved_findings: true } }],
+    ["running", { review: { status: "running" } }],
+    ["unknown-findings", { review: { has_any_findings: null } }],
+    ["missing-completion-row", null],
+    ["maintainer-editor", {}],
+    ["real-finding", {}],
+    ["pending-review", {}],
+  ];
+  for (const [suffix, options, reactions = [officialPrBodyThumb()]] of cases) {
+    const github = createGitHubMock({
+      issueComments: [
+        options ? timedNativeReviewComment(options) :
+          nativeReviewCompletionComment({ updated_at: "2026-08-25T08:10:00Z" }),
+        ...(suffix === "real-finding" ? [findingIssueComment()] : []),
+      ],
+      reviews: suffix === "pending-review" ?
+        [{ ...findingReview(), state: "PENDING", submitted_at: null, body: "" }] : [],
+      baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+      nativeCompletionResponseMutator: suffix === "maintainer-editor"
+        ? (node) => ({ ...node, editor: { __typename: "User", login: "maintainer" } }) : null,
+      requestInterceptor: ({ method, path }) => method === "GET" && path === PR_BODY_REACTIONS_PATH
+        ? jsonResponse(reactions) : undefined,
+    });
+    const { result } = await runGate(runtimeEnvironment(context, { suffix }), github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+test("a disappearing PR thumbs-up or changing timed summary never writes success", async (context) => {
+  for (const suffix of ["removed-thumb", "changed-completion-time"]) {
+    let reads = 0;
+    const github = createGitHubMock({
+      issueComments: [timedNativeReviewComment()],
+      baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+      nativeCompletionResponseMutator: suffix === "changed-completion-time"
+        ? (node) => ({ ...node, body: node.body.replaceAll(
+          TIMED_REVIEW_COMPLETED_AT, "2026-08-25T08:06:46.057773Z",
+        ) }) : null,
+      requestInterceptor: ({ method, path }) => method === "GET" && path === PR_BODY_REACTIONS_PATH
+        ? jsonResponse(suffix === "removed-thumb" && ++reads > 1 ? [] : [officialPrBodyThumb()])
+        : undefined,
+    });
+    const { result } = await runGate(runtimeEnvironment(context, { suffix }), github);
+    assert.notEqual(result.report.gateOutcome, "success", suffix);
+    assert.equal(github.statusWrites.some(({ state }) => state === "success"), false, suffix);
+  }
+});
+
+function cleanSecurityReviewReceipt(overrides = {}) {
+  return cleanIssueComment(OLD_HEAD, {
+    id: 298,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-298`,
+    body: [
+      "<!-- codex-review-receipt:v1 -->",
+      "",
+      "### 🛡️ Codex Security Review · _Automatically triggered_",
+      "",
+      "Security review completed. No security issues were found in this pull request.",
+      "",
+      `**Reviewed commit:** \`${OLD_HEAD.slice(0, 10)}\``,
+      "",
+      "[View security finding report](https://chatgpt.com/codex/cloud/tasks/task_example)",
+      "",
+      "_Only the user who started this review can view the report in Codex._",
+      "",
+      "<details> <summary>ℹ️ About Codex security reviews in GitHub</summary>",
+      "<br/>",
+      "",
+      "This is an experimental Codex feature. Security reviews are triggered when:",
+      '- You comment "@codex security review"',
+      '- A regular code review gets triggered (for example, "@codex review" or when a PR is opened), and you’re opted in so security review runs alongside code review',
+      "",
+      "Once complete, Codex will leave suggestions, or a comment if no findings are found.",
+      "",
+      "",
+      "</details>",
+    ].join("\n"),
+    ...overrides,
+  });
+}
+
+test("PR-body thumbs-up corroborates a timed code review beside a clean Security Review receipt", async (context) => {
+  const security = cleanSecurityReviewReceipt();
+  for (const [suffix, comments, expected] of [
+    ["observed-security-clean", [security, timedNativeReviewComment()], "success"],
+    ["security-alone", [security], "pending"],
+    ["security-finding", [{ ...security, body: security.body.replace(
+      "No security issues were found in this pull request.", "A security finding needs attention.",
+    ) }, timedNativeReviewComment()], "pending"],
+    ["extra-visible-payload", [{ ...security, body: security.body + "\nNew finding." },
+      timedNativeReviewComment()], "pending"],
+    ["edited-security-clean", [{ ...security, updated_at: "2026-08-25T08:10:00Z" },
+      timedNativeReviewComment()], "pending"],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: comments,
+      baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+      requestInterceptor: ({ method, path }) => method === "GET" && path === PR_BODY_REACTIONS_PATH
+        ? jsonResponse([officialPrBodyThumb()]) : undefined,
+    });
+    const { result } = await runGate(runtimeEnvironment(context, { suffix }), github);
+    assert.equal(result.report.gateOutcome, expected, `${suffix}: ${result.report.reason}`);
+  }
+});
+
+test("an independent post-retarget clean never depends on reading PR reactions", async (context) => {
+  const github = createGitHubMock({
+    issueComments: [timedNativeReviewComment(), cleanIssueComment(HEAD, {
+      created_at: "2026-08-25T08:06:45Z", updated_at: "2026-08-25T08:06:45Z",
+    })],
+    baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+  });
+  const { result } = await runGate(runtimeEnvironment(context), github);
+  assert.equal(result.report.gateOutcome, "success", result.report.reason);
+  assert.equal(github.calls.some(({ path }) => path === PR_BODY_REACTIONS_PATH), false);
 });
 
 test("native review completion suppresses controller POST and reruns only the protected verifier", async (context) => {

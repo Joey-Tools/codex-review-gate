@@ -377,11 +377,18 @@ carrier fingerprint 和两次稳定 snapshot。展示文字与 aggregate 编辑�
 或可证明该正文从未编辑。保留 Bot/App 原作者信息但由人工修改的摘要不能提供原生 authority。
 被选字段变化则重新 acquisition。身份或当前 marker 丢失不能掩盖真实 provider
 evidence。该依据不能清除当前 head finding、不透明或已编辑的 provider evidence，以及未知删除
-历史，也不是 request-generation receipt。base retarget 后，必须是原始摘要创建时间晚于该 epoch；
-后续编辑时间不能替代新的 review。GitHub 独立的 conversation-resolution 要求继续生效。
+历史，也不是 request-generation receipt。base retarget 后，原始摘要若在该事件后创建，沿用现有路径。
+verifier 也可采用更早创建的摘要，但 Code Review 行必须给出匹配且明确的完成时间，晚于 retarget 所在的秒；
+官方 connector 账号还必须在完成所在的秒或之后对 PR 正文点 👍，且没有同时或更新的官方 👀。
+完整 SHA 和两个无 findings 标志仍以机器状态为准；稳定快照会回读完成时间和同一个反应。
+摘要更新时间、人工点赞或 Security Review 行不能代替这些证据。格式明确且未编辑的官方 Security
+Review 无问题收据可与原生 Code Review 依据共存，但不能单独放行；已编辑收据、安全 finding 与未知
+官方正文仍按现有保护判定。时间下限不证明 review 覆盖某个特定 base SHA。
+GitHub 独立的 conversation-resolution 要求继续生效。
 
-controller 在创建或复用 canonical request 前检查该原生完成状态；满足条件时直接复用并重跑
-受保护的 verifier，不再补发 request。verifier 仍独立读取完整证据，controller 不会直接将 check
+controller 在创建或复用 canonical request 前仍按摘要原始创建时间检查原生完成状态；满足条件时直接复用并重跑
+受保护的 verifier，不再补发 request。只有 verifier 用现有的 `issues: read` 权限读取 PR 正文反应。
+verifier 仍独立读取完整证据，controller 不会直接将 check
 置绿。在途请求沿用现有复用与完成路径。摘要事件仍只供诊断，兼容既有 consumer 订阅；如果没有
 后续已订阅的完成评论，使用现有 manual `reconcile`。request/comment 数量不代表后端执行或收费次数。
 
