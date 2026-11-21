@@ -102,7 +102,9 @@ Before posting a request, the controller can reuse a verified native
 `codex-review-state:v1` code-review completion for the exact current full head
 with both findings flags boolean `false`. It then reruns the protected verifier,
 which independently acquires complete, stable evidence. The same optional frame
-can supply direct clean evidence there; display-only `Completed` cannot. Existing
+can supply direct clean evidence there; display-only `Completed` cannot. A
+pre-retarget summary can qualify in the verifier on its explicit post-retarget
+Code Review completion time corroborated by an official PR-body thumbs-up. Existing
 in-flight request adoption and consumer workflow subscriptions remain compatible.
 See [native completion](packages/action/README.md#optional-native-code-review-completion).
 
