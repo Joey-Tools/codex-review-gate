@@ -5479,7 +5479,9 @@ async function loadV2DecisionCarriers(
   if (
     decisionEvidence.decision.gateOutcome !== "success" &&
     providerEvidence.errors.length === 0 &&
-    providerEvidence.opaqueTopLevelProviderActivities.length === 0 &&
+    providerEvidence.opaqueTopLevelProviderActivities.every((activity) =>
+      activity.cleanSecurityReceipt === true
+    ) &&
     deletedCommentEvents.length === 0 &&
     !providerEvidence.artifacts.some((artifact) =>
       artifact.orderingError || artifact.resolutionError || artifact.edited === true ||
@@ -8667,6 +8669,7 @@ async function collectV2ProviderEvidence(
         id: String(comment.id),
         carrierCreatedAt: comment.created_at,
         revisionAt,
+        cleanSecurityReceipt: isV2KnownCleanSecurityReceipt(comment.body),
       });
     }
   }
@@ -10720,6 +10723,36 @@ function hasV2OfficialSummaryMarkerBody(body) {
 function isV2OfficialPullRequestReviewSummary(comment) {
   return hasExactProviderIdentity(comment) &&
     hasV2OfficialSummaryMarkerBody(comment?.body);
+}
+
+function isV2KnownCleanSecurityReceipt(body) {
+  // Called only for an unedited official Bot/App comment. This exact receipt
+  // is neutral for native Code Review evidence, never positive on its own.
+  const footer = [
+    "<details> <summary>ℹ️ About Codex security reviews in GitHub</summary>",
+    "<br/>",
+    "",
+    "This is an experimental Codex feature. Security reviews are triggered when:",
+    '- You comment "@codex security review"',
+    '- A regular code review gets triggered (for example, "@codex review" or when a PR is opened), and you’re opted in so security review runs alongside code review',
+    "",
+    "Once complete, Codex will leave suggestions, or a comment if no findings are found.",
+    "",
+    "",
+    "</details>",
+  ].join("\n");
+  const normalized = body.replaceAll("\r\n", "\n").trimEnd();
+  const suffix = `\n\n${footer}`;
+  if (!normalized.endsWith(suffix)) return false;
+  const lines = normalized.slice(0, -suffix.length).split("\n");
+  return lines.length === 11 &&
+    lines[0] === "<!-- codex-review-receipt:v1 -->" &&
+    lines[2] === "### 🛡️ Codex Security Review · _Automatically triggered_" &&
+    lines[4] === "Security review completed. No security issues were found in this pull request." &&
+    /^\*\*Reviewed commit:\*\* `[0-9a-f]{7,40}`$/u.test(lines[6]) &&
+    /^\[View security finding report\]\(https:\/\/chatgpt\.com\/codex\/cloud\/tasks\/task_[a-zA-Z0-9_]+\)$/u.test(lines[8]) &&
+    lines[10] === "_Only the user who started this review can view the report in Codex._" &&
+    [1, 3, 5, 7, 9].every((index) => lines[index] === "");
 }
 
 function selectV2NativeReviewCompletion(comments, headSha, baseEpoch, { timed = false } = {}) {

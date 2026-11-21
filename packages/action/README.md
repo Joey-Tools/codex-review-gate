@@ -570,6 +570,10 @@ same-time or newer official eyes reaction. The full SHA and both no-findings
 flags still come from the machine frame. The completion timestamp and exact
 reaction are checked again in the stable snapshots. A later aggregate edit,
 a human thumbs-up, or the Security Review row cannot supply this proof.
+An exact, unedited official Security Review no-findings receipt can coexist
+with native Code Review evidence. It cannot pass Code Review by itself.
+Edited receipts, security findings, and unknown provider bodies remain subject
+to the existing evidence guards.
 The time floor does not attest review coverage of a particular base SHA.
 GitHub's separate conversation-resolution requirement remains in force.
 

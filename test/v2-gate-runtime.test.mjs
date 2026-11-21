@@ -12679,6 +12679,63 @@ test("a disappearing PR thumbs-up or changing timed summary never writes success
   }
 });
 
+function cleanSecurityReviewReceipt(overrides = {}) {
+  return cleanIssueComment(OLD_HEAD, {
+    id: 298,
+    html_url: `https://github.com/${REPOSITORY}/pull/${PR}#issuecomment-298`,
+    body: [
+      "<!-- codex-review-receipt:v1 -->",
+      "",
+      "### 🛡️ Codex Security Review · _Automatically triggered_",
+      "",
+      "Security review completed. No security issues were found in this pull request.",
+      "",
+      `**Reviewed commit:** \`${OLD_HEAD.slice(0, 10)}\``,
+      "",
+      "[View security finding report](https://chatgpt.com/codex/cloud/tasks/task_example)",
+      "",
+      "_Only the user who started this review can view the report in Codex._",
+      "",
+      "<details> <summary>ℹ️ About Codex security reviews in GitHub</summary>",
+      "<br/>",
+      "",
+      "This is an experimental Codex feature. Security reviews are triggered when:",
+      '- You comment "@codex security review"',
+      '- A regular code review gets triggered (for example, "@codex review" or when a PR is opened), and you’re opted in so security review runs alongside code review',
+      "",
+      "Once complete, Codex will leave suggestions, or a comment if no findings are found.",
+      "",
+      "",
+      "</details>",
+    ].join("\n"),
+    ...overrides,
+  });
+}
+
+test("PR-body thumbs-up corroborates a timed code review beside a clean Security Review receipt", async (context) => {
+  const security = cleanSecurityReviewReceipt();
+  for (const [suffix, comments, expected] of [
+    ["observed-security-clean", [security, timedNativeReviewComment()], "success"],
+    ["security-alone", [security], "pending"],
+    ["security-finding", [{ ...security, body: security.body.replace(
+      "No security issues were found in this pull request.", "A security finding needs attention.",
+    ) }, timedNativeReviewComment()], "pending"],
+    ["extra-visible-payload", [{ ...security, body: security.body + "\nNew finding." },
+      timedNativeReviewComment()], "pending"],
+    ["edited-security-clean", [{ ...security, updated_at: "2026-08-25T08:10:00Z" },
+      timedNativeReviewComment()], "pending"],
+  ]) {
+    const github = createGitHubMock({
+      issueComments: comments,
+      baseEpoch: baseRefChangedEvent({ createdAt: "2026-08-25T08:05:00Z" }),
+      requestInterceptor: ({ method, path }) => method === "GET" && path === PR_BODY_REACTIONS_PATH
+        ? jsonResponse([officialPrBodyThumb()]) : undefined,
+    });
+    const { result } = await runGate(runtimeEnvironment(context, { suffix }), github);
+    assert.equal(result.report.gateOutcome, expected, `${suffix}: ${result.report.reason}`);
+  }
+});
+
 test("an independent post-retarget clean never depends on reading PR reactions", async (context) => {
   const github = createGitHubMock({
     issueComments: [timedNativeReviewComment(), cleanIssueComment(HEAD, {

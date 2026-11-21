@@ -381,8 +381,10 @@ evidence。该依据不能清除当前 head finding、不透明或已编辑的 p
 verifier 也可采用更早创建的摘要，但 Code Review 行必须给出匹配且明确的完成时间，晚于 retarget 所在的秒；
 官方 connector 账号还必须在完成所在的秒或之后对 PR 正文点 👍，且没有同时或更新的官方 👀。
 完整 SHA 和两个无 findings 标志仍以机器状态为准；稳定快照会回读完成时间和同一个反应。
-摘要更新时间、人工点赞或 Security Review 行不能代替这些证据。时间下限不证明 review 覆盖某个
-特定 base SHA。GitHub 独立的 conversation-resolution 要求继续生效。
+摘要更新时间、人工点赞或 Security Review 行不能代替这些证据。格式明确且未编辑的官方 Security
+Review 无问题收据可与原生 Code Review 依据共存，但不能单独放行；已编辑收据、安全 finding 与未知
+官方正文仍按现有保护判定。时间下限不证明 review 覆盖某个特定 base SHA。
+GitHub 独立的 conversation-resolution 要求继续生效。
 
 controller 在创建或复用 canonical request 前仍按摘要原始创建时间检查原生完成状态；满足条件时直接复用并重跑
 受保护的 verifier，不再补发 request。只有 verifier 用现有的 `issues: read` 权限读取 PR 正文反应。

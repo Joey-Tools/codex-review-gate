@@ -36,10 +36,17 @@ superseded_by:
 - [Observed provider summary](https://github.com/Joey-Project/print-layout/pull/1#issuecomment-7066243869)
   supplied the Code Review row and microsecond UTC timestamp format. The
   exact-head review observed there had findings and correctly does not qualify.
+- A later complete live read found a clean exact-head summary and an official
+  PR-body thumbs-up on the same PR. The conversation also retained an older-head
+  [clean Security Review receipt](https://github.com/Joey-Project/print-layout/pull/1#issuecomment-7066804140).
+  Replaying that combination exposed a native-evidence false block. Only the
+  exact, unedited official no-issues Security Review receipt is neutral for
+  native Code Review evidence; it never supplies positive Code Review evidence
+  or excludes findings, extra payloads, or edits.
 - Local regressions replay the observed shape with a clean state and a
   connector reaction, and cover pending results, mismatched head, stale
   evidence, human reactions, pagination, and changing snapshots.
-- Node.js 24.15.0: all 547 affected v2, workflow-contract, core, and
+- Node.js 24.15.0: all 548 affected v2, workflow-contract, core, and
   evidence-budget tests pass; syntax and journal checks pass. The unsharded
   full-suite attempt exceeded its local time budget and did not yield a verdict.
 - Release and live consumer validation are separate from the source change.
