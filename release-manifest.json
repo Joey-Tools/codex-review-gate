@@ -1,7 +1,7 @@
 {
   "$schema": "urn:joey-tools:codex-review-gate:release-manifest:4",
   "schema_version": 4,
-  "version": "2.2.15",
+  "version": "2.2.16",
   "contract_versions": {
     "toolchain": "node24",
     "release_schema": 4,
@@ -12,13 +12,13 @@
   "source": {
     "repository": "Joey-Tools/codex-review-gate",
     "path": "packages/action",
-    "tree": "b053aeb77188bf9e6885c7dec753795e3d4d1fac"
+    "tree": "2cea5dda0c93535de5a7dbc7c8d175567fa9f0f1"
   },
   "target": {
     "repository": "JoeyTeng/codex-review-gate-action",
     "ref": "refs/heads/master",
-    "expected_head": "20bec03fd7d5dc94f257a797859d1f3ed5fafcda",
-    "previous_version": "2.2.14"
+    "expected_head": "4531d128f00a8b8f9ac2a3864623b3b8401df2f6",
+    "previous_version": "2.2.15"
   },
   "files": [
     {
@@ -67,15 +67,15 @@
       "path": "README.md",
       "type": "file",
       "mode": "100644",
-      "size": 66516,
-      "sha256": "ef09efc5e2d9e78b66ea24576d382b78d9b801889e3ad68c0867237b3f7a9eed"
+      "size": 67504,
+      "sha256": "ac8731fbd8275728bd377104629a2765fc070396826fee71bc8b63ad7bb91691"
     },
     {
       "path": "README.zh-CN.md",
       "type": "file",
       "mode": "100644",
-      "size": 59571,
-      "sha256": "bbb1af4c253d624958bb1538f1de475bb848666d39b98d42420a6b839e21c3e0"
+      "size": 60381,
+      "sha256": "526c541be97b09fcaf4333ed61492986d5a00454f67d4ef4a5dbcd20260e051f"
     },
     {
       "path": "SECURITY.md",
@@ -110,7 +110,7 @@
       "type": "file",
       "mode": "100644",
       "size": 482,
-      "sha256": "003f3931ce3cfa391d8542f92ffe501c632cda36ecee47defe219be771dafa78"
+      "sha256": "1036cd511be2ddfbd904c05dc45bc20e6de39d7c4f8caffe092acc617ae6d648"
     },
     {
       "path": "producer-receipt.schema.json",
@@ -144,8 +144,8 @@
       "path": "src/v2/gate-runtime.mjs",
       "type": "file",
       "mode": "100644",
-      "size": 394180,
-      "sha256": "f49d4c0fcf30bba2d0d8fa58064f8c281de9cf3328b694294e436a05ec75761b"
+      "size": 400042,
+      "sha256": "9007f8be723aabf25abc910e03f4670ecd175b488534bb1ff631b40d2e18ba84"
     }
   ],
   "entrypoint": {
