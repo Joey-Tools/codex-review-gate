@@ -768,9 +768,13 @@ name 匹配该 fork。以 fork 自身的 default branch 和受保护配置为准
 review、variables、secrets 和 protection；Action 不复制上游设置。已有 canonical workflows
 可通过 floating `@v2` 获得这项 runtime 支持。
 
+GitHub 官方 Dependabot 创建的同仓库 PR 适用常规审查检查。GitHub 返回的 bot 登录名和账户 ID
+必须匹配，不以分支名判断身份。Dependabot 不享有审查豁免：只有有效的当前 head 审查证据才能
+通过。Verifier 保持只读，受保护 controller 沿用现有请求策略。
+
 GHES、外部 fork PR、merge queues、任意非 default base、手工 feature-branch 链、non-default trunk
-stack、drafts、bot-owned PRs、Windows/macOS
-runners，以及对 closed/merged PR 发起的新 operation 都会 fail closed。
+stack、drafts、其他 bot 创建的 PR 或 bot 所有的 head 仓库、Windows/macOS runners，以及对
+closed/merged PR 发起的新 operation 都会 fail closed。
 
 选择 self-hosted Linux runner 是基于 operator 信任的假设：operator 负责 runner
 host 及其隔离。Action 不会证明 host integrity 或 isolation；独立 GitHub jobs 也不提供

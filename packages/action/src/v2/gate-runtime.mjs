@@ -79,6 +79,8 @@ const FULL_SHA = /^[0-9a-f]{40}$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
 const SAFE_REPOSITORY_PATH_SEGMENT = /^[A-Za-z0-9._-]+$/u;
 const OFFICIAL_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]";
+const OFFICIAL_DEPENDABOT_LOGIN = "dependabot[bot]";
+const OFFICIAL_DEPENDABOT_ACCOUNT_ID = 49_699_333;
 const V2_REACTION_CONTENTS = new Set([
   "+1",
   "-1",
@@ -4912,12 +4914,21 @@ function classifyUnsupportedV2Target(repository, pullRequest, config) {
   ) {
     return "Action v2 does not support fork pull requests";
   }
+  if (pullRequest.head.ref.startsWith("gh-readonly-queue/")) {
+    return "Action v2 does not support merge queue branches";
+  }
+  if (pullRequest.head.user.type === "Bot") {
+    return "Action v2 does not support bot-owned head repositories";
+  }
+  const author = pullRequest.user;
+  // GitHub supplies the PR author; Dependabot branch naming is configurable.
+  // This exception only admits the target to the usual review-evidence checks.
   if (
-    String(pullRequest.head?.ref || "").startsWith("gh-readonly-queue/") ||
-    pullRequest.user?.type === "Bot" ||
-    pullRequest.head?.user?.type === "Bot"
+    author.type === "Bot" &&
+    (author.login !== OFFICIAL_DEPENDABOT_LOGIN ||
+      author.id !== OFFICIAL_DEPENDABOT_ACCOUNT_ID)
   ) {
-    return "Action v2 supports ordinary, non-bot same-repository branches only";
+    return "Action v2 supports bot-authored pull requests only from GitHub Dependabot";
   }
   if (config.triggerSource === "manual" || config.triggerSource === "auto") {
     const refType = String(config.environment.GITHUB_REF_TYPE || "");

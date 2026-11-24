@@ -49,6 +49,7 @@ const TEST_MERGE = "e".repeat(40);
 const OLD_HEAD = "c".repeat(40);
 const CODEX_BOT = { login: "chatgpt-codex-connector[bot]", type: "Bot" };
 const ACTIONS_BOT = { login: "github-actions[bot]", type: "Bot" };
+const DEPENDABOT = { id: 49_699_333, login: "dependabot[bot]", type: "Bot" };
 const HUMAN = { login: "joey", type: "User" };
 const READER = { login: "reader", type: "User" };
 const CODEX_APP = { slug: "chatgpt-codex-connector" };
@@ -1376,6 +1377,97 @@ test("pull_request verifier publishes exact outputs and succeeds only for stable
     assert.match(body.query, /databaseId:\s*fullDatabaseId/u);
     assert.match(body.query, /\bbody\b/u);
     assert.match(body.query, /lastEditedAt/u);
+  }
+});
+
+test("Dependabot verifier still requires clean evidence for the exact current head", async (context) => {
+  for (const [label, headRef, issueComments, outcome, recoveryCode] of [
+    ["current", "dependabot/cargo/cargo-1234567890", [cleanIssueComment(HEAD)], "success", "none"],
+    ["custom-branch", "deps-cargo-cargo-1234567890", [cleanIssueComment(HEAD)], "success", "none"],
+    ["old-head", "dependabot/cargo/cargo-1234567890", [cleanIssueComment(OLD_HEAD)], "pending", "wait_provider"],
+    ["finding", "dependabot/cargo/cargo-1234567890", [findingIssueComment(HEAD)], "failure", "fix_findings"],
+  ]) {
+    const event = pullRequestEvent();
+    event.sender = DEPENDABOT;
+    event.pull_request.user = DEPENDABOT;
+    event.pull_request.head.ref = headRef;
+    const github = createGitHubMock({
+      issueComments,
+      pullRequestOverrides: {
+        user: DEPENDABOT,
+        head: { ref: headRef, user: { login: "owner", type: "Organization" } },
+      },
+      selfVerifierRun: verifierSelfRun({ head_branch: headRef }),
+    });
+    const environment = runtimeEnvironment(context, { suffix: `dependabot-${label}`, event });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.report.executionHealth, "healthy", `${label}: ${result.report.reason}`);
+    assert.equal(result.report.gateOutcome, outcome, label);
+    assert.equal(result.report.recoveryCode, recoveryCode, label);
+    assert.equal(result.exitCode, outcome === "success" ? 0 : 1, label);
+    assert.deepEqual(github.requestBodies, []);
+    assert.deepEqual(github.rerunRequests, []);
+    assert.deepEqual(github.statusWrites, []);
+  }
+});
+
+test("Dependabot controller can request review through the existing workflow_run path", async (context) => {
+  const headRef = "dependabot/cargo/cargo-1234567890";
+  const run = verifierRun({ head_branch: headRef });
+  run.pull_requests[0].head.ref = headRef;
+  const github = createGitHubMock({
+    pullRequestOverrides: { user: DEPENDABOT, head: { ref: headRef } },
+    verifierRuns: [run],
+    verifierRunAttempts: [run],
+  });
+  const environment = runtimeEnvironment(context, {
+    suffix: "dependabot-controller",
+    eventName: "workflow_run",
+    operation: "begin-review",
+    event: workflowRunEvent(run),
+  });
+  const { result } = await runGate(environment, github);
+
+  assert.equal(result.report.executionHealth, "healthy", result.report.reason);
+  assert.equal(result.report.gateOutcome, "pending");
+  assert.equal(result.report.recoveryCode, "wait_provider");
+  assert.deepEqual(github.requestBodies, [canonicalRequestBody()]);
+  assert.deepEqual(github.rerunRequests, []);
+  assert.deepEqual(github.statusWrites, []);
+});
+
+test("Dependabot eligibility does not admit other bots or widen PR scope", async (context) => {
+  for (const [label, overrides, reason] of [
+    ["other-bot", { user: ACTIONS_BOT }, /bot-authored/u],
+    ["wrong-account-id", { user: { ...DEPENDABOT, id: 1 } }, /bot-authored/u],
+    ["wrong-login", { user: { ...DEPENDABOT, login: "other-app[bot]" } }, /bot-authored/u],
+    ["bot-head-owner", { head: { user: ACTIONS_BOT } }, /bot-owned/u],
+    ["external-head", { head: { repo: { id: 99, full_name: "someone/fork" } } }, /fork pull requests/u],
+    ["queue", { head: { ref: "gh-readonly-queue/main/pr-17" } }, /merge queue/u],
+    ["draft", { draft: true }, /draft pull requests/u],
+    ["non-default-base", { base: { ref: "release" } }, /repository default branch/u],
+  ]) {
+    const github = createGitHubMock({
+      pullRequestOverrides: {
+        user: DEPENDABOT,
+        ...overrides,
+        head: { ref: "dependabot/cargo/cargo-1234567890", ...overrides.head },
+      },
+    });
+    const environment = runtimeEnvironment(context, {
+      suffix: `dependabot-reject-${label}`,
+      operation: "begin-review",
+    });
+    const { result } = await runGate(environment, github);
+
+    assert.equal(result.exitCode, 1, label);
+    assert.equal(result.report.gateOutcome, "not_applicable", label);
+    assert.equal(result.report.recoveryCode, "unsupported_target", label);
+    assert.match(result.report.reason, reason, label);
+    assert.deepEqual(github.requestBodies, [], label);
+    assert.deepEqual(github.rerunRequests, [], label);
+    assert.deepEqual(github.statusWrites, [], label);
   }
 });
 

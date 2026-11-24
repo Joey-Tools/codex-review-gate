@@ -1108,10 +1108,16 @@ metadata does not grant another target or configuration authority. Existing
 verifier and protected-controller checks remain unchanged; this adds no new
 permissions, workflow events, trust input or upstream configuration copying.
 
+Same-repository PRs from GitHub's Dependabot account are an exception only to
+the bot-author exclusion. The PR API must report a `Bot` with login
+`dependabot[bot]` and numeric account ID `49699333`. The branch pattern, event
+sender and commit author do not grant this exception. All other target checks,
+current-head evidence checks and protected-controller write safeguards apply.
+
 It fails closed for GHES, external fork PRs, merge queues, arbitrary non-default bases,
 manual feature-base chains and stacks with a non-default trunk, drafts,
-bot-owned PRs, Windows/macOS runners and new operations on closed or merged
-PRs. A selected self-hosted Linux runner is trusted by operator assumption;
+PRs from other bots or bot-owned head repositories, Windows/macOS runners and
+new operations on closed or merged PRs. A selected self-hosted Linux runner is trusted by operator assumption;
 the Action does not prove host integrity or isolation, and separate GitHub jobs
 are not host isolation. The controller host must be trusted when it can receive
 the controller token. No additional runner-specific trust flag, allowlist,

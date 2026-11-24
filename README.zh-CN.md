@@ -170,6 +170,12 @@ repository identity、default branch、受保护 controller 和 ruleset 为准�
 不会复制上游设置，也不会向外部 PR 暴露 secrets。已有 canonical workflows 可通过 floating
 `@v2` 获得 runtime 支持，不增加 event、permission 或 fork-trust input。
 
+## Dependabot PR
+
+GitHub 官方 Dependabot 创建的同仓库 PR 和人工创建的 PR 一样，必须通过当前 head 的 Codex
+审查检查。Action 根据 GitHub 返回的作者身份判定，不依赖可配置的分支名。Verifier 不需要额外
+secrets 或权限；是否自动发送审查请求仍由现有受保护 controller 配置决定。
+
 ## GitHub 原生 stacked PR
 
 GitHub 原生 stacked PR 可在经验证的 stack metadata 证明 trunk 是仓库当前 default branch 时

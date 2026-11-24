@@ -873,9 +873,13 @@ runner 选择仍是 `ubuntu-slim`，采用 `ubuntu-latest` fallback。
 其他目标或配置的 authority。Verifier 与受保护 controller 的既有检查保持不变；不新增 permissions、
 workflow events、trust input，也不复制上游配置。
 
+GitHub 官方 Dependabot 的同仓库 PR 只例外于 bot 作者限制。PR API 必须返回类型 `Bot`、
+登录名 `dependabot[bot]` 和数字账户 ID `49699333`。分支命名、事件发送者和提交作者都
+不能获得此例外。其余目标限制、当前 head 审查证据检查和受保护 controller 的写入限制均不变。
+
 GHES、外部 fork PR、merge queues、任意非 default base、手工 feature-base 链和 non-default trunk
-stack、drafts、bot-owned PRs、Windows/macOS
-runners，以及对 closed/merged PR 发起的新 operation 都会 fail closed。选择
+stack、drafts、其他 bot 创建的 PR 或 bot 所有的 head 仓库、Windows/macOS runners，以及对
+closed/merged PR 发起的新 operation 都会 fail closed。选择
 self-hosted Linux runner 是基于 operator 信任的假设；Action 不会证明 host integrity
 或 isolation，独立 GitHub jobs 也不提供 host isolation。能够接收 controller token 的
 controller host 必须可信。无需额外 runner-specific trust flag、allowlist、host API、

@@ -1057,10 +1057,16 @@ configure Actions, Codex review, variables, secrets and protection in the fork
 itself as applicable; the Action does not copy them from upstream. Existing
 canonical workflows may obtain this runtime support through floating `@v2`.
 
+Same-repository PRs authored by official GitHub Dependabot are eligible for
+the ordinary review checks. The GitHub-reported bot login and account ID must
+match; the branch name is not an identity signal. Dependabot has no review
+exemption: only valid current-head evidence can pass. The verifier remains
+read-only and the protected controller retains its existing request policy.
+
 It fails closed for GHES, external fork PRs, merge queues, arbitrary non-default
 bases, manual feature-branch chains, and stacks with a non-default trunk, as well as drafts,
-bot-owned PRs, Windows/macOS runners, and new operations on closed or merged
-PRs.
+PRs from other bots or bot-owned head repositories, Windows/macOS runners, and
+new operations on closed or merged PRs.
 
 Selecting a self-hosted Linux runner is an operator trust assumption: the
 operator is responsible for the runner host and its isolation. The Action does
