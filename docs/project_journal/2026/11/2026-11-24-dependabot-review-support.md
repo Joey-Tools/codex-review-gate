@@ -1,11 +1,11 @@
 ---
 id: 20261124-dependabot-review-support
 title: Dependabot Pull Request Review Support
-status: active
+status: completed
 created: 2026-11-24
 updated: 2026-11-24
 branch: wip/dependabot-support
-pr:
+pr: https://github.com/Joey-Tools/codex-review-gate/pull/156
 supersedes: []
 superseded_by:
 ---
@@ -31,16 +31,24 @@ superseded_by:
 - On Node.js 24.15.0, syntax checks and all 551 tests in the v2 runtime,
   Action, workflow contract, core and evidence-budget files passed. The
   broader local CI selection exceeded its execution budget and did not
-  produce a complete result; Node.js 20 CI remains a delivery check.
+  produce a complete result. Both Node.js 20 and 24 CI matrices passed in
+  [implementation PR #156](https://github.com/Joey-Tools/codex-review-gate/pull/156).
+  The source squash commit `70b2d9bfaac5111d20ffa34695fb99b543d47c01`
+  matches the tree of the exact reviewed head.
 - Offline regressions cover a clean current head, stale clean evidence,
   findings, custom branch naming, the automatic request path, and rejection
   of other bot or out-of-scope targets. Mocked API results do not prove live
   review completion or provider entitlement.
 
-## Next Steps
+## Release Intent
 
-- Publish the reviewed runtime through the regular Action patch release.
-  Existing canonical consumers of the floating `@v2` need no workflow edit.
+- The stable 2.2.17 intent packages that source, with the verified v2.2.16
+  public parent `08bcbf6ec83f49819c8099cbe2704e7e2590a491`. The manifest and
+  package version are the only non-journal changes in the intent.
+- The default-branch manifest push starts the existing publisher. Human
+  `marketplace-production` approval and independent verification of the
+  immutable release and signed floating `v2` remain separate from source
+  delivery. Existing floating consumers need no workflow edit.
 
 ## Evidence
 
