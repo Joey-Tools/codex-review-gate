@@ -254,6 +254,14 @@ this support does not copy upstream settings or expose secrets to external PRs.
 Existing canonical consumers receive the runtime change through floating `@v2`;
 no new event, permission or fork-trust input is introduced.
 
+## Dependabot pull requests
+
+Same-repository PRs from the official GitHub Dependabot account use the same
+current-head Codex review checks as human-authored PRs. The Action uses the
+GitHub-reported author identity, not the configurable branch name. No extra
+secrets or permissions are needed in the verifier. Automatic review requests
+still depend on the existing protected controller configuration.
+
 ## Native stacked pull requests
 
 A GitHub-native stacked PR may qualify when authenticated stack metadata binds
